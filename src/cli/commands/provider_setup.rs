@@ -736,4 +736,28 @@ mod tests {
         assert!(config.contains("auth = \"none\""));
         assert!(config.contains("requires_api_key = false"));
     }
+
+    #[test]
+    fn provider_add_preserves_omniroutev2_user_facing_case() {
+        let _lock = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        let mut options = base_options();
+        options.name = "OmniRouteV2".to_string();
+        options.base_url = "http://127.0.0.1:20128/v1".to_string();
+        options.model = "auto/best-free".to_string();
+        options.api_key = None;
+
+        let report = configure_provider_profile(options).expect("configure provider");
+
+        assert_eq!(report.profile, "OmniRouteV2");
+        let config = std::fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        let parsed: Config = toml::from_str(&config).expect("valid config");
+        assert_eq!(
+            parsed.provider.default_provider.as_deref(),
+            Some("OmniRouteV2")
+        );
+        assert!(parsed.providers.contains_key("OmniRouteV2"));
+        assert!(!parsed.providers.contains_key("omniroutev2"));
+    }
 }
