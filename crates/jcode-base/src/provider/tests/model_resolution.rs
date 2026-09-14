@@ -2110,9 +2110,29 @@ fn spawn_single_response_chat_server_or() -> (String, std::sync::mpsc::Receiver<
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set read timeout");
-        let mut request = vec![0u8; 16384];
-        let n = stream.read(&mut request).unwrap_or(0);
-        let request = String::from_utf8_lossy(&request[..n]).into_owned();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length:")?.trim().parse().ok())
+                .unwrap_or(0usize);
+            if request.len() >= header_end + content_length {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&request).into_owned();
         let _ = request_tx.send(request);
 
         let body = "data: [DONE]\n\n";

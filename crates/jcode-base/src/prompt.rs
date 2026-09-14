@@ -34,6 +34,42 @@ pub fn load_base_system_prompt(working_dir: Option<&Path>) -> String {
 /// Prompt guidance for the optional Mermaid rendering capability.
 pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
 
+/// Operational guidance for recovering from blockers. This is deliberately
+/// framed as subordinate guidance: execution safety, developer instructions,
+/// user constraints, and explicit permission gates remain authoritative.
+pub const AUTONOMOUS_BLOCKER_UNBLOCKING_PROMPT: &str = r#"## Autonomous blocker resolution
+
+When a task encounters an error or blocker, do not stop at the first failure.
+Preserve the user's actual objective and update the todo before continuing.
+
+1. Reproduce the failure with a bounded, read-only check when possible. Classify
+   it as access/auth, network, toolchain/dependency, source/configuration,
+   context, evidence, external-policy, safety, or unknown.
+2. Form a concrete hypothesis and try the smallest evidence-producing next step.
+   For research or access failures, test an alternate official channel, archive,
+   mirror, local source checkout, or more authoritative equivalent. Do not treat
+   search snippets or an unverified claim as full evidence.
+3. Retry only when new evidence or a changed tested variable justifies it. Do
+   not loop on identical retries. Prefer reversible local actions and attach a
+   concrete acceptance check to every reversible change.
+4. Apply the existing command-risk, safety, permission, credential, and
+   confirmation boundaries. This policy never grants permission, bypasses a
+   higher-priority instruction, resets passwords, exposes secrets, or silently
+   performs destructive, external, financial, account, deployment, or human-
+   communication actions.
+5. Verify the requested outcome through the strongest practical feedback loop:
+   use the real public or end-user path when available, then check edge cases,
+   integration boundaries, packaging, and likely failure modes. Record a concise
+   decision trace in the todo or artifact: blocker, hypothesis, alternative,
+   action, observed result, and remaining limitation. Do not reveal private
+   chain-of-thought.
+6. If the route is exhausted, unsafe, outside scope, or genuinely requires a
+   user decision or unavailable external state, keep the mission active, record
+   the blocker and next option, and ask only for the specific missing decision.
+
+Confidence must follow evidence. A 96% confidence target is aspirational, not a
+reason to inflate certainty or skip a missing acceptance check."#;
+
 /// Harness capabilities that conditionally contribute prompt modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCapabilities {
@@ -58,7 +94,10 @@ fn base_system_prompt_parts(
     capabilities: PromptCapabilities,
     working_dir: Option<&Path>,
 ) -> Vec<String> {
-    let mut parts = vec![load_base_system_prompt(working_dir)];
+    let mut parts = vec![
+        load_base_system_prompt(working_dir),
+        AUTONOMOUS_BLOCKER_UNBLOCKING_PROMPT.to_string(),
+    ];
     if capabilities.mermaid {
         parts.push(MERMAID_PROMPT.to_string());
     }

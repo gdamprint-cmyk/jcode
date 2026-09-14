@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod background;
+pub mod blocker_policy;
 pub mod browser;
 pub mod bus;
 pub mod cache_invalidation;

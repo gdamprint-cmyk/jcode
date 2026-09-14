@@ -1018,6 +1018,31 @@ fn goals_path(session_id: &str) -> Result<PathBuf> {
         .join(format!("{}-goals.json", session_id)))
 }
 
+/// Blocker records live beside todos, goals, and the plan so recovery evidence
+/// remains durable without changing the legacy bare todo-list format.
+pub fn load_blockers(session_id: &str) -> Result<Vec<crate::blocker_policy::BlockerRecord>> {
+    let path = blockers_path(session_id)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    storage::read_json(&path).or_else(|_| Ok(Vec::new()))
+}
+
+pub fn save_blockers(
+    session_id: &str,
+    blockers: &[crate::blocker_policy::BlockerRecord],
+) -> Result<()> {
+    let path = blockers_path(session_id)?;
+    storage::write_json_fast(&path, blockers)
+}
+
+fn blockers_path(session_id: &str) -> Result<PathBuf> {
+    let base = storage::jcode_dir()?;
+    Ok(base
+        .join("todos")
+        .join(format!("{}-blockers.json", session_id)))
+}
+
 /// The plan-level intent assessment lives in its own file beside the todo list
 /// and per-group goals, so each format stays independently readable.
 pub fn load_plan(session_id: &str) -> Result<TodoPlan> {

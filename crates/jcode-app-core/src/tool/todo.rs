@@ -1,11 +1,12 @@
 use super::{Tool, ToolContext, ToolOutput};
+use crate::blocker_policy::BlockerRecord;
 use crate::bus::{Bus, BusEvent, TodoEvent};
 use crate::todo::{
     GateObservation, GateObservationKind, SEVERE_INTENT_MISUNDERSTANDING,
     TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE, TodoGoal, TodoGoalChange, TodoGoalField,
     TodoItem, TodoPlan, TodoPlanChange, TodoPlanField, append_gate_observations,
-    feedback_loop_passes, intent_understanding_passes, load_goals, load_plan, load_todos,
-    save_goals, save_plan, save_todos, update_todo_review_cycle,
+    feedback_loop_passes, intent_understanding_passes, load_blockers, load_goals, load_plan,
+    load_todos, save_blockers, save_goals, save_plan, save_todos, update_todo_review_cycle,
 };
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -70,6 +71,7 @@ struct TodoInput {
     todos: Option<Vec<TodoItem>>,
     goals: Option<Vec<TodoGoal>>,
     plan: Option<TodoPlan>,
+    blockers: Option<Vec<BlockerRecord>>,
 }
 
 fn parse_todo_input(input: Value) -> Result<TodoInput> {
@@ -84,7 +86,50 @@ fn parse_todo_input(input: Value) -> Result<TodoInput> {
             todo.status
         );
     }
+    if let Some(blocker) = params.blockers.as_ref().and_then(|blockers| {
+        blockers
+            .iter()
+            .find(|blocker| blocker.id.trim().is_empty() || blocker.symptom.trim().is_empty())
+    }) {
+        bail!(
+            "invalid blocker {:?}; id and symptom must be non-empty",
+            blocker.id
+        );
+    }
     Ok(params)
+}
+
+fn merge_blockers(
+    stored: &[BlockerRecord],
+    incoming: Option<Vec<BlockerRecord>>,
+) -> Vec<BlockerRecord> {
+    let Some(incoming) = incoming else {
+        return stored.to_vec();
+    };
+
+    let mut merged = stored.to_vec();
+    for mut blocker in incoming {
+        if let Some(existing) = merged.iter_mut().find(|item| item.id == blocker.id) {
+            // Attempts are append-only audit evidence. Accept a complete
+            // incoming record, but never discard prior attempts when a model
+            // sends only the latest observation in a status update.
+            for attempt in blocker.attempts.drain(..) {
+                if !existing.attempts.contains(&attempt) {
+                    existing.attempts.push(attempt);
+                }
+            }
+            if blocker.todo_id.is_some() {
+                existing.todo_id = blocker.todo_id;
+            }
+            existing.kind = blocker.kind;
+            existing.symptom = blocker.symptom;
+            existing.status = blocker.status;
+            existing.next_step = blocker.next_step;
+        } else {
+            merged.push(blocker);
+        }
+    }
+    merged
 }
 
 /// Normalize a goal's group label: trimmed, with empty/whitespace collapsed
@@ -567,6 +612,7 @@ fn build_todo_output(
     todos: Vec<TodoItem>,
     plan: TodoPlan,
     goals: Vec<TodoGoal>,
+    blockers: Vec<BlockerRecord>,
     plan_change: Option<TodoPlanChange>,
     goal_changes: Option<Vec<TodoGoalChange>>,
     continuations: impl IntoIterator<Item = String>,
@@ -584,6 +630,10 @@ fn build_todo_output(
         text.push_str("\n\nGoals:\n");
         text.push_str(&serde_json::to_string_pretty(&goals)?);
     }
+    if !blockers.is_empty() {
+        text.push_str("\n\nBlockers:\n");
+        text.push_str(&serde_json::to_string_pretty(&blockers)?);
+    }
     if let Some(plan_change) = plan_change.as_ref() {
         text.push_str("\n\nPlan updates:\n");
         text.push_str(&serde_json::to_string_pretty(plan_change)?);
@@ -596,7 +646,7 @@ fn build_todo_output(
         text.push_str("\n\n");
         text.push_str(&continuation);
     }
-    let mut metadata = json!({"todos": todos, "plan": plan, "goals": goals});
+    let mut metadata = json!({"todos": todos, "plan": plan, "goals": goals, "blockers": blockers});
     if let Some(plan_change) = plan_change {
         metadata["plan_update"] = serde_json::to_value(plan_change)?;
     }
@@ -643,7 +693,7 @@ fn normalize_todo_input(mut input: Value) -> Value {
             }
         }
     }
-    for key in ["todos", "goals"] {
+    for key in ["todos", "goals", "blockers"] {
         let Some(entries) = obj.get_mut(key) else {
             continue;
         };
@@ -727,7 +777,7 @@ impl Tool for TodoTool {
         // deliberately handwritten. Never generate it from gate constants or
         // interpolate private thresholds, because that would teach the model
         // how to target the evaluator instead of reporting an honest assessment.
-        "Read or update structured todo items and optional goal-level assessments."
+        "Read or update structured todo items, blocker records, and optional goal-level assessments."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -853,6 +903,45 @@ impl Tool for TodoTool {
                             }
                         }
                     }
+                },
+                "blockers": {
+                    "type": "array",
+                    "description": "Concise blocker records and evidence-producing recovery attempts. Omit to retain existing records.",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "kind", "symptom", "status", "attempts"],
+                        "properties": {
+                            "id": {"type": "string", "description": "Stable blocker ID."},
+                            "todo_id": {"type": "string", "description": "Optional related todo ID."},
+                            "kind": {
+                                "type": "string",
+                                "enum": ["access", "authentication", "network", "toolchain", "dependency", "source", "configuration", "context", "evidence", "external_policy", "safety", "unknown"],
+                                "description": "Blocker cause category."
+                            },
+                            "symptom": {"type": "string", "description": "Observed failure, not a guess."},
+                            "status": {
+                                "type": "string",
+                                "enum": ["open", "resolved", "escalated"],
+                                "description": "Current blocker lifecycle status."
+                            },
+                            "attempts": {
+                                "type": "array",
+                                "description": "Concise evidence-producing attempts, including result and evidence strength.",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["kind", "summary", "succeeded", "evidence", "changed_tested_variable"],
+                                    "properties": {
+                                        "kind": {"type": "string", "description": "Action kind used for this attempt."},
+                                        "summary": {"type": "string", "description": "What was tried and what it observed."},
+                                        "succeeded": {"type": "boolean"},
+                                        "evidence": {"type": "string", "enum": ["none", "indirect", "partial", "representative", "acceptance_aligned"]},
+                                        "changed_tested_variable": {"type": "boolean"}
+                                    }
+                                }
+                            },
+                            "next_step": {"type": "string", "description": "Next bounded option or the specific escalation needed."}
+                        }
+                    }
                 }
             }
         })
@@ -860,7 +949,10 @@ impl Tool for TodoTool {
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params = parse_todo_input(input)?;
-        let is_write = params.todos.is_some() || params.goals.is_some() || params.plan.is_some();
+        let is_write = params.todos.is_some()
+            || params.goals.is_some()
+            || params.plan.is_some()
+            || params.blockers.is_some();
         let operation = if is_write { "write" } else { "read" };
         let result = if is_write {
             // Goals/plan-only writes keep the stored todo list.
@@ -870,8 +962,10 @@ impl Tool for TodoTool {
             (|| {
                 let stored_goals = load_goals(&ctx.session_id).unwrap_or_default();
                 let stored_plan = load_plan(&ctx.session_id).unwrap_or_default();
+                let stored_blockers = load_blockers(&ctx.session_id).unwrap_or_default();
                 let goals = prune_orphaned_goals(merge_goals(&stored_goals, params.goals), &todos);
                 let plan = merge_plan(&stored_plan, params.plan);
+                let blockers = merge_blockers(&stored_blockers, params.blockers);
                 let (observations, nudges) =
                     record_reframe_observations(&plan, &goals, &todos, &previous);
                 for observation in &observations {
@@ -914,6 +1008,7 @@ impl Tool for TodoTool {
                 save_todos(&ctx.session_id, &todos)?;
                 save_goals(&ctx.session_id, &goals)?;
                 save_plan(&ctx.session_id, &plan)?;
+                save_blockers(&ctx.session_id, &blockers)?;
                 if let Err(err) = update_todo_review_cycle(&ctx.session_id, &previous, &todos) {
                     crate::logging::warn(&format!(
                         "[tool:todo] failed to update review cycle session_id={} error={}",
@@ -931,6 +1026,7 @@ impl Tool for TodoTool {
                     todos,
                     plan,
                     goals,
+                    blockers,
                     concise_plan_change,
                     concise_goal_changes,
                     nudges,
@@ -941,8 +1037,9 @@ impl Tool for TodoTool {
                 let todos = load_todos(&ctx.session_id)?;
                 let goals = load_goals(&ctx.session_id).unwrap_or_default();
                 let plan = load_plan(&ctx.session_id).unwrap_or_default();
+                let blockers = load_blockers(&ctx.session_id).unwrap_or_default();
                 record_todo_telemetry(&todos, &todos, &goals, &plan);
-                build_todo_output(todos, plan, goals, None, None, Vec::new())
+                build_todo_output(todos, plan, goals, blockers, None, None, Vec::new())
             })()
         };
         result.map_err(|err| {
@@ -971,11 +1068,12 @@ mod tests {
             .get("properties")
             .and_then(|v| v.as_object())
             .expect("todo schema should have properties");
-        assert_eq!(props.len(), 4);
+        assert_eq!(props.len(), 5);
         assert!(props.contains_key("intent"));
         assert!(props.contains_key("todos"));
         assert!(props.contains_key("plan"));
         assert!(props.contains_key("goals"));
+        assert!(props.contains_key("blockers"));
 
         let item = props["todos"]
             .get("items")
@@ -1039,6 +1137,44 @@ mod tests {
         assert!(!goal_props.contains_key("alignment_score"));
         assert!(!goal_props.contains_key("objective"));
         assert_eq!(goal_props.len(), 11);
+
+        let blocker_item = props["blockers"]
+            .get("items")
+            .and_then(|value| value.as_object())
+            .expect("blockers should describe item objects");
+        let blocker_required = blocker_item["required"]
+            .as_array()
+            .expect("blocker should advertise required fields");
+        for required in ["id", "kind", "symptom", "status", "attempts"] {
+            assert!(
+                blocker_required.iter().any(|value| value == required),
+                "blocker schema omitted required field {required}"
+            );
+        }
+        let blocker_props = blocker_item["properties"]
+            .as_object()
+            .expect("blocker should advertise properties");
+        assert!(blocker_props.contains_key("next_step"));
+        assert!(blocker_props.contains_key("todo_id"));
+        let attempt_item = blocker_props["attempts"]["items"]
+            .as_object()
+            .expect("blocker attempts should describe item objects");
+        for required in [
+            "kind",
+            "summary",
+            "succeeded",
+            "evidence",
+            "changed_tested_variable",
+        ] {
+            assert!(
+                attempt_item["required"]
+                    .as_array()
+                    .expect("attempt should advertise required fields")
+                    .iter()
+                    .any(|value| value == required),
+                "attempt schema omitted required field {required}"
+            );
+        }
         assert_eq!(
             goal_props["feedback_loop_relevance"]["enum"],
             json!([
@@ -1092,21 +1228,17 @@ mod tests {
             .expect("alignment score should describe representation coverage");
         assert!(alignment_description.contains("what the user wants"));
         assert!(alignment_description.contains("when guessing"));
-        // The detailed calibration rubric moved out of the always-on schema
-        // into deferred turn-finish continuation messages, which are paid only
-        // when the completed turn needs another quality pass.
-        for required_concept in [
-            "requirement inventory",
-            "outcomes, deliverables, constraints, prohibited actions",
-            "integration paths, edge cases, and necessary follow-through",
-            "Do not ask the user",
-        ] {
-            assert!(
-                crate::todo::TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE
-                    .contains(required_concept),
-                "intent gate message omitted {required_concept}"
-            );
-        }
+        // The always-on gate message is intentionally concise. The detailed
+        // calibration guidance lives in the system policy and deferred
+        // continuation paths, so the schema does not reveal private scoring.
+        assert!(
+            crate::todo::TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE
+                .contains("Try to avoid asking the user")
+        );
+        assert!(
+            crate::todo::TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE
+                .contains("todo is up to date")
+        );
         let feedback_description = goal_props["feedback_loop"]
             .get("description")
             .and_then(Value::as_str)
@@ -1123,17 +1255,14 @@ mod tests {
             feedback_description_lower.contains("explicit observation or check"),
             "feedback_loop description omitted per-requirement check coverage: {feedback_description}"
         );
-        for required_concept in [
-            "reports back on each requirement",
-            "run tests, verify, or review count only",
-            "non-testable requirements",
-        ] {
-            assert!(
-                crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
-                    .contains(required_concept),
-                "feedback gate message omitted {required_concept}"
-            );
-        }
+        assert!(
+            crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
+                .contains("what feedback loops you need")
+        );
+        assert!(
+            crate::todo::TODO_CLOSED_FEEDBACK_LOOP_CONTINUATION_MESSAGE
+                .contains("todo is up to date")
+        );
         assert!(
             !alignment_description
                 .to_ascii_lowercase()
@@ -1297,6 +1426,78 @@ mod tests {
     fn empty_string_todos_means_read() {
         let parsed = parse(json!({"todos": ""})).expect("empty string should parse");
         assert!(parsed.todos.is_none());
+    }
+
+    #[test]
+    fn accepts_and_validates_blocker_records() {
+        let parsed = parse(json!({
+            "blockers": [{
+                "id": "reddit-403",
+                "kind": "external_policy",
+                "symptom": "Reddit JSON returned HTTP 403",
+                "status": "open",
+                "attempts": [{
+                    "kind": "alternate_source",
+                    "summary": "Fetched the same discussion through Arctic Shift",
+                    "succeeded": true,
+                    "evidence": "representative",
+                    "changed_tested_variable": true
+                }],
+                "next_step": "Compare with official documentation"
+            }]
+        }))
+        .expect("blocker record should parse");
+        let blocker = &parsed.blockers.expect("blockers present")[0];
+        assert_eq!(blocker.id, "reddit-403");
+        assert_eq!(
+            blocker.kind,
+            crate::blocker_policy::BlockerKind::ExternalPolicy
+        );
+        assert_eq!(blocker.attempts.len(), 1);
+        assert!(
+            parse(json!({
+                "blockers": [{
+                    "id": " ",
+                    "kind": "unknown",
+                    "symptom": "observed",
+                    "status": "open",
+                    "attempts": []
+                }]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blocker_merge_preserves_prior_attempts() {
+        let mut stored = BlockerRecord::new(
+            "cline-acp-model",
+            crate::blocker_policy::BlockerKind::Configuration,
+            "ACP model is empty",
+        );
+        stored.record_attempt(crate::blocker_policy::BlockerAttempt {
+            kind: crate::blocker_policy::ActionKind::Diagnose,
+            summary: "provider catalog was empty".to_string(),
+            succeeded: true,
+            evidence: crate::blocker_policy::EvidenceLevel::Partial,
+            changed_tested_variable: false,
+        });
+
+        let mut update = stored.clone();
+        update.attempts.clear();
+        update.status = crate::blocker_policy::BlockerStatus::Escalated;
+        update.next_step = Some("supply a non-empty model selection".to_string());
+
+        let merged = merge_blockers(&[stored], Some(vec![update]));
+        assert_eq!(merged[0].attempts.len(), 1);
+        assert_eq!(
+            merged[0].status,
+            crate::blocker_policy::BlockerStatus::Escalated
+        );
+        assert_eq!(
+            merged[0].next_step.as_deref(),
+            Some("supply a non-empty model selection")
+        );
     }
 
     #[test]
@@ -1632,6 +1833,7 @@ mod tests {
             todos.clone(),
             plan.clone(),
             goals.clone(),
+            Vec::new(),
             None,
             None,
             [crate::todo::TODO_OWNERSHIP_CONTINUATION_MESSAGE.to_string()],
@@ -1648,7 +1850,7 @@ mod tests {
         );
         assert_eq!(
             output.metadata,
-            Some(json!({"todos": todos, "plan": plan, "goals": goals}))
+            Some(json!({"todos": todos, "plan": plan, "goals": goals, "blockers": []}))
         );
     }
 
@@ -1661,6 +1863,49 @@ mod tests {
             stdin_request_tx: None,
             graceful_shutdown_signal: None,
             execution_mode: crate::tool::ToolExecutionMode::Direct,
+        }
+    }
+
+    #[tokio::test]
+    async fn blocker_records_round_trip_through_todo_storage_and_output() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", dir.path());
+        let session = "blocker-round-trip";
+        let tool = TodoTool::new();
+        let input = json!({
+            "blockers": [{
+                "id": "toolchain-dlltool",
+                "kind": "toolchain",
+                "symptom": "dlltool was missing from PATH",
+                "status": "open",
+                "attempts": [],
+                "next_step": "Use the installed MinGW bin directory"
+            }]
+        });
+
+        let output = tool
+            .execute(input, test_ctx(session))
+            .await
+            .expect("blocker write");
+        let stored = load_blockers(session).expect("blockers should be persisted");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "toolchain-dlltool");
+        assert!(output.output.contains("Blockers:"));
+        assert_eq!(
+            output.metadata.as_ref().and_then(|metadata| {
+                metadata
+                    .get("blockers")
+                    .and_then(|blockers| blockers.as_array())
+                    .map(Vec::len)
+            }),
+            Some(1)
+        );
+
+        match previous_home {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
         }
     }
 

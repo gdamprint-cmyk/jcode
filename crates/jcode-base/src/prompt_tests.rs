@@ -40,6 +40,29 @@ fn mermaid_prompt_module_follows_capability() {
     assert!(!disabled.static_part.contains("fenced `mermaid` code block"));
 }
 
+#[test]
+fn blocker_policy_is_always_present_and_preserves_safety_boundaries() {
+    let (split, _) = build_system_prompt_split_with_capabilities(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities { mermaid: false },
+    );
+
+    assert!(
+        split
+            .static_part
+            .contains(AUTONOMOUS_BLOCKER_UNBLOCKING_PROMPT)
+    );
+    let policy_lower = split.static_part.to_ascii_lowercase();
+    assert!(policy_lower.contains("never grants permission"));
+    assert!(policy_lower.contains("do not reveal private"));
+    assert!(policy_lower.contains("chain-of-thought"));
+    assert!(policy_lower.contains("do not stop at the first failure"));
+}
+
 /// Verify skill prompts don't accidentally introduce "Claude Code" identity
 #[test]
 fn test_skill_prompt_integration() {
