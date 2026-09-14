@@ -2498,7 +2498,7 @@ async fn run_single_message_with_agent(
             let text = run_single_message_command_capture_with_auto_poke(agent, message).await?;
             let report = RunCommandReport {
                 session_id: agent.session_id().to_string(),
-                provider: provider.name().to_string(),
+                provider: run_command_provider_display_name(provider.as_ref()),
                 model: provider.model(),
                 text,
                 usage: agent.last_usage().clone(),
@@ -2953,12 +2953,13 @@ async fn run_single_message_command_ndjson(
         session_id: Some(session_id.clone()),
         ..NdjsonRunState::default()
     };
+    let provider_display_name = run_command_provider_display_name(provider.as_ref());
     write_json_line(
         &mut stdout,
         &serde_json::json!({
             "type": "start",
             "session_id": session_id,
-            "provider": provider.name(),
+            "provider": &provider_display_name,
             "model": provider.model(),
         }),
     )?;
@@ -3102,7 +3103,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "done",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": &provider_display_name,
                     "model": provider.model(),
                     "text": state.text,
                     "usage": state.usage,
@@ -3120,7 +3121,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "error",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": &provider_display_name,
                     "model": provider.model(),
                     "message": format!("{err:#}"),
                 }),
@@ -3128,6 +3129,10 @@ async fn run_single_message_command_ndjson(
             Err(err)
         }
     }
+}
+
+fn run_command_provider_display_name(provider: &dyn crate::provider::Provider) -> String {
+    provider.display_name()
 }
 
 fn emit_ndjson_event(
@@ -3351,16 +3356,14 @@ pub async fn run_model_command(
     if models.is_empty() {
         anyhow::bail!(
             "No models found for provider '{}'. Check credentials or try a different --provider.",
-            provider.name()
+            provider.display_name()
         );
     }
 
     if emit_json {
         let provider_label = super::provider_init::login_provider_for_choice(choice)
             .map(|provider| provider.display_name.to_string())
-            .unwrap_or_else(|| {
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            });
+            .unwrap_or_else(|| provider.display_name());
         let report = ModelListReport {
             provider: provider_label,
             selected_model: provider.model(),
@@ -3378,10 +3381,7 @@ pub async fn run_model_command(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         if verbose {
-            println!(
-                "Provider: {}",
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            );
+            println!("Provider: {}", provider.display_name());
             println!("Selected model: {}", provider.model());
             println!("Available models: {}", models.len());
             println!();

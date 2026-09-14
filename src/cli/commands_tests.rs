@@ -126,9 +126,23 @@ impl Provider for TestProvider {
         "test"
     }
 
+    fn display_name(&self) -> String {
+        "Test Runtime Profile".to_string()
+    }
+
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(Self)
     }
+}
+
+#[test]
+fn ndjson_provider_label_uses_runtime_display_name() {
+    let provider = TestProvider;
+    assert_eq!(provider.name(), "test");
+    assert_eq!(
+        run_command_provider_display_name(&provider),
+        "Test Runtime Profile"
+    );
 }
 
 struct FailingTestProvider;

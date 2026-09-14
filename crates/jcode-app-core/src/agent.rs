@@ -133,7 +133,7 @@ fn log_agent_provider_stream_lifecycle(
 ) {
     let mut owned = vec![
         ("phase".to_string(), phase.to_string()),
-        ("provider".to_string(), agent.provider.name().to_string()),
+        ("provider".to_string(), agent.provider.display_name()),
         ("model".to_string(), agent.provider.model()),
         ("session_id".to_string(), agent.session.id.clone()),
         (
