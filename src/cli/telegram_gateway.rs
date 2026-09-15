@@ -156,7 +156,10 @@ impl TelegramApi {
             .json(&payload)
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("Telegram {method} request failed"))?;
+            .map_err(|error| {
+                let detail = error.to_string().replace(&self.bot_token, "<redacted>");
+                anyhow::anyhow!("Telegram {method} request failed: {detail}")
+            })?;
         let status = response.status();
         let body: TelegramResponse<T> = response
             .json()
@@ -176,7 +179,7 @@ impl TelegramApi {
     async fn get_updates(&self, offset: Option<i64>) -> Result<Vec<BotUpdate>> {
         let mut payload = json!({
             "timeout": 30,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         });
         if let Some(offset) = offset {
             payload["offset"] = json!(offset);
@@ -185,6 +188,17 @@ impl TelegramApi {
     }
 
     async fn send_message(&self, chat_id: i64, thread_id: Option<i64>, text: &str) -> Result<i64> {
+        self.send_message_with_markup(chat_id, thread_id, text, None)
+            .await
+    }
+
+    async fn send_message_with_markup(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+        reply_markup: Option<serde_json::Value>,
+    ) -> Result<i64> {
         let mut payload = json!({
             "chat_id": chat_id,
             "text": text,
@@ -193,6 +207,9 @@ impl TelegramApi {
         if let Some(thread_id) = thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
+        if let Some(reply_markup) = reply_markup {
+            payload["reply_markup"] = reply_markup;
+        }
         Ok(self
             .call::<SentMessage>("sendMessage", payload)
             .await?
@@ -200,13 +217,41 @@ impl TelegramApi {
     }
 
     async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        self.edit_message_with_markup(chat_id, message_id, text, None)
+            .await
+    }
+
+    async fn edit_message_with_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        if let Some(reply_markup) = reply_markup {
+            payload["reply_markup"] = reply_markup;
+        }
         self.call::<serde_json::Value>(
             "editMessageText",
+            payload,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn answer_callback_query(&self, callback_query_id: &str, text: &str) -> Result<()> {
+        self.call::<bool>(
+            "answerCallbackQuery",
             json!({
-                "chat_id": chat_id,
-                "message_id": message_id,
+                "callback_query_id": callback_query_id,
                 "text": text,
-                "disable_web_page_preview": true,
+                "show_alert": false,
             }),
         )
         .await
@@ -232,10 +277,13 @@ struct BotUpdate {
     update_id: i64,
     #[serde(default)]
     message: Option<BotMessage>,
+    #[serde(default)]
+    callback_query: Option<BotCallbackQuery>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct BotMessage {
+    message_id: i64,
     chat: BotChat,
     #[serde(default)]
     from: Option<BotUser>,
@@ -245,16 +293,26 @@ struct BotMessage {
     message_thread_id: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct BotChat {
     id: i64,
     #[serde(rename = "type", default)]
     kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct BotUser {
     id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BotCallbackQuery {
+    id: String,
+    from: BotUser,
+    #[serde(default)]
+    message: Option<BotMessage>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,6 +522,23 @@ impl Bridge {
                     reconnect_attempt = 0;
                     for update in updates {
                         let next_offset = update.update_id.saturating_add(1);
+                        if let Some(callback) = update.callback_query {
+                            if let Err(error) = self.handle_callback(&callback).await {
+                                let _ = self
+                                    .bot
+                                    .answer_callback_query(&callback.id, "Bridge error")
+                                    .await;
+                                if let Some(message) = callback.message.as_ref() {
+                                    let _ = self
+                                        .send_text(
+                                            message.chat.id,
+                                            message.message_thread_id,
+                                            &format!("❌ Bridge error: {error}"),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
                         if let Some(message) = update.message {
                             if self.authorized(&message) {
                                 if let Err(error) = self.handle_message(&message).await {
@@ -492,6 +567,82 @@ impl Bridge {
         }
     }
 
+    async fn handle_callback(&self, callback: &BotCallbackQuery) -> Result<()> {
+        let Some(message) = callback.message.as_ref() else {
+            self.bot
+                .answer_callback_query(&callback.id, "No message to update")
+                .await?;
+            return Ok(());
+        };
+        if !self.authorized_callback(callback, message) {
+            self.bot
+                .answer_callback_query(&callback.id, "Not allowed")
+                .await?;
+            return Ok(());
+        }
+
+        let Some((command, label)) = callback_action(callback.data.as_deref().unwrap_or_default())
+        else {
+            self.bot
+                .answer_callback_query(&callback.id, "Unknown action")
+                .await?;
+            return Ok(());
+        };
+
+        // ACK first so Telegram stops the button spinner while the gateway work
+        // is running. The original menu message is then updated in place.
+        self.bot
+            .answer_callback_query(&callback.id, "Запускаю")
+            .await?;
+        let _ = self
+            .bot
+            .edit_message_with_markup(
+                message.chat.id,
+                message.message_id,
+                &format!("⏳ {label}…"),
+                None,
+            )
+            .await;
+
+        let synthetic_message = BotMessage {
+            message_id: message.message_id,
+            chat: message.chat.clone(),
+            from: Some(callback.from.clone()),
+            text: Some(command.to_string()),
+            message_thread_id: message.message_thread_id,
+        };
+        let outcome = self.handle_message(&synthetic_message).await;
+        let menu_text = match &outcome {
+            Ok(()) => format!("✅ {label} завершено.\n\nВыбери следующее действие:"),
+            Err(error) => format!("❌ {label}: {error}\n\nМожно повторить действие:"),
+        };
+        if let Err(error) = self
+            .bot
+            .edit_message_with_markup(
+                message.chat.id,
+                message.message_id,
+                &menu_text,
+                Some(main_menu_markup()),
+            )
+            .await
+        {
+            eprintln!("Telegram callback menu update failed: {error}");
+            self.send_menu(
+                message.chat.id,
+                message.message_thread_id,
+                &menu_text,
+            )
+            .await?;
+        }
+        // The action result is already represented in the replaced menu. Do not
+        // emit a second generic bridge-error message for an expected action error.
+        Ok(())
+    }
+
+    fn authorized_callback(&self, callback: &BotCallbackQuery, message: &BotMessage) -> bool {
+        self.authorized(message) && self.config.allowed_user_ids.contains(&callback.from.id)
+    }
+
     async fn send_text(&self, chat_id: i64, thread_id: Option<i64>, text: &str) -> Result<()> {
         let chunks = split_text(text, MAX_TELEGRAM_CHARS);
         if chunks.is_empty() {
@@ -502,6 +653,13 @@ impl Bridge {
             }
         }
         Ok(())
+    }
+
+    async fn send_menu(&self, chat_id: i64, thread_id: Option<i64>, text: &str) -> Result<()> {
+        self.bot
+            .send_message_with_markup(chat_id, thread_id, text, Some(main_menu_markup()))
+            .await
+            .map(|_| ())
     }
 
     async fn bind_session(
@@ -589,7 +747,7 @@ impl Bridge {
         }
         match parse_command(text) {
             BridgeCommand::Help => {
-                self.send_text(message.chat.id, message.message_thread_id, HELP_TEXT)
+                self.send_menu(message.chat.id, message.message_thread_id, HELP_TEXT)
                     .await
             }
             BridgeCommand::New => {
@@ -1256,7 +1414,7 @@ fn parse_command(text: &str) -> BridgeCommand {
     let command = words.next().unwrap_or_default();
     let command = command.split('@').next().unwrap_or(command);
     match command {
-        "/start" | "/help" => BridgeCommand::Help,
+        "/start" | "/help" | "/menu" => BridgeCommand::Help,
         "/new" => BridgeCommand::New,
         "/sessions" => BridgeCommand::Sessions,
         "/resume" => words.next().map_or(BridgeCommand::Help, |value| {
@@ -1270,6 +1428,37 @@ fn parse_command(text: &str) -> BridgeCommand {
         "/cancel" => BridgeCommand::Cancel,
         "/continue" => BridgeCommand::Continue,
         _ => BridgeCommand::Help,
+    }
+}
+
+fn main_menu_markup() -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                { "text": "🆕 Новая сессия", "callback_data": "jcode:new" },
+                { "text": "📊 Статус", "callback_data": "jcode:status" }
+            ],
+            [
+                { "text": "📚 Сессии", "callback_data": "jcode:sessions" },
+                { "text": "▶️ Продолжить", "callback_data": "jcode:continue" }
+            ],
+            [
+                { "text": "⏹ Отмена", "callback_data": "jcode:cancel" },
+                { "text": "❓ Помощь", "callback_data": "jcode:help" }
+            ]
+        ]
+    })
+}
+
+fn callback_action(data: &str) -> Option<(&'static str, &'static str)> {
+    match data {
+        "jcode:new" => Some(("/new", "Новая сессия")),
+        "jcode:sessions" => Some(("/sessions", "Список сессий")),
+        "jcode:status" => Some(("/status", "Статус")),
+        "jcode:continue" => Some(("/continue", "Продолжение")),
+        "jcode:cancel" => Some(("/cancel", "Отмена")),
+        "jcode:help" => Some(("/help", "Помощь")),
+        _ => None,
     }
 }
 
@@ -1288,6 +1477,7 @@ mod tests {
     fn command_parser_handles_commands_and_bot_suffix() {
         assert_eq!(parse_command("/new"), BridgeCommand::New);
         assert_eq!(parse_command("/status@my_bot"), BridgeCommand::Status);
+        assert_eq!(parse_command("/menu"), BridgeCommand::Help);
         assert_eq!(
             parse_command("/resume abc-123"),
             BridgeCommand::Resume("abc-123".to_string())
@@ -1297,6 +1487,27 @@ mod tests {
             BridgeCommand::Text("hello jcode".to_string())
         );
         assert_eq!(parse_command("/unknown"), BridgeCommand::Help);
+    }
+
+    #[test]
+    fn callback_actions_map_to_safe_commands_and_menu_buttons() {
+        assert_eq!(callback_action("jcode:new"), Some(("/new", "Новая сессия")));
+        assert_eq!(
+            callback_action("jcode:status"),
+            Some(("/status", "Статус"))
+        );
+        assert_eq!(callback_action("unknown"), None);
+
+        let markup = main_menu_markup();
+        let rows = markup
+            .get("inline_keyboard")
+            .and_then(serde_json::Value::as_array)
+            .expect("inline keyboard rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0][0]["callback_data"],
+            serde_json::Value::String("jcode:new".to_string())
+        );
     }
 
     #[test]

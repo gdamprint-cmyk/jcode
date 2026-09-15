@@ -1,6 +1,8 @@
 # Telegram gateway session bridge
 
-**Status:** implemented, opt-in, not started automatically.
+**Status:** implemented, opt-in, supervisable. The local deployment uses a
+Windows Task Scheduler wrapper; ordinary Jcode and ambient startup still do not
+start this client.
 
 The full Telegram client is intentionally separate from Jcode ambient mode:
 
@@ -58,7 +60,10 @@ jcode telegram gateway
 ```
 
 It is not started by ordinary Jcode startup, ambient startup, or the gateway
-server. Run it under a supervisor only after the first manual harmless test.
+server. The local Windows installation runs it through the idempotent
+`~/.jcode/start-telegram-gateway.ps1` wrapper registered as the
+`Jcode Telegram Gateway` scheduled task. The local config points the bridge at
+the authenticated loopback gateway `ws://127.0.0.1:7644/ws`.
 
 Supported commands:
 
@@ -71,7 +76,16 @@ Supported commands:
 - `/cancel` request cancellation
 - `/continue` ask the active session to continue from a safe point
 - `/help` show help
+- `/menu` show the inline action menu
 - Any other text is sent to the active session
+
+`/start`, `/help`, and `/menu` include an inline keyboard for creating a new
+session, viewing status or known sessions, continuing, cancelling, and opening
+help. Button presses are received as Telegram `callback_query` updates, are
+answered immediately, and replace the original menu message in place. If an
+edit is rejected by Telegram, the bridge sends a replacement menu message rather
+than leaving the button spinner unresolved. Callback authorization checks both
+the allowlisted user ID and the chat policy.
 
 Responses are streamed through throttled Telegram message edits, typing status is
 refreshed while a request is running, and final responses are split below the Bot
@@ -87,6 +101,9 @@ processed.
   generic with respect to the Bot API URL.
 - The bridge uses the gateway's bearer-token WebSocket protocol. It does not expose
   a new listener and does not bypass gateway pairing.
+- `callback_query` is explicitly included in `getUpdates.allowed_updates`; omitting
+  it makes Telegram buttons appear to do nothing even when the old menu message is
+  visible.
 - Tool events are displayed as progress only. The current gateway wire protocol has
   no tool-approval request variant, so the bridge does not invent approval buttons
   or pretend that a Telegram click authorized a tool. Approval support requires a
