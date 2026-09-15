@@ -89,6 +89,13 @@ edit is rejected by Telegram, the bridge sends a replacement menu message rather
 than leaving the button spinner unresolved. Callback authorization checks both
 the allowlisted user ID and the chat policy.
 
+The command list shown by Telegram's menu button beside the input is also
+managed automatically. On startup the bridge calls the official Bot API
+`setMyCommands` for the default scope and each allowlisted private-chat scope,
+which replaces stale commands left by an older bot such as Hermes. BotFather is
+not required for this update. Telegram clients may need the menu button to be
+closed and reopened before displaying the refreshed list.
+
 Responses are streamed through throttled Telegram message edits, typing status is
 refreshed while a request is running, and final responses are split below the Bot
 API message limit. The state file is written using a temporary file and rename.

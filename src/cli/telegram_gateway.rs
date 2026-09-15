@@ -591,6 +591,7 @@ impl Bridge {
                         let next_offset = update.update_id.saturating_add(1);
                         if let Some(callback) = update.callback_query {
                             if let Err(error) = self.handle_callback(&callback).await {
+                                eprintln!("Telegram callback handling failed: {error:#}");
                                 let _ = self
                                     .bot
                                     .answer_callback_query(&callback.id, "Bridge error")
@@ -609,6 +610,7 @@ impl Bridge {
                         if let Some(message) = update.message {
                             if self.authorized(&message) {
                                 if let Err(error) = self.handle_message(&message).await {
+                                    eprintln!("Telegram message handling failed: {error:#}");
                                     let _ = self
                                         .send_text(
                                             message.chat.id,
