@@ -342,6 +342,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Ambient(AmbientCommand),
 
+    /// Run a full Telegram client backed by persistent jcode sessions over the gateway
+    #[command(subcommand)]
+    Telegram(TelegramCommand),
+
     /// Optional Jcode Cloud/Jade integration commands
     #[command(subcommand)]
     Cloud(CloudCommand),
@@ -1093,6 +1097,12 @@ pub(crate) enum AmbientCommand {
     /// Run an ambient cycle in a visible TUI (internal, spawned by the ambient runner)
     #[command(hide = true)]
     RunVisible,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum TelegramCommand {
+    /// Run the persistent Telegram-to-gateway session bridge
+    Gateway,
 }
 
 #[derive(Subcommand, Debug)]

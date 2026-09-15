@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::args::{
     AmbientCommand, Args, AuthCommand, CloudCommand, CloudSessionsCommand, Command, MemoryCommand,
-    ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
+    ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand, TelegramCommand,
     TranscriptModeArg,
 };
 use crate::{
@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    account, acp, commands, debug, hot_exec, login, output, provider_init, selfdev, terminal,
-    tui_launch,
+    account, acp, commands, debug, hot_exec, login, output, provider_init, selfdev,
+    telegram_gateway, terminal, tui_launch,
 };
 use provider_init::ProviderChoice;
 
@@ -448,6 +448,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         },
         Some(Command::Ambient(subcmd)) => {
             commands::run_ambient_command(map_ambient_subcommand(subcmd)).await?;
+        }
+        Some(Command::Telegram(TelegramCommand::Gateway)) => {
+            telegram_gateway::run().await?;
         }
         Some(Command::Cloud(subcmd)) => {
             commands::run_cloud_command(map_cloud_subcommand(subcmd))?;
