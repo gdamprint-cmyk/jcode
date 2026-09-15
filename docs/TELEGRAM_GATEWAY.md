@@ -20,6 +20,8 @@ The bridge owns the Telegram `getUpdates` poller and maps each private chat, or
 Telegram topic when present, to one persistent jcode session. Ambient remains an
 internal background runner and its existing Telegram channel must not run at the
 same time because Telegram allows only one consumer for a bot's update stream.
+The Windows bridge also takes a kernel-backed named mutex, so a second manual or
+Task Scheduler launch exits without starting a competing poller.
 
 ## Prerequisites
 
@@ -97,6 +99,8 @@ processed.
 
 - Authorization requires an allowlisted `from.id`; a private-chat default also
   rejects group and supergroup updates unless explicitly enabled.
+- Windows starts take `Local\\JcodeTelegramFullSessionBridge`; duplicate launches
+  exit cleanly, and the mutex is released automatically if the process crashes.
 - The bridge never prints bot or gateway tokens. Network errors are intentionally
   generic with respect to the Bot API URL.
 - The bridge uses the gateway's bearer-token WebSocket protocol. It does not expose
