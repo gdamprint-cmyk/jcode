@@ -1608,9 +1608,8 @@ mod tests {
 
     #[test]
     fn telegram_command_menu_contains_supported_bridge_commands() {
-        let commands = telegram_command_menu()
-            .as_array()
-            .expect("Telegram command menu array");
+        let menu = telegram_command_menu();
+        let commands = menu.as_array().expect("Telegram command menu array");
         assert_eq!(commands.len(), 11);
         assert_eq!(commands[0]["command"], "start");
         assert_eq!(commands[2]["command"], "new");
