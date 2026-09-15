@@ -267,6 +267,18 @@ impl TelegramApi {
             .await
             .map(|_| ())
     }
+
+    async fn set_my_commands(&self, scope: Option<serde_json::Value>) -> Result<()> {
+        let mut payload = json!({
+            "commands": telegram_command_menu(),
+        });
+        if let Some(scope) = scope {
+            payload["scope"] = scope;
+        }
+        self.call::<bool>("setMyCommands", payload)
+            .await
+            .map(|_| ())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +571,11 @@ impl Bridge {
     }
 
     async fn run(&self) -> Result<()> {
+        if let Err(error) = self.sync_command_menu().await {
+            eprintln!("Telegram command menu sync failed; polling continues: {error}");
+        } else {
+            eprintln!("Telegram command menu synchronized via Bot API");
+        }
         eprintln!(
             "Telegram full-session bridge active. Gateway: {}. State: {}",
             self.config.gateway_url,
@@ -682,6 +699,22 @@ impl Bridge {
         }
         // The action result is already represented in the replaced menu. Do not
         // emit a second generic bridge-error message for an expected action error.
+        Ok(())
+    }
+
+    async fn sync_command_menu(&self) -> Result<()> {
+        // Set the default scope and the allowlisted private-chat scopes. The
+        // latter also overrides a stale chat-specific menu left by a previous
+        // bot implementation such as Hermes.
+        self.bot.set_my_commands(None).await?;
+        for user_id in &self.config.allowed_user_ids {
+            self.bot
+                .set_my_commands(Some(json!({
+                    "type": "chat",
+                    "chat_id": user_id,
+                })))
+                .await?;
+        }
         Ok(())
     }
 
@@ -1508,6 +1541,22 @@ fn callback_action(data: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn telegram_command_menu() -> serde_json::Value {
+    json!([
+        {"command": "start", "description": "Открыть меню jcode"},
+        {"command": "menu", "description": "Показать меню действий"},
+        {"command": "new", "description": "Создать постоянную сессию"},
+        {"command": "sessions", "description": "Список сессий этого чата"},
+        {"command": "resume", "description": "Подключить сессию по ID"},
+        {"command": "model", "description": "Выбрать модель активной сессии"},
+        {"command": "rename", "description": "Переименовать активную сессию"},
+        {"command": "status", "description": "Показать состояние сессии"},
+        {"command": "cancel", "description": "Остановить текущий turn"},
+        {"command": "continue", "description": "Продолжить текущую сессию"},
+        {"command": "help", "description": "Справка по Telegram bridge"}
+    ])
+}
+
 const HELP_TEXT: &str = "jcode Telegram full-session bridge\n\n/new — новая постоянная сессия\n/sessions — сессии этого чата\n/resume SESSION_ID — подключить существующую\n/model MODEL — сменить модель\n/rename TITLE — переименовать\n/status — состояние\n/cancel — остановить текущий turn\n/continue — продолжить работу\n/help — эта справка\n\nОбычный текст отправляется в активную сессию. Ambient уведомления и этот bridge — разные процессы.";
 
 pub async fn run() -> Result<()> {
@@ -1555,6 +1604,22 @@ mod tests {
             rows[0][0]["callback_data"],
             serde_json::Value::String("jcode:new".to_string())
         );
+    }
+
+    #[test]
+    fn telegram_command_menu_contains_supported_bridge_commands() {
+        let commands = telegram_command_menu()
+            .as_array()
+            .expect("Telegram command menu array");
+        assert_eq!(commands.len(), 11);
+        assert_eq!(commands[0]["command"], "start");
+        assert_eq!(commands[2]["command"], "new");
+        assert_eq!(commands[10]["command"], "help");
+        assert!(commands.iter().all(|command| {
+            command["command"]
+                .as_str()
+                .is_some_and(|value| value.chars().all(|ch| ch.is_ascii_lowercase()))
+        }));
     }
 
     #[test]
