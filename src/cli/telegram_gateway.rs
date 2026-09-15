@@ -237,12 +237,9 @@ impl TelegramApi {
         if let Some(reply_markup) = reply_markup {
             payload["reply_markup"] = reply_markup;
         }
-        self.call::<serde_json::Value>(
-            "editMessageText",
-            payload,
-        )
-        .await
-        .map(|_| ())
+        self.call::<serde_json::Value>("editMessageText", payload)
+            .await
+            .map(|_| ())
     }
 
     async fn answer_callback_query(&self, callback_query_id: &str, text: &str) -> Result<()> {
@@ -482,6 +479,59 @@ struct Bridge {
     state: Mutex<BridgeState>,
 }
 
+#[cfg(windows)]
+struct InstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl InstanceGuard {
+    fn acquire() -> Result<Option<Self>> {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        // A kernel mutex is released by Windows when the owning process exits,
+        // including an ungraceful crash. This protects every launch path, even
+        // when Task Scheduler and a manual shell cannot see each other through
+        // the process query used by the wrapper.
+        const MUTEX_NAME: &str = "Local\\JcodeTelegramFullSessionBridge";
+        let name = MUTEX_NAME.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error()).context("create Telegram bridge mutex");
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Ok(None);
+        }
+        Ok(Some(Self { handle }))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct InstanceGuard;
+
+#[cfg(not(windows))]
+impl InstanceGuard {
+    fn acquire() -> Result<Option<Self>> {
+        // The current deployment target is Windows. Unix service managers are
+        // expected to provide process supervision; keep this path dependency-free
+        // for source builds on other platforms.
+        Ok(Some(Self))
+    }
+}
+
 impl Bridge {
     fn new(config: BridgeConfig) -> Result<Self> {
         let bot = TelegramApi::new(config.bot_token.clone())?;
@@ -627,12 +677,8 @@ impl Bridge {
             .await
         {
             eprintln!("Telegram callback menu update failed: {error}");
-            self.send_menu(
-                message.chat.id,
-                message.message_thread_id,
-                &menu_text,
-            )
-            .await?;
+            self.send_menu(message.chat.id, message.message_thread_id, &menu_text)
+                .await?;
         }
         // The action result is already represented in the replaced menu. Do not
         // emit a second generic bridge-error message for an expected action error.
@@ -1466,6 +1512,10 @@ const HELP_TEXT: &str = "jcode Telegram full-session bridge\n\n/new — нова
 
 pub async fn run() -> Result<()> {
     let config = BridgeConfig::from_env()?;
+    let Some(_instance_guard) = InstanceGuard::acquire()? else {
+        eprintln!("Telegram full-session bridge already running; exiting duplicate launch");
+        return Ok(());
+    };
     Bridge::new(config)?.run().await
 }
 
@@ -1492,10 +1542,7 @@ mod tests {
     #[test]
     fn callback_actions_map_to_safe_commands_and_menu_buttons() {
         assert_eq!(callback_action("jcode:new"), Some(("/new", "Новая сессия")));
-        assert_eq!(
-            callback_action("jcode:status"),
-            Some(("/status", "Статус"))
-        );
+        assert_eq!(callback_action("jcode:status"), Some(("/status", "Статус")));
         assert_eq!(callback_action("unknown"), None);
 
         let markup = main_menu_markup();
