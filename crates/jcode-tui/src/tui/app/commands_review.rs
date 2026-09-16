@@ -3,7 +3,65 @@ use super::{App, DisplayMessage};
 use crate::id;
 use crate::message::{ContentBlock, Role, ToolCall};
 use crate::session::{Session, StoredMessage};
+#[cfg(test)]
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
+
+#[cfg(test)]
+pub(super) const STALL_JUDGE_MAX_OUTPUT_CHARS: usize = 2_048;
+pub(super) const STALL_JUDGE_TIMEOUT_SECS: u64 = 45;
+pub(super) const STALL_JUDGE_MAX_TOKENS: u32 = 1_200;
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StallJudgeAction {
+    Continue,
+    Stop,
+    Blocked,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StallJudgeDecision {
+    pub action: StallJudgeAction,
+    pub reason: String,
+    #[serde(default)]
+    pub next_step: Option<String>,
+}
+
+#[cfg(test)]
+pub(super) fn parse_stall_judge_decision(raw: &str) -> Result<StallJudgeDecision, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > STALL_JUDGE_MAX_OUTPUT_CHARS {
+        return Err("stall judge output is empty or exceeds the bounded size".to_string());
+    }
+    if trimmed.starts_with("```") || trimmed.ends_with("```") {
+        return Err("stall judge must return raw JSON without a code fence".to_string());
+    }
+    let decision: StallJudgeDecision = serde_json::from_str(trimmed)
+        .map_err(|error| format!("invalid stall judge JSON: {error}"))?;
+    if decision.reason.trim().is_empty() || decision.reason.len() > 1_024 {
+        return Err("stall judge reason must be non-empty and bounded".to_string());
+    }
+    if matches!(decision.action, StallJudgeAction::Continue)
+        && decision
+            .next_step
+            .as_deref()
+            .is_none_or(|step| step.trim().is_empty())
+    {
+        return Err("continue requires a concrete next_step".to_string());
+    }
+    if decision
+        .next_step
+        .as_deref()
+        .is_some_and(|step| step.len() > 1_024)
+    {
+        return Err("stall judge next_step is too long".to_string());
+    }
+    Ok(decision)
+}
 
 fn review_session_read_only_guardrails() -> &'static str {
     "Important constraints for this session:\n\
@@ -24,11 +82,14 @@ fn judge_session_visible_context_notice() -> &'static str {
 }
 
 fn is_judge_session_title(title: Option<&str>) -> bool {
-    matches!(title, Some("judge" | "autojudge"))
+    matches!(title, Some("judge" | "autojudge" | "stall-judge"))
 }
 
 fn is_analysis_feedback_session_title(title: Option<&str>) -> bool {
-    matches!(title, Some("review" | "autoreview" | "judge" | "autojudge"))
+    matches!(
+        title,
+        Some("review" | "autoreview" | "judge" | "autojudge" | "stall-judge")
+    )
 }
 
 fn resolve_feedback_target_session_id(session_id: &str) -> String {
@@ -610,6 +671,26 @@ Do not ask the user anything unless absolutely necessary. Keep your own session 
     )
 }
 
+pub(super) fn build_stall_judge_startup_message(
+    parent_session_id: &str,
+    episode_key: &str,
+    stall_count: u8,
+) -> String {
+    format!(
+        "You are a one-shot bounded stall judge for parent session `{parent_session_id}`.\n\
+The parent agent has made {stall_count} unchanged progress checks in stall episode `{episode_key}`.\n\
+Inspect only the recent parent work and determine whether one concrete continuation can make progress, or whether the parent should stop safely.\n\n\
+{visible}\
+Hard limits: one judgment, at most {timeout}s, at most {tokens} output tokens, no spawning agents, no auto-poke, no autojudge, no autoreview, no swarm, and no recursive judge. Do not modify files or repo state.\n\n\
+Return exactly one raw JSON object and nothing else. The schema is:\n\
+{{\"action\":\"continue|stop|blocked\",\"reason\":\"short evidence-based reason\",\"next_step\":\"one concrete bounded next step or null\"}}\n\
+Use `continue` only when the next step is specific and likely to change the progress signature. Use `blocked` for missing credentials, unavailable external state, or an unresolved dependency. Use `stop` when another automatic poke is unlikely to help. Do not send a prose prefix or Markdown fence.",
+        visible = judge_session_visible_context_notice(),
+        timeout = STALL_JUDGE_TIMEOUT_SECS,
+        tokens = STALL_JUDGE_MAX_TOKENS,
+    )
+}
+
 pub(super) fn preferred_one_shot_review_override() -> Option<(String, String)> {
     let creds = crate::auth::codex::load_credentials().ok()?;
     let has_oauth = !creds.refresh_token.trim().is_empty() || creds.id_token.is_some();
@@ -860,6 +941,43 @@ fn launch_judge_once_local(app: &mut App) -> anyhow::Result<bool> {
     )
 }
 
+fn stall_judge_model_candidates(app: &App) -> Vec<(Option<String>, Option<String>)> {
+    let mut candidates = Vec::new();
+    if let Some(model) = current_autojudge_model_override() {
+        candidates.push((Some(model), None));
+    }
+    if let Some(candidate) = preferred_one_shot_review_override() {
+        candidates.push((Some(candidate.0), Some(candidate.1)));
+    }
+    candidates.push((app.session.model.clone(), app.session.provider_key.clone()));
+    candidates.dedup();
+    candidates
+}
+
+pub(super) fn launch_stall_judge_window_local(
+    app: &mut App,
+    episode_key: &str,
+    stall_count: u8,
+) -> anyhow::Result<bool> {
+    let parent_session_id = current_feedback_target_session_id(app);
+    let startup = build_stall_judge_startup_message(&parent_session_id, episode_key, stall_count);
+    let mut last_error = None;
+    for (model, provider) in stall_judge_model_candidates(app) {
+        match launch_review_window_local(
+            app,
+            "stall-judge",
+            "Stall judge",
+            startup.clone(),
+            model,
+            provider,
+        ) {
+            Ok(opened) => return Ok(opened),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no stall judge model candidate")))
+}
+
 pub(super) fn queue_review_spawn_remote(
     app: &mut App,
     label: &str,
@@ -876,6 +994,25 @@ pub(super) fn queue_review_spawn_remote(
     app.pending_split_started_at = Some(Instant::now());
     app.pending_split_request = true;
     app.set_status_notice(format!("{} queued", label));
+}
+
+pub(super) fn queue_stall_judge_remote(app: &mut App, episode_key: &str, stall_count: u8) {
+    if app.pending_split_request || app.pending_split_startup_message.is_some() {
+        return;
+    }
+    let parent_session_id = current_feedback_target_session_id(app);
+    let (model_override, provider_key_override) = stall_judge_model_candidates(app)
+        .into_iter()
+        .next()
+        .unwrap_or((None, None));
+    queue_review_spawn_remote(
+        app,
+        "Stall judge",
+        parent_session_id.clone(),
+        build_stall_judge_startup_message(&parent_session_id, episode_key, stall_count),
+        model_override,
+        provider_key_override,
+    );
 }
 
 #[cfg(test)]

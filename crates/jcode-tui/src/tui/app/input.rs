@@ -1648,6 +1648,19 @@ impl App {
             return false;
         }
 
+        if self.stall_judge_attempted
+            && self.stall_judge_started_at.is_some_and(|started| {
+                started.elapsed().as_secs() >= super::commands::STALL_JUDGE_TIMEOUT_SECS
+            })
+        {
+            crate::logging::warn("STALL_JUDGE action=stop reason=timeout");
+            super::commands::disable_auto_poke(self);
+            self.push_display_message(DisplayMessage::system(
+                "🛑 The isolated stall judge timed out, so auto-poke stopped safely. Review the remaining work and use /poke to resume.",
+            ));
+            return false;
+        }
+
         let todos = super::commands::poke_todos(self);
         let todo_session_id = self
             .remote_session_id
@@ -1675,6 +1688,10 @@ impl App {
             // equivalent work appears later, it is a new cycle and deserves
             // one fresh nudge rather than being mistaken for the old stall.
             self.last_auto_poke_fingerprint = None;
+            self.auto_poke_stall_count = 0;
+            self.stall_judge_attempted = false;
+            self.stall_judge_episode_key = None;
+            self.stall_judge_started_at = None;
             if todos.is_empty() {
                 // No todo list exists yet for this session. Auto-poke is armed
                 // by default (`features.auto_poke`), so disarming here would
@@ -1812,12 +1829,46 @@ impl App {
         // retrigger the same evidence gate against unchanged completed todos.
         self.todo_confidence_spike_challenged = false;
         self.last_todo_ownership_fingerprint = None;
-        let fingerprint =
-            serde_json::to_string(&incomplete).unwrap_or_else(|_| poke_message.clone());
-        if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint) {
+        let goals = crate::todo::load_goals(&todo_session_id).unwrap_or_default();
+        let fingerprint = super::commands::build_auto_poke_progress_signature(&todos, &goals);
+        if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint)
+            && self.auto_poke_stall_count >= 3
+        {
+            if self.stall_judge_attempted
+                && self.stall_judge_episode_key.as_deref() == Some(&fingerprint)
+            {
+                crate::logging::info(&format!(
+                    "AUTO_POKE_DECISION action=stop reason=stall_judge_already_attempted stalls={}",
+                    self.auto_poke_stall_count
+                ));
+                return false;
+            }
+            let stall_count = self.auto_poke_stall_count;
+            self.stall_judge_attempted = true;
+            self.stall_judge_episode_key = Some(fingerprint.clone());
+            self.stall_judge_started_at = Some(Instant::now());
+            super::commands::clear_queued_poke_messages(self);
+            self.push_display_message(DisplayMessage::system(
+                "⚠️ Auto-poke detected stalled progress. Launching one isolated judge; automatic pokes are paused until you review its bounded result.",
+            ));
+            let judge_result = if self.is_remote {
+                super::commands::queue_stall_judge_remote(self, &fingerprint, stall_count);
+                Ok(())
+            } else {
+                super::commands::launch_stall_judge_window_local(self, &fingerprint, stall_count)
+                    .map(|_| ())
+            };
+            if let Err(error) = judge_result {
+                crate::logging::warn(&format!(
+                    "STALL_JUDGE action=stop reason=launch_failed error={error}"
+                ));
+                self.push_display_message(DisplayMessage::system(
+                    "🛑 The isolated stall judge could not start, so auto-poke stopped safely. Review the remaining work and use /poke to resume.",
+                ));
+            }
             crate::logging::info(&format!(
-                "AUTO_POKE_DECISION action=idle reason=unchanged_todos incomplete={}",
-                incomplete.len()
+                "STALL_JUDGE action=launch episode={} stalls={}",
+                fingerprint, stall_count
             ));
             return false;
         }
@@ -1841,7 +1892,14 @@ impl App {
         // Open todos mean the model is still iterating; completion-gate
         // exhaustion should only trip when the gate itself stops moving.
         self.todo_completion_gate_attempts = 0;
-        self.last_auto_poke_fingerprint = Some(fingerprint);
+        if self.last_auto_poke_fingerprint.as_ref() == Some(&fingerprint) {
+            self.auto_poke_stall_count = self.auto_poke_stall_count.saturating_add(1);
+        } else {
+            self.last_auto_poke_fingerprint = Some(fingerprint);
+            self.auto_poke_stall_count = 1;
+            self.stall_judge_attempted = false;
+            self.stall_judge_episode_key = None;
+        }
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;
         true
@@ -2931,7 +2989,10 @@ fn paste_placeholder(content: &str) -> String {
 impl App {
     pub(super) fn handle_key_event(&mut self, event: crossterm::event::KeyEvent) {
         if self.remote_login.is_some() {
-            if matches!(event.kind, crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat) {
+            if matches!(
+                event.kind,
+                crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+            ) {
                 let _ = self.handle_key_press_event(event);
             }
             return;

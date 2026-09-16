@@ -899,9 +899,15 @@ fn auto_poke_does_not_repeat_until_incomplete_todos_change() {
         // Simulate dispatch and completion of the automatically poked turn.
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
         assert!(
             !app.schedule_auto_poke_followup_if_needed(),
-            "an unchanged list must not consume another model turn"
+            "stall budget must stop repeated unchanged progress checks"
         );
 
         crate::todo::save_todos(&app.session.id, &[pending("Review worker result")])
@@ -921,6 +927,44 @@ fn auto_poke_does_not_repeat_until_incomplete_todos_change() {
             app.schedule_auto_poke_followup_if_needed(),
             "an equivalent todo in a new cycle must receive one fresh nudge"
         );
+    });
+}
+
+#[test]
+fn stalled_auto_poke_queues_one_isolated_judge_per_episode() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.auto_poke_incomplete_todos = true;
+        crate::todo::save_todos(
+            &app.session.id,
+            &[crate::todo::TodoItem {
+                id: "todo-1".into(),
+                content: "Wait for worker".into(),
+                status: "pending".into(),
+                priority: "high".into(),
+                ..Default::default()
+            }],
+        )
+        .expect("save incomplete todo");
+
+        for _ in 0..3 {
+            assert!(app.schedule_auto_poke_followup_if_needed());
+            app.queued_messages.clear();
+            app.pending_queued_dispatch = false;
+        }
+        assert!(!app.schedule_auto_poke_followup_if_needed());
+        assert!(app.stall_judge_attempted);
+        assert!(app.pending_split_request);
+        assert!(
+            app.display_messages()
+                .iter()
+                .any(|message| message.content.contains("isolated judge"))
+        );
+
+        app.pending_split_request = false;
+        app.pending_split_startup_message = None;
+        assert!(!app.schedule_auto_poke_followup_if_needed());
     });
 }
 
