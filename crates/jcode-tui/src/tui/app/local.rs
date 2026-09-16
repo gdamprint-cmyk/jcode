@@ -621,3 +621,4 @@ pub(super) fn finish_turn(app: &mut App) {
     }
     let _ = super::commands::maybe_begin_pending_local_transfer(app);
 }
+            app.actual_model = None;

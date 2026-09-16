@@ -2913,3 +2913,7 @@ fn runtime_activity_status_notice(message: &str) -> String {
         .trim_end_matches('.')
         .to_string()
 }
+        ServerEvent::ActualModel { model } => {
+            app.actual_model = Some(model);
+            false
+        }

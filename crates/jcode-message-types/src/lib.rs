@@ -747,6 +747,8 @@ pub enum StreamEvent {
     },
     /// Upstream provider info (e.g., which provider OpenRouter routed to)
     UpstreamProvider { provider: String },
+    /// Exact model selected by a routing gateway such as OmniRoute.
+    ActualModel { model: String },
     /// Native tool call from a provider bridge that needs execution by jcode
     NativeToolCall {
         request_id: String,

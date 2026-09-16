@@ -870,6 +870,9 @@ impl App {
                                         // Store the upstream provider (e.g., Fireworks, Together)
                                         self.upstream_provider = Some(provider);
                                     }
+                                    StreamEvent::ActualModel { model } => {
+                                        self.actual_model = Some(model);
+                                    }
                                     StreamEvent::ToolResult { tool_use_id, content, is_error } => {
                                         // SDK already executed this tool
                                         self.tool_result_ids.insert(tool_use_id.clone());

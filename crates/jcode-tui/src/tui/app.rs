@@ -2561,3 +2561,5 @@ fn ratio_pct(numerator: u64, denominator: u64) -> u8 {
 
 #[cfg(test)]
 mod tests;
+    // Exact model selected by a routing gateway (e.g. OmniRoute).
+    actual_model: Option<String>,

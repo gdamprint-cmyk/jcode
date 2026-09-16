@@ -10,7 +10,7 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
 
     let mut lines: Vec<Line> = Vec::new();
 
-    let short_name = crate::tui::session_facts::pretty_model(model);
+    let short_name = display_model_name(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![
@@ -173,7 +173,7 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
         return Vec::new();
     };
 
-    let short_name = crate::tui::session_facts::pretty_model(model);
+    let short_name = display_model_name(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![Span::styled(
@@ -382,6 +382,14 @@ fn home_relative_dir(path: &str) -> String {
     crate::tui::session_facts::dir_label(path)
 }
 
+fn display_model_name(model: &str) -> String {
+    if model.contains('/') {
+        model.to_string()
+    } else {
+        crate::tui::session_facts::pretty_model(model)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +459,16 @@ mod tests {
         assert!(independent.contains("[fast]"));
         assert!(overview.contains("(hi)"));
         assert!(overview.contains("[fast]"));
+    }
+
+    #[test]
+    fn provider_qualified_model_id_stays_exact() {
+        let data = InfoWidgetData {
+            model: Some("combo/agent-smart".to_string()),
+            ..data()
+        };
+        let rendered = first_line_text(render_model_widget(&data, Rect::new(0, 0, 40, 8)));
+        assert!(rendered.contains("combo/agent-smart"));
     }
 
     #[test]

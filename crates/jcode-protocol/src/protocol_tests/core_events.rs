@@ -310,6 +310,21 @@ fn test_connection_type_event_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_actual_model_event_roundtrip_preserves_provider_qualified_id() -> Result<()> {
+    let event = ServerEvent::ActualModel {
+        model: "codex/gpt-5.5".to_string(),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"actual_model\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::ActualModel { model } = decoded else {
+        return Err(anyhow!("wrong event type"));
+    };
+    assert_eq!(model, "codex/gpt-5.5");
+    Ok(())
+}
+
+#[test]
 fn test_status_detail_event_roundtrip() -> Result<()> {
     let event = ServerEvent::StatusDetail {
         detail: "reusing websocket".to_string(),

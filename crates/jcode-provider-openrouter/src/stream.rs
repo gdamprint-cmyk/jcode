@@ -52,6 +52,8 @@ pub struct OpenRouterStream {
     reasoning_buffer: String,
     finish_reason: Option<String>,
     message_end_emitted: bool,
+    actual_model: Option<String>,
+    actual_model_emitted: bool,
 }
 
 #[derive(Default)]
@@ -68,6 +70,15 @@ impl OpenRouterStream {
         model: String,
         provider_pin: Arc<Mutex<Option<ProviderPin>>>,
     ) -> Self {
+        Self::new_with_actual_model(stream, model, provider_pin, None)
+    }
+
+    pub fn new_with_actual_model(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        model: String,
+        provider_pin: Arc<Mutex<Option<ProviderPin>>>,
+        actual_model: Option<String>,
+    ) -> Self {
         Self {
             inner: Box::pin(stream),
             buffer: String::new(),
@@ -81,6 +92,8 @@ impl OpenRouterStream {
             reasoning_buffer: String::new(),
             finish_reason: None,
             message_end_emitted: false,
+            actual_model: actual_model.filter(|value| !value.trim().is_empty()),
+            actual_model_emitted: false,
         }
     }
 
@@ -235,6 +248,13 @@ impl OpenRouterStream {
     fn parse_next_event(&mut self) -> Option<StreamEvent> {
         if let Some(event) = self.pending.pop_front() {
             return Some(event);
+        }
+
+        if !self.actual_model_emitted {
+            self.actual_model_emitted = true;
+            if let Some(model) = self.actual_model.clone() {
+                return Some(StreamEvent::ActualModel { model });
+            }
         }
 
         while let Some(event_str) = take_sse_event(&mut self.buffer) {
@@ -553,6 +573,54 @@ mod tests {
             "test-model".to_string(),
             Arc::new(std::sync::Mutex::new(None)),
         )
+    }
+
+    #[test]
+    fn actual_model_metadata_is_emitted_before_provider_chunks() {
+        let mut stream = OpenRouterStream::new_with_actual_model(
+            futures::stream::empty(),
+            "combo/agent-smart".to_string(),
+            Arc::new(std::sync::Mutex::new(None)),
+            Some("codex/gpt-5.5".to_string()),
+        );
+
+        assert!(matches!(
+            stream.parse_next_event(),
+            Some(StreamEvent::ActualModel { model }) if model == "codex/gpt-5.5"
+        ));
+    }
+
+    #[test]
+    fn actual_model_metadata_is_emitted_once_and_blank_metadata_is_ignored() {
+        let mut stream = OpenRouterStream::new_with_actual_model(
+            futures::stream::empty(),
+            "combo/agent-smart".to_string(),
+            Arc::new(std::sync::Mutex::new(None)),
+            Some("codex/gpt-5.5".to_string()),
+        );
+        stream.buffer =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".to_string();
+
+        assert!(matches!(
+            stream.parse_next_event(),
+            Some(StreamEvent::ActualModel { model }) if model == "codex/gpt-5.5"
+        ));
+        assert!(matches!(
+            stream.parse_next_event(),
+            Some(StreamEvent::TextDelta(delta)) if delta == "ok"
+        ));
+
+        let mut blank = OpenRouterStream::new_with_actual_model(
+            futures::stream::empty(),
+            "combo/agent-smart".to_string(),
+            Arc::new(std::sync::Mutex::new(None)),
+            Some("   ".to_string()),
+        );
+        blank.buffer = "data: [DONE]\n\n".to_string();
+        assert!(matches!(
+            blank.parse_next_event(),
+            Some(StreamEvent::MessageEnd { .. })
+        ));
     }
 
     #[test]

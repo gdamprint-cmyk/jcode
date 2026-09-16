@@ -4260,3 +4260,4 @@ mod terminal_control_sequence_tests {
         ));
     }
 }
+        self.actual_model = None;

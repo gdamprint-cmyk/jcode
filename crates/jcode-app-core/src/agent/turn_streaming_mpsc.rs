@@ -871,6 +871,9 @@ impl Agent {
                         self.last_upstream_provider = Some(provider.clone());
                         let _ = event_tx.send(ServerEvent::UpstreamProvider { provider });
                     }
+                    StreamEvent::ActualModel { model } => {
+                        let _ = event_tx.send(ServerEvent::ActualModel { model });
+                    }
                     StreamEvent::Error {
                         message,
                         retry_after_secs,

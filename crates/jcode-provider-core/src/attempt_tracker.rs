@@ -54,6 +54,7 @@ fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
         | StreamEvent::Error { .. }
         | StreamEvent::SessionId(_)
         | StreamEvent::UpstreamProvider { .. } => false,
+        StreamEvent::ActualModel { .. } => false,
     }
 }
 

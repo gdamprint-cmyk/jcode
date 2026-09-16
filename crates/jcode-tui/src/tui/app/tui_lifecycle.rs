@@ -1392,3 +1392,5 @@ impl App {
         self.remote_startup_phase_started = Some(Instant::now());
     }
 }
+            actual_model: None,
+            actual_model: None,

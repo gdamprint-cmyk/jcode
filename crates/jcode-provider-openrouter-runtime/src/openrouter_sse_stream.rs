@@ -245,7 +245,17 @@ async fn stream_response(
         }))
         .await;
 
-    let mut stream = OpenRouterStream::new(response.bytes_stream(), model.clone(), provider_pin);
+    let actual_model = response
+        .headers()
+        .get("x-omniroute-model")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut stream = OpenRouterStream::new_with_actual_model(
+        response.bytes_stream(),
+        model.clone(),
+        provider_pin,
+        actual_model,
+    );
 
     // Idle timeout between streamed chunks. Configurable so slow reasoning
     // models (e.g. DeepSeek) that think silently for minutes before emitting

@@ -920,6 +920,10 @@ pub enum ServerEvent {
     #[serde(rename = "upstream_provider")]
     UpstreamProvider { provider: String },
 
+    /// Exact model selected by a routing gateway such as OmniRoute.
+    #[serde(rename = "actual_model")]
+    ActualModel { model: String },
+
     /// Swarm status update (subagent/session lifecycle info)
     #[serde(rename = "swarm_status")]
     SwarmStatus { members: Vec<SwarmMemberStatus> },
@@ -1305,7 +1309,9 @@ pub enum ServerEvent {
 
     /// Usage delta for a route, independent of catalog availability or Agent locks.
     #[serde(rename = "model_usage_updated")]
-    ModelUsageUpdated { route: jcode_provider_core::ModelRoute },
+    ModelUsageUpdated {
+        route: jcode_provider_core::ModelRoute,
+    },
 
     /// Available models updated (pushed after auth changes)
     #[serde(rename = "available_models_updated")]

@@ -1346,6 +1346,7 @@ impl crate::tui::TuiState for App {
                 self.provider.native_compaction_threshold_tokens(),
             )
         };
+        let model = self.actual_model.clone().or(model);
 
         let (session_count, client_count) = if self.is_remote {
             (Some(self.remote_sessions.len()), None)

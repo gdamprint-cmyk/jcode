@@ -567,6 +567,7 @@ impl Agent {
                         }
                         self.last_upstream_provider = Some(provider);
                     }
+                    StreamEvent::ActualModel { .. } => {}
                     StreamEvent::OpenAIReasoning {
                         id,
                         summary,
