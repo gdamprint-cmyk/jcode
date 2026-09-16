@@ -262,7 +262,12 @@ fn run_client_handoff_watchdog(spec: ClientHandoffSpec) -> Result<()> {
                 spec.candidate
             );
             let mut fallback = spawn_handoff_client(&spec, &spec.fallback)?;
-            let _ = wait_for_handoff_ready(&spec, &mut fallback);
+            if !keep_handoff_alive(&mut fallback) {
+                eprintln!(
+                    "jcode rollback client {:?} exited during its grace window",
+                    spec.fallback
+                );
+            }
             let _ = std::fs::remove_file(&spec.ready_file);
             return Ok(());
         }
@@ -284,10 +289,10 @@ fn run_client_handoff_watchdog(spec: ClientHandoffSpec) -> Result<()> {
     let _ = std::fs::remove_file(&spec.ready_file);
 
     let mut fallback = spawn_handoff_client(&spec, &spec.fallback)?;
-    if !wait_for_handoff_ready(&spec, &mut fallback) {
+    if !keep_handoff_alive(&mut fallback) {
         eprintln!(
-            "jcode rollback client {:?} did not publish readiness within {:?}",
-            spec.fallback, spec.timeout
+            "jcode rollback client {:?} exited during its grace window",
+            spec.fallback
         );
     }
     let _ = std::fs::remove_file(&spec.ready_file);
