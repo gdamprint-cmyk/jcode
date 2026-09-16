@@ -275,6 +275,50 @@ pub fn is_process_running(pid: u32) -> bool {
     }
 }
 
+/// Publish the readiness signal consumed by the Windows client handoff
+/// watchdog.
+///
+/// The launcher supplies a unique path through `JCODE_HANDOFF_READY_FILE`.
+/// Write a small temporary file and rename it so the watchdog never observes
+/// a partially written marker. The environment variables are removed after a
+/// successful publication so a later reload from the resumed client can use a
+/// fresh watchdog instead of inheriting the bootstrap guard.
+pub fn mark_client_handoff_ready() {
+    let Some(raw_path) = std::env::var_os("JCODE_HANDOFF_READY_FILE") else {
+        return;
+    };
+    let path = Path::new(&raw_path);
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("jcode: failed to create handoff marker directory: {error}");
+        return;
+    }
+
+    let temp_path = path.with_extension(format!("handoff-tmp-{}", std::process::id()));
+    if let Err(error) = std::fs::write(&temp_path, std::process::id().to_string()) {
+        eprintln!("jcode: failed to write handoff readiness marker: {error}");
+        return;
+    }
+
+    let published = std::fs::rename(&temp_path, path).or_else(|_| {
+        // A unique marker should not exist, but replacing it makes retries
+        // deterministic if a previous watchdog was interrupted.
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&temp_path, path)
+    });
+    match published {
+        Ok(()) => {
+            crate::env::remove_var("JCODE_HANDOFF_READY_FILE");
+            crate::env::remove_var("JCODE_HANDOFF_SKIP_WATCHDOG");
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("jcode: failed to publish handoff readiness marker: {error}");
+        }
+    }
+}
+
 /// Send a signal to an entire detached process group/session led by `pid`.
 ///
 /// On Unix, detached tasks are spawned with `setsid()`, so the leader PID is

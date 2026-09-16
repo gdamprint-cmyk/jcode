@@ -106,6 +106,13 @@ fn run_main() -> Result<()> {
     configure_system_allocator();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // The Windows handoff watchdog is intentionally handled before Tokio,
+    // providers, hooks, and update checks. It must remain a tiny supervisor
+    // while the old client exits and the candidate/fallback client is tested.
+    if jcode::cli::hot_exec::maybe_run_client_handoff_watchdog()? {
+        return Ok(());
+    }
+
     // SessionStart hooks should be effectively invisible to Claude Code and
     // Codex. Handle this tiny callback before the Tokio runtime and normal Jcode
     // startup path so it does not initialize providers, start cleanup threads,

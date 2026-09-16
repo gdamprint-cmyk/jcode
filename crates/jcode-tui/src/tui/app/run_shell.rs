@@ -850,6 +850,10 @@ impl App {
                 remote::PostConnectOutcome::Ready => {}
                 remote::PostConnectOutcome::Quit => break 'outer,
             }
+            // A replacement client is considered healthy only after the real
+            // server handshake and history bootstrap have completed. This is
+            // the acceptance boundary used by the Windows handoff watchdog.
+            crate::platform::mark_client_handoff_ready();
             status_spinner_renderer.invalidate();
             needs_redraw = true;
 

@@ -1,9 +1,298 @@
 use anyhow::Result;
-use std::process::Command as ProcessCommand;
+use std::{
+    path::{Path, PathBuf},
+    process::{Child, Command as ProcessCommand},
+    time::{Duration, Instant},
+};
 
 pub use crate::session_rebuild::{hot_rebuild, spawn_background_session_rebuild};
 
 use crate::{build, tui::RunResult, update};
+
+const CLIENT_HANDOFF_WATCHDOG_ARG: &str = "__jcode-client-handoff-watchdog";
+
+/// Handle the private Windows handoff helper invocation before normal CLI
+/// startup. The helper is deliberately a subcommand of the same binary so it
+/// does not add another installed executable that can drift out of sync.
+pub fn maybe_run_client_handoff_watchdog() -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) != Some(CLIENT_HANDOFF_WATCHDOG_ARG) {
+            return Ok(false);
+        }
+
+        let spec = ClientHandoffSpec::parse(&args[1..])?;
+        run_client_handoff_watchdog(spec)?;
+        return Ok(true);
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+/// Signal the watchdog only after the replacement client has completed the
+/// real server handshake and history bootstrap. The implementation lives in
+/// the shared platform crate because the TUI crate cannot depend on the root
+/// CLI module.
+pub fn mark_client_handoff_ready() {
+    crate::platform::mark_client_handoff_ready();
+}
+
+fn replace_client_process(
+    exe: &Path,
+    session_id: &str,
+    cwd: &Path,
+    is_selfdev: bool,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if std::env::var_os("JCODE_HANDOFF_SKIP_WATCHDOG").is_none() {
+            let fallback = std::env::current_exe()?;
+            schedule_client_handoff_watchdog(exe, &fallback, session_id, cwd, is_selfdev)?;
+            // The watchdog owns the rest of this handoff. Exiting here is
+            // intentional: it closes every old client handle before the
+            // candidate is allowed to start.
+            std::process::exit(0);
+        }
+    }
+
+    let mut cmd = ProcessCommand::new(exe);
+    if is_selfdev {
+        cmd.arg("self-dev");
+    }
+    cmd.arg("--resume")
+        .arg(session_id)
+        .arg("--no-update")
+        .env("JCODE_RELOAD_FAST_START", "1")
+        .env_remove("JCODE_MIGRATE_BINARY")
+        .current_dir(cwd);
+    let err = crate::platform::replace_process(&mut cmd);
+    Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
+}
+
+#[cfg(windows)]
+const CLIENT_HANDOFF_PARENT_WAIT: Duration = Duration::from_secs(15);
+
+#[cfg(windows)]
+const CLIENT_HANDOFF_READY_GRACE: Duration = Duration::from_secs(3);
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct ClientHandoffSpec {
+    parent_pid: u32,
+    candidate: PathBuf,
+    fallback: PathBuf,
+    session_id: String,
+    cwd: PathBuf,
+    ready_file: PathBuf,
+    timeout: Duration,
+    is_selfdev: bool,
+}
+
+#[cfg(windows)]
+impl ClientHandoffSpec {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut parent_pid = None;
+        let mut candidate = None;
+        let mut fallback = None;
+        let mut session_id = None;
+        let mut cwd = None;
+        let mut ready_file = None;
+        let mut timeout_ms = None;
+        let mut is_selfdev = false;
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if arg == "--selfdev" {
+                is_selfdev = true;
+                index += 1;
+                continue;
+            }
+            let value = |name: &str| -> Result<String> {
+                args.get(index + 1)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for {name}"))
+            };
+            match arg {
+                "--parent-pid" => parent_pid = Some(value(arg)?.parse::<u32>()?),
+                "--candidate" => candidate = Some(PathBuf::from(value(arg)?)),
+                "--fallback" => fallback = Some(PathBuf::from(value(arg)?)),
+                "--session" => session_id = Some(value(arg)?),
+                "--cwd" => cwd = Some(PathBuf::from(value(arg)?)),
+                "--ready-file" => ready_file = Some(PathBuf::from(value(arg)?)),
+                "--timeout-ms" => timeout_ms = Some(value(arg)?.parse::<u64>()?),
+                other => anyhow::bail!("unknown handoff watchdog argument: {other}"),
+            }
+            index += 2;
+        }
+
+        let timeout_ms = timeout_ms.unwrap_or(90_000).clamp(5_000, 300_000);
+        Ok(Self {
+            parent_pid: parent_pid.ok_or_else(|| anyhow::anyhow!("missing --parent-pid"))?,
+            candidate: candidate.ok_or_else(|| anyhow::anyhow!("missing --candidate"))?,
+            fallback: fallback.ok_or_else(|| anyhow::anyhow!("missing --fallback"))?,
+            session_id: session_id.ok_or_else(|| anyhow::anyhow!("missing --session"))?,
+            cwd: cwd.ok_or_else(|| anyhow::anyhow!("missing --cwd"))?,
+            ready_file: ready_file.ok_or_else(|| anyhow::anyhow!("missing --ready-file"))?,
+            timeout: Duration::from_millis(timeout_ms),
+            is_selfdev,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn schedule_client_handoff_watchdog(
+    candidate: &Path,
+    fallback: &Path,
+    session_id: &str,
+    cwd: &Path,
+    is_selfdev: bool,
+) -> Result<()> {
+    let ready_file = new_client_handoff_ready_file()?;
+    let watchdog_exe = std::env::current_exe()?;
+    let mut cmd = ProcessCommand::new(&watchdog_exe);
+    cmd.arg(CLIENT_HANDOFF_WATCHDOG_ARG)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .arg("--candidate")
+        .arg(candidate)
+        .arg("--fallback")
+        .arg(fallback)
+        .arg("--session")
+        .arg(session_id)
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--ready-file")
+        .arg(&ready_file)
+        .arg("--timeout-ms")
+        .arg("90000")
+        .current_dir(cwd);
+    if is_selfdev {
+        cmd.arg("--selfdev");
+    }
+
+    crate::platform::reap_detached(crate::platform::spawn_detached(&mut cmd)?);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn new_client_handoff_ready_file() -> Result<PathBuf> {
+    let directory = crate::storage::jcode_dir()?.join("client-handoff");
+    std::fs::create_dir_all(&directory)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(directory.join(format!("{}-{nonce}.ready", std::process::id())))
+}
+
+#[cfg(windows)]
+fn spawn_handoff_client(spec: &ClientHandoffSpec, binary: &Path) -> std::io::Result<Child> {
+    let mut cmd = ProcessCommand::new(binary);
+    if spec.is_selfdev {
+        cmd.arg("self-dev");
+    }
+    cmd.arg("--resume")
+        .arg(&spec.session_id)
+        .arg("--no-update")
+        .env("JCODE_RESUMING", "1")
+        .env("JCODE_RELOAD_FAST_START", "1")
+        .env("JCODE_HANDOFF_READY_FILE", &spec.ready_file)
+        .env("JCODE_HANDOFF_SKIP_WATCHDOG", "1")
+        .env_remove("JCODE_MIGRATE_BINARY")
+        .current_dir(&spec.cwd);
+    cmd.spawn()
+}
+
+#[cfg(windows)]
+fn wait_for_handoff_ready(spec: &ClientHandoffSpec, child: &mut Child) -> bool {
+    let deadline = Instant::now() + spec.timeout;
+    while Instant::now() < deadline {
+        if spec.ready_file.exists() {
+            return child_is_alive(child);
+        }
+        if !child_is_alive(child) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[cfg(windows)]
+fn keep_handoff_alive(child: &mut Child) -> bool {
+    let deadline = Instant::now() + CLIENT_HANDOFF_READY_GRACE;
+    while Instant::now() < deadline {
+        if !child_is_alive(child) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+#[cfg(windows)]
+fn child_is_alive(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(None))
+}
+
+#[cfg(windows)]
+fn run_client_handoff_watchdog(spec: ClientHandoffSpec) -> Result<()> {
+    let parent_deadline = Instant::now() + CLIENT_HANDOFF_PARENT_WAIT;
+    while crate::platform::is_process_running(spec.parent_pid) && Instant::now() < parent_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if crate::platform::is_process_running(spec.parent_pid) {
+        anyhow::bail!(
+            "client handoff parent {} did not exit; candidate was not started",
+            spec.parent_pid
+        );
+    }
+
+    let _ = std::fs::remove_file(&spec.ready_file);
+    let mut candidate = match spawn_handoff_client(&spec, &spec.candidate) {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!(
+                "jcode handoff candidate {:?} could not start: {error}; rolling back",
+                spec.candidate
+            );
+            let mut fallback = spawn_handoff_client(&spec, &spec.fallback)?;
+            let _ = wait_for_handoff_ready(&spec, &mut fallback);
+            let _ = std::fs::remove_file(&spec.ready_file);
+            return Ok(());
+        }
+    };
+
+    let healthy =
+        wait_for_handoff_ready(&spec, &mut candidate) && keep_handoff_alive(&mut candidate);
+    if healthy {
+        let _ = std::fs::remove_file(&spec.ready_file);
+        return Ok(());
+    }
+
+    eprintln!(
+        "jcode handoff candidate {:?} failed readiness; rolling back to {:?}",
+        spec.candidate, spec.fallback
+    );
+    let _ = candidate.kill();
+    let _ = candidate.wait();
+    let _ = std::fs::remove_file(&spec.ready_file);
+
+    let mut fallback = spawn_handoff_client(&spec, &spec.fallback)?;
+    if !wait_for_handoff_ready(&spec, &mut fallback) {
+        eprintln!(
+            "jcode rollback client {:?} did not publish readiness within {:?}",
+            spec.fallback, spec.timeout
+        );
+    }
+    let _ = std::fs::remove_file(&spec.ready_file);
+    Ok(())
+}
 
 pub fn has_requested_action(run_result: &RunResult) -> bool {
     run_result.reload_session.is_some()
@@ -41,14 +330,7 @@ pub fn hot_restart(session_id: &str) -> Result<()> {
 
     crate::env::set_var("JCODE_RESUMING", "1");
 
-    let mut cmd = ProcessCommand::new(&exe);
-    if is_selfdev {
-        cmd.arg("self-dev");
-    }
-    cmd.arg("--resume").arg(session_id).current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
-
-    Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
+    replace_client_process(&exe, session_id, &cwd, is_selfdev)
 }
 
 pub fn hot_reload(session_id: &str) -> Result<()> {
@@ -60,14 +342,7 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
         let binary_path = std::path::PathBuf::from(&migrate_binary);
         if binary_path.exists() {
             crate::logging::info("Migrating to stable binary...");
-            let mut cmd = ProcessCommand::new(&binary_path);
-            cmd.arg("--resume")
-                .arg(session_id)
-                .arg("--no-update")
-                .env_remove("JCODE_MIGRATE_BINARY")
-                .current_dir(cwd);
-            let err = crate::platform::replace_process(&mut cmd);
-            return Err(anyhow::anyhow!("Failed to exec {:?}: {}", binary_path, err));
+            return replace_client_process(&binary_path, session_id, &cwd, false);
         } else {
             crate::logging::warn(&format!(
                 "Migration binary not found at {:?}, falling back to local binary",
@@ -106,29 +381,17 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
                 continue;
             }
         }
-        let mut cmd = ProcessCommand::new(&exe);
-        if is_selfdev {
-            cmd.arg("self-dev");
+        match replace_client_process(&exe, session_id, &cwd, is_selfdev) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < 2 && error.to_string().contains("No such file") => {
+                crate::logging::warn(&format!(
+                    "exec attempt {} failed (ENOENT) for {:?}, retrying...",
+                    attempt + 1,
+                    exe
+                ));
+            }
+            Err(error) => return Err(error),
         }
-        cmd.arg("--resume")
-            .arg(session_id)
-            // The server has already completed its handoff before the client
-            // re-execs. Let the replacement client paint and accept input from
-            // its startup stub immediately; the authoritative History payload
-            // will repopulate the transcript after reconnect.
-            .env("JCODE_RELOAD_FAST_START", "1")
-            .current_dir(&cwd);
-        let err = crate::platform::replace_process(&mut cmd);
-
-        if err.kind() == std::io::ErrorKind::NotFound && attempt < 2 {
-            crate::logging::warn(&format!(
-                "exec attempt {} failed (ENOENT) for {:?}, retrying...",
-                attempt + 1,
-                exe
-            ));
-            continue;
-        }
-        return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
     }
     Err(anyhow::anyhow!(
         "Failed to exec {:?}: binary not found after retries",
@@ -170,16 +433,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
 
                     crate::env::set_var("JCODE_RESUMING", "1");
 
-                    let mut cmd = ProcessCommand::new(&exe);
-                    if is_selfdev {
-                        cmd.arg("self-dev");
-                    }
-                    cmd.arg("--resume")
-                        .arg(session_id)
-                        .arg("--no-update")
-                        .current_dir(&cwd);
-                    let err = crate::platform::replace_process(&mut cmd);
-                    return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
+                    return replace_client_process(&exe, session_id, &cwd, is_selfdev);
                 }
                 Err(e) => {
                     update::print_centered(&format!(
@@ -209,16 +463,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
     crate::env::set_var("JCODE_RESUMING", "1");
     let exe = std::env::current_exe()?;
     let is_selfdev = crate::cli::selfdev::client_selfdev_requested();
-    let mut cmd = ProcessCommand::new(&exe);
-    if is_selfdev {
-        cmd.arg("self-dev");
-    }
-    cmd.arg("--resume")
-        .arg(session_id)
-        .arg("--no-update")
-        .current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
-    Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
+    replace_client_process(&exe, session_id, &cwd, is_selfdev)
 }
 
 pub fn get_repo_dir() -> Option<std::path::PathBuf> {
@@ -280,6 +525,53 @@ pub fn check_for_updates() -> Option<bool> {
         Some(count > 0)
     } else {
         None
+    }
+}
+
+#[cfg(all(test, windows))]
+mod handoff_tests {
+    use super::ClientHandoffSpec;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn watchdog_parser_accepts_paths_and_selfdev_flag() {
+        let spec = ClientHandoffSpec::parse(&args(&[
+            "--parent-pid",
+            "42",
+            "--candidate",
+            "C:\\candidate\\jcode.exe",
+            "--fallback",
+            "C:\\known-good\\jcode.exe",
+            "--session",
+            "session-1",
+            "--cwd",
+            "C:\\work",
+            "--ready-file",
+            "C:\\markers\\ready",
+            "--timeout-ms",
+            "12000",
+            "--selfdev",
+        ]))
+        .expect("valid watchdog arguments");
+
+        assert_eq!(spec.parent_pid, 42);
+        assert_eq!(spec.session_id, "session-1");
+        assert!(spec.is_selfdev);
+        assert_eq!(spec.timeout, std::time::Duration::from_secs(12));
+    }
+
+    #[test]
+    fn watchdog_parser_rejects_unknown_arguments() {
+        let error = ClientHandoffSpec::parse(&args(&["--unexpected", "value"]))
+            .expect_err("unknown arguments must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown handoff watchdog argument")
+        );
     }
 }
 
