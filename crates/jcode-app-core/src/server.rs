@@ -20,6 +20,7 @@ mod comm_graph;
 mod comm_plan;
 mod comm_session;
 mod comm_sync;
+mod coordination;
 mod debug;
 mod debug_ambient;
 mod debug_command_exec;
@@ -59,6 +60,7 @@ use self::background_tasks::{
 use self::debug::{ClientConnectionInfo, ClientDebugState};
 use self::debug_jobs::DebugJob;
 use self::headless::create_headless_session;
+use self::coordination::{TodoOverlapNotice, WorkItemCoordinationRegistry};
 use self::reload::await_reload_signal;
 use self::runtime::ServerRuntime;
 use self::swarm::{
@@ -1949,6 +1951,68 @@ impl Server {
         members.values().any(|member| member.status == "running")
     }
 
+    /// Notify both independent sessions when their active TODO snapshots open
+    /// a new overlap episode. This is intentionally advisory: the sessions
+    /// keep separate TODO files, plans, swarms, and ownership.
+    async fn dispatch_todo_overlap_notice(
+        notice: &TodoOverlapNotice,
+        swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    ) {
+        let (left_name, right_name) = {
+            let members = swarm_members.read().await;
+            (
+                members
+                    .get(&notice.left_session_id)
+                    .and_then(|member| member.friendly_name.clone()),
+                members
+                    .get(&notice.right_session_id)
+                    .and_then(|member| member.friendly_name.clone()),
+            )
+        };
+        let left_label = left_name.as_deref().unwrap_or(&notice.left_session_id);
+        let right_label = right_name.as_deref().unwrap_or(&notice.right_session_id);
+        let message = format!(
+            "⚠ Session coordination: possible duplicate active work detected between {} (TODO `{}`) and {} (TODO `{}`). Match: {}. Coordination attempt `{}`. No TODO, swarm, or ownership was merged; compare the work and explicitly coordinate before editing the same files.",
+            left_label,
+            notice.left_todo_id,
+            right_label,
+            notice.right_todo_id,
+            notice.match_kind,
+            notice.attempt_id,
+        );
+
+        for target_session_id in [&notice.left_session_id, &notice.right_session_id] {
+            let delivered = fanout_session_event(
+                swarm_members,
+                target_session_id,
+                ServerEvent::Notification {
+                    from_session: "coordination".to_string(),
+                    from_name: Some("session coordinator".to_string()),
+                    notification_type: NotificationType::Message {
+                        scope: Some("session_coordination".to_string()),
+                        channel: None,
+                        tldr: Some("Possible duplicate active TODO work".to_string()),
+                    },
+                    message: message.clone(),
+                },
+            )
+            .await;
+            if delivered == 0 {
+                crate::logging::info(&format!(
+                    "TODO overlap episode {} has no attached client for session {}",
+                    notice.attempt_id, target_session_id
+                ));
+            }
+        }
+        crate::logging::info(&format!(
+            "TODO overlap episode {} opened between sessions {} and {} ({})",
+            notice.attempt_id,
+            notice.left_session_id,
+            notice.right_session_id,
+            notice.match_kind
+        ));
+    }
+
     /// Monitor the global Bus for FileTouch events and detect conflicts
     #[expect(
         clippy::too_many_arguments,
@@ -1968,6 +2032,7 @@ impl Server {
         swarm_event_tx: broadcast::Sender<SwarmEvent>,
     ) {
         let mut receiver = Bus::global().subscribe();
+        let mut work_item_registry = WorkItemCoordinationRegistry::default();
         let mut last_cleanup = Instant::now();
         const TOUCH_EXPIRY: Duration = Duration::from_secs(30 * 60); // 30 min
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 min
@@ -2272,6 +2337,25 @@ impl Server {
                 // swarm strip so a coordinator can see each managed agent's work.
                 Ok(BusEvent::TodoUpdated(event)) => {
                     dispatch_swarm_todo_progress(&event, &swarm_members, &swarms_by_id).await;
+
+                    let (working_dir, live_session_ids) = {
+                        let members = swarm_members.read().await;
+                        (
+                            members
+                                .get(&event.session_id)
+                                .and_then(|member| member.working_dir.clone()),
+                            members.keys().cloned().collect::<HashSet<_>>(),
+                        )
+                    };
+                    work_item_registry.prune_missing_sessions(&live_session_ids);
+                    let overlap_notices = work_item_registry.update_session(
+                        &event.session_id,
+                        working_dir.as_deref(),
+                        &event.todos,
+                    );
+                    for notice in overlap_notices {
+                        Self::dispatch_todo_overlap_notice(&notice, &swarm_members).await;
+                    }
                 }
                 Ok(BusEvent::SwarmOutputTail(tail)) => {
                     dispatch_swarm_output_tail(&tail, &swarm_members, &swarms_by_id).await;
