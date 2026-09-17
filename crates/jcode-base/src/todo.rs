@@ -33,6 +33,29 @@ pub use jcode_task_types::{
     TodoPlanField,
 };
 
+/// Server-authored provenance for one persisted TODO item.
+///
+/// This intentionally lives beside the existing bare `Vec<TodoItem>` payload
+/// instead of adding required fields to `TodoItem`. That keeps old consumers
+/// and existing struct literals source-compatible while still recording which
+/// session first created and most recently updated an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoProvenanceRecord {
+    pub todo_id: String,
+    pub created_by_session_id: String,
+    pub last_updated_by_session_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TodoProvenanceFile {
+    schema_version: u32,
+    entries: Vec<TodoProvenanceRecord>,
+}
+
+const TODO_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+
 /// Return the canonical todo status for model-written status vocabulary.
 ///
 /// The todo tool historically accepted any string, so persisted sessions can
@@ -879,6 +902,11 @@ pub fn todos_exist(session_id: &str) -> Result<bool> {
 pub fn save_todos(session_id: &str, todos: &[TodoItem]) -> Result<()> {
     let path = todo_path(session_id)?;
     storage::write_json_fast(&path, todos)?;
+    if let Err(error) = update_todo_provenance(session_id, todos) {
+        crate::logging::warn(&format!(
+            "Failed to update TODO provenance for {session_id}: {error}"
+        ));
+    }
     if let Err(error) = crate::recent_session_index::refresh_todo_title(session_id) {
         crate::logging::warn(&format!(
             "Failed to refresh indexed todo title for {session_id}: {error}"
@@ -887,9 +915,67 @@ pub fn save_todos(session_id: &str, todos: &[TodoItem]) -> Result<()> {
     Ok(())
 }
 
+/// Load the server-authored provenance sidecar for one session's TODO list.
+/// Missing or unreadable sidecars are treated as empty so legacy sessions keep
+/// working exactly as before the sidecar was introduced.
+pub fn load_todo_provenance(session_id: &str) -> Result<Vec<TodoProvenanceRecord>> {
+    let path = todo_provenance_path(session_id)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let stored: TodoProvenanceFile = storage::read_json(&path)?;
+    if stored.schema_version != TODO_PROVENANCE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported TODO provenance schema version {}",
+            stored.schema_version
+        );
+    }
+    Ok(stored.entries)
+}
+
+fn update_todo_provenance(session_id: &str, todos: &[TodoItem]) -> Result<()> {
+    if session_id.trim().is_empty() {
+        return Ok(());
+    }
+    let mut entries = load_todo_provenance(session_id).unwrap_or_default();
+    let now = chrono::Utc::now();
+    for todo in todos {
+        let todo_id = todo.id.trim();
+        if todo_id.is_empty() {
+            continue;
+        }
+        if let Some(existing) = entries.iter_mut().find(|entry| entry.todo_id == todo_id) {
+            existing.last_updated_by_session_id = session_id.to_string();
+            existing.last_updated_at = now;
+        } else {
+            entries.push(TodoProvenanceRecord {
+                todo_id: todo_id.to_string(),
+                created_by_session_id: session_id.to_string(),
+                last_updated_by_session_id: session_id.to_string(),
+                created_at: now,
+                last_updated_at: now,
+            });
+        }
+    }
+    storage::write_json_fast(
+        &todo_provenance_path(session_id)?,
+        &TodoProvenanceFile {
+            schema_version: TODO_PROVENANCE_SCHEMA_VERSION,
+            entries,
+        },
+    )
+}
+
 fn todo_path(session_id: &str) -> Result<PathBuf> {
     let base = storage::jcode_dir()?;
     Ok(base.join("todos").join(format!("{}.json", session_id)))
+}
+
+fn todo_provenance_path(session_id: &str) -> Result<PathBuf> {
+    let base = storage::jcode_dir()?;
+    Ok(base
+        .join("todos")
+        .join(format!("{}-provenance.json", session_id)))
 }
 
 fn todo_review_path(session_id: &str) -> Result<PathBuf> {
@@ -1402,6 +1488,43 @@ mod tests {
         // Clearing an absent log is not an error, since the digest path clears
         // unconditionally.
         clear_gate_observations(session).expect("clear again");
+
+        match previous_home {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+
+    #[test]
+    fn todo_provenance_sidecar_tracks_creator_and_last_writer_without_changing_todo_shape() {
+        let _guard = crate::storage::lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", dir.path());
+
+        let session = "todo-provenance-round-trip";
+        let todo = TodoItem {
+            content: "track this task".to_string(),
+            status: "in_progress".to_string(),
+            priority: "high".to_string(),
+            id: "tracked-task".to_string(),
+            ..Default::default()
+        };
+        save_todos(session, std::slice::from_ref(&todo)).expect("save initial TODO");
+        let initial = load_todo_provenance(session).expect("load initial provenance");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].todo_id, "tracked-task");
+        assert_eq!(initial[0].created_by_session_id, session);
+        assert_eq!(initial[0].last_updated_by_session_id, session);
+
+        let mut changed = todo;
+        changed.status = "completed".to_string();
+        save_todos(session, std::slice::from_ref(&changed)).expect("save updated TODO");
+        let updated = load_todo_provenance(session).expect("load updated provenance");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].created_by_session_id, session);
+        assert_eq!(updated[0].last_updated_by_session_id, session);
+        assert!(updated[0].last_updated_at >= initial[0].last_updated_at);
 
         match previous_home {
             Some(value) => crate::env::set_var("JCODE_HOME", value),
