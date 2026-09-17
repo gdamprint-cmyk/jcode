@@ -326,6 +326,34 @@ pub(crate) fn git_common_dir_for(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Return the server-owned coordination scope for a working directory.
+///
+/// This is deliberately separate from `swarm_id_for_dir`. A repository is a
+/// useful conflict-detection boundary, but it must not implicitly merge
+/// independently-created root sessions into one swarm plan. The scope is only
+/// used for narrow runtime coordination, such as warning about two sessions
+/// modifying the same file.
+pub(crate) fn coordination_scope_for_dir(dir: Option<&Path>) -> Option<String> {
+    let dir = dir?;
+    if let Some(git_common) = git_common_dir_for(dir) {
+        return Some(format!("git:{}", git_common.to_string_lossy()));
+    }
+    Some(format!(
+        "dir:{}",
+        canonicalize_or(dir.to_path_buf()).to_string_lossy()
+    ))
+}
+
+pub(crate) fn same_coordination_scope(left: Option<&Path>, right: Option<&Path>) -> bool {
+    match (
+        coordination_scope_for_dir(left),
+        coordination_scope_for_dir(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 pub(crate) fn swarm_id_for_dir(dir: Option<PathBuf>) -> Option<String> {
     if let Ok(sw_id) = std::env::var("JCODE_SWARM_ID") {
         let trimmed = sw_id.trim();

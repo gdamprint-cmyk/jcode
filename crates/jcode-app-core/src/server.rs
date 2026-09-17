@@ -630,7 +630,7 @@ use self::util::{
 };
 
 mod file_activity;
-use self::file_activity::file_activity_scope_label;
+use self::file_activity::{coordination_session_ids, file_activity_scope_label};
 
 mod file_touch_service;
 pub(crate) use self::file_touch_service::FileTouchService;
@@ -2026,23 +2026,32 @@ impl Server {
                         .await;
                     }
 
-                    // Find the swarm this session belongs to
-                    let swarm_session_ids: Vec<String> = {
+                    // Find the runtime coordination peers for this session.
+                    //
+                    // Explicit swarm membership remains authoritative and is
+                    // preserved exactly. Independently-created root sessions
+                    // additionally coordinate when the server can prove that
+                    // they share a repository or the same non-git working
+                    // directory. This does not merge their swarm plans.
+                    let coordination_session_ids: HashSet<String> = {
                         let members = swarm_members.read().await;
-                        if let Some(member) = members.get(&session_id) {
-                            if let Some(ref swarm_id) = member.swarm_id {
-                                let swarms = swarms_by_id.read().await;
-                                if let Some(swarm) = swarms.get(swarm_id) {
-                                    swarm.iter().cloned().collect()
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                vec![]
-                            }
+                        let current_member = members.get(&session_id);
+                        let current_swarm_members = if let Some(Some(swarm_id)) =
+                            current_member.map(|member| member.swarm_id.as_ref())
+                        {
+                            let swarms = swarms_by_id.read().await;
+                            swarms.get(swarm_id).cloned()
                         } else {
-                            vec![]
-                        }
+                            None
+                        };
+                        coordination_session_ids(
+                            &session_id,
+                            current_swarm_members.as_ref(),
+                            current_member.and_then(|member| member.working_dir.as_deref()),
+                            members.iter().map(|(candidate_id, candidate)| {
+                                (candidate_id.as_str(), candidate.working_dir.as_deref())
+                            }),
+                        )
                     };
 
                     // Only notify on modifications, and only about prior peer modifications.
@@ -2051,10 +2060,10 @@ impl Server {
                     let is_modification = touch.op.is_modification();
                     if is_modification {
                         crate::logging::info(&format!(
-                            "[file-activity] modification by {} on {}, swarm_peers: {:?}",
+                            "[file-activity] modification by {} on {}, coordination_peers: {:?}",
                             &session_id[..8.min(session_id.len())],
                             path.display(),
-                            swarm_session_ids
+                            coordination_session_ids
                                 .iter()
                                 .map(|s| &s[..8.min(s.len())])
                                 .collect::<Vec<_>>()
@@ -2062,10 +2071,11 @@ impl Server {
                     }
                     let previous_touches: Vec<FileAccess> = if is_modification {
                         if let Some(accesses) = file_touch.accesses_for_path(&path).await {
-                            let swarm_session_ids_set: HashSet<String> =
-                                swarm_session_ids.iter().cloned().collect();
-                            let result =
-                                latest_peer_touches(&accesses, &session_id, &swarm_session_ids_set);
+                            let result = latest_peer_touches(
+                                &accesses,
+                                &session_id,
+                                &coordination_session_ids,
+                            );
                             crate::logging::info(&format!(
                                 "[file-activity] {} prior peer touches ({} total accesses)",
                                 result.len(),
