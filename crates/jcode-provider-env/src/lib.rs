@@ -104,32 +104,37 @@ pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option
         return Some(key);
     }
 
-    let config_path = jcode_storage::app_config_dir().ok()?.join(file_name);
-    jcode_storage::harden_secret_file_permissions(&config_path);
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let prefix = format!("{}=", env_key);
+    if let Some(config_path) = jcode_storage::app_config_dir()
+        .ok()
+        .map(|dir| dir.join(file_name))
+    {
+        jcode_storage::harden_secret_file_permissions(&config_path);
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            let prefix = format!("{}=", env_key);
 
-    for line in content.lines() {
-        if let Some(key) = line.strip_prefix(&prefix)
-            && let Some(key) = clean_loaded_value(key, env_key)
-        {
-            return Some(key);
-        }
-    }
+            for line in content.lines() {
+                if let Some(key) = line.strip_prefix(&prefix)
+                    && let Some(key) = clean_loaded_value(key, env_key)
+                {
+                    return Some(key);
+                }
+            }
 
-    if env_key == "ZHIPU_API_KEY" {
-        if let Ok(key) = std::env::var("ZAI_API_KEY")
-            && let Some(key) = clean_loaded_value(&key, "ZAI_API_KEY")
-        {
-            return Some(key);
-        }
+            if env_key == "ZHIPU_API_KEY" {
+                if let Ok(key) = std::env::var("ZAI_API_KEY")
+                    && let Some(key) = clean_loaded_value(&key, "ZAI_API_KEY")
+                {
+                    return Some(key);
+                }
 
-        let legacy_prefix = "ZAI_API_KEY=";
-        for line in content.lines() {
-            if let Some(key) = line.strip_prefix(legacy_prefix)
-                && let Some(key) = clean_loaded_value(key, "ZAI_API_KEY")
-            {
-                return Some(key);
+                let legacy_prefix = "ZAI_API_KEY=";
+                for line in content.lines() {
+                    if let Some(key) = line.strip_prefix(legacy_prefix)
+                        && let Some(key) = clean_loaded_value(key, "ZAI_API_KEY")
+                    {
+                        return Some(key);
+                    }
+                }
             }
         }
     }

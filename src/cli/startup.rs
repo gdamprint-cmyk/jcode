@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use crate::{
     build, logging, perf, server, setup_hints, startup_profile, storage, telemetry, update,
@@ -13,6 +16,41 @@ use super::{
 
 fn sync_output_style_from_config() {
     crate::output_style::set_emoji_enabled(crate::config::config().display.emoji);
+}
+
+const VAULTWARDEN_OMNIROUTE_ENV: &str = "JCODE_PROVIDER_OMNIROUTEV2_API_KEY";
+const VAULTWARDEN_CREDENTIAL_HELPER: &str =
+    r"C:\Users\WorkShop1\.jcode\vaultwarden_credential_helper.py";
+
+/// Resolve the allowlisted local OmniRoute key only when normal env/config
+/// sources are absent. The helper returns the value through a private child
+/// stdout pipe; it is never placed in command arguments, logs, or config files.
+fn load_vaultwarden_api_key(env_key: &str) -> Option<String> {
+    if env_key != VAULTWARDEN_OMNIROUTE_ENV {
+        return None;
+    }
+
+    let mut command = ProcessCommand::new("python");
+    command
+        .arg(VAULTWARDEN_CREDENTIAL_HELPER)
+        .arg("--provider")
+        .arg("OmniRouteV2")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 pub async fn run() -> Result<()> {
@@ -68,6 +106,7 @@ pub async fn run() -> Result<()> {
     crate::provider_catalog::register_api_key_fallback_resolver(
         crate::auth::external::load_api_key_for_env,
     );
+    crate::provider_catalog::register_api_key_fallback_resolver(load_vaultwarden_api_key);
 
     // Register externally-implemented provider runtimes with the base
     // provider registry. These crates sit downstream of jcode-base (so
