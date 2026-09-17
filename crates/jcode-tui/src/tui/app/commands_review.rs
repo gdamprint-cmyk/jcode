@@ -3,17 +3,18 @@ use super::{App, DisplayMessage};
 use crate::id;
 use crate::message::{ContentBlock, Role, ToolCall};
 use crate::session::{Session, StoredMessage};
-#[cfg(test)]
-use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use serde::Deserialize;
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
-#[cfg(test)]
 pub(super) const STALL_JUDGE_MAX_OUTPUT_CHARS: usize = 2_048;
+pub(super) const STALL_JUDGE_MAX_RESULT_CHARS: usize = 4_096;
 pub(super) const STALL_JUDGE_TIMEOUT_SECS: u64 = 45;
 pub(super) const STALL_JUDGE_MAX_TOKENS: u32 = 1_200;
+pub(super) const STALL_JUDGE_RESULT_MARKER: &str = "JCODE_STALL_JUDGE_RESULT";
+const STALL_JUDGE_LOCAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum StallJudgeAction {
     Continue,
@@ -21,8 +22,7 @@ pub(super) enum StallJudgeAction {
     Blocked,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StallJudgeDecision {
     pub action: StallJudgeAction,
@@ -31,7 +31,6 @@ pub(super) struct StallJudgeDecision {
     pub next_step: Option<String>,
 }
 
-#[cfg(test)]
 pub(super) fn parse_stall_judge_decision(raw: &str) -> Result<StallJudgeDecision, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > STALL_JUDGE_MAX_OUTPUT_CHARS {
@@ -61,6 +60,188 @@ pub(super) fn parse_stall_judge_decision(raw: &str) -> Result<StallJudgeDecision
         return Err("stall judge next_step is too long".to_string());
     }
     Ok(decision)
+}
+
+pub(super) fn stall_judge_episode_token(episode_key: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    episode_key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub(super) fn parse_stall_judge_result(raw: &str) -> Result<(String, StallJudgeDecision), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > STALL_JUDGE_MAX_RESULT_CHARS {
+        return Err("stall judge result is empty or exceeds the bounded size".to_string());
+    }
+    let Some(rest) = trimmed.strip_prefix(STALL_JUDGE_RESULT_MARKER) else {
+        return Err("stall judge result marker is missing".to_string());
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix("episode=") else {
+        return Err("stall judge result episode token is missing".to_string());
+    };
+    let (episode_token, json) = rest
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| "stall judge result JSON is missing".to_string())?;
+    if episode_token.len() != 16 || !episode_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("stall judge result episode token is invalid".to_string());
+    }
+    let decision = parse_stall_judge_decision(json)?;
+    Ok((episode_token.to_ascii_lowercase(), decision))
+}
+
+/// Consume one validated result from an isolated stall judge.
+///
+/// The result is accepted only from a child session titled `stall-judge`, whose
+/// parent resolves to the currently active root session, and only while the
+/// matching bounded episode is still live. A continue decision queues exactly
+/// one user-role continuation on this parent session. Stop and blocked decisions
+/// trip the existing auto-poke breaker instead of silently retrying.
+pub(super) fn handle_stall_judge_result_notification(
+    app: &mut App,
+    from_session: &str,
+    message: &str,
+) -> bool {
+    let Ok((episode_token, decision)) = parse_stall_judge_result(message) else {
+        return false;
+    };
+    let Some(child) = Session::load(from_session).ok() else {
+        return false;
+    };
+    if child.title.as_deref() != Some("stall-judge") {
+        return false;
+    }
+
+    let parent_session_id = current_feedback_target_session_id(app);
+    if child.parent_id.as_deref() != Some(parent_session_id.as_str()) {
+        return false;
+    }
+    if !app.stall_judge_attempted {
+        return false;
+    }
+    let Some(episode_key) = app.stall_judge_episode_key.as_deref() else {
+        return false;
+    };
+    if episode_token != stall_judge_episode_token(episode_key)
+        || app
+            .stall_judge_started_at
+            .is_none_or(|started| started.elapsed().as_secs() >= STALL_JUDGE_TIMEOUT_SECS)
+    {
+        return false;
+    }
+
+    let reason = truncate_judge_visible_text(&decision.reason, 240);
+    app.stall_judge_started_at = None;
+    match decision.action {
+        StallJudgeAction::Continue => {
+            let next_step = decision
+                .next_step
+                .expect("parse_stall_judge_decision guarantees next_step for continue");
+            let next_step = next_step.trim().to_string();
+            app.last_auto_poke_fingerprint = Some(episode_key.to_string());
+            app.auto_poke_stall_count = 0;
+            app.stall_judge_attempted = false;
+            app.stall_judge_episode_key = None;
+            app.stall_judge_session_id = None;
+            app.stall_judge_last_polled_at = None;
+            app.queued_messages.push(format!(
+                "Continue the original work now. The isolated stall judge approved one bounded next step: {next_step}\n\nExecute that step, verify its real acceptance boundary, and update the TODOs with evidence. Do not launch another stall judge for this same episode."
+            ));
+            app.pending_queued_dispatch = true;
+            app.push_display_message(DisplayMessage::system(format!(
+                "✅ Stall judge approved one bounded continuation: {reason}"
+            )));
+            app.set_status_notice("Stall judge continuation queued");
+        }
+        StallJudgeAction::Stop | StallJudgeAction::Blocked => {
+            super::commands::disable_auto_poke(app);
+            app.push_display_message(DisplayMessage::system(format!(
+                "🛑 Stall judge stopped auto-poke: {reason}"
+            )));
+            app.set_status_notice("Stall judge stopped auto-poke");
+        }
+    }
+    true
+}
+
+/// Poll a locally launched stall-judge child for its exact callback marker.
+///
+/// Local review children are intentionally not put in the parent's swarm, so
+/// their `communicate dm` call cannot reach the parent through the server
+/// notification bus. The child still persists its assistant tool call to its
+/// session file. Poll only the tracked child, inspect only the bounded marker,
+/// and reuse the same episode/parent/token validation as remote notifications.
+pub(super) fn poll_stall_judge_result(app: &mut App) -> bool {
+    let Some(child_id) = app.stall_judge_session_id.clone() else {
+        return false;
+    };
+    let now = Instant::now();
+    if app
+        .stall_judge_last_polled_at
+        .is_some_and(|last| now.duration_since(last) < STALL_JUDGE_LOCAL_POLL_INTERVAL)
+    {
+        return false;
+    }
+    app.stall_judge_last_polled_at = Some(now);
+    let Ok(child) = Session::load(&child_id) else {
+        return false;
+    };
+    let parent_session_id = current_feedback_target_session_id(app);
+    for (message_index, stored) in child.messages.iter().enumerate().rev() {
+        for block in &stored.content {
+            let candidate = match block {
+                ContentBlock::Text { text, .. } => Some(text.clone()),
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } if name == "communicate"
+                    && input.get("action").and_then(serde_json::Value::as_str) == Some("dm")
+                    && input
+                        .get("to_session")
+                        .or_else(|| input.get("target_session"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(parent_session_id.as_str())
+                    && local_communicate_tool_succeeded(&child.messages, message_index, id) =>
+                {
+                    input
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                _ => None,
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if !candidate
+                .trim_start()
+                .starts_with(STALL_JUDGE_RESULT_MARKER)
+            {
+                continue;
+            }
+            return handle_stall_judge_result_notification(app, &child_id, &candidate);
+        }
+    }
+    false
+}
+
+fn local_communicate_tool_succeeded(
+    messages: &[StoredMessage],
+    tool_message_index: usize,
+    tool_id: &str,
+) -> bool {
+    messages
+        .iter()
+        .skip(tool_message_index.saturating_add(1))
+        .flat_map(|stored| stored.content.iter())
+        .find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } if tool_use_id == tool_id => Some(*is_error != Some(true)),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn review_session_read_only_guardrails() -> &'static str {
@@ -676,18 +857,23 @@ pub(super) fn build_stall_judge_startup_message(
     episode_key: &str,
     stall_count: u8,
 ) -> String {
+    let episode_token = stall_judge_episode_token(episode_key);
     format!(
         "You are a one-shot bounded stall judge for parent session `{parent_session_id}`.\n\
-The parent agent has made {stall_count} unchanged progress checks in stall episode `{episode_key}`.\n\
+	The parent agent has made {stall_count} unchanged progress checks in stall episode `{episode_key}` (callback token `{episode_token}`).\n\
 Inspect only the recent parent work and determine whether one concrete continuation can make progress, or whether the parent should stop safely.\n\n\
 {visible}\
 Hard limits: one judgment, at most {timeout}s, at most {tokens} output tokens, no spawning agents, no auto-poke, no autojudge, no autoreview, no swarm, and no recursive judge. Do not modify files or repo state.\n\n\
 Return exactly one raw JSON object and nothing else. The schema is:\n\
 {{\"action\":\"continue|stop|blocked\",\"reason\":\"short evidence-based reason\",\"next_step\":\"one concrete bounded next step or null\"}}\n\
-Use `continue` only when the next step is specific and likely to change the progress signature. Use `blocked` for missing credentials, unavailable external state, or an unresolved dependency. Use `stop` when another automatic poke is unlikely to help. Do not send a prose prefix or Markdown fence.",
+Use `continue` only when the next step is specific and likely to change the progress signature. Use `blocked` for missing credentials, unavailable external state, or an unresolved dependency. Use `stop` when another automatic poke is unlikely to help. Do not send a prose prefix or Markdown fence.\n\
+After deciding, send exactly one DM to session `{parent_session_id}` using `communicate` with action `dm`. The DM message must be exactly one line consisting of this marker, the callback token, one space, and the raw JSON object:\n\
+`{marker} episode={episode_token} {{\"action\":\"continue|stop|blocked\",\"reason\":\"...\",\"next_step\":\"... or null\"}}`\n\
+Do not send any other DM or prose.",
         visible = judge_session_visible_context_notice(),
         timeout = STALL_JUDGE_TIMEOUT_SECS,
         tokens = STALL_JUDGE_MAX_TOKENS,
+        marker = STALL_JUDGE_RESULT_MARKER,
     )
 }
 
@@ -868,6 +1054,10 @@ fn launch_review_window_local(
         Some(session_title.to_string()),
         None,
     );
+    if session_title == "stall-judge" {
+        app.stall_judge_session_id = Some(session_id.clone());
+        app.stall_judge_last_polled_at = None;
+    }
     let exe = super::launch_client_executable();
     let cwd = active_working_dir(app)
         .filter(|path| path.is_dir())

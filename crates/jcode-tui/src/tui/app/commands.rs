@@ -12,14 +12,20 @@ pub(super) use super::commands_plan::{
 #[cfg(test)]
 pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
-    ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
-    autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
-    build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
-    handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_forked_session_local,
-    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
-    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
-    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
+    ImproveCommand, ManualSubagentSpec, RefactorCommand, STALL_JUDGE_TIMEOUT_SECS,
+    autojudge_status_message, autoreview_status_message, build_autojudge_startup_message,
+    build_autoreview_startup_message, build_judge_startup_message, build_review_startup_message,
+    current_feedback_target_session_id, handle_autojudge_command_local,
+    handle_autoreview_command_local, handle_judge_command_local, handle_observe_command,
+    handle_review_command_local, handle_stall_judge_result_notification,
+    launch_forked_session_local, launch_prompt_in_new_session_local,
+    launch_stall_judge_window_local, maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
+    poll_stall_judge_result, preferred_one_shot_review_override, prepare_review_spawned_session,
+    queue_review_spawn_remote, queue_stall_judge_remote, reset_current_session,
+};
+pub(super) use super::commands_review::{
+    STALL_JUDGE_RESULT_MARKER, StallJudgeAction, build_stall_judge_startup_message,
+    parse_stall_judge_decision, parse_stall_judge_result, stall_judge_episode_token,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -84,6 +90,50 @@ pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
         || message.starts_with("All todos are done. Todo confidence summary:")
 }
 
+/// Stable semantic state used by the auto-poke stall detector. The raw todo
+/// prompt is intentionally not part of this signature: wording and ordering
+/// changes should count only when the persisted work state changes.
+pub(super) fn build_auto_poke_progress_signature(
+    todos: &[crate::todo::TodoItem],
+    goals: &[crate::todo::TodoGoal],
+) -> String {
+    let mut todo_state = todos
+        .iter()
+        .map(|todo| {
+            serde_json::json!({
+                "id": todo.id,
+                "group": todo.group,
+                "content": todo.content,
+                "status": todo.status,
+                "priority": todo.priority,
+                "confidence": todo.confidence,
+                "completion_confidence": todo.completion_confidence,
+                "confidence_history": todo.confidence_history,
+            })
+        })
+        .collect::<Vec<_>>();
+    todo_state.sort_by_key(|value| value.to_string());
+    let mut goal_state = goals
+        .iter()
+        .map(|goal| {
+            serde_json::json!({
+                "group": goal.group,
+                "delivery_state": goal.delivery_state,
+                "autonomy": goal.autonomy,
+                "iteration_maturity": goal.iteration_maturity,
+                "feedback_loop": goal.feedback_loop,
+                "closed_feedback_loop": goal.closed_feedback_loop,
+                "feedback_loop_relevance": goal.feedback_loop_relevance,
+                "feedback_loop_coverage": goal.feedback_loop_coverage,
+                "feedback_loop_traceability": goal.feedback_loop_traceability,
+                "stopping_evidence": goal.stopping_evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    goal_state.sort_by_key(|value| value.to_string());
+    serde_json::to_string(&(todo_state, goal_state)).unwrap_or_default()
+}
+
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
     !messages.is_empty() && messages.iter().all(|message| is_poke_message(message))
 }
@@ -113,6 +163,12 @@ pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.auto_poke_stall_count = 0;
+    app.stall_judge_attempted = false;
+    app.stall_judge_episode_key = None;
+    app.stall_judge_started_at = None;
+    app.stall_judge_session_id = None;
+    app.stall_judge_last_polled_at = None;
     app.last_todo_ownership_fingerprint = None;
     app.todo_gate_digest_delivered = false;
     cleared
@@ -246,6 +302,12 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.auto_poke_stall_count = 0;
+    app.stall_judge_attempted = false;
+    app.stall_judge_episode_key = None;
+    app.stall_judge_started_at = None;
+    app.stall_judge_session_id = None;
+    app.stall_judge_last_polled_at = None;
     app.last_todo_ownership_fingerprint = None;
     // Re-arming starts a fresh review cycle, so the deferred quality digest is
     // eligible to be delivered again for the upcoming work.

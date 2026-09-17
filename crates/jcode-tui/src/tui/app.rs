@@ -870,6 +870,8 @@ pub struct App {
     current_turn_system_reminder: Option<String>,
     // Upstream provider (e.g., which provider OpenRouter routed to)
     upstream_provider: Option<String>,
+    // Exact model selected by a routing gateway (e.g. OmniRoute).
+    actual_model: Option<String>,
     // Active stream connection type (websocket/https/etc.)
     connection_type: Option<String>,
     // Provider-supplied human-readable transport detail for the current stream
@@ -959,9 +961,28 @@ pub struct App {
     /// final response for the current todo cycle.
     todo_final_response_requested: bool,
     /// Exact continuation sent for the last incomplete todo state. An unchanged
-    /// list must not trigger another automatic turn: the agent may be parked on
-    /// a worker, wake, or human decision, and repeated pokes cannot help.
+    /// list may stall briefly while a worker or tool finishes. Permit a small
+    /// bounded episode before stopping, rather than suppressing the second poke.
     last_auto_poke_fingerprint: Option<String>,
+    /// Number of consecutive auto-pokes against the same incomplete-todo state.
+    /// This is a progress-aware budget, not a lifetime counter: any todo change
+    /// resets it. Keep the episode bounded to avoid infinite repeated turns.
+    auto_poke_stall_count: u8,
+    /// Whether the one-shot isolated stall judge has already been launched for
+    /// the current unchanged-progress episode. This is deliberately runtime
+    /// state: a reload must not relaunch the judge for the same episode.
+    stall_judge_attempted: bool,
+    /// Progress signature associated with the last stall-judge attempt.
+    stall_judge_episode_key: Option<String>,
+    /// Start time of the bounded stall-judge attempt.
+    stall_judge_started_at: Option<Instant>,
+    /// Local child session used by the isolated stall judge. Remote judges
+    /// report through a swarm DM, while local children need a bounded session
+    /// file poll because they are not members of the parent's swarm.
+    stall_judge_session_id: Option<String>,
+    /// Last local child-session poll, used to avoid filesystem I/O on every UI
+    /// tick while the isolated judge is still thinking.
+    stall_judge_last_polled_at: Option<Instant>,
     /// Set when the current turn ended with a provider guardrail/refusal stop
     /// (ServerEvent::ProviderGuardrail). Consumed by the Done handler to
     /// update `consecutive_guardrail_stops`.
@@ -976,6 +997,11 @@ pub struct App {
     overnight_auto_poke: Option<OvernightAutoPokeState>,
     // Pending cross-provider resend after a failover warning/countdown.
     pending_provider_failover: Option<PendingProviderFailover>,
+    // One bounded client-side retry after OmniRoute's own transport retry
+    // budget is exhausted. The request keeps its auto/* model so OmniRoute
+    // can choose a different combo candidate instead of Jcode picking one.
+    omniroute_retry_attempts: u8,
+    omniroute_retry_pending: bool,
     // Interactive "switch to next best model/method and resend" offer surfaced
     // after a provider turn error; accepted with a keypress.
     pending_fallback_offer: Option<PendingFallbackOffer>,
@@ -2561,5 +2587,3 @@ fn ratio_pct(numerator: u64, denominator: u64) -> u8 {
 
 #[cfg(test)]
 mod tests;
-    // Exact model selected by a routing gateway (e.g. OmniRoute).
-    actual_model: Option<String>,

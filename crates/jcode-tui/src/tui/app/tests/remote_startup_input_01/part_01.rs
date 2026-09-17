@@ -322,6 +322,133 @@ fn test_queue_autojudge_remote_targets_original_non_judge_session() {
 }
 
 #[test]
+fn test_stall_judge_result_queues_one_bounded_parent_continuation() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_id = app.session.id.clone();
+        let episode_key = "episode-for-parent-callback";
+        let mut child = crate::session::Session::create(
+            Some(parent_id.clone()),
+            Some("stall-judge".to_string()),
+        );
+        child.save().expect("save stall judge child");
+
+        app.stall_judge_attempted = true;
+        app.stall_judge_episode_key = Some(episode_key.to_string());
+        app.stall_judge_started_at = Some(Instant::now());
+        let result = format!(
+            "{} episode={} {}",
+            super::commands::STALL_JUDGE_RESULT_MARKER,
+            super::commands::stall_judge_episode_token(episode_key),
+            r#"{"action":"continue","reason":"a worker result can be checked","next_step":"inspect the worker result once"}"#
+        );
+
+        assert!(super::commands::handle_stall_judge_result_notification(
+            &mut app, &child.id, &result,
+        ));
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.queued_messages[0].contains("inspect the worker result once"));
+        assert!(!app.stall_judge_attempted);
+        assert!(app.stall_judge_episode_key.is_none());
+    });
+}
+
+#[test]
+fn test_poll_stall_judge_result_reads_local_communicate_tool_call() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_id = app.session.id.clone();
+        let episode_key = "episode-for-local-poll";
+        let mut child = crate::session::Session::create(
+            Some(parent_id.clone()),
+            Some("stall-judge".to_string()),
+        );
+        let result = format!(
+            "{} episode={} {}",
+            super::commands::STALL_JUDGE_RESULT_MARKER,
+            super::commands::stall_judge_episode_token(episode_key),
+            r#"{"action":"continue","reason":"the local child persisted a decision","next_step":"inspect the persisted callback"}"#
+        );
+        child.add_message(
+            crate::message::Role::Assistant,
+            vec![crate::message::ContentBlock::ToolUse {
+                id: "communicate-call".to_string(),
+                name: "communicate".to_string(),
+                input: serde_json::json!({
+                    "action": "dm",
+                    "to_session": parent_id,
+                    "message": result,
+                }),
+                thought_signature: None,
+            }],
+        );
+        child.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::ToolResult {
+                tool_use_id: "communicate-call".to_string(),
+                content: "Direct message sent".to_string(),
+                is_error: Some(false),
+            }],
+        );
+        child.save().expect("save local stall judge callback");
+
+        app.stall_judge_attempted = true;
+        app.stall_judge_episode_key = Some(episode_key.to_string());
+        app.stall_judge_started_at = Some(Instant::now());
+        app.stall_judge_session_id = Some(child.id.clone());
+
+        assert!(super::commands::poll_stall_judge_result(&mut app));
+        assert!(app.pending_queued_dispatch);
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.queued_messages[0].contains("inspect the persisted callback"));
+        assert!(app.stall_judge_session_id.is_none());
+    });
+}
+
+#[test]
+fn test_stall_judge_result_ignores_foreign_child_and_wrong_episode() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let parent_id = app.session.id.clone();
+        let episode_key = "episode-for-parent-callback";
+        let mut foreign_parent = crate::session::Session::create(None, Some("other".to_string()));
+        foreign_parent.save().expect("save foreign parent");
+        let mut foreign_child = crate::session::Session::create(
+            Some(foreign_parent.id.clone()),
+            Some("stall-judge".to_string()),
+        );
+        foreign_child.save().expect("save foreign child");
+        let mut right_child =
+            crate::session::Session::create(Some(parent_id), Some("stall-judge".to_string()));
+        right_child.save().expect("save right child");
+
+        app.stall_judge_attempted = true;
+        app.stall_judge_episode_key = Some(episode_key.to_string());
+        app.stall_judge_started_at = Some(Instant::now());
+        let result = format!(
+            "{} episode={} {}",
+            super::commands::STALL_JUDGE_RESULT_MARKER,
+            super::commands::stall_judge_episode_token("different-episode"),
+            r#"{"action":"continue","reason":"wrong episode","next_step":"do not run"}"#
+        );
+
+        assert!(!super::commands::handle_stall_judge_result_notification(
+            &mut app,
+            &foreign_child.id,
+            &result,
+        ));
+        assert!(!super::commands::handle_stall_judge_result_notification(
+            &mut app,
+            &right_child.id,
+            &result,
+        ));
+        assert!(app.queued_messages.is_empty());
+        assert!(app.stall_judge_attempted);
+    });
+}
+
+#[test]
 fn test_new_for_remote_restores_spawn_startup_hints_and_dispatch_state() {
     with_temp_jcode_home(|| {
         let session_id = "session_spawn_child";

@@ -1692,6 +1692,8 @@ impl App {
             self.stall_judge_attempted = false;
             self.stall_judge_episode_key = None;
             self.stall_judge_started_at = None;
+            self.stall_judge_session_id = None;
+            self.stall_judge_last_polled_at = None;
             if todos.is_empty() {
                 // No todo list exists yet for this session. Auto-poke is armed
                 // by default (`features.auto_poke`), so disarming here would
@@ -1899,6 +1901,8 @@ impl App {
             self.auto_poke_stall_count = 1;
             self.stall_judge_attempted = false;
             self.stall_judge_episode_key = None;
+            self.stall_judge_session_id = None;
+            self.stall_judge_last_polled_at = None;
         }
         self.queued_messages.push(poke_message);
         self.pending_queued_dispatch = true;
@@ -3793,6 +3797,9 @@ impl App {
 
     /// Submit input - just sets up message and flags, processing happens in next loop iteration
     pub(super) fn submit_input(&mut self) {
+        // A normal user submission starts a fresh OmniRoute retry episode.
+        self.omniroute_retry_pending = false;
+        self.omniroute_retry_attempts = 0;
         // Connected SSH input is dispatched through the wire client, never the
         // local submit fallback (which reads skills and persists prompts).
         if crate::tui::is_ssh_remote() {
@@ -4046,6 +4053,7 @@ impl App {
         self.streaming.streaming_cache_creation_tokens = None;
         self.kv_cache.current_api_usage_recorded = false;
         self.upstream_provider = None;
+        self.actual_model = None;
         self.status_detail = None;
         self.streaming.streaming_tps_start = None;
         self.streaming.streaming_tps_elapsed = Duration::ZERO;
@@ -4260,4 +4268,3 @@ mod terminal_control_sequence_tests {
         ));
     }
 }
-        self.actual_model = None;

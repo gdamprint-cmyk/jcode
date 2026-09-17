@@ -24,6 +24,9 @@ pub(super) async fn process_turn_with_input(
     event_stream: &mut EventStream,
     bus_receiver: &mut Receiver<BusEvent>,
 ) {
+    // The flag only marks the queued OmniRoute resend. Clear it before the
+    // request starts so the next real user submission resets the episode.
+    app.omniroute_retry_pending = false;
     match app
         .run_turn_interactive(terminal, event_stream, Some(bus_receiver))
         .await
@@ -106,6 +109,7 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     needs_redraw |= app.progress_update_simulator();
     needs_redraw |= app.poll_compaction_completion();
     needs_redraw |= app.maybe_refresh_overnight_display_card();
+    needs_redraw |= super::commands::poll_stall_judge_result(app);
     needs_redraw |= super::commands::poll_local_transfer_prepare(app);
     needs_redraw |= super::commands::maybe_begin_pending_local_transfer(app);
     needs_redraw |= app.maybe_progress_provider_failover_countdown();
@@ -233,6 +237,7 @@ pub(super) fn handle_bus_event(
             app.provider_session_id = None;
             app.session.provider_session_id = None;
             app.upstream_provider = None;
+            app.actual_model = None;
             app.invalidate_model_picker_cache();
             app.update_context_limit_for_model(&model);
             app.session.provider_key = provider_key.or_else(|| {
@@ -621,4 +626,3 @@ pub(super) fn finish_turn(app: &mut App) {
     }
     let _ = super::commands::maybe_begin_pending_local_transfer(app);
 }
-            app.actual_model = None;

@@ -1000,6 +1000,10 @@ pub(in crate::tui::app) fn handle_server_event(
             app.upstream_provider = Some(provider);
             false
         }
+        ServerEvent::ActualModel { model } => {
+            app.actual_model = Some(model);
+            false
+        }
         ServerEvent::Ack { id } => {
             let _ = app.acknowledge_pending_soft_interrupt(id);
             false
@@ -2300,8 +2304,10 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::ModelUsageUpdated { route } => {
             for cached in &mut app.remote_model_options {
-                if cached.model == route.model && cached.provider == route.provider
-                    && cached.api_method == route.api_method {
+                if cached.model == route.model
+                    && cached.provider == route.provider
+                    && cached.api_method == route.api_method
+                {
                     cached.usage = route.usage.clone();
                 }
             }
@@ -2650,6 +2656,23 @@ pub(in crate::tui::app) fn handle_server_event(
                 return false;
             }
 
+            let direct_message_scope = matches!(
+                &notification_type,
+                crate::protocol::NotificationType::Message {
+                    scope: Some(scope),
+                    ..
+                } if scope == "dm"
+            );
+            if direct_message_scope
+                && app_mod::commands::handle_stall_judge_result_notification(
+                    app,
+                    &from_session,
+                    &message,
+                )
+            {
+                return false;
+            }
+
             let presentation = present_swarm_notification(
                 &sender,
                 &notification_type,
@@ -2795,6 +2818,10 @@ pub(in crate::tui::app) fn handle_server_event(
             let model_override = app.pending_split_model_override.take();
             let provider_key_override = app.pending_split_provider_key_override.take();
             let split_label = app.pending_split_label.take();
+            if split_label.as_deref() == Some("Stall judge") {
+                app.stall_judge_session_id = Some(new_session_id.clone());
+                app.stall_judge_last_polled_at = None;
+            }
             if let Some(startup_message) = startup_message {
                 app_mod::commands::prepare_review_spawned_session(
                     &new_session_id,
@@ -2913,7 +2940,3 @@ fn runtime_activity_status_notice(message: &str) -> String {
         .trim_end_matches('.')
         .to_string()
 }
-        ServerEvent::ActualModel { model } => {
-            app.actual_model = Some(model);
-            false
-        }
