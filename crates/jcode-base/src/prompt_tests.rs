@@ -412,6 +412,59 @@ fn test_prompt_overlay_files_are_loaded_from_project_and_global_jcode_dirs() {
 }
 
 #[test]
+fn prompt_overlay_same_file_is_loaded_once_when_project_is_home() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let root = tempfile::TempDir::new().unwrap();
+    let jcode_home = root.path().join(".jcode");
+    crate::env::set_var("JCODE_HOME", &jcode_home);
+    std::fs::create_dir_all(&jcode_home).unwrap();
+    let instructions = "one physical overlay file";
+    std::fs::write(jcode_home.join("prompt-overlay.md"), instructions).unwrap();
+
+    let (content, chars) = load_prompt_overlay_files_from_dir(Some(root.path()));
+    let content = content.expect("overlay content");
+
+    assert_eq!(content.matches(instructions).count(), 1);
+    assert_eq!(chars, instructions.len());
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn load_agents_md_includes_global_jcode_file_without_truncating_tail() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let root = tempfile::TempDir::new().unwrap();
+    let jcode_home = root.path().join(".jcode");
+    crate::env::set_var("JCODE_HOME", &jcode_home);
+    std::fs::create_dir_all(&jcode_home).unwrap();
+    let instructions = "global jcode instructions\n\nTAIL_SENTINEL_20260918";
+    std::fs::write(jcode_home.join("AGENTS.md"), instructions).unwrap();
+    let project_dir = root.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let (content, info) = load_agents_md_files_from_dir(Some(&project_dir));
+    let content = content.expect("global jcode AGENTS.md content");
+
+    assert!(!info.has_project_agents_md);
+    assert!(info.has_global_agents_md);
+    assert_eq!(info.global_agents_md_chars, instructions.len());
+    assert!(content.contains("# Global Jcode Instructions (~/.jcode/AGENTS.md)"));
+    assert!(content.contains("TAIL_SENTINEL_20260918"));
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
 fn test_preferred_tools_files_are_loaded_from_project_and_global_jcode_dirs() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");

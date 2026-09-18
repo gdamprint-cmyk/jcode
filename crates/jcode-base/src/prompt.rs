@@ -948,24 +948,35 @@ fn gpu_summary() -> Option<String> {
     }
 }
 
-fn load_agents_md_files_from_dirs(
+fn canonical_file_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn load_agents_md_files_from_sources(
     project_dir: &Path,
-    global_agents_md: Option<&Path>,
+    global_agents: &[(PathBuf, &str)],
 ) -> (Option<String>, ContextInfo) {
     let mut contents = vec![];
     let mut info = ContextInfo::default();
+    let mut loaded_files = Vec::<PathBuf>::new();
 
-    // Helper to load a file if it exists, returns (formatted_content, raw_size)
-    let load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
-        if path.exists() {
-            std::fs::read_to_string(path).ok().map(|content| {
-                let raw_size = content.len();
-                let formatted = format!("# {}\n\n{}", label, content.trim());
-                (formatted, raw_size)
-            })
-        } else {
-            None
+    // Helper to load each physical file at most once. This matters when the
+    // working directory is the user's home: project .jcode/prompt-overlay.md
+    // and the global ~/.jcode/prompt-overlay.md can be the same file, and an
+    // AGENTS.md can likewise be reachable through multiple configured roots.
+    let mut load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
+        if !path.exists() {
+            return None;
         }
+        let identity = canonical_file_identity(path);
+        if loaded_files.iter().any(|loaded| loaded == &identity) {
+            return None;
+        }
+        let content = std::fs::read_to_string(path).ok()?;
+        loaded_files.push(identity);
+        let raw_size = content.len();
+        let formatted = format!("# {}\n\n{}", label, content.trim());
+        Some((formatted, raw_size))
     };
 
     let project_agents_md = project_dir.join("AGENTS.md");
@@ -976,27 +987,12 @@ fn load_agents_md_files_from_dirs(
         contents.push(content);
     }
 
-    // Canonical file identity handles cwd=$HOME as well as symlinked aliases.
-    // If either file is absent or cannot be resolved, loading below remains the
-    // source of truth and simply skips unreadable files.
-    let global_duplicates_project = global_agents_md.is_some_and(|global_agents_md| {
-        match (
-            std::fs::canonicalize(&project_agents_md),
-            std::fs::canonicalize(global_agents_md),
-        ) {
-            (Ok(project), Ok(global)) => project == global,
-            _ => false,
+    for (global_agents_md, label) in global_agents {
+        if let Some((content, size)) = load_file(global_agents_md, label) {
+            info.has_global_agents_md = true;
+            info.global_agents_md_chars += size;
+            contents.push(content);
         }
-    });
-
-    if !global_duplicates_project
-        && let Some(global_agents_md) = global_agents_md
-        && let Some((content, size)) =
-            load_file(global_agents_md, "Global Instructions (~/AGENTS.md)")
-    {
-        info.has_global_agents_md = true;
-        info.global_agents_md_chars = size;
-        contents.push(content);
     }
 
     if contents.is_empty() {
@@ -1006,28 +1002,52 @@ fn load_agents_md_files_from_dirs(
     }
 }
 
+#[cfg(test)]
+fn load_agents_md_files_from_dirs(
+    project_dir: &Path,
+    global_agents_md: Option<&Path>,
+) -> (Option<String>, ContextInfo) {
+    let global_agents = global_agents_md
+        .map(|path| vec![(path.to_path_buf(), "Global Instructions (~/AGENTS.md)")])
+        .unwrap_or_default();
+    load_agents_md_files_from_sources(project_dir, &global_agents)
+}
+
 /// Load AGENTS.md files from a specific working directory.
 pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, ContextInfo) {
     let project_dir = working_dir.unwrap_or(Path::new("."));
-    let global_agents_md = crate::storage::user_home_path("AGENTS.md").ok();
-    load_agents_md_files_from_dirs(project_dir, global_agents_md.as_deref())
+    let mut global_agents = Vec::new();
+    if let Ok(global_agents_md) = crate::storage::user_home_path("AGENTS.md") {
+        global_agents.push((global_agents_md, "Global Instructions (~/AGENTS.md)"));
+    }
+    if let Ok(jcode_agents_md) = crate::storage::jcode_dir().map(|dir| dir.join("AGENTS.md")) {
+        global_agents.push((
+            jcode_agents_md,
+            "Global Jcode Instructions (~/.jcode/AGENTS.md)",
+        ));
+    }
+    load_agents_md_files_from_sources(project_dir, &global_agents)
 }
 
 /// Load optional prompt overlay markdown from ~/.jcode/ and ./.jcode/
 fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<String>, usize) {
     let mut contents = vec![];
     let mut total_chars = 0usize;
+    let mut loaded_files = Vec::<PathBuf>::new();
 
-    let load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
-        if path.exists() {
-            std::fs::read_to_string(path).ok().map(|content| {
-                let raw_size = content.len();
-                let formatted = format!("# {}\n\n{}", label, content.trim());
-                (formatted, raw_size)
-            })
-        } else {
-            None
+    let mut load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
+        if !path.exists() {
+            return None;
         }
+        let identity = canonical_file_identity(path);
+        if loaded_files.iter().any(|loaded| loaded == &identity) {
+            return None;
+        }
+        let content = std::fs::read_to_string(path).ok()?;
+        loaded_files.push(identity);
+        let raw_size = content.len();
+        let formatted = format!("# {}\n\n{}", label, content.trim());
+        Some((formatted, raw_size))
     };
 
     let project_dir = working_dir.unwrap_or(Path::new("."));
