@@ -285,6 +285,20 @@ pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
         return Some("jcode".to_string());
     }
 
+    // A named provider profile is a separate runtime identity even when its
+    // transport is implemented through the internal OpenRouter-compatible
+    // slot. Prefer the explicit profile name while that profile lock is
+    // active, otherwise a TokenHarbor/OmniRoute session can be attributed to
+    // the generic OpenRouter namespace after the transport identity is reset.
+    if std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_some() {
+        if let Ok(profile_name) = std::env::var("JCODE_PROVIDER_PROFILE_NAME") {
+            let profile_name = profile_name.trim().to_ascii_lowercase();
+            if !profile_name.is_empty() {
+                return Some(profile_name);
+            }
+        }
+    }
+
     if let Ok(runtime_provider) = std::env::var("JCODE_RUNTIME_PROVIDER") {
         let runtime_provider = runtime_provider.trim().to_ascii_lowercase();
         if !runtime_provider.is_empty() && runtime_provider != "openai-compatible" {

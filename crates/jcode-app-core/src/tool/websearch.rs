@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use url::Url;
 
 /// Web search using DuckDuckGo or Bing (HTML scraping, with optional Bing API)
 pub struct WebSearchTool {
@@ -16,6 +17,18 @@ impl WebSearchTool {
             client: crate::provider::shared_http_client(),
         }
     }
+}
+
+fn searxng_loopback_base(base: &str) -> bool {
+    let Ok(url) = Url::parse(base) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        matches!(
+            host.trim_matches(['[', ']']),
+            "localhost" | "127.0.0.1" | "::1"
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -352,7 +365,7 @@ impl WebSearchTool {
             })?;
 
         let endpoint = format!("{}/search", base.trim_end_matches('/'));
-        let response = self
+        let mut request = self
             .client
             .get(&endpoint)
             .query(&[("q", query), ("format", "json")])
@@ -360,9 +373,17 @@ impl WebSearchTool {
                 reqwest::header::USER_AGENT,
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             )
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await?;
+            .header(reqwest::header::ACCEPT, "application/json");
+
+        // SearXNG's botdetection layer intentionally reports a missing client
+        // address when a direct local request has neither proxy header. For a
+        // loopback instance, this client is the local caller, so provide the
+        // truthful address. Never inject this header for a non-local instance.
+        if searxng_loopback_base(&base) {
+            request = request.header("X-Real-IP", "127.0.0.1");
+        }
+
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -833,5 +854,14 @@ mod tests {
             Some(WebSearchEngine::Searxng)
         );
         assert_eq!(WebSearchEngine::Searxng.as_str(), "searxng");
+    }
+
+    #[test]
+    fn searxng_loopback_header_is_limited_to_local_instances() {
+        assert!(searxng_loopback_base("http://127.0.0.1:8080"));
+        assert!(searxng_loopback_base("http://localhost:8080/"));
+        assert!(searxng_loopback_base("http://[::1]:8080"));
+        assert!(!searxng_loopback_base("https://searx.example.org"));
+        assert!(!searxng_loopback_base("not a url"));
     }
 }

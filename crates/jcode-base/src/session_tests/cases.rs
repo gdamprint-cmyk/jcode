@@ -32,6 +32,8 @@ fn test_session_exists_roundtrip() -> Result<()> {
 #[test]
 fn derive_session_provider_key_prefers_runtime_identity_over_transport() {
     let _lock = lock_env();
+    let _profile_active = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_ACTIVE");
+    let _profile_name = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_NAME");
     let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "azure-openai");
     let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "azure-cache");
     let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
@@ -45,6 +47,8 @@ fn derive_session_provider_key_prefers_runtime_identity_over_transport() {
 #[test]
 fn derive_session_provider_key_falls_back_to_openrouter_namespace() {
     let _lock = lock_env();
+    let _profile_active = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_ACTIVE");
+    let _profile_name = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_NAME");
     let _runtime = EnvVarGuard::remove("JCODE_RUNTIME_PROVIDER");
     let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "azure-openai");
     let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
@@ -58,6 +62,8 @@ fn derive_session_provider_key_falls_back_to_openrouter_namespace() {
 #[test]
 fn derive_session_provider_key_keeps_openai_compatible_profile_namespace() {
     let _lock = lock_env();
+    let _profile_active = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_ACTIVE");
+    let _profile_name = EnvVarGuard::remove("JCODE_PROVIDER_PROFILE_NAME");
     let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "openai-compatible");
     let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "zai");
     let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
@@ -65,6 +71,21 @@ fn derive_session_provider_key_keeps_openai_compatible_profile_namespace() {
     assert_eq!(
         derive_session_provider_key("openrouter").as_deref(),
         Some("zai")
+    );
+}
+
+#[test]
+fn derive_session_provider_key_prefers_active_named_profile_identity() {
+    let _lock = lock_env();
+    let _active_profile = EnvVarGuard::set("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
+    let _profile_name = EnvVarGuard::set("JCODE_PROVIDER_PROFILE_NAME", "TokenHarborFree");
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "openai-compatible");
+    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "openrouter");
+    let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
+
+    assert_eq!(
+        derive_session_provider_key("openrouter").as_deref(),
+        Some("tokenharborfree")
     );
 }
 
