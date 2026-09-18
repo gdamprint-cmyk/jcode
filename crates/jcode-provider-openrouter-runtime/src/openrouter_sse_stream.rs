@@ -183,6 +183,7 @@ async fn stream_response(
             client
                 .post(&url)
                 .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
                 .header("Accept-Encoding", "identity"),
         )
         .await?,
