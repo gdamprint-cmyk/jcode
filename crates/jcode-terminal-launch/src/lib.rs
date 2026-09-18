@@ -479,10 +479,11 @@ pub fn spawn_command_in_new_terminal_with(
 
 /// Parse an external spawn-hook command line into argv parts.
 ///
-/// Supports basic POSIX-style word splitting: whitespace separates arguments,
-/// single and double quotes group words, and backslash escapes the next
-/// character (outside single quotes). Errors on empty input, unterminated
-/// quotes, and trailing escapes.
+/// Supports basic shell-style word splitting: whitespace separates arguments,
+/// single and double quotes group words, and backslash escapes a quote or
+/// whitespace. Other backslashes are preserved so ordinary Windows paths such
+/// as `C:\\Users\\name\\hook.ps1` do not lose their separators. Errors on
+/// empty input, unterminated quotes, and trailing escapes.
 pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -491,15 +492,12 @@ pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
     let mut token_started = false;
 
     for ch in raw.chars() {
-        if escaped {
-            current.push(ch);
-            token_started = true;
-            escaped = false;
-            continue;
-        }
-
         if let Some(quote_ch) = quote {
-            if ch == quote_ch {
+            if escaped {
+                current.push(ch);
+                token_started = true;
+                escaped = false;
+            } else if ch == quote_ch {
                 quote = None;
             } else if ch == '\\' && quote_ch == '"' {
                 escaped = true;
@@ -507,6 +505,18 @@ pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
                 current.push(ch);
                 token_started = true;
             }
+            continue;
+        }
+
+        if escaped {
+            if ch == '\\' || ch == '\'' || ch == '"' || ch.is_whitespace() {
+                current.push(ch);
+            } else {
+                current.push('\\');
+                current.push(ch);
+            }
+            token_started = true;
+            escaped = false;
             continue;
         }
 
@@ -1586,6 +1596,15 @@ mod tests {
         assert_eq!(
             parse_hook_command(r#"hook "a \"b\" c""#).unwrap(),
             vec!["hook", r#"a "b" c"#]
+        );
+        assert_eq!(
+            parse_hook_command(r"powershell.exe -File C:\Users\WorkShop1\.jcode\event-log.ps1")
+                .unwrap(),
+            vec![
+                "powershell.exe",
+                "-File",
+                r"C:\Users\WorkShop1\.jcode\event-log.ps1",
+            ]
         );
     }
 
