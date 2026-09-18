@@ -232,7 +232,7 @@ pub fn dispatch_observer(event: HookEvent) {
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
-                match crate::platform::spawn_detached(&mut cmd) {
+                match crate::platform::spawn_observer_detached(&mut cmd) {
                     Ok(child) => {
                         crate::platform::reap_detached(child);
                         crate::logging::debug(&format!(
@@ -795,5 +795,62 @@ mod tests {
             String::from_utf8_lossy(&second_output.stdout),
             "client-pane-b|herdr-pane-b|client-pane-b|herdr-pane-b"
         );
+        }
     }
-}
+
+    #[cfg(windows)]
+    #[test]
+    fn observer_dispatch_runs_quoted_powershell_hook_with_windows_path() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let script = temp.path().join("observer hook.ps1");
+        let record = temp.path().join("observer result.txt");
+        std::fs::write(
+            &script,
+            "Set-Content -LiteralPath $env:JCODE_OBSERVER_TEST_FILE -Value (\"$env:JCODE_HOOK_EVENT|$env:JCODE_HOOK_SESSION_ID|$env:JCODE_HOOK_STATUS|$env:JCODE_HOOKS_DISABLED\") -Encoding utf8\n",
+        )
+        .expect("write PowerShell observer");
+
+        let previous_hook = std::env::var_os("JCODE_HOOK_TURN_END");
+        let previous_record = std::env::var_os("JCODE_OBSERVER_TEST_FILE");
+        crate::env::set_var("JCODE_OBSERVER_TEST_FILE", &record);
+        crate::env::set_var(
+            "JCODE_HOOK_TURN_END",
+            format!(
+                "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+                script.display()
+            ),
+        );
+
+        dispatch_observer(
+            HookEvent::new("turn_end")
+                .session_id("ses_windows_observer")
+                .field("STATUS", "ok"),
+        );
+
+        let mut recorded = String::new();
+        for _ in 0..500 {
+            if let Ok(data) = std::fs::read_to_string(&record)
+                && !data.trim().is_empty()
+            {
+                recorded = data.trim_start_matches('\u{feff}').trim().to_string();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        match previous_hook {
+            Some(value) => crate::env::set_var("JCODE_HOOK_TURN_END", value),
+            None => crate::env::remove_var("JCODE_HOOK_TURN_END"),
+        }
+        match previous_record {
+            Some(value) => crate::env::set_var("JCODE_OBSERVER_TEST_FILE", value),
+            None => crate::env::remove_var("JCODE_OBSERVER_TEST_FILE"),
+        }
+
+        assert_eq!(
+            recorded,
+            "turn_end|ses_windows_observer|ok|1",
+            "quoted Windows observer command did not produce the expected event"
+        );
+    }

@@ -468,6 +468,40 @@ pub fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<std::p
     cmd.spawn()
 }
 
+/// Spawn a fire-and-forget background hook without inheriting a console.
+///
+/// Windows' `DETACHED_PROCESS` flag is appropriate for terminal/session
+/// children, but it prevents some PowerShell observer commands from executing
+/// reliably when their stdio handles are explicitly null. Observer hooks need
+/// the no-console flag instead, while retaining a separate process group.
+pub fn spawn_observer_detached(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()
+}
+
 /// Reap a detached child without blocking the caller.
 pub fn reap_detached(child: std::process::Child) {
     #[cfg(unix)]
