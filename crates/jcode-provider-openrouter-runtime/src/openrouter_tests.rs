@@ -2619,6 +2619,13 @@ fn non_subscription_runtimes_keep_existing_display_and_route_identity() {
 
     let openrouter =
         OpenRouterProvider::new_openrouter_api_key_runtime().expect("build OpenRouter runtime");
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE")
+            .ok()
+            .as_deref(),
+        Some("openrouter")
+    );
+    assert_eq!(openrouter.api_base, "https://openrouter.ai/api/v1");
     assert_eq!(openrouter.runtime_display_name(), "OpenRouter");
     assert_eq!(Provider::display_name(&openrouter), "OpenRouter");
     assert_eq!(openrouter.direct_openai_compatible_route_parts(), None);

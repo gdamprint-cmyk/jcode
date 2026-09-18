@@ -808,6 +808,64 @@ pub fn clear_anthropic_profile_env() {
     }
 }
 
+/// Check credentials for a named provider without consulting the shared
+/// OpenRouter transport slot.
+///
+/// Named profiles have their own runtime instance and must not make the
+/// native OpenRouter credential probe depend on whichever profile happened to
+/// be activated last. Keep this check aligned with the named runtime factory:
+/// `auth = none` needs no key, while bearer/header auth needs either an inline
+/// key or a key resolved from the configured environment source.
+pub fn named_provider_profile_has_credentials(
+    profile_name: &str,
+    config: &crate::config::Config,
+) -> bool {
+    let Some(profile) = config.providers.get(profile_name) else {
+        return false;
+    };
+
+    if matches!(profile.auth, crate::config::NamedProviderAuth::None) {
+        return true;
+    }
+
+    if profile
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return true;
+    }
+
+    let Some(env_key) = profile
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if !is_safe_env_key_name(env_key) {
+        return false;
+    }
+
+    let Some(env_file) = profile
+        .env_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return std::env::var(env_key)
+            .ok()
+            .is_some_and(|key| !key.trim().is_empty());
+    };
+    if !is_safe_env_file_name(env_file) {
+        return false;
+    }
+
+    load_api_key_from_env_or_config(env_key, env_file).is_some()
+}
+
 pub fn apply_named_provider_profile_env(profile_name: &str) -> anyhow::Result<String> {
     let config = crate::config::Config::load_strict()?;
     apply_named_provider_profile_env_from_config(profile_name, &config)
@@ -833,11 +891,20 @@ pub fn apply_named_provider_profile_env_from_config(
         )
     })?;
 
+    // A named profile owns a separate runtime instance. Reset the legacy
+    // shared transport state before selecting it so a profile such as
+    // OmniRouteV2 cannot replace the native OpenRouter endpoint, key source,
+    // catalog namespace, or auth mode in process-global environment.
+    force_apply_openai_compatible_profile_env(None);
+
     if matches!(
         profile.provider_type,
         crate::config::NamedProviderType::AnthropicCompatible
     ) {
+        clear_anthropic_profile_env();
         crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", profile_name);
+        crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", profile_name);
+        crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
         crate::env::set_var("JCODE_ANTHROPIC_API_BASE", &api_base);
         crate::env::set_var("JCODE_RUNTIME_PROVIDER", "anthropic-api");
         if let Some(model) = profile
@@ -932,138 +999,48 @@ pub fn apply_named_provider_profile_env_from_config(
     }
 
     clear_anthropic_profile_env();
-
-    crate::env::remove_var("JCODE_PROVIDER_PROFILE_ACTIVE");
-    crate::env::remove_var("JCODE_PROVIDER_PROFILE_NAME");
-    crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE");
-    apply_openai_compatible_profile_env(None);
-    crate::env::set_var("JCODE_OPENROUTER_API_BASE", &api_base);
-    crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", profile_name);
     crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", profile_name);
-    let provider_is_openrouter = matches!(
-        profile.provider_type,
-        crate::config::NamedProviderType::OpenRouter
-    );
-
-    let provider_features =
-        provider_is_openrouter || profile.provider_routing || profile.allow_provider_pinning;
+    crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", profile_name);
+    crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
     crate::env::set_var(
-        "JCODE_OPENROUTER_PROVIDER_FEATURES",
-        if provider_features { "1" } else { "0" },
-    );
-    crate::env::set_var(
-        "JCODE_OPENROUTER_MODEL_CATALOG",
-        if profile.model_catalog
-            || matches!(
-                profile.provider_type,
-                crate::config::NamedProviderType::OpenRouter
-            )
-        {
-            "1"
+        "JCODE_RUNTIME_PROVIDER",
+        if matches!(
+            profile.provider_type,
+            crate::config::NamedProviderType::OpenRouter
+        ) {
+            "openrouter"
         } else {
-            "0"
+            "openai-compatible"
         },
     );
 
-    if let Some(model) = profile
-        .default_model
+    if let Some(key_env) = profile
+        .api_key_env
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        crate::env::set_var("JCODE_OPENROUTER_MODEL", model);
-    }
-
-    let static_models = profile
-        .models
-        .iter()
-        .map(|model| model.id.trim())
-        .filter(|id| !id.is_empty())
-        .collect::<Vec<_>>();
-    if !static_models.is_empty() {
-        crate::env::set_var("JCODE_OPENROUTER_STATIC_MODELS", static_models.join("\n"));
-    }
-
-    match profile.auth {
-        crate::config::NamedProviderAuth::None => {
-            crate::env::set_var("JCODE_OPENROUTER_ALLOW_NO_AUTH", "1");
-            crate::env::set_var("JCODE_OPENROUTER_TRANSPORT_STATE", "direct-no-auth");
+        if !is_safe_env_key_name(key_env) {
+            anyhow::bail!(
+                "Provider profile '{}' has invalid api_key_env '{}'.",
+                profile_name,
+                key_env
+            );
         }
-        crate::config::NamedProviderAuth::Bearer | crate::config::NamedProviderAuth::Header => {
-            let key_env = profile
-                .api_key_env
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| {
-                    profile.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(|key| {
-                        let env_name = inline_key_env_name(profile_name);
-                        crate::env::set_var(&env_name, key);
-                        crate::logging::warn(&format!(
-                            "Provider profile '{}' stores an inline API key in config.toml. Prefer api_key_env to avoid accidental leaks.",
-                            profile_name
-                        ));
-                        env_name
-                    })
-                });
+    }
 
-            if let Some(key_env) = key_env {
-                if !is_safe_env_key_name(&key_env) {
-                    anyhow::bail!(
-                        "Provider profile '{}' has invalid api_key_env '{}'.",
-                        profile_name,
-                        key_env
-                    );
-                }
-                crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", &key_env);
-            }
-
-            if let Some(env_file) = profile
-                .env_file
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                if !is_safe_env_file_name(env_file) {
-                    anyhow::bail!(
-                        "Provider profile '{}' has invalid env_file '{}'.",
-                        profile_name,
-                        env_file
-                    );
-                }
-                crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", env_file);
-            }
-
-            let requires_key = profile
-                .requires_api_key
-                .unwrap_or(!api_base_uses_localhost(&api_base));
-            if !requires_key {
-                crate::env::set_var("JCODE_OPENROUTER_ALLOW_NO_AUTH", "1");
-                crate::env::set_var("JCODE_OPENROUTER_TRANSPORT_STATE", "direct-no-auth");
-            } else if provider_is_openrouter {
-                crate::env::set_var("JCODE_OPENROUTER_TRANSPORT_STATE", "openrouter-api-key");
-            } else {
-                crate::env::set_var("JCODE_OPENROUTER_TRANSPORT_STATE", "direct-api-key");
-            }
-
-            match profile.auth {
-                crate::config::NamedProviderAuth::Bearer => {
-                    crate::env::set_var("JCODE_OPENROUTER_AUTH_HEADER", "bearer");
-                }
-                crate::config::NamedProviderAuth::Header => {
-                    crate::env::set_var("JCODE_OPENROUTER_AUTH_HEADER", "api-key");
-                    if let Some(header) = profile
-                        .auth_header
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                    {
-                        crate::env::set_var("JCODE_OPENROUTER_AUTH_HEADER_NAME", header);
-                    }
-                }
-                crate::config::NamedProviderAuth::None => {}
-            }
+    if let Some(env_file) = profile
+        .env_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if !is_safe_env_file_name(env_file) {
+            anyhow::bail!(
+                "Provider profile '{}' has invalid env_file '{}'.",
+                profile_name,
+                env_file
+            );
         }
     }
 

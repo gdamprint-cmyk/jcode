@@ -656,7 +656,9 @@ fn maybe_enable_config_default_provider_for_auto() -> Result<bool> {
             default_provider,
             cfg,
         )?;
-        return Ok(provider::openrouter::has_credentials());
+        return Ok(
+            crate::provider_catalog::named_provider_profile_has_credentials(default_provider, cfg),
+        );
     }
 
     Ok(false)

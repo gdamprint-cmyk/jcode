@@ -125,7 +125,14 @@ impl MultiProvider {
             .assessment_for_provider(crate::provider_catalog::CURSOR_LOGIN_PROVIDER)
             .is_available();
         let has_bedrock_creds = bedrock::BedrockProvider::has_credentials();
-        let has_openrouter_creds = openrouter::has_credentials();
+        let active_named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+            .ok()
+            .or_else(|| default_named_provider_profile.clone());
+        let has_openrouter_creds = active_named_profile
+            .as_deref()
+            .filter(|name| cfg.providers.contains_key(*name))
+            .map(|name| crate::provider_catalog::named_provider_profile_has_credentials(name, cfg))
+            .unwrap_or_else(openrouter::has_credentials);
 
         let use_claude_cli = std::env::var("JCODE_USE_CLAUDE_CLI")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

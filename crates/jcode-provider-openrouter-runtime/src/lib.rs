@@ -1595,7 +1595,19 @@ impl OpenRouterProvider {
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
-            .and_then(|id| openai_compatible_profile_by_id(&id).map(|_| id))
+            // The namespace is process-global for legacy cache helpers. Do
+            // not let a namespace left by a previously constructed native or
+            // named runtime misclassify this instance when its endpoint has
+            // since changed. A profile identity is valid only for its own
+            // canonical API base.
+            .and_then(|id| {
+                openai_compatible_profile_by_id(&id)
+                    .filter(|profile| {
+                        normalize_api_base(profile.api_base)
+                            .is_some_and(|profile_base| profile_base == api_base)
+                    })
+                    .map(|_| id)
+            })
             .or_else(|| {
                 autodetected_profile
                     .as_ref()
@@ -1695,6 +1707,12 @@ impl OpenRouterProvider {
                     path
                 )
             })?;
+
+        // A named OpenAI-compatible profile may have been active earlier in
+        // this process. The endpoint and credentials are already owned by
+        // this native runtime constructor, so also restore the native catalog
+        // cache namespace instead of inheriting the old profile identity.
+        jcode_base::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "openrouter");
 
         Ok(Self {
             client: jcode_provider_core::shared_http_client(),

@@ -705,6 +705,9 @@ fn named_provider_profile_maps_to_openai_compatible_runtime_env() {
         "JCODE_OPENROUTER_AUTH_HEADER",
         "JCODE_OPENROUTER_AUTH_HEADER_NAME",
         "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_RUNTIME_PROVIDER",
         "MY_GATEWAY_API_KEY",
     ]);
 
@@ -730,62 +733,51 @@ fn named_provider_profile_maps_to_openai_compatible_runtime_env() {
 
     apply_named_provider_profile_env_from_config("my-gateway", &cfg).expect("apply profile");
 
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_API_BASE").ok().as_deref(),
-        Some("https://llm.example.com/v1")
+    assert!(
+        std::env::var("JCODE_OPENROUTER_API_BASE").is_err(),
+        "named profile must not replace native OpenRouter API base"
     );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
-            .ok()
-            .as_deref(),
-        Some("MY_GATEWAY_API_KEY")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_PROVIDER_FEATURES")
-            .ok()
-            .as_deref(),
-        Some("0")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_TRANSPORT_STATE")
-            .ok()
-            .as_deref(),
-        Some("direct-api-key")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_MODEL_CATALOG")
-            .ok()
-            .as_deref(),
-        Some("0")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_MODEL").ok().as_deref(),
-        Some("opaque/model@id")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_STATIC_MODELS")
-            .ok()
-            .as_deref(),
-        Some("opaque/model@id\nanother-local-id")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_AUTH_HEADER")
-            .ok()
-            .as_deref(),
-        Some("api-key")
-    );
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_AUTH_HEADER_NAME")
-            .ok()
-            .as_deref(),
-        Some("x-api-key")
-    );
+    for var in [
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_OPENROUTER_ENV_FILE",
+        "JCODE_OPENROUTER_CACHE_NAMESPACE",
+        "JCODE_OPENROUTER_PROVIDER_FEATURES",
+        "JCODE_OPENROUTER_TRANSPORT_STATE",
+        "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_OPENROUTER_MODEL_CATALOG",
+        "JCODE_OPENROUTER_MODEL",
+        "JCODE_OPENROUTER_STATIC_MODELS",
+        "JCODE_OPENROUTER_AUTH_HEADER",
+        "JCODE_OPENROUTER_AUTH_HEADER_NAME",
+    ] {
+        assert!(
+            std::env::var(var).is_err(),
+            "named profile must not leak {var} into native OpenRouter state"
+        );
+    }
     assert_eq!(
         std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
             .ok()
             .as_deref(),
         Some("my-gateway")
     );
+    assert_eq!(
+        std::env::var("JCODE_PROVIDER_PROFILE_NAME").ok().as_deref(),
+        Some("my-gateway")
+    );
+    assert_eq!(
+        std::env::var("JCODE_PROVIDER_PROFILE_ACTIVE")
+            .ok()
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("openai-compatible")
+    );
+    assert!(!named_provider_profile_has_credentials("my-gateway", &cfg));
+    crate::env::set_var("MY_GATEWAY_API_KEY", "test-gateway-key");
+    assert!(named_provider_profile_has_credentials("my-gateway", &cfg));
 }
 
 #[test]
@@ -799,6 +791,9 @@ fn named_provider_inline_api_key_is_private_runtime_fallback() {
         "JCODE_OPENROUTER_TRANSPORT_STATE",
         "JCODE_OPENROUTER_MODEL_CATALOG",
         "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_RUNTIME_PROVIDER",
         "JCODE_PROVIDER_MY_GATEWAY_API_KEY",
     ]);
 
@@ -814,18 +809,15 @@ fn named_provider_inline_api_key_is_private_runtime_fallback() {
 
     apply_named_provider_profile_env_from_config("my-gateway", &cfg).expect("apply profile");
 
-    assert_eq!(
-        std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
-            .ok()
-            .as_deref(),
-        Some("JCODE_PROVIDER_MY_GATEWAY_API_KEY")
+    assert!(
+        std::env::var("JCODE_OPENROUTER_API_KEY_NAME").is_err(),
+        "inline named key must not become native OpenRouter key metadata"
     );
-    assert_eq!(
-        std::env::var("JCODE_PROVIDER_MY_GATEWAY_API_KEY")
-            .ok()
-            .as_deref(),
-        Some("inline-secret")
+    assert!(
+        std::env::var("JCODE_PROVIDER_MY_GATEWAY_API_KEY").is_err(),
+        "inline named key must remain owned by the named runtime config"
     );
+    assert!(named_provider_profile_has_credentials("my-gateway", &cfg));
 }
 
 #[test]
