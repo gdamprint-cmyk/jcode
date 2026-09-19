@@ -719,12 +719,9 @@ mod tests {
 
         assert_eq!(command.program, "bash");
         assert_eq!(command.args.first().map(String::as_str), Some("-lc"));
-        assert!(
-            command
-                .args
-                .last()
-                .is_some_and(|arg| arg.contains("scripts/dev_cargo.sh"))
-        );
+        assert!(command.args.last().is_some_and(|arg| {
+            arg.contains(&scripts.join("dev_cargo.sh").to_string_lossy().to_string())
+        }));
     }
 
     #[test]
@@ -833,6 +830,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_payload_follows_channel_symlink_to_wrapper() {
         // The real layout: builds/<channel>/jcode -> versions/<v>/jcode (wrapper).
@@ -847,6 +845,26 @@ mod tests {
         assert_eq!(
             resolve_binary_payload(&link),
             std::fs::canonicalize(&payload).expect("canonical payload")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copied_wrapper_requires_colocated_payload() {
+        let (temp, wrapper, payload) = release_install_fixture();
+        let channel = temp.path().join("channel");
+        std::fs::create_dir_all(&channel).unwrap();
+        let copied = channel.join("jcode");
+        std::fs::copy(wrapper, &copied).unwrap();
+        assert_eq!(
+            resolve_binary_payload(&copied),
+            std::fs::canonicalize(&copied).unwrap()
+        );
+        let local_payload = channel.join("jcode-linux-x86_64.bin");
+        std::fs::copy(payload, &local_payload).unwrap();
+        assert_eq!(
+            resolve_binary_payload(&copied),
+            std::fs::canonicalize(local_payload).unwrap()
         );
     }
 

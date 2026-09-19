@@ -188,6 +188,20 @@ fn test_find_repo_in_ancestors_walks_upward() {
     assert_eq!(found, repo);
 }
 
+// Windows channels are staged copies, not Unix symlinks. Check payload as well
+// as channel selection instead of requiring identical canonical paths.
+fn assert_same_payload(actual: impl AsRef<Path>, expected: impl AsRef<Path>) {
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::canonicalize(actual.as_ref()).unwrap(),
+        std::fs::canonicalize(expected.as_ref()).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(actual.as_ref()).unwrap(),
+        std::fs::read(expected.as_ref()).unwrap()
+    );
+}
+
 #[test]
 fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
     let _guard = test_env_lock();
@@ -203,10 +217,7 @@ fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
 
     let candidate = client_update_candidate(true).expect("expected selfdev candidate");
     assert_eq!(candidate.1, "current");
-    assert_eq!(
-        std::fs::canonicalize(candidate.0).expect("canonical candidate"),
-        std::fs::canonicalize(version_binary).expect("canonical version binary")
-    );
+    assert_same_payload(candidate.0, version_binary);
 
     if let Some(prev_home) = prev_home {
         jcode_core::env::set_var("JCODE_HOME", prev_home);
@@ -239,10 +250,7 @@ fn update_launcher_symlink_stays_inside_sandbox_home() {
             .join("bin")
             .join(binary_name());
         assert_eq!(launcher, expected_launcher);
-        assert_eq!(
-            std::fs::canonicalize(&launcher).expect("canonical launcher"),
-            std::fs::canonicalize(version_binary).expect("canonical version binary")
-        );
+        assert_same_payload(&launcher, version_binary);
     });
 }
 
@@ -404,7 +412,7 @@ fn shared_server_candidate_prefers_approved_channel_over_current() {
         let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
         let approved = std::fs::canonicalize(version_binary_path(approved_version).unwrap())
             .expect("canonical approved");
-        assert_eq!(selected, approved);
+        assert_same_payload(selected, approved);
     });
 }
 
@@ -427,7 +435,7 @@ fn normal_shared_server_candidate_repairs_stale_shared_channel_to_stable() {
         let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
         let installed = std::fs::canonicalize(version_binary_path(installed_version).unwrap())
             .expect("canonical installed");
-        assert_eq!(selected, installed);
+        assert_same_payload(selected, installed);
     });
 }
 
@@ -608,13 +616,7 @@ fn simulate_stable_update_channel_swap(new_version: &str) {
 /// `server_update_candidate` in the server, which both go through
 /// `shared_server_update_candidate(false)`.
 fn daemon_reload_target_version() -> Option<String> {
-    let (candidate, _label) = shared_server_update_candidate(false)?;
-    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-    // versions/<version>/jcode -> <version>
-    canonical
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+    candidate_version(shared_server_update_candidate(false))
 }
 
 /// Reproduces the user-reported "/update gives the new client but a stale
@@ -700,8 +702,23 @@ fn update_advances_daemon_reload_target_when_shared_server_tracks_stable() {
 }
 
 fn candidate_version(candidate: Option<(PathBuf, &'static str)>) -> Option<String> {
-    let (candidate, _label) = candidate?;
+    let (candidate, label) = candidate?;
+    #[cfg(windows)]
+    {
+        let version = match label {
+            "stable" => read_stable_version().ok().flatten(),
+            "current" => read_current_version().ok().flatten(),
+            "shared-server" => read_shared_server_version().ok().flatten(),
+            _ => None,
+        }?;
+        assert_same_payload(&candidate, version_binary_path(&version).unwrap());
+        return Some(version);
+    }
+    #[cfg(not(windows))]
+    let _ = label;
+    #[cfg(not(windows))]
     let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    #[cfg(not(windows))]
     canonical
         .parent()
         .and_then(|p| p.file_name())
@@ -778,8 +795,10 @@ fn write_versioned_binary(version: &str, mtime: std::time::SystemTime) -> PathBu
     std::fs::create_dir_all(&dir).expect("create version dir");
     let path = dir.join(binary_name());
     std::fs::write(&path, format!("bin {version}")).expect("write binary");
-    std::fs::File::open(&path)
-        .expect("open binary")
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open writable binary")
         .set_modified(mtime)
         .expect("set mtime");
     path
