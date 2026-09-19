@@ -1,0 +1,7 @@
+# Infigraph indexing exclusions for generated and local artifacts
+.infigraph/
+target/
+target-ttest/
+.tmp/
+telemetry-worker/backups/
+captures/

@@ -245,6 +245,73 @@ impl App {
         }
     }
 
+    fn is_omniroute_v2_auto_route(&self) -> bool {
+        !self.is_remote
+            && self
+                .current_provider_label_for_fallback()
+                .eq_ignore_ascii_case("OmniRouteV2")
+            && self
+                .current_model_for_fallback()
+                .to_ascii_lowercase()
+                .starts_with("auto/")
+    }
+
+    fn omniroute_v2_auto_retry_allowed(&self, error: &str) -> bool {
+        if !self.is_omniroute_v2_auto_route() || self.omniroute_retry_attempts >= 1 {
+            return false;
+        }
+
+        let lower = error.to_ascii_lowercase();
+        let auth_failure = [
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "authentication failed",
+            "credentials are not configured",
+            "no credentials",
+            "token exchange failed",
+            "provider not configured",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+            || lower.starts_with("401 ")
+            || lower.starts_with("403 ")
+            || lower.contains("http 401")
+            || lower.contains("http 403")
+            || lower.contains("status 401")
+            || lower.contains("status 403");
+        if auth_failure {
+            return false;
+        }
+
+        let decision = jcode_provider_core::classify_failover_error_message(error);
+        decision.should_failover()
+            || crate::network_retry::classify_message(error).is_some()
+            || [
+                "server error",
+                "service unavailable",
+                "bad gateway",
+                "gateway timeout",
+                "upstream error",
+                "http 500",
+                "http 502",
+                "http 503",
+                "http 504",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+    }
+
+    fn queue_omniroute_auto_retry(&mut self) {
+        self.omniroute_retry_attempts += 1;
+        self.omniroute_retry_pending = true;
+        self.pending_turn = true;
+        self.set_status_notice("OmniRoute retrying with its next available route");
+        self.push_display_message(DisplayMessage::system(
+            "↻ OmniRoute failed after its transport retries; retrying once and letting OmniRoute choose the next combo route.",
+        ));
+    }
+
     /// Short label for a route, e.g. "claude-sonnet-4 via OAuth (Anthropic)".
     fn describe_route(route: &crate::provider::ModelRoute) -> String {
         let method = crate::provider::ModelRouteApiMethod::parse(&route.api_method).display_label();
@@ -825,6 +892,19 @@ impl App {
                 self.stop_overnight_auto_poke_for_non_retryable_error(&error);
             }
         } else {
+            if self.omniroute_v2_auto_retry_allowed(&error) {
+                self.queue_omniroute_auto_retry();
+                return;
+            }
+            if self.is_omniroute_v2_auto_route() {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {} Run /fix to attempt recovery.",
+                    error
+                )));
+                super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
+                self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+                return;
+            }
             // Offer a one-keypress switch to the next best model/auth-method
             // (e.g. broken API key -> working OAuth login) before giving up. The
             // offer is informational; auto-poke still stops so an unattended loop

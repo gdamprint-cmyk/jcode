@@ -32,14 +32,25 @@ impl ChannelRegistry {
                 config.telegram_chat_id.clone(),
             )
         {
+            let reply_enabled = config.telegram_reply_enabled
+                && if config.telegram_allowed_user_ids.is_empty() {
+                    logging::warn(
+                        "telegram reply mode requested without telegram_allowed_user_ids; replies disabled",
+                    );
+                    false
+                } else {
+                    true
+                };
             logging::info(&format!(
                 "registering telegram notification channel reply_enabled={}",
-                config.telegram_reply_enabled
+                reply_enabled
             ));
             channels.push(Arc::new(TelegramChannel::new(
                 token,
                 chat_id,
-                config.telegram_reply_enabled,
+                reply_enabled,
+                config.telegram_allowed_user_ids.clone(),
+                config.telegram_allow_group_replies,
             )));
         }
 
@@ -159,18 +170,90 @@ pub struct TelegramChannel {
     token: String,
     chat_id: String,
     reply_enabled: bool,
+    allowed_user_ids: Vec<String>,
+    allow_group_replies: bool,
     client: reqwest::Client,
 }
 
 impl TelegramChannel {
-    pub fn new(token: String, chat_id: String, reply_enabled: bool) -> Self {
+    pub fn new(
+        token: String,
+        chat_id: String,
+        reply_enabled: bool,
+        allowed_user_ids: Vec<String>,
+        allow_group_replies: bool,
+    ) -> Self {
         Self {
             token,
             chat_id,
             reply_enabled,
+            allowed_user_ids,
+            allow_group_replies,
             client: crate::provider::shared_http_client(),
         }
     }
+}
+
+const TELEGRAM_MAX_INBOUND_CHARS: usize = 4000;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct TelegramOffsetState {
+    chat_id: String,
+    next_offset: i64,
+}
+
+fn telegram_offset_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::storage::jcode_dir()?
+        .join("telegram")
+        .join("offset.json"))
+}
+
+fn load_telegram_offset(configured_chat_id: &str) -> Option<i64> {
+    let path = telegram_offset_path().ok()?;
+    let state = crate::storage::read_json::<TelegramOffsetState>(&path).ok()?;
+    (state.chat_id.trim() == configured_chat_id.trim()).then_some(state.next_offset)
+}
+
+fn save_telegram_offset(configured_chat_id: &str, next_offset: i64) {
+    let Ok(path) = telegram_offset_path() else {
+        logging::warn("telegram offset path unavailable; keeping offset in memory");
+        return;
+    };
+    let state = TelegramOffsetState {
+        chat_id: configured_chat_id.trim().to_string(),
+        next_offset,
+    };
+    if let Err(error) = crate::storage::write_json_fast(&path, &state) {
+        logging::warn(&format!(
+            "telegram offset persistence failed; keeping offset in memory: {error}"
+        ));
+    }
+}
+
+fn telegram_text_is_acceptable(text: &str) -> bool {
+    text.chars().count() <= TELEGRAM_MAX_INBOUND_CHARS
+}
+
+fn telegram_message_is_authorized(
+    message: &crate::telegram::TelegramMessage,
+    configured_chat_id: &str,
+    allowed_user_ids: &[String],
+    allow_group_replies: bool,
+) -> bool {
+    if message.chat.id.to_string() != configured_chat_id.trim() {
+        return false;
+    }
+
+    if !allow_group_replies && message.chat.kind.as_deref() != Some("private") {
+        return false;
+    }
+
+    let Some(sender) = message.from.as_ref() else {
+        return false;
+    };
+    allowed_user_ids
+        .iter()
+        .any(|allowed| allowed.trim() == sender.id.to_string())
 }
 
 #[async_trait]
@@ -192,15 +275,24 @@ impl MessageChannel for TelegramChannel {
             "sending telegram notification bytes={}",
             text.len()
         ));
-        crate::telegram::send_message(&self.client, &self.token, &self.chat_id, text).await
+        crate::telegram::send_message_with_inline_keyboard(
+            &self.client,
+            &self.token,
+            &self.chat_id,
+            text,
+            crate::telegram::default_inline_keyboard(),
+        )
+        .await
     }
 
     async fn reply_loop(&self, runner: AmbientRunnerHandle) {
-        let mut offset: Option<i64> = None;
+        let mut offset = load_telegram_offset(&self.chat_id);
+        let mut reconnect_attempt: u64 = 0;
 
         loop {
             match crate::telegram::get_updates(&self.client, &self.token, offset, 30).await {
                 Ok(updates) => {
+                    reconnect_attempt = 0;
                     if !updates.is_empty() {
                         logging::debug(&format!(
                             "telegram reply loop received update_count={}",
@@ -208,27 +300,112 @@ impl MessageChannel for TelegramChannel {
                         ));
                     }
                     for update in updates {
-                        offset = Some(update.update_id + 1);
+                        let previous_offset = offset;
+                        let next_offset = update.update_id.saturating_add(1);
+                        offset = Some(next_offset);
+
+                        if let Some(callback) = update.callback_query {
+                            let Some(message) = callback.message.as_ref() else {
+                                save_telegram_offset(&self.chat_id, next_offset);
+                                continue;
+                            };
+                            let chat_ok = message.chat.id.to_string() == self.chat_id.trim()
+                                && (self.allow_group_replies
+                                    || message.chat.kind.as_deref() == Some("private"));
+                            let user_ok = self
+                                .allowed_user_ids
+                                .iter()
+                                .any(|allowed| allowed.trim() == callback.from.id.to_string());
+                            if !chat_ok || !user_ok {
+                                let _ = crate::telegram::answer_callback_query(
+                                    &self.client,
+                                    &self.token,
+                                    &callback.id,
+                                    "Not allowed",
+                                )
+                                .await;
+                                save_telegram_offset(&self.chat_id, next_offset);
+                                continue;
+                            }
+
+                            let data = callback.data.as_deref().unwrap_or_default();
+                            let directive = match data {
+                                "jcode:status" => Some(
+                                    "Status check: report current active session, pending todos, and blockers.",
+                                ),
+                                "jcode:continue" => Some(
+                                    "Continue the current highest-priority unfinished todo autonomously. Report only if blocked.",
+                                ),
+                                "jcode:help" => Some(
+                                    "Telegram help: briefly explain available remote commands and safety limits.",
+                                ),
+                                _ => None,
+                            };
+                            let callback_text = if let Some(directive) = directive {
+                                let _ = crate::telegram::send_chat_action(
+                                    &self.client,
+                                    &self.token,
+                                    &self.chat_id,
+                                    "typing",
+                                )
+                                .await;
+                                let injected = runner.inject_message(directive, "telegram").await;
+                                if injected { "Sent" } else { "Queued" }
+                            } else {
+                                "Unknown action"
+                            };
+                            let _ = crate::telegram::answer_callback_query(
+                                &self.client,
+                                &self.token,
+                                &callback.id,
+                                callback_text,
+                            )
+                            .await;
+                            save_telegram_offset(&self.chat_id, next_offset);
+                            continue;
+                        }
 
                         let msg = match update.message {
                             Some(m) => m,
-                            None => continue,
+                            None => {
+                                save_telegram_offset(&self.chat_id, next_offset);
+                                continue;
+                            }
                         };
 
-                        if msg.chat.id.to_string() != self.chat_id {
+                        if !telegram_message_is_authorized(
+                            &msg,
+                            &self.chat_id,
+                            &self.allowed_user_ids,
+                            self.allow_group_replies,
+                        ) {
+                            save_telegram_offset(&self.chat_id, next_offset);
                             continue;
                         }
 
                         let text = match msg.text {
                             Some(t) => t,
-                            None => continue,
+                            None => {
+                                save_telegram_offset(&self.chat_id, next_offset);
+                                continue;
+                            }
                         };
 
                         let trimmed = text.trim();
                         if trimmed.is_empty() {
+                            save_telegram_offset(&self.chat_id, next_offset);
                             continue;
                         }
 
+                        if !telegram_text_is_acceptable(trimmed) {
+                            let _ = self
+                                .send("Telegram message rejected: it exceeds the 4000-character limit.")
+                                .await;
+                            save_telegram_offset(&self.chat_id, next_offset);
+                            continue;
+                        }
+
+                        let mut processed = true;
                         if let Some(req_id) = crate::notifications::extract_permission_id(trimmed) {
                             let (approved, message) =
                                 crate::notifications::parse_permission_reply(trimmed);
@@ -242,6 +419,7 @@ impl MessageChannel for TelegramChannel {
                                     "Failed to record permission from Telegram for {}: {}",
                                     req_id, e
                                 ));
+                                processed = false;
                             } else {
                                 logging::info(&format!(
                                     "Permission {} via Telegram: {}",
@@ -250,30 +428,52 @@ impl MessageChannel for TelegramChannel {
                                 ));
                                 let _ = self
                                     .send(&format!(
-                                        "✅ Permission {} for `{}`",
+                                        "Permission {} for {}",
                                         if approved { "approved" } else { "denied" },
                                         req_id
                                     ))
                                     .await;
                             }
                         } else {
+                            let _ = crate::telegram::send_chat_action(
+                                &self.client,
+                                &self.token,
+                                &self.chat_id,
+                                "typing",
+                            )
+                            .await;
                             let injected = runner.inject_message(trimmed, "telegram").await;
                             logging::info(&format!(
                                 "telegram reply injected into session injected={}",
                                 injected
                             ));
                             let ack = if injected {
-                                format!("💬 Message sent to active session: _{}_", trimmed)
+                                "Message sent to active session.".to_string()
                             } else {
-                                format!("📋 Message queued, waking agent: _{}_", trimmed)
+                                "Message queued; waking agent.".to_string()
                             };
                             let _ = self.send(&ack).await;
+                        }
+                        if processed {
+                            save_telegram_offset(&self.chat_id, next_offset);
+                        } else {
+                            offset = previous_offset;
+                            break;
                         }
                     }
                 }
                 Err(e) => {
                     logging::error(&format!("Telegram poll error: {}", e));
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    match crate::telegram::next_reconnect_delay(reconnect_attempt) {
+                        Some(delay) => {
+                            reconnect_attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        }
+                        None => {
+                            logging::error("Telegram reconnect limit reached; exiting reply loop");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -776,6 +976,102 @@ mod tests {
         }"#;
         let msg: DiscordMessage = serde_json::from_str(json).unwrap();
         assert!(msg.author.bot.unwrap());
+    }
+
+    fn telegram_message(
+        chat_id: i64,
+        chat_kind: Option<&str>,
+        sender_id: Option<i64>,
+        text: &str,
+    ) -> crate::telegram::TelegramMessage {
+        crate::telegram::TelegramMessage {
+            text: Some(text.to_string()),
+            chat: crate::telegram::Chat {
+                id: chat_id,
+                kind: chat_kind.map(ToOwned::to_owned),
+            },
+            from: sender_id.map(|id| crate::telegram::TelegramUser { id }),
+            _date: 1,
+        }
+    }
+
+    #[test]
+    fn telegram_reply_requires_exact_private_chat_and_sender_allowlist() {
+        let allowed = vec!["789".to_string()];
+        let accepted = telegram_message(456, Some("private"), Some(789), "hello");
+        assert!(telegram_message_is_authorized(
+            &accepted, "456", &allowed, false
+        ));
+
+        let wrong_sender = telegram_message(456, Some("private"), Some(790), "hello");
+        assert!(!telegram_message_is_authorized(
+            &wrong_sender,
+            "456",
+            &allowed,
+            false
+        ));
+
+        let missing_sender = telegram_message(456, Some("private"), None, "hello");
+        assert!(!telegram_message_is_authorized(
+            &missing_sender,
+            "456",
+            &allowed,
+            false
+        ));
+
+        let group = telegram_message(456, Some("group"), Some(789), "hello");
+        assert!(!telegram_message_is_authorized(
+            &group, "456", &allowed, false
+        ));
+        assert!(telegram_message_is_authorized(
+            &group, "456", &allowed, true
+        ));
+    }
+
+    #[test]
+    fn telegram_reply_rejects_wrong_chat_and_oversized_text() {
+        let allowed = vec!["789".to_string()];
+        let wrong_chat = telegram_message(457, Some("private"), Some(789), "hello");
+        assert!(!telegram_message_is_authorized(
+            &wrong_chat,
+            "456",
+            &allowed,
+            false
+        ));
+
+        let oversized = "x".repeat(TELEGRAM_MAX_INBOUND_CHARS + 1);
+        assert!(!telegram_text_is_acceptable(&oversized));
+        assert!(telegram_text_is_acceptable(
+            &"⎨".repeat(TELEGRAM_MAX_INBOUND_CHARS)
+        ));
+    }
+
+    #[test]
+    fn telegram_registry_fails_closed_without_sender_allowlist() {
+        let mut config = SafetyConfig {
+            telegram_enabled: true,
+            telegram_bot_token: Some("test-token".to_string()),
+            telegram_chat_id: Some("456".to_string()),
+            telegram_reply_enabled: true,
+            ..SafetyConfig::default()
+        };
+
+        let registry = ChannelRegistry::from_config(&config);
+        assert!(
+            !registry
+                .find_by_name("telegram")
+                .expect("telegram channel")
+                .is_reply_enabled()
+        );
+
+        config.telegram_allowed_user_ids = vec!["789".to_string()];
+        let registry = ChannelRegistry::from_config(&config);
+        assert!(
+            registry
+                .find_by_name("telegram")
+                .expect("telegram channel")
+                .is_reply_enabled()
+        );
     }
 
     #[test]

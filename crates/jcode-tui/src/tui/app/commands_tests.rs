@@ -59,6 +59,95 @@ fn parse_manual_subagent_spec_rejects_missing_prompt() {
 }
 
 #[test]
+fn stall_judge_parser_accepts_only_bounded_continue_json() {
+    let decision = super::parse_stall_judge_decision(
+        r#"{"action":"continue","reason":"worker output is pending","next_step":"inspect the worker result once"}"#,
+    )
+    .expect("valid stall judge JSON");
+    assert_eq!(decision.action, super::StallJudgeAction::Continue);
+    assert_eq!(
+        decision.next_step.as_deref(),
+        Some("inspect the worker result once")
+    );
+}
+
+#[test]
+fn stall_judge_parser_rejects_prose_unknown_fields_and_missing_next_step() {
+    for raw in [
+        "CONTINUE: inspect the worker",
+        r#"{"action":"continue","reason":"repeat","unexpected":true,"next_step":"retry"}"#,
+        r#"{"action":"continue","reason":"repeat","next_step":null}"#,
+        "```json\n{\"action\":\"stop\",\"reason\":\"blocked\"}\n```",
+    ] {
+        assert!(
+            super::parse_stall_judge_decision(raw).is_err(),
+            "must reject {raw}"
+        );
+    }
+}
+
+#[test]
+fn stall_judge_prompt_contains_isolation_and_hard_bounds() {
+    let prompt = super::build_stall_judge_startup_message("parent", "episode", 3);
+    for marker in [
+        "no auto-poke",
+        "no autojudge",
+        "no autoreview",
+        "no swarm",
+        "no recursive judge",
+        "raw JSON",
+        "action",
+        "45s",
+        "1200",
+    ] {
+        assert!(prompt.contains(marker), "prompt missing {marker}");
+    }
+    assert!(prompt.contains(super::STALL_JUDGE_RESULT_MARKER));
+    assert!(prompt.contains(&super::stall_judge_episode_token("episode")));
+    assert!(prompt.contains("action `dm`"));
+}
+
+#[test]
+fn stall_judge_result_parser_binds_a_valid_episode_token() {
+    let token = super::stall_judge_episode_token("episode");
+    let raw = format!(
+        "{} episode={} {}",
+        super::STALL_JUDGE_RESULT_MARKER,
+        token,
+        r#"{"action":"continue","reason":"worker output is pending","next_step":"inspect the worker result once"}"#
+    );
+    let (parsed_token, decision) =
+        super::parse_stall_judge_result(&raw).expect("valid episode-bound stall judge result");
+    assert_eq!(parsed_token, token);
+    assert_eq!(decision.action, super::StallJudgeAction::Continue);
+}
+
+#[test]
+fn stall_judge_result_parser_rejects_untrusted_shapes() {
+    let token = super::stall_judge_episode_token("episode");
+    let valid_json = r#"{"action":"stop","reason":"no bounded action","next_step":null}"#;
+    for raw in [
+        format!("episode={} {}", token, valid_json),
+        format!(
+            "{} episode=not-a-token {}",
+            super::STALL_JUDGE_RESULT_MARKER,
+            valid_json
+        ),
+        format!(
+            "{} episode={} {} extra",
+            super::STALL_JUDGE_RESULT_MARKER,
+            token,
+            valid_json
+        ),
+    ] {
+        assert!(
+            super::parse_stall_judge_result(&raw).is_err(),
+            "must reject {raw}"
+        );
+    }
+}
+
+#[test]
 fn swarm_prompt_edit_path_prefers_nonblank_project_override() {
     let project = tempfile::tempdir().expect("project tempdir");
     let jcode_home = tempfile::tempdir().expect("jcode tempdir");

@@ -644,6 +644,19 @@ impl Config {
                 self.safety.telegram_reply_enabled = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_TELEGRAM_ALLOWED_USER_IDS") {
+            self.safety.telegram_allowed_user_ids = v
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        if let Ok(v) = std::env::var("JCODE_TELEGRAM_ALLOW_GROUP_REPLIES") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.safety.telegram_allow_group_replies = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_DISCORD_BOT_TOKEN") {
             self.safety.discord_bot_token = Some(v);
             self.safety.discord_enabled = true;

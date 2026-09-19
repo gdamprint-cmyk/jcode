@@ -1407,6 +1407,13 @@ pub struct SafetyConfig {
     pub telegram_chat_id: Option<String>,
     /// Enable Telegram reply → agent directive feature (default: false)
     pub telegram_reply_enabled: bool,
+    /// Exact Telegram user IDs allowed to send replies or permission decisions.
+    /// Reply mode refuses to start when this list is empty.
+    #[serde(default)]
+    pub telegram_allowed_user_ids: Vec<String>,
+    /// Allow Telegram replies from configured group chats (default: false).
+    /// Private-chat replies remain the only default remote-control mode.
+    pub telegram_allow_group_replies: bool,
     /// Enable Discord notifications (default: false)
     pub discord_enabled: bool,
     /// Discord bot token
@@ -1456,6 +1463,8 @@ impl Default for SafetyConfig {
             telegram_bot_token: None,
             telegram_chat_id: None,
             telegram_reply_enabled: false,
+            telegram_allowed_user_ids: Vec::new(),
+            telegram_allow_group_replies: false,
             discord_enabled: false,
             discord_bot_token: None,
             discord_channel_id: None,

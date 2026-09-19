@@ -677,6 +677,8 @@ desktop_notifications = true
 # telegram_bot_token = ""  # From @BotFather (prefer JCODE_TELEGRAM_BOT_TOKEN env var)
 # telegram_chat_id = ""    # Your user/chat ID
 # telegram_reply_enabled = false  # Reply to bot messages to send directives
+# telegram_allowed_user_ids = []   # Required exact sender IDs for reply mode
+# telegram_allow_group_replies = false  # Keep remote replies private by default
 
 # Discord notifications via Bot API (https://discord.com/developers)
 # discord_enabled = false

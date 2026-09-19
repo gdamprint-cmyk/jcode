@@ -479,25 +479,61 @@ pub fn spawn_command_in_new_terminal_with(
 
 /// Parse an external spawn-hook command line into argv parts.
 ///
-/// Supports basic shell-style word splitting: whitespace separates arguments,
-/// single and double quotes group words, and backslash escapes a quote or
-/// whitespace. Other backslashes are preserved so ordinary Windows paths such
-/// as `C:\\Users\\name\\hook.ps1` do not lose their separators. Errors on
-/// empty input, unterminated quotes, and trailing escapes.
+/// Supports basic POSIX-style word splitting: whitespace separates arguments,
+/// quotes group words, and backslash escapes the next character outside single
+/// quotes. On Windows, drive and UNC path arguments preserve separators, even
+/// inside double quotes. In those paths, backslashes immediately before a double
+/// quote follow Windows argv rules: pairs produce a backslash, an odd remainder
+/// escapes the quote. Quote paths containing spaces and double a trailing
+/// backslash before a closing double quote. No shell expansion is performed.
 pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
+    parse_hook_command_for_platform(raw, cfg!(windows))
+}
+
+fn parse_hook_command_for_platform(raw: &str, windows: bool) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut token_started = false;
+    let mut windows_path = false;
+    let mut chars = raw.char_indices().peekable();
 
-    for ch in raw.chars() {
+    while let Some((index, ch)) = chars.next() {
+        if escaped {
+            current.push(ch);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        if windows && current.is_empty() && !windows_path {
+            let rest = raw[index..].as_bytes();
+            windows_path = rest.starts_with(b"\\\\")
+                || (rest.len() >= 3
+                    && rest[0].is_ascii_alphabetic()
+                    && rest[1] == b':'
+                    && matches!(rest[2], b'\\' | b'/'));
+        }
+        if windows_path && ch == '\\' && quote != Some('\'') {
+            let mut count = 1;
+            while chars.peek().is_some_and(|(_, ch)| *ch == '\\') {
+                chars.next();
+                count += 1;
+            }
+            if chars.peek().is_some_and(|(_, ch)| *ch == '"') {
+                current.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 == 1 {
+                    chars.next();
+                    current.push('"');
+                }
+            } else {
+                current.extend(std::iter::repeat_n('\\', count));
+            }
+            token_started = true;
+            continue;
+        }
         if let Some(quote_ch) = quote {
-            if escaped {
-                current.push(ch);
-                token_started = true;
-                escaped = false;
-            } else if ch == quote_ch {
+            if ch == quote_ch {
                 quote = None;
             } else if ch == '\\' && quote_ch == '"' {
                 escaped = true;
@@ -505,18 +541,6 @@ pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
                 current.push(ch);
                 token_started = true;
             }
-            continue;
-        }
-
-        if escaped {
-            if ch == '\\' || ch == '\'' || ch == '"' || ch.is_whitespace() {
-                current.push(ch);
-            } else {
-                current.push('\\');
-                current.push(ch);
-            }
-            token_started = true;
-            escaped = false;
             continue;
         }
 
@@ -533,6 +557,7 @@ pub fn parse_hook_command(raw: &str) -> Result<Vec<String>> {
                 if token_started {
                     parts.push(std::mem::take(&mut current));
                     token_started = false;
+                    windows_path = false;
                 }
             }
             ch => {

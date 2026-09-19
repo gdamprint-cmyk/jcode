@@ -565,6 +565,52 @@ fn test_handle_turn_error_failover_prompt_countdown_can_switch_and_retry() {
     });
 }
 
+#[test]
+fn omniroute_v2_auto_route_retries_without_manual_ctrl_y_offer() {
+    with_temp_jcode_home(|| {
+        let mut app = create_named_provider_test_app("OmniRouteV2", "auto/included");
+        app.last_submitted_input = Some("retry through OmniRoute".to_string());
+
+        app.handle_turn_error("503 Service Unavailable");
+
+        assert!(app.pending_turn, "the bounded OmniRoute resend must be queued");
+        assert!(app.pending_fallback_offer.is_none());
+        assert_eq!(app.omniroute_retry_attempts, 1);
+        assert_eq!(app.provider.model(), "auto/included");
+        assert!(app
+            .display_messages
+            .iter()
+            .any(|message| message.content.contains("letting OmniRoute choose")));
+
+        // A second failure is terminal for this episode, but must still not
+        // surface the generic Ctrl+Y route picker.
+        app.pending_turn = false;
+        app.handle_turn_error("503 Service Unavailable");
+        assert!(!app.pending_turn);
+        assert!(app.pending_fallback_offer.is_none());
+        let last = app.display_messages.last().expect("terminal error message");
+        assert!(last.content.contains("Run /fix"));
+    });
+}
+
+#[test]
+fn omniroute_v2_auth_failure_does_not_retry_or_offer_ctrl_y() {
+    with_temp_jcode_home(|| {
+        let mut app = create_named_provider_test_app("OmniRouteV2", "auto/included");
+        app.last_submitted_input = Some("do not resend with a bad credential".to_string());
+
+        app.handle_turn_error("HTTP 401 Unauthorized");
+
+        assert!(!app.pending_turn);
+        assert!(app.pending_fallback_offer.is_none());
+        assert_eq!(app.omniroute_retry_attempts, 0);
+        assert!(app
+            .display_messages
+            .iter()
+            .any(|message| message.content.contains("Run /fix")));
+    });
+}
+
 /// A new session must start with auto-poke off when the config says so, and
 /// `/poke on` must still be able to turn it back on for that session (#664).
 ///

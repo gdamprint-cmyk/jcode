@@ -8,6 +8,7 @@ ios_simulator_screenshot.png
 # from $HOME (see scripts/onboarding_sandbox.sh seed-real-logins). Never commit.
 /.tmp/
 /.jcode/generated-images/
+/.infigraph/
 /telemetry-worker/backups/
 target-ttest/
 target-ttest*/

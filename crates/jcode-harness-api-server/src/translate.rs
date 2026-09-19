@@ -470,7 +470,9 @@ impl BridgeState {
                 vec![
                     Outbound::Legacy(subscribe),
                     Outbound::Legacy(json!({"type": "state", "id": state_id})),
-                    Outbound::Legacy(json!({"type": "get_model_catalog", "id": catalog_id, "subscribe_usage_updates": true})),
+                    Outbound::Legacy(
+                        json!({"type": "get_model_catalog", "id": catalog_id, "subscribe_usage_updates": true}),
+                    ),
                 ]
             }
             "send_message" => {
@@ -1658,9 +1660,9 @@ impl BridgeState {
             if let ApiEvent::Attached { session } | ApiEvent::SessionForked { session } =
                 &mut frame.event
             {
-                jcode_harness_api::enrich_sessions_from_local_swarm_state(
-                    std::slice::from_mut(session),
-                );
+                jcode_harness_api::enrich_sessions_from_local_swarm_state(std::slice::from_mut(
+                    session,
+                ));
             }
         }
         frames
