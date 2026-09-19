@@ -37,6 +37,11 @@ pub struct ModelCost {
     pub cache_read_usd_per_mtok: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_usd_per_mtok: Option<f64>,
+    /// Published total context window in tokens from models.dev
+    /// (`limit.context`). Absent in caches written before this field existed;
+    /// `#[serde(default)]` keeps those older cache files loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,6 +276,10 @@ fn parse_api_response(body: &str) -> anyhow::Result<PricingCache> {
                     output_usd_per_mtok: output,
                     cache_read_usd_per_mtok: cost.get("cache_read").and_then(|v| v.as_f64()),
                     cache_write_usd_per_mtok: cost.get("cache_write").and_then(|v| v.as_f64()),
+                    context_window: model
+                        .get("limit")
+                        .and_then(|limit| limit.get("context"))
+                        .and_then(|v| v.as_u64()),
                 },
             );
         }
@@ -286,6 +295,60 @@ fn parse_api_response(body: &str) -> anyhow::Result<PricingCache> {
         cached_at_unix_secs: now_unix_secs(),
         providers,
     })
+}
+
+/// Infer the models.dev provider namespace for an arbitrary model id, for
+/// lookups where the active jcode provider has no direct models.dev mapping
+/// (e.g. generic `openai-compatible` gateways serving open-weight models).
+///
+/// Only id shapes with strong first-party identity are matched, so an
+/// ambiguous id resolves to no namespace rather than to a wrong window.
+fn infer_provider_for_model(model: &str) -> Option<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    let m = m.rsplit_once('/').map_or(m.as_str(), |(_, bare)| bare);
+    if m.starts_with("glm-") {
+        Some("zai")
+    } else if m.starts_with("kimi-") {
+        Some("moonshotai")
+    } else if m.starts_with("deepseek-") {
+        Some("deepseek")
+    } else if m.starts_with("minimax-") {
+        Some("minimax")
+    } else if m.starts_with("mimo-") {
+        Some("xiaomi")
+    } else {
+        None
+    }
+}
+
+/// Look up the published context window (tokens) for `model` from the cached
+/// models.dev catalog. Resolution order:
+/// 1. first-party namespace inferred from the model id itself, because that
+///    carries the model's published window (gateway-specific entries are
+///    sometimes truncated by the serving deployment);
+/// 2. `jcode_provider`'s own models.dev namespace, when one is mapped.
+///
+/// Never blocks on the network; schedules the same throttled background
+/// refresh as pricing lookups when the cache is missing or stale.
+pub fn lookup_context_limit(jcode_provider: &str, model: &str) -> Option<u64> {
+    let cache = ensure_cache_fresh()?;
+    let model = normalize_model_id(model);
+    let mut candidates: [Option<&str>; 2] = [infer_provider_for_model(model), None];
+    candidates[1] = models_dev_provider_id(jcode_provider);
+    for provider_id in candidates.into_iter().flatten() {
+        let Some(models) = cache.providers.get(provider_id) else {
+            continue;
+        };
+        if let Some(cost) = models.get(model) {
+            return cost.context_window;
+        }
+        if let Some((_, bare)) = model.rsplit_once('/')
+            && let Some(cost) = models.get(bare)
+        {
+            return cost.context_window;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -392,6 +455,7 @@ mod tests {
                     output_usd_per_mtok: 25.0,
                     cache_read_usd_per_mtok: Some(0.5),
                     cache_write_usd_per_mtok: Some(6.25),
+                    context_window: None,
                 },
             ),
             (
@@ -402,6 +466,7 @@ mod tests {
                     output_usd_per_mtok: 2.0,
                     cache_read_usd_per_mtok: None,
                     cache_write_usd_per_mtok: None,
+                    context_window: None,
                 },
             ),
         ]);
@@ -424,5 +489,96 @@ mod tests {
         } else {
             crate::env::remove_var("JCODE_HOME");
         }
+    }
+
+    #[test]
+    fn parses_limit_context_into_context_window() {
+        let body = r#"{
+            "zai": {
+                "models": {
+                    "glm-5.3-flash": {
+                        "cost": {"input": 0.0, "output": 0.0},
+                        "limit": {"context": 1000000, "output": 131072}
+                    },
+                    "glm-legacy": {"cost": {"input": 0.1, "output": 0.2}}
+                }
+            }
+        }"#;
+        let cache = parse_api_response(body).expect("parsed");
+        let zai = cache.providers.get("zai").expect("zai");
+        assert_eq!(zai.get("glm-5.3-flash").and_then(|c| c.context_window), Some(1_000_000));
+        assert_eq!(zai.get("glm-legacy").and_then(|c| c.context_window), None);
+    }
+
+    #[test]
+    fn context_limit_lookup_prefers_inferred_namespace_then_provider() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        clear_memory_cache_for_tests();
+
+        save_test_cache(&[
+            (
+                "zai",
+                "glm-5.3-flash",
+                ModelCost {
+                    input_usd_per_mtok: 0.0,
+                    output_usd_per_mtok: 0.0,
+                    cache_read_usd_per_mtok: None,
+                    cache_write_usd_per_mtok: None,
+                    context_window: Some(1_000_000),
+                },
+            ),
+            (
+                "openrouter",
+                "glm-5.3-flash",
+                ModelCost {
+                    input_usd_per_mtok: 0.0,
+                    output_usd_per_mtok: 0.0,
+                    cache_read_usd_per_mtok: None,
+                    cache_write_usd_per_mtok: None,
+                    context_window: Some(131_072),
+                },
+            ),
+        ]);
+
+        // First-party inference wins over the provider namespace entry.
+        let inferred = lookup_context_limit("openrouter", "glm-5.3-flash");
+        assert_eq!(inferred, Some(1_000_000));
+
+        // Direct zai profile resolves through its own namespace.
+        let direct = lookup_context_limit("zai", "glm-5.3-flash");
+        assert_eq!(direct, Some(1_000_000));
+
+        // Long-context alias and pinned suffixes are stripped before lookup.
+        let aliased = lookup_context_limit("zai", "glm-5.3-flash[1m]");
+        assert_eq!(aliased, Some(1_000_000));
+
+        // Unknown model with a mappable provider resolves to nothing.
+        assert!(lookup_context_limit("zai", "glm-unknown").is_none());
+        // Unmapped gateway + unknown family id: no inference, no scan.
+        assert!(lookup_context_limit("openai-compatible", "totally-unknown").is_none());
+
+        clear_memory_cache_for_tests();
+        if let Some(prev) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    #[test]
+    fn infer_provider_matches_first_party_id_shapes() {
+        assert_eq!(infer_provider_for_model("glm-5.3-flash"), Some("zai"));
+        assert_eq!(infer_provider_for_model("GLM-5.2"), Some("zai"));
+        assert_eq!(infer_provider_for_model("moonshotai/kimi-k2.5"), Some("moonshotai"));
+        assert_eq!(infer_provider_for_model("deepseek-v4-pro"), Some("deepseek"));
+        assert_eq!(infer_provider_for_model("MiniMax-M2.7"), Some("minimax"));
+        assert_eq!(infer_provider_for_model("mimo-v2.5-pro"), Some("xiaomi"));
+        assert_eq!(infer_provider_for_model("gpt-5.4"), None);
+        assert_eq!(infer_provider_for_model("claude-opus-4-6"), None);
+        // Company-prefixed third-party ids must not claim a first-party slot.
+        assert_eq!(infer_provider_for_model("somevendor/glm-5.2"), Some("zai"));
     }
 }
