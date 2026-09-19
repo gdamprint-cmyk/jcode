@@ -1096,7 +1096,11 @@ impl App {
         current_model: &str,
     ) -> Vec<crate::provider::ModelRoute> {
         crate::provider::simplified_model_routes_for_picker(
-            self.provider.name(),
+            // The orchestrator's `name()` is always "OpenRouter" for its
+            // shared slot. `display_name()` carries the selected direct
+            // compatible runtime, such as OmniRouteV2, which is required to
+            // keep slash-qualified catalog models on the active endpoint.
+            &self.provider.display_name(),
             current_model,
             self.provider.available_models_display(),
         )

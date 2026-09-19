@@ -26,6 +26,28 @@ pub fn simplified_model_routes_for_picker(
     display_models: impl IntoIterator<Item = String>,
 ) -> Vec<ModelRoute> {
     let auth = AuthStatus::check_fast();
+    // A direct OpenAI-compatible runtime shares the OpenRouter slot in the
+    // orchestrator, but its slash-qualified model ids must stay on that
+    // runtime. Resolve the stable profile id once so the picker can emit a
+    // structured route instead of the legacy `auto/openrouter` fallback.
+    let current_compatible_profile_id = if current_provider_name
+        .trim()
+        .eq_ignore_ascii_case("OpenRouter")
+    {
+        None
+    } else {
+        crate::provider_catalog::openai_compatible_profile_id_for_display_name(
+            current_provider_name,
+        )
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            crate::config::config()
+                .providers
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(current_provider_name.trim()))
+                .cloned()
+        })
+    };
     let mut routes = Vec::new();
 
     for model in display_models {
@@ -100,12 +122,21 @@ pub fn simplified_model_routes_for_picker(
                     },
                 )
             } else if model.contains('/') {
-                (
-                    "auto".to_string(),
-                    "openrouter".to_string(),
-                    auth.openrouter != AuthState::NotConfigured,
-                    "simplified catalog".to_string(),
-                )
+                if let Some(profile_id) = current_compatible_profile_id.as_deref() {
+                    (
+                        current_provider_name.to_string(),
+                        format!("openai-compatible:{profile_id}"),
+                        true,
+                        "active provider catalog".to_string(),
+                    )
+                } else {
+                    (
+                        "auto".to_string(),
+                        "openrouter".to_string(),
+                        auth.openrouter != AuthState::NotConfigured,
+                        "simplified catalog".to_string(),
+                    )
+                }
             } else {
                 match provider_for_model(&model) {
                     Some("claude") => {
@@ -1492,6 +1523,42 @@ mod tests {
                 has_oauth || has_api_key
             );
         }
+    }
+
+    #[test]
+    fn simplified_slash_models_stay_on_active_compatible_profile() {
+        let _guard = EnvGuard::new();
+        let jcode_home = std::env::var_os("JCODE_HOME").expect("JCODE_HOME set");
+        std::fs::write(
+            std::path::PathBuf::from(jcode_home).join("config.toml"),
+            "[providers.OmniRouteV2]\ntype = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:20128/v1\"\n",
+        )
+        .expect("write config.toml");
+        crate::config::invalidate_config_cache();
+
+        let routes = simplified_model_routes_for_picker(
+            "OmniRouteV2",
+            "auto/included",
+            ["poolside/laguna-s-2.1".to_string()],
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].provider, "OmniRouteV2");
+        assert_eq!(routes[0].api_method, "openai-compatible:OmniRouteV2");
+        assert!(routes[0].available);
+    }
+
+    #[test]
+    fn simplified_slash_models_keep_native_openrouter_route() {
+        let routes = simplified_model_routes_for_picker(
+            "OpenRouter",
+            "openrouter/auto",
+            ["poolside/laguna-s-2.1".to_string()],
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].provider, "auto");
+        assert_eq!(routes[0].api_method, "openrouter");
     }
 
     /// Issue #694 through the real path a user hits: a custom

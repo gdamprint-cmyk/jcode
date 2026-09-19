@@ -914,7 +914,13 @@ impl ModelRouteApiMethod {
             "remote-catalog" => Self::RemoteCatalog,
             "current" => Self::Current,
             _ => {
-                if let Some(("openai-compatible", profile_id)) = lower.split_once(':') {
+                if let Some((prefix, profile_id)) = trimmed.split_once(':')
+                    && prefix.eq_ignore_ascii_case("openai-compatible")
+                {
+                    // Keep the profile spelling supplied by the route. Named
+                    // config profiles may intentionally use mixed case (for
+                    // example `OmniRouteV2`), while built-in profile lookup
+                    // remains case-insensitive.
                     let profile_id = profile_id.trim();
                     Self::OpenAiCompatible {
                         profile_id: (!profile_id.is_empty()).then(|| profile_id.to_string()),
@@ -1616,6 +1622,10 @@ mod tests {
             RuntimeKey::OpenAiCompatible {
                 profile_id: Some("nvidia-nim".to_string())
             }
+        );
+        assert_eq!(
+            ModelRouteApiMethod::parse("openai-compatible:OmniRouteV2").profile_id(),
+            Some("OmniRouteV2")
         );
     }
 
