@@ -467,6 +467,7 @@ mod tests {
                         output_usd_per_mtok: 99.0,
                         cache_read_usd_per_mtok: None,
                         cache_write_usd_per_mtok: None,
+                        context_window: None,
                     },
                 ),
                 (
@@ -477,6 +478,7 @@ mod tests {
                         output_usd_per_mtok: 0.28,
                         cache_read_usd_per_mtok: Some(0.0028),
                         cache_write_usd_per_mtok: None,
+                        context_window: None,
                     },
                 ),
             ]);

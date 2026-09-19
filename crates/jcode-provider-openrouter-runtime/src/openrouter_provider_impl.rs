@@ -790,8 +790,19 @@ impl Provider for OpenRouterProvider {
                 jcode_base::provider_catalog::openai_compatible_profile_context_limit(
                     profile_id, &model_id,
                 )
+            {
+                return limit;
+            }
+        // models.dev published context windows (same 24h cache the pricing
+        // resolver uses). Family data lives in first-party namespaces (zai,
+        // moonshotai, ...), so this outranks the static family classifier and
+        // stays fresh when vendors ship new context tiers without a jcode
+        // release. Never blocks: a stale/missing cache schedules one
+        // background refresh and returns None immediately.
+        if let Some(limit) =
+            jcode_base::model_pricing::lookup_context_limit(self.name(), &model_id)
         {
-            return limit;
+            return limit as usize;
         }
         jcode_provider_core::context_limit_for_model_with_provider(&model_id, Some(self.name()))
             .unwrap_or(jcode_provider_core::DEFAULT_CONTEXT_LIMIT)

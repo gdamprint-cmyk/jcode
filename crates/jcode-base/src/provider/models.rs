@@ -1119,11 +1119,15 @@ pub fn context_limit_for_model_with_provider(
     model: &str,
     provider_hint: Option<&str>,
 ) -> Option<usize> {
-    context_limit_for_model_with_provider_and_cache(
-        model,
-        provider_hint,
-        cached_context_limit_for_model,
-    )
+    context_limit_for_model_with_provider_and_cache(model, provider_hint, |model| {
+        cached_context_limit_for_model(model).or_else(|| {
+            crate::model_pricing::lookup_context_limit(
+                provider_hint.unwrap_or_default(),
+                model,
+            )
+            .map(|limit| limit as usize)
+        })
+    })
 }
 
 pub fn resolve_model_capabilities(model: &str, provider_hint: Option<&str>) -> ModelCapabilities {
