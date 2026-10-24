@@ -319,14 +319,10 @@ fn apply_profile_key_based_endpoint_overrides(
         .map(ToString::to_string)
         .or_else(|| load_env_value_from_env_or_config(&resolved.api_key_env, &resolved.env_file));
 
-    if key
-        .as_deref()
-        .map(|key| key.trim_start().starts_with("sk-cp-"))
-        .unwrap_or(false)
-    {
-        resolved.api_base = MINIMAX_CHINA_API_BASE.to_string();
-        resolved.setup_url = MINIMAX_CHINA_SETUP_URL.to_string();
-    }
+    // Token Plan (sk-cp-) keys are validated against the international endpoint
+    // (api.minimax.io); the previous china (api.minimaxi.com) routing returned
+    // 401 for these keys. Do not override the endpoint based on the key prefix.
+    let _ = key;
 }
 
 pub fn resolve_openai_compatible_profile_selection(input: &str) -> Option<OpenAiCompatibleProfile> {
