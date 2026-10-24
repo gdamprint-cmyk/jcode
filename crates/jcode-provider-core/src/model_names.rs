@@ -584,6 +584,8 @@ mod tests {
             ("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro"),
             ("Llama-3.3-70B-Instruct", "Llama 3.3 70B Instruct"),
             ("MiniMax-M2.5-highspeed", "MiniMax M2.5 Highspeed"),
+            ("MiniMax-M3.1-Flash", "MiniMax M3.1 Flash"),
+            ("MiniMax-M3", "MiniMax M3"),
             ("moonshotai/kimi-k2.5:free", "Kimi K2.5 (free)"),
             ("gpt-oss-120b-medium", "GPT-OSS 120B Medium"),
             ("GLM-5.1", "GLM-5.1"),

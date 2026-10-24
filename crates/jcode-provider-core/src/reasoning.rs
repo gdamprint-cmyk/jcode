@@ -51,6 +51,13 @@ pub fn inferred_reasoning_efforts(
         return DEEPSEEK_SELECTABLE_EFFORTS.to_vec();
     }
 
+    if provider.contains("minimax") {
+        if model.is_empty() || model.contains("m3") {
+            return OPENAI_SELECTABLE_EFFORTS.to_vec();
+        }
+        return Vec::new();
+    }
+
     if provider.contains("z.ai") || provider == "zai" || model.starts_with("glm-") {
         return OPENAI_SELECTABLE_EFFORTS.to_vec();
     }

@@ -1493,6 +1493,8 @@ mod tests {
             ("kimi-k2p5-turbo", "Kimi K2p5 Turbo"),
             ("glm-4.6", "GLM 4.6"),
             ("deepseek-v4-flash", "Deepseek V4 Flash"),
+            ("minimax-m3.1-flash", "Minimax M3.1 Flash"),
+            ("minimax-m3", "Minimax M3"),
             ("minimax-m2.7", "Minimax M2.7"),
             // Meta / Mistral / Qwen / community
             ("llama-3.3-70b", "Llama 3.3 70B"),
