@@ -71,6 +71,7 @@ pub fn install_jcode_markdown_hooks() {
             markdown_spacing: to_markdown_spacing_mode(cfg.display.markdown_spacing),
             show_link_urls: cfg.display.show_link_urls,
             mermaid_enabled: cfg.features.mermaid,
+            mermaid_halfblocks: cfg.features.mermaid_halfblocks,
             latex_rendering: to_markdown_latex_mode(cfg.display.latex_rendering),
         }
     });

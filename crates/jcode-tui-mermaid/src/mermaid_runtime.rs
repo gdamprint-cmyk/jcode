@@ -521,6 +521,29 @@ thread_local! {
     /// of relying on process-wide ordering.
     static IMAGE_PROTOCOL_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+    /// Scoped test override for *native* image-protocol availability. A picker
+    /// that fell back to the Unicode half-block renderer is still "available"
+    /// (it can draw), but it is not a native protocol, so the two signals are
+    /// pinned separately.
+    static NATIVE_IMAGE_PROTOCOL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with native image-protocol availability forced on/off on the current
+/// thread (or `None` to restore the real detection). Independent of
+/// [`with_image_protocol_override`], which pins whether any renderer exists.
+pub fn with_native_image_protocol_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
+    NATIVE_IMAGE_PROTOCOL_OVERRIDE.with(|cell| {
+        let prev = cell.replace(enabled);
+        struct Reset<'a>(&'a std::cell::Cell<Option<bool>>, Option<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _reset = Reset(cell, prev);
+        f()
+    })
 }
 
 /// Run `f` with image-protocol availability forced on/off on the current
@@ -562,6 +585,9 @@ fn protocol_supports_native_images(
 /// useful raster fallback, but Mermaid source is more useful than a degraded
 /// diagram on terminals without Kitty, iTerm2, or Sixel support.
 pub fn native_image_protocol_available() -> bool {
+    if let Some(enabled) = NATIVE_IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
     if let Some(enabled) = IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
         return enabled;
     }

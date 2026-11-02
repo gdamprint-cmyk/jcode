@@ -1174,6 +1174,16 @@ pub struct FeatureConfig {
     pub swarm: bool,
     /// Enable Mermaid rendering and Mermaid-specific model guidance (default: true)
     pub mermaid: bool,
+    /// Render Mermaid diagrams with the Unicode half-block fallback when the
+    /// terminal has no native image protocol (default: false).
+    ///
+    /// Terminals behind a multiplexer that only forwards Kitty graphics (for
+    /// example Windows Terminal hosted by herdr) expose neither Kitty nor
+    /// Sixel to the inner program, so jcode cannot draw a diagram as an image.
+    /// The half-block fallback rasterizes the diagram into Unicode cells
+    /// itself, which every terminal can display. It is lower fidelity than a
+    /// native image protocol, so it stays opt-in.
+    pub mermaid_halfblocks: bool,
     /// Default state of auto-poke (automatic follow-up when the model stops with
     /// incomplete todos). `/poke on` / `/poke off` still override this per session
     /// (default: true)
@@ -1207,6 +1217,7 @@ impl Default for FeatureConfig {
             memory: true,
             swarm: true,
             mermaid: true,
+            mermaid_halfblocks: false,
             auto_poke: true,
             todo_gate_digest: false,
             todo_gate_diagnostics: false,

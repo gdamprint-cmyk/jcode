@@ -366,6 +366,11 @@ impl Config {
                 self.features.mermaid = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MERMAID_HALFBLOCKS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.mermaid_halfblocks = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_CHECK_UPDATES") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.check_updates = parsed;

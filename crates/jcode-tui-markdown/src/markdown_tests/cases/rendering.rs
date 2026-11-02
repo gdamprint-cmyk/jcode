@@ -550,6 +550,69 @@ fn mermaid_gate_accepts_native_protocol_and_rejects_halfblock_fallback() {
     });
 }
 
+// reference: https://github.com/1jehuang/jcode/blob/master/crates/jcode-tui-markdown/src/markdown_context.rs
+// (thread-local scoped override pattern already used by with_mermaid_rendering_override)
+#[cfg(feature = "mermaid-renderer")]
+#[test]
+fn mermaid_gate_allows_halfblocks_only_when_explicitly_enabled() {
+    // Windows Terminal behind herdr forwards neither Kitty nor Sixel, so the
+    // Unicode half-block renderer is the only way to draw a diagram there.
+    // It stays opt-in: without `features.mermaid_halfblocks` the Mermaid
+    // source is more useful than a degraded raster.
+    with_mermaid_rendering_override(Some(true), || {
+        mermaid::with_native_image_protocol_override(Some(false), || {
+            mermaid::with_image_protocol_override(Some(true), || {
+                // Opt-in off: source is shown, no image placeholder.
+                with_mermaid_halfblocks_override(Some(false), || {
+                    assert!(!should_render_mermaid_block(Some("mermaid")));
+                });
+                // Opt-in on: the diagram renders through the half-block path.
+                with_mermaid_halfblocks_override(Some(true), || {
+                    assert!(should_render_mermaid_block(Some("mermaid")));
+                });
+            });
+            // Opt-in on but no renderer at all: still source, never a
+            // placeholder that nothing can draw.
+            mermaid::with_image_protocol_override(Some(false), || {
+                with_mermaid_halfblocks_override(Some(true), || {
+                    assert!(!should_render_mermaid_block(Some("mermaid")));
+                });
+            });
+        });
+        // A native protocol renders regardless of the half-block opt-in.
+        mermaid::with_native_image_protocol_override(Some(true), || {
+            with_mermaid_halfblocks_override(Some(false), || {
+                assert!(should_render_mermaid_block(Some("mermaid")));
+            });
+        });
+    });
+}
+
+#[cfg(feature = "mermaid-renderer")]
+#[test]
+fn mermaid_halfblocks_opt_in_takes_the_image_path_instead_of_showing_source() {
+    let md = "```mermaid\nflowchart LR\n    A --> B\n```";
+    let lines = with_mermaid_rendering_override(Some(true), || {
+        mermaid::with_native_image_protocol_override(Some(false), || {
+            mermaid::with_image_protocol_override(Some(true), || {
+                with_mermaid_halfblocks_override(Some(true), || {
+                    render_markdown(md)
+                })
+            })
+        })
+    });
+    let text = lines_to_string(&lines);
+
+    assert!(
+        !text.contains("flowchart LR"),
+        "half-block opt-in must not fall back to the Mermaid source: {text}"
+    );
+    assert!(
+        text.contains("mermaid diagram"),
+        "half-block opt-in must take the diagram path, not the source path: {text}"
+    );
+}
+
 #[test]
 fn test_mixed_code_and_mermaid() {
     // Mixed content should render both correctly
