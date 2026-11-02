@@ -880,6 +880,11 @@ impl OpenRouterProvider {
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
+        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            // MiniMax accepts `low | medium | high | xhigh | max` and rejects
+            // everything else with HTTP 400, so clamp instead of forwarding a
+            // value the API would refuse.
+            request["reasoning_effort"] = serde_json::json!(Self::clamp_minimax_effort(effort));
         } else if self.supports_openai_reasoning_effort() {
             // Strict endpoints such as Mistral reject the UX alias `max`.
             let effort = if strict_openai_schema && effort == "max" {
@@ -909,6 +914,14 @@ impl OpenRouterProvider {
 
     fn profile_supports_openai_reasoning_effort(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("zai"))
+    }
+
+    /// MiniMax speaks the OpenAI-compatible `reasoning_effort` request field
+    /// but accepts a NARROWER ladder than OpenAI: `low | medium | high |
+    /// xhigh | max`. `none` is rejected with HTTP 400 ("requires adaptive
+    /// thinking"), so it must never reach the wire.
+    fn profile_supports_minimax_reasoning_effort(profile_id: Option<&str>) -> bool {
+        matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("minimax"))
     }
 
     /// DeepSeek-family models accept the DeepSeek-style top-level
@@ -969,6 +982,7 @@ impl OpenRouterProvider {
         }
         if self.builtin_azure
             || Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
+            || Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
         {
             return true;
         }
@@ -1015,6 +1029,7 @@ impl OpenRouterProvider {
     pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
         self.supports_deepseek_reasoning_effort()
             || self.supports_openai_reasoning_effort()
+            || Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
             || Self::profile_supports_unified_reasoning(
                 self.profile_id.as_deref(),
                 self.send_openrouter_headers,
@@ -1024,6 +1039,8 @@ impl OpenRouterProvider {
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
         if self.supports_deepseek_reasoning_effort() {
             Self::normalize_reasoning_effort(effort)
+        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            Self::normalize_minimax_reasoning_effort(effort)
         } else if self.supports_openai_reasoning_effort() {
             Self::normalize_openai_reasoning_effort(effort)
         } else {
@@ -1040,7 +1057,8 @@ impl OpenRouterProvider {
     ) -> Option<String> {
         let supported = reasoning_effort_support.unwrap_or(
             Self::profile_supports_reasoning_effort(profile_id)
-                || Self::profile_supports_openai_reasoning_effort(profile_id),
+                || Self::profile_supports_openai_reasoning_effort(profile_id)
+                || Self::profile_supports_minimax_reasoning_effort(profile_id),
         );
         if !supported {
             return None;
@@ -1052,6 +1070,8 @@ impl OpenRouterProvider {
             .and_then(|effort| {
                 if Self::profile_supports_openai_reasoning_effort(profile_id) {
                     Self::normalize_openai_reasoning_effort(effort)
+                } else if Self::profile_supports_minimax_reasoning_effort(profile_id) {
+                    Self::normalize_minimax_reasoning_effort(effort)
                 } else {
                     Self::normalize_reasoning_effort(effort)
                 }
@@ -1110,6 +1130,46 @@ impl OpenRouterProvider {
                 ));
                 None
             }
+        }
+    }
+
+    /// MiniMax's documented effort vocabulary: `low | medium | high | xhigh |
+    /// max`, plus Jcode's `swarm` sentinel.
+    ///
+    /// `none` is refused by the API with HTTP 400 ("requires adaptive
+    /// thinking"), and `minimal` is undocumented, so neither is accepted.
+    fn normalize_minimax_reasoning_effort(raw: &str) -> Option<String> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return None;
+        }
+        match value.as_str() {
+            "low" | "medium" | "high" | "xhigh" | "max" | "swarm" => Some(value),
+            other => {
+                jcode_base::logging::info(&format!(
+                    "Warning: Ignoring unsupported MiniMax reasoning effort '{}'; expected low|medium|high|xhigh|max.",
+                    other
+                ));
+                None
+            }
+        }
+    }
+
+    /// Clamp an effort value into MiniMax's accepted range.
+    ///
+    /// MiniMax accepts `low | medium | high | xhigh | max` and rejects every
+    /// other value with HTTP 400. It also cannot disable thinking, so the
+    /// OpenAI/DeepSeek rungs `none` and `minimal` (and Jcode's `swarm`
+    /// sentinel) map to the CHEAPEST documented level `low`: that keeps the
+    /// user intent "think less" instead of silently raising the level to the
+    /// API's own `max` default.
+    fn clamp_minimax_effort(effort: &str) -> &'static str {
+        match effort.trim().to_ascii_lowercase().as_str() {
+            "medium" => "medium",
+            "high" => "high",
+            "xhigh" => "xhigh",
+            "max" => "max",
+            _ => "low",
         }
     }
 

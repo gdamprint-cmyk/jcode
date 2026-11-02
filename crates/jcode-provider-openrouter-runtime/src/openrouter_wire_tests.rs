@@ -188,6 +188,91 @@ fn configured_swarm_root_effort_covers_all_wire_formats() {
     }
 }
 
+/// The MiniMax profile must put a DOCUMENTED effort level on the wire.
+///
+/// MiniMax accepts `low | medium | high | xhigh | max` and answers HTTP 400
+/// for anything else (`none` is "requires adaptive thinking"), so the runtime
+/// clamps before sending instead of forwarding a value the API refuses.
+#[test]
+fn minimax_reasoning_effort_reaches_the_wire_as_a_documented_level() {
+    let minimax = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        ..make_custom_compatible_provider()
+    };
+
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let mut request = serde_json::json!({});
+        assert!(
+            minimax.apply_resolved_reasoning_effort(&mut request, effort, false),
+            "MiniMax must accept the documented level '{effort}'"
+        );
+        assert_eq!(
+            request["reasoning_effort"], effort,
+            "MiniMax wire effort must be the documented level itself"
+        );
+    }
+
+    // Values the API rejects must never reach the wire. `none` is a real
+    // OpenAI/DeepSeek rung, `minimal` is an OpenAI rung, and `swarm` is
+    // Jcode's UI sentinel.
+    for rejected in ["none", "minimal", "swarm"] {
+        let mut request = serde_json::json!({});
+        assert!(
+            minimax.apply_resolved_reasoning_effort(&mut request, rejected, false),
+            "MiniMax must still report that an effort was applied"
+        );
+        let wire = request["reasoning_effort"].as_str().unwrap_or_default();
+        assert!(
+            matches!(wire, "low" | "medium" | "high" | "xhigh" | "max"),
+            "MiniMax wire effort '{wire}' (from '{rejected}') is not a documented level"
+        );
+        assert_ne!(wire, "none");
+        assert_ne!(wire, "minimal");
+        assert_ne!(wire, "swarm");
+    }
+}
+
+/// The MiniMax selectable ladder is exactly the documented vocabulary plus
+/// Jcode's `swarm` sentinel, and `/effort` must not reject the sentinel.
+#[test]
+fn minimax_ladder_offers_documented_levels_and_keeps_the_swarm_sentinel() {
+    let minimax = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        minimax.available_efforts(),
+        jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
+    );
+    assert!(minimax.available_efforts().contains(&"max"));
+    assert!(minimax.available_efforts().contains(&"swarm"));
+    assert!(!minimax.available_efforts().contains(&"none"));
+    assert!(!minimax.available_efforts().contains(&"minimal"));
+
+    // `none` is not selectable for MiniMax.
+    assert!(minimax.set_reasoning_effort("none").is_err());
+    assert!(minimax.set_reasoning_effort("minimal").is_err());
+
+    // The swarm sentinel stays selectable and is preserved in session state.
+    minimax.set_reasoning_effort("swarm").unwrap();
+    assert_eq!(minimax.reasoning_effort().as_deref(), Some("swarm"));
+}
+
+/// `/effort` must not bail out for the MiniMax profile: the generic
+/// `supports_any_reasoning_effort` gate used to reject it before the ladder
+/// was ever consulted.
+#[test]
+fn minimax_profile_reports_reasoning_effort_support() {
+    let minimax = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        ..make_custom_compatible_provider()
+    };
+    assert!(minimax.supports_any_reasoning_effort());
+    minimax.set_reasoning_effort("high").unwrap();
+    assert_eq!(minimax.reasoning_effort().as_deref(), Some("high"));
+}
+
 #[test]
 fn azure_tool_turn_uses_responses_with_reasoning_and_replays_tool_history() {
     use std::io::{Read, Write};
@@ -598,6 +683,52 @@ fn configured_swarm_root_effort_reads_real_config() {
         );
         assert_eq!(provider.reasoning_effort().as_deref(), Some(mode));
     }
+}
+
+/// `/effort swarm` must keep working on the MiniMax profile: the sentinel is
+/// resolved to the configured swarm root effort and that RESOLVED level is
+/// what reaches the wire, as a documented MiniMax level.
+#[test]
+fn minimax_swarm_sentinel_resolves_to_the_root_effort_on_the_wire() {
+    let _lock = ENV_LOCK.lock();
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let minimax = OpenRouterProvider {
+        api_base,
+        profile_id: Some("minimax".into()),
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+
+    minimax.set_reasoning_effort("swarm").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut stream = minimax.complete(&[], &[], "test", None).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    });
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The sentinel itself must never reach the wire.
+    assert!(
+        !request.contains(r#""reasoning_effort":"swarm""#),
+        "the swarm sentinel must not be sent to MiniMax: {request}"
+    );
+    // Whatever level arrived must be one MiniMax documents.
+    let wire = request
+        .split(r#""reasoning_effort":""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_default();
+    assert!(
+        matches!(wire, "low" | "medium" | "high" | "xhigh" | "max"),
+        "MiniMax wire effort '{wire}' is not a documented level: {request}"
+    );
+    // The stored mode stays the sentinel, so the UI keeps showing swarm.
+    assert_eq!(minimax.reasoning_effort().as_deref(), Some("swarm"));
 }
 
 /// Grok Build: a real chat/completions request built by the Grok Build
