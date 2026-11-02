@@ -199,6 +199,7 @@ fn minimax_reasoning_effort_reaches_the_wire_as_a_documented_level() {
         profile_id: Some("minimax".into()),
         ..make_custom_compatible_provider()
     };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
 
     for effort in ["low", "medium", "high", "xhigh", "max"] {
         let mut request = serde_json::json!({});
@@ -240,6 +241,7 @@ fn minimax_ladder_offers_documented_levels_and_keeps_the_swarm_sentinel() {
         profile_id: Some("minimax".into()),
         ..make_custom_compatible_provider()
     };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
 
     assert_eq!(
         minimax.available_efforts(),
@@ -268,6 +270,7 @@ fn minimax_profile_reports_reasoning_effort_support() {
         profile_id: Some("minimax".into()),
         ..make_custom_compatible_provider()
     };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
     assert!(minimax.supports_any_reasoning_effort());
     minimax.set_reasoning_effort("high").unwrap();
     assert_eq!(minimax.reasoning_effort().as_deref(), Some("high"));
@@ -698,6 +701,7 @@ fn minimax_swarm_sentinel_resolves_to_the_root_effort_on_the_wire() {
         supports_model_catalog: false,
         ..make_custom_compatible_provider()
     };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
 
     minimax.set_reasoning_effort("swarm").unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -729,6 +733,109 @@ fn minimax_swarm_sentinel_resolves_to_the_root_effort_on_the_wire() {
     );
     // The stored mode stays the sentinel, so the UI keeps showing swarm.
     assert_eq!(minimax.reasoning_effort().as_deref(), Some("swarm"));
+}
+
+/// MiniMax documents `reasoning_effort` as effective for `MiniMax-M3.1-Flash`
+/// only. A live probe on 2026-11-02 showed the older models ACCEPT the field
+/// with HTTP 200 instead of rejecting it, so sending it is harmless - but on
+/// those models it is silently ignored, so offering an effort ladder there
+/// offers a dial that does nothing. The documented scope is M3.1.
+#[test]
+fn minimax_effort_ladder_is_scoped_to_the_documented_m31_models() {
+    let _lock = ENV_LOCK.lock();
+    let minimax = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        ..make_custom_compatible_provider()
+    };
+
+    // M3.1-Flash: the documented target.
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
+    assert_eq!(
+        minimax.available_efforts(),
+        jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
+    );
+    let mut request = serde_json::json!({});
+    assert!(minimax.apply_resolved_reasoning_effort(&mut request, "high", false));
+    assert_eq!(request["reasoning_effort"], "high");
+
+    // M3: accepts the field with HTTP 200 but does not honour it, so it is
+    // outside the documented scope.
+    minimax.set_model("MiniMax-M3").unwrap();
+    assert_eq!(
+        minimax.available_efforts(),
+        vec!["swarm"],
+        "MiniMax-M3 accepts reasoning_effort but does not honour it"
+    );
+
+    // M2.x: outside the scope, so no effort rungs and nothing on the wire.
+    // The swarm sentinel survives, because it is a Jcode UI mode rather than
+    // a wire-level effort: `/effort swarm` must keep working there.
+    minimax.set_model("MiniMax-M2.7").unwrap();
+    assert_eq!(
+        minimax.available_efforts(),
+        vec!["swarm"],
+        "MiniMax-M2.7 must not offer an effort ladder the API ignores"
+    );
+    minimax.set_reasoning_effort("swarm").unwrap();
+    assert_eq!(minimax.reasoning_effort().as_deref(), Some("swarm"));
+    // An effort rung that the model ignores must be rejected outright, so the
+    // UI cannot offer a dial that does nothing.
+    assert!(minimax.set_reasoning_effort("high").is_err());
+    let mut request = serde_json::json!({});
+    assert!(!minimax.apply_resolved_reasoning_effort(&mut request, "high", false));
+    assert!(
+        request.get("reasoning_effort").is_none(),
+        "an out-of-scope MiniMax model must not receive reasoning_effort"
+    );
+}
+
+/// The MiniMax profile owns its vocabulary even when a profile-level
+/// `supports_reasoning_effort = true` override is set. That override makes the
+/// generic DeepSeek-style check true, and the DeepSeek ladder contains
+/// `none`, which the MiniMax API answers with HTTP 400.
+#[test]
+fn minimax_profile_keeps_its_vocabulary_under_a_reasoning_effort_override() {
+    let _lock = ENV_LOCK.lock();
+    let minimax = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        reasoning_effort_support: Some(true),
+        ..make_custom_compatible_provider()
+    };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
+
+    // The MiniMax ladder, not the DeepSeek one: no `none`.
+    assert_eq!(
+        minimax.available_efforts(),
+        jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
+    );
+    assert!(!minimax.available_efforts().contains(&"none"));
+
+    // `none` is not selectable on MiniMax.
+    assert!(minimax.set_reasoning_effort("none").is_err());
+
+    // Even if `none` reached the wire path, it must be clamped to `low` and
+    // never sent verbatim: MiniMax answers a literal `none` with HTTP 400.
+    let mut request = serde_json::json!({});
+    assert!(minimax.apply_resolved_reasoning_effort(&mut request, "none", false));
+    assert_eq!(request["reasoning_effort"], "low");
+
+    // A documented level still reaches the wire unchanged.
+    let mut request = serde_json::json!({});
+    assert!(minimax.apply_resolved_reasoning_effort(&mut request, "high", false));
+    assert_eq!(request["reasoning_effort"], "high");
+
+    // The other direction: a profile that explicitly disables reasoning effort
+    // gets no ladder and nothing on the wire, like every other profile.
+    let disabled = OpenRouterProvider {
+        profile_id: Some("minimax".into()),
+        reasoning_effort_support: Some(false),
+        ..make_custom_compatible_provider()
+    };
+    disabled.set_model("MiniMax-M3.1-Flash").unwrap();
+    assert!(disabled.available_efforts().is_empty());
+    let mut request = serde_json::json!({});
+    assert!(!disabled.apply_resolved_reasoning_effort(&mut request, "high", false));
+    assert!(request.get("reasoning_effort").is_none(), "{request}");
 }
 
 /// Grok Build: a real chat/completions request built by the Grok Build

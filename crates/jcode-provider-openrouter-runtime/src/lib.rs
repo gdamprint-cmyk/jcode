@@ -870,7 +870,31 @@ impl OpenRouterProvider {
         effort: &str,
         strict_openai_schema: bool,
     ) -> bool {
-        if self.supports_deepseek_reasoning_effort() {
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            // The MiniMax profile owns its vocabulary. This branch comes FIRST
+            // on purpose: a profile-level `supports_reasoning_effort = true`
+            // override makes `supports_deepseek_reasoning_effort` true, and
+            // the DeepSeek-style branch below would then send MiniMax a
+            // `none` level, which the API answers with HTTP 400.
+            if self.minimax_reasoning_disabled_by_profile() {
+                return false;
+            }
+            if self.model_reasoning_support() == Some(false) {
+                // A named profile can declare a model as not supporting
+                // reasoning. That explicit opt-out wins here, exactly as it
+                // does for the other profiles.
+                return false;
+            }
+            if !self.model_supports_minimax_reasoning_effort() {
+                // The MiniMax profile on a model that ignores `reasoning_effort`:
+                // send nothing rather than a field that does nothing.
+                return false;
+            }
+            // MiniMax accepts `low | medium | high | xhigh | max` and rejects
+            // everything else with HTTP 400, so clamp instead of forwarding a
+            // value the API would refuse.
+            request["reasoning_effort"] = serde_json::json!(Self::clamp_minimax_effort(effort));
+        } else if self.supports_deepseek_reasoning_effort() {
             let effort = match effort {
                 "minimal" => "low",
                 "xhigh" => "high",
@@ -880,11 +904,6 @@ impl OpenRouterProvider {
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
-        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
-            // MiniMax accepts `low | medium | high | xhigh | max` and rejects
-            // everything else with HTTP 400, so clamp instead of forwarding a
-            // value the API would refuse.
-            request["reasoning_effort"] = serde_json::json!(Self::clamp_minimax_effort(effort));
         } else if self.supports_openai_reasoning_effort() {
             // Strict endpoints such as Mistral reject the UX alias `max`.
             let effort = if strict_openai_schema && effort == "max" {
@@ -922,6 +941,31 @@ impl OpenRouterProvider {
     /// thinking"), so it must never reach the wire.
     fn profile_supports_minimax_reasoning_effort(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("minimax"))
+    }
+
+    /// A named profile can turn reasoning effort off explicitly. The MiniMax
+    /// profile owns its vocabulary, and that ownership includes honouring the
+    /// opt-out: without this, the MiniMax branches below would send
+    /// `reasoning_effort` on a profile the user disabled it for.
+    fn minimax_reasoning_disabled_by_profile(&self) -> bool {
+        self.reasoning_effort_support == Some(false)
+    }
+
+    /// Does the ACTIVE model honour MiniMax's `reasoning_effort`?
+    ///
+    /// MiniMax's own API reference says the field is "effective for
+    /// `MiniMax-M3.1-Flash` only", and the guide repeats that only M3.1-Flash
+    /// has "tunable thinking depth (effort)". A live probe on 2026-11-02 showed
+    /// M3, M2.7 and M2.5 all ACCEPT the field with HTTP 200 instead of
+    /// rejecting it - but accepting is not honouring, and on those models it is
+    /// silently ignored, which would offer a dial that does nothing.
+    ///
+    /// The scope is therefore `M3.1`, exactly the documented target. An
+    /// unknown model is treated as supported, matching
+    /// `inferred_reasoning_efforts`.
+    fn model_supports_minimax_reasoning_effort(&self) -> bool {
+        let model = self.model_snapshot().trim().to_ascii_lowercase();
+        model.is_empty() || model.contains("m3.1")
     }
 
     /// DeepSeek-family models accept the DeepSeek-style top-level
@@ -1029,7 +1073,8 @@ impl OpenRouterProvider {
     pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
         self.supports_deepseek_reasoning_effort()
             || self.supports_openai_reasoning_effort()
-            || Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
+            || (!self.minimax_reasoning_disabled_by_profile()
+                && Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()))
             || Self::profile_supports_unified_reasoning(
                 self.profile_id.as_deref(),
                 self.send_openrouter_headers,
@@ -1037,10 +1082,17 @@ impl OpenRouterProvider {
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
-        if self.supports_deepseek_reasoning_effort() {
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            // Before the DeepSeek check on purpose: see
+            // `apply_resolved_reasoning_effort` for why the MiniMax profile
+            // has to own its vocabulary.
+            if self.minimax_reasoning_disabled_by_profile() {
+                None
+            } else {
+                Self::normalize_minimax_reasoning_effort(effort)
+            }
+        } else if self.supports_deepseek_reasoning_effort() {
             Self::normalize_reasoning_effort(effort)
-        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
-            Self::normalize_minimax_reasoning_effort(effort)
         } else if self.supports_openai_reasoning_effort() {
             Self::normalize_openai_reasoning_effort(effort)
         } else {
