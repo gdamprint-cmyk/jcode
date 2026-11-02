@@ -169,6 +169,10 @@ impl Provider for OpenRouterProvider {
         if let Some(enable) = thinking_enabled
             && !sent_reasoning_config
             && !strict_openai_schema
+            // MiniMax rejects `thinking: {"type":"disabled"}` on M3.1-Flash and
+            // `{"type":"enabled"}` on M3, and thinking is on by default, so the
+            // field is never sent for that profile.
+            && !Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
         {
             request["thinking"] = serde_json::json!({
                 "type": if enable { "enabled" } else { "disabled" }
@@ -456,7 +460,8 @@ impl Provider for OpenRouterProvider {
         }
 
         if (self.builtin_azure
-            || Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref()))
+            || Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
+            || Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()))
             || self
                 .model_reasoning_config()
                 .and_then(|config| config.1.as_ref())
@@ -526,6 +531,8 @@ impl Provider for OpenRouterProvider {
     fn available_efforts(&self) -> Vec<&'static str> {
         if self.supports_deepseek_reasoning_effort() {
             jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
+        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
         } else if self.supports_openai_reasoning_effort() {
             jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
         } else if Self::profile_supports_unified_reasoning(

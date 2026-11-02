@@ -19,6 +19,17 @@ pub const OPENROUTER_SELECTABLE_EFFORTS: &[&str] =
 /// Direct DeepSeek effort levels, followed by Jcode's swarm mode.
 pub const DEEPSEEK_SELECTABLE_EFFORTS: &[&str] = &["none", "low", "medium", "high", "max", "swarm"];
 
+/// MiniMax effort levels, followed by Jcode's swarm mode.
+///
+/// MiniMax documents `low | medium | high | xhigh | max` for the
+/// `reasoning_effort` request field (OpenAI-compatible protocol) and for
+/// `output_config.effort` (Anthropic-compatible protocol). `none` is NOT
+/// accepted: the API answers HTTP 400 with "requires adaptive thinking;
+/// reasoning effort none is not allowed". `minimal` is accepted by the live
+/// endpoint but is undocumented, so it is not offered as a selectable level
+/// (measured 2026-11-02 against `MiniMax-M3.1-Flash`).
+pub const MINIMAX_SELECTABLE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "swarm"];
+
 /// Convert a provider-advertised OpenAI/OpenRouter effort into the canonical
 /// static value used by the provider trait.
 pub fn canonical_reasoning_effort(value: &str) -> Option<&'static str> {
@@ -53,7 +64,7 @@ pub fn inferred_reasoning_efforts(
 
     if provider.contains("minimax") {
         if model.is_empty() || model.contains("m3") {
-            return OPENAI_SELECTABLE_EFFORTS.to_vec();
+            return MINIMAX_SELECTABLE_EFFORTS.to_vec();
         }
         return Vec::new();
     }
@@ -134,6 +145,25 @@ mod tests {
             inferred_reasoning_efforts(Some("openai-compatible:zai"), Some("glm-5.3-flash")),
             OPENAI_SELECTABLE_EFFORTS
         );
+    }
+
+    #[test]
+    fn minimax_ladder_excludes_levels_the_api_rejects() {
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M3.1-Flash")),
+            MINIMAX_SELECTABLE_EFFORTS
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("openai-compatible:minimax"), Some("MiniMax-M3")),
+            MINIMAX_SELECTABLE_EFFORTS
+        );
+        // `none` is answered with HTTP 400 by the live API, and `minimal` is
+        // undocumented, so neither belongs in the selectable ladder.
+        assert!(!MINIMAX_SELECTABLE_EFFORTS.contains(&"none"));
+        assert!(!MINIMAX_SELECTABLE_EFFORTS.contains(&"minimal"));
+        assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"max"));
+        // The swarm sentinel stays selectable so `/effort swarm` keeps working.
+        assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"swarm"));
     }
 
     #[test]
