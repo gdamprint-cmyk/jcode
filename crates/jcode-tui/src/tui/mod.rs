@@ -123,6 +123,33 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
+/// Whether the Kitty keyboard protocol can be used on this platform.
+///
+/// crossterm's Windows backend has no `CSI u` parser at all: the parser lives
+/// only in the Unix implementation (`event/sys/unix/parse.rs`), while the
+/// Windows backend reads Win32 console key records. A terminal that reports
+/// keys in that encoding therefore delivers the sequences to the application
+/// as literal text — the tail of a released key arrives as `[101;1:3u`.
+///
+/// Windows Terminal translates those sequences for native console
+/// applications, so the protocol appears to work there. A multiplexer such as
+/// herdr forwards them verbatim, and the tail of every keystroke then lands
+/// in the composer as noise. The protocol is therefore kept off on Windows,
+/// and any flags the terminal still has armed are cleared instead.
+#[cfg(windows)]
+pub(crate) const KITTY_KEYBOARD_SUPPORTED: bool = false;
+#[cfg(not(windows))]
+pub(crate) const KITTY_KEYBOARD_SUPPORTED: bool = true;
+
+/// Clear any Kitty keyboard flags the terminal may still have armed.
+///
+/// This is the `set` form with an empty flag set, which removes every
+/// enhancement without touching the terminal's keyboard stack, so it cannot
+/// pop an entry another program owns.
+fn clear_kitty_keyboard_flags_to(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    writer.write_all(b"\x1b[=0u")
+}
+
 /// Whether this process still owns an unbalanced entry on the terminal's
 /// Kitty keyboard-protocol stack.
 ///
@@ -179,6 +206,17 @@ pub fn enable_keyboard_enhancement() -> bool {
         crate::logging::info("Keyboard enhancement request skipped: termination already started");
         return false;
     }
+    if !KITTY_KEYBOARD_SUPPORTED {
+        // The protocol cannot be parsed on this platform, so it is never
+        // armed. Clear whatever an earlier run left enabled, then report that
+        // no Kitty entry is owned: a later cleanup must not pop the terminal's
+        // stack, because this process never pushed onto it.
+        let _ = clear_kitty_keyboard_flags_to(&mut std::io::stdout());
+        crate::logging::info(
+            "Keyboard enhancement request skipped: Kitty protocol unsupported on this platform",
+        );
+        return false;
+    }
     let result = enable_keyboard_enhancement_to(&mut std::io::stdout(), inside_tmux()).is_ok();
     crate::logging::info(&format!(
         "Keyboard enhancement request: {}",
@@ -219,6 +257,12 @@ fn enable_keyboard_enhancement_to(
 ) -> std::io::Result<()> {
     use crossterm::event::PushKeyboardEnhancementFlags;
     request_tmux_extended_keys_to(writer, inside_tmux)?;
+    if !KITTY_KEYBOARD_SUPPORTED {
+        // Nothing is pushed, so nothing may be popped later. Clear whatever
+        // the terminal still has armed instead, so a terminal left in Kitty
+        // mode by an earlier run stops reporting enhanced keys.
+        return clear_kitty_keyboard_flags_to(writer);
+    }
     crossterm::execute!(
         writer,
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
@@ -360,6 +404,11 @@ fn disable_keyboard_enhancement_to(
     if inside_tmux {
         writer.write_all(b"\x1b[>4;0m")?;
     }
+    if !KITTY_KEYBOARD_SUPPORTED {
+        // The process never pushed a Kitty entry, so a pop would remove
+        // another program's entry. Clearing the flags is the safe equivalent.
+        return clear_kitty_keyboard_flags_to(writer);
+    }
     crossterm::execute!(writer, crossterm::event::PopKeyboardEnhancementFlags)
 }
 
@@ -379,6 +428,9 @@ fn reapply_keyboard_enhancement_to(
     inside_tmux: bool,
 ) -> std::io::Result<()> {
     request_tmux_extended_keys_to(writer, inside_tmux)?;
+    if !KITTY_KEYBOARD_SUPPORTED {
+        return clear_kitty_keyboard_flags_to(writer);
+    }
     write!(writer, "\x1b[={}u", keyboard_enhancement_flags().bits())
 }
 
@@ -560,30 +612,58 @@ mod terminal_mode_tests {
     fn tmux_keyboard_lifecycle_requests_and_resets_extended_keys() {
         let mut output = Vec::new();
         enable_keyboard_enhancement_to(&mut output, true).unwrap();
-        assert_eq!(output, b"\x1b[>4;2m\x1b[>7u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[>4;2m\x1b[>7u");
+        } else {
+            // The protocol is never armed here, and the terminal's flags are
+            // cleared instead so a stale Kitty mode cannot report keys.
+            assert_eq!(output, b"\x1b[>4;2m\x1b[=0u");
+        }
 
         output.clear();
         reapply_keyboard_enhancement_to(&mut output, true).unwrap();
-        assert_eq!(output, b"\x1b[>4;2m\x1b[=7u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[>4;2m\x1b[=7u");
+        } else {
+            assert_eq!(output, b"\x1b[>4;2m\x1b[=0u");
+        }
 
         output.clear();
         disable_keyboard_enhancement_to(&mut output, true).unwrap();
-        assert_eq!(output, b"\x1b[>4;0m\x1b[<1u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[>4;0m\x1b[<1u");
+        } else {
+            // No Kitty entry is owned, so the flags are cleared rather than
+            // popping the terminal's stack.
+            assert_eq!(output, b"\x1b[>4;0m\x1b[=0u");
+        }
     }
 
     #[test]
     fn outside_tmux_keyboard_lifecycle_keeps_kitty_protocol_only() {
         let mut output = Vec::new();
         enable_keyboard_enhancement_to(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[>7u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[>7u");
+        } else {
+            assert_eq!(output, b"\x1b[=0u");
+        }
 
         output.clear();
         reapply_keyboard_enhancement_to(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[=7u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[=7u");
+        } else {
+            assert_eq!(output, b"\x1b[=0u");
+        }
 
         output.clear();
         disable_keyboard_enhancement_to(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[<1u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[<1u");
+        } else {
+            assert_eq!(output, b"\x1b[=0u");
+        }
     }
 
     #[test]
@@ -643,7 +723,14 @@ mod terminal_mode_tests {
                     "must keep focus reporting enabled"
                 );
                 assert_eq!(output.contains("\x1b[?1000h"), mouse_capture);
-                assert_eq!(output.contains("\x1b[=7u"), keyboard_enhanced);
+                if super::KITTY_KEYBOARD_SUPPORTED {
+                    assert_eq!(output.contains("\x1b[=7u"), keyboard_enhanced);
+                } else {
+                    // The protocol is never armed, so the reapply only clears
+                    // the terminal's flags.
+                    assert_eq!(output.contains("\x1b[=0u"), keyboard_enhanced);
+                    assert!(!output.contains("\x1b[=7u"));
+                }
                 assert!(
                     !output.contains("\x1b[>7u"),
                     "must not push the Kitty keyboard stack (tmux modifyOtherKeys is allowed)"
