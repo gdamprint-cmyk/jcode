@@ -10,14 +10,42 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
 
+/// The ImageMagick binary to use for Sixel conversion, if any.
+///
+/// On Windows `convert.exe` in `C:\Windows\System32` is the FAT-to-NTFS
+/// filesystem converter, not ImageMagick. It exits 0 and prints nothing, so a
+/// bare exit-status probe reports it as ImageMagick and every Sixel conversion
+/// then fails at runtime. Probe the version banner instead and prefer the
+/// unambiguous `magick` binary.
+fn imagemagick_binary() -> Option<&'static str> {
+    for candidate in ["magick", "convert"] {
+        let Ok(output) = Command::new(candidate).arg("--version").output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let banner = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if banner.contains("ImageMagick") {
+            return Some(if candidate == "magick" {
+                "magick"
+            } else {
+                "convert"
+            });
+        }
+    }
+    None
+}
+
 /// Cache whether ImageMagick is available for Sixel conversion
-static HAS_IMAGEMAGICK: LazyLock<bool> = LazyLock::new(|| {
-    Command::new("convert")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-});
+static IMAGEMAGICK_BINARY: LazyLock<Option<&'static str>> = LazyLock::new(imagemagick_binary);
+
+/// Cache whether ImageMagick is available for Sixel conversion
+static HAS_IMAGEMAGICK: LazyLock<bool> = LazyLock::new(|| IMAGEMAGICK_BINARY.is_some());
 
 /// Terminal image protocol support
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -447,9 +475,9 @@ fn display_sixel(
     img_width: u32,
     img_height: u32,
 ) -> io::Result<bool> {
-    if !*HAS_IMAGEMAGICK {
+    let Some(binary) = *IMAGEMAGICK_BINARY else {
         return Ok(false);
-    }
+    };
 
     let (cols, rows) =
         calculate_display_size(img_width, img_height, params.max_cols, params.max_rows);
@@ -463,7 +491,12 @@ fn display_sixel(
     // -geometry: resize to fit
     // -colors 256: limit palette for Sixel
     // sixel:-: output Sixel to stdout
-    let output = Command::new("convert")
+    let mut command = Command::new(binary);
+    if binary == "magick" {
+        // ImageMagick 7 needs the `magick` subcommand before the input file.
+        command.arg("convert");
+    }
+    let output = command
         .arg(path)
         .arg("-geometry")
         .arg(format!("{}x{}>", pixel_width, pixel_height))

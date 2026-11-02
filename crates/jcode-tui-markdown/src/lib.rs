@@ -29,6 +29,9 @@ pub struct MarkdownConfigSnapshot {
     pub diagram_mode: DiagramDisplayMode,
     pub markdown_spacing: MarkdownSpacingMode,
     pub mermaid_enabled: bool,
+    /// Render Mermaid diagrams through the Unicode half-block fallback when no
+    /// native terminal image protocol is available.
+    pub mermaid_halfblocks: bool,
     pub latex_rendering: LatexRenderingMode,
 }
 
@@ -38,6 +41,7 @@ impl Default for MarkdownConfigSnapshot {
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
             mermaid_enabled: true,
+            mermaid_halfblocks: false,
             latex_rendering: LatexRenderingMode::default(),
         }
     }
@@ -108,9 +112,10 @@ mod wrap;
 #[cfg(test)]
 pub(crate) use context::with_markdown_spacing_mode_override;
 pub use context::{
-    center_code_blocks, get_diagram_mode_override, mermaid_rendering_enabled,
-    set_center_code_blocks, set_diagram_mode_override, with_center_code_blocks,
-    with_deferred_mermaid_render_context, with_diagram_mode_scope, with_mermaid_rendering_override,
+    center_code_blocks, get_diagram_mode_override, mermaid_halfblocks_enabled,
+    mermaid_rendering_enabled, set_center_code_blocks, set_diagram_mode_override,
+    with_center_code_blocks, with_deferred_mermaid_render_context, with_diagram_mode_scope,
+    with_mermaid_halfblocks_override, with_mermaid_rendering_override,
 };
 use context::{
     deferred_mermaid_render_context_enabled, effective_diagram_mode,
@@ -166,10 +171,21 @@ use render_support::{
 };
 
 fn should_render_mermaid_block(lang: Option<&str>) -> bool {
-    mermaid_rendering_enabled()
-        && lang.map(mermaid::is_mermaid_lang).unwrap_or(false)
-        && mermaid::native_image_protocol_available()
+    if !mermaid_rendering_enabled() || !lang.map(mermaid::is_mermaid_lang).unwrap_or(false) {
+        return false;
+    }
+    // A native image protocol (Kitty, iTerm2, Sixel) renders the diagram as a
+    // real image. Without one, jcode used to show the Mermaid source instead,
+    // because the Unicode half-block fallback is a lower-fidelity raster. Users
+    // behind a multiplexer that forwards neither Kitty nor Sixel (Windows
+    // Terminal hosted by herdr) have no image path at all, so the half-block
+    // fallback is opt-in via `features.mermaid_halfblocks`.
+    if mermaid::native_image_protocol_available() {
+        return true;
+    }
+    mermaid_halfblocks_enabled() && mermaid::image_protocol_available()
 }
+
 pub use render_support::{highlight_file_lines, highlight_line, render_table_with_width};
 
 // Syntax highlighting resources (loaded once)
