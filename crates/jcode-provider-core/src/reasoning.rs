@@ -63,10 +63,18 @@ pub fn inferred_reasoning_efforts(
     }
 
     if provider.contains("minimax") {
-        if model.is_empty() || model.contains("m3") {
+        // MiniMax's API reference: `reasoning_effort` is "effective for
+        // MiniMax-M3.1-Flash only". Other MiniMax models accept the field with
+        // HTTP 200 and silently ignore it, so offering a ladder there offers a
+        // dial that does nothing.
+        if model.is_empty() || model.contains("m3.1") {
             return MINIMAX_SELECTABLE_EFFORTS.to_vec();
         }
-        return Vec::new();
+        // A MiniMax model outside the documented scope ignores
+        // `reasoning_effort`, so it gets no effort rungs. The swarm sentinel
+        // stays: it is a Jcode UI mode rather than a wire-level effort, so
+        // `/effort swarm` keeps working on those models.
+        return vec!["swarm"];
     }
 
     if provider.contains("z.ai") || provider == "zai" || model.starts_with("glm-") {
@@ -153,9 +161,10 @@ mod tests {
             inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M3.1-Flash")),
             MINIMAX_SELECTABLE_EFFORTS
         );
+        // M3 accepts the field with HTTP 200 but does not honour it.
         assert_eq!(
             inferred_reasoning_efforts(Some("openai-compatible:minimax"), Some("MiniMax-M3")),
-            MINIMAX_SELECTABLE_EFFORTS
+            vec!["swarm"]
         );
         // `none` is answered with HTTP 400 by the live API, and `minimal` is
         // undocumented, so neither belongs in the selectable ladder.
@@ -164,6 +173,26 @@ mod tests {
         assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"max"));
         // The swarm sentinel stays selectable so `/effort swarm` keeps working.
         assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"swarm"));
+    }
+
+    #[test]
+    fn minimax_ladder_outside_the_documented_scope_keeps_only_the_swarm_sentinel() {
+        // A MiniMax model outside the documented scope (only M3.1-Flash is
+        // documented as honouring `reasoning_effort`) ignores the field, so it
+        // gets no effort rungs. The swarm sentinel is a Jcode UI mode, not a
+        // wire-level effort, so it stays and `/effort swarm` keeps working.
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M2.7")),
+            vec!["swarm"]
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M3")),
+            vec!["swarm"]
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("openai-compatible:minimax"), Some("MiniMax-M2.5")),
+            vec!["swarm"]
+        );
     }
 
     #[test]

@@ -509,6 +509,7 @@ impl Provider for OpenRouterProvider {
         let mut accepted = self.available_efforts().contains(&requested.as_str());
         if !self.supports_deepseek_reasoning_effort()
             && !self.supports_openai_reasoning_effort()
+            && !Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
             && requested == "max"
         {
             accepted = true;
@@ -529,10 +530,26 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if self.supports_deepseek_reasoning_effort() {
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            // The MiniMax profile owns its ladder. A model that ignores
+            // `reasoning_effort` gets no effort rungs, rather than falling
+            // through to the generic OpenAI ladder the MiniMax change exists
+            // to remove. The swarm sentinel stays: it is a Jcode UI mode, not
+            // a wire-level effort, so `/effort swarm` keeps working there.
+            //
+            // This branch comes BEFORE the DeepSeek one: a profile-level
+            // `supports_reasoning_effort = true` override makes the DeepSeek
+            // check true, and that ladder contains `none`, which the MiniMax
+            // API answers with HTTP 400.
+            if self.minimax_reasoning_disabled_by_profile() {
+                Vec::new()
+            } else if self.model_supports_minimax_reasoning_effort() {
+                jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
+            } else {
+                vec!["swarm"]
+            }
+        } else if self.supports_deepseek_reasoning_effort() {
             jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
-        } else if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
-            jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
         } else if self.supports_openai_reasoning_effort() {
             jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
         } else if Self::profile_supports_unified_reasoning(
