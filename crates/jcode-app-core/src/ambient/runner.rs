@@ -137,13 +137,19 @@ impl AmbientRunnerHandle {
 
     /// Manually trigger an ambient cycle (returns immediately, cycle runs async).
     pub async fn trigger(&self) {
-        // Set status to idle so should_run returns true
+        // Set status to idle so should_run returns true.
+        //
+        // `Disabled` is included so a stopped ambient loop can be revived.
+        // `stop()` sets that status, and `ambient_allowed()` returns false
+        // for it, so the (infinite) loop stopped running cycles and only a
+        // process restart could bring ambient back. Measured 2026-11-03.
         let mut state = self.inner.state.write().await;
         if matches!(
             state.status,
-            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
+            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle | AmbientStatus::Disabled
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();
@@ -163,6 +169,20 @@ impl AmbientRunnerHandle {
     pub async fn start(&self, provider: Arc<dyn Provider>) -> bool {
         let already_running = *self.inner.running.read().await;
         if already_running {
+            // The loop task is alive but blocked: `stop()` set the persisted
+            // status to `Disabled`, and `ambient_allowed()` is false for it,
+            // so the loop kept spinning without running a cycle. Returning
+            // false here made a stopped ambient mode unrevivable except by
+            // restarting the process. Revive it instead: reset the status to
+            // Idle and nudge the live loop. Measured 2026-11-03.
+            let mut state = self.inner.state.write().await;
+            if matches!(state.status, AmbientStatus::Disabled) {
+                state.status = AmbientStatus::Idle;
+                let _ = state.save();
+                drop(state);
+                self.inner.wake_notify.notify_one();
+                return true;
+            }
             return false;
         }
         {
