@@ -220,6 +220,29 @@ impl Provider for OpenRouterProvider {
             request["provider"] = obj;
         }
 
+        // MiniMax splits thinking into a separate `reasoning_content` field
+        // only when `reasoning_split` is true. Without it, MiniMax-M3 and the
+        // M2.x family return their thinking INSIDE `content` wrapped in
+        // `<think>` tags, and jcode's stream parser reads only
+        // `reasoning_content` - so the reasoning text was rendered as ordinary
+        // assistant text. MiniMax-M3.1-Flash goes further and REQUIRES
+        // `reasoning_split: true` (`reasoning_split: false` is answered with
+        // HTTP 400 "requires reasoning_split=true").
+        //
+        // Measured live on 2026-11-03 against api.minimax.io:
+        //   M3.1-Flash split=omitted -> reasoning_content=286, no think tags
+        //   M3         split=omitted -> reasoning_content=None, 1 think tag
+        //   M3         split=true    -> reasoning_content=233, no think tags
+        //   M2.7       split=true    -> reasoning_content=189, no think tags
+        //   M3.1-Flash split=false   -> HTTP 400 (2013)
+        //
+        // The field is set BEFORE the extra_body merge below, so a user who
+        // needs a different value can still override it from named-profile
+        // config.
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            request["reasoning_split"] = serde_json::json!(true);
+        }
+
         // Merge user-configured extra request-body fields last so they can
         // satisfy non-standard backend requirements (e.g. NVIDIA NIM
         // DeepSeek-V4 `chat_template_kwargs`) and intentionally override any
