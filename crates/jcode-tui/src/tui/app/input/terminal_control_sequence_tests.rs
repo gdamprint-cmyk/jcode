@@ -192,6 +192,69 @@ fn per_character_path_preserves_ordinary_text() {
     }
 }
 
+/// A paste of 5 or more lines takes the placeholder branch: only the
+/// placeholder reaches the composer, and the payload is substituted back in
+/// later - at expand time, or in place on a repeat paste. Neither of those
+/// paths goes through `insert_input_text`, so the payload must be sanitized
+/// where it is stored and wherever it is substituted, or a terminal report
+/// that arrived inside a large paste reaches the model verbatim.
+///
+/// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse report format)
+#[test]
+fn multi_line_paste_payload_is_sanitized_wherever_it_is_substituted() {
+    // A 5-line payload whose first line carries a mouse report tail.
+    let payload = "[<65;50;24M\nline2\nline3\nline4\nline5";
+
+    // Stored payload is clean.
+    let mut app = create_test_app();
+    super::handle_text_paste(&mut app, payload.to_string());
+    assert_eq!(app.pasted_contents.len(), 1);
+    assert!(
+        !app.pasted_contents[0].contains("[<65;50;24M"),
+        "stored paste payload must not carry the report: {:?}",
+        app.pasted_contents[0]
+    );
+
+    // The expanded text sent to the model is clean.
+    let expanded = super::expand_paste_placeholders(&app, &app.input);
+    assert!(
+        !expanded.contains("[<65;50;24M"),
+        "expanded paste content must not carry the report: {expanded:?}"
+    );
+    assert!(
+        expanded.contains("line2") && expanded.contains("line5"),
+        "the rest of the paste must survive: {expanded:?}"
+    );
+
+    // The in-place repeat-paste expansion is clean too.
+    let mut app = create_test_app();
+    super::handle_text_paste(&mut app, payload.to_string());
+    let placeholder = app.input.clone();
+    assert!(
+        placeholder.contains("[pasted"),
+        "expected a placeholder: {placeholder:?}"
+    );
+    super::handle_text_paste(&mut app, payload.to_string());
+    assert!(
+        !app.input.contains("[<65;50;24M"),
+        "in-place expansion must not carry the report: {:?}",
+        app.input
+    );
+
+    // Negative control: ordinary text in a multi-line paste survives.
+    let ordinary = "array[0]\nlist[1] = list[2]\n[TODO] fix\nplain\nlines";
+    let mut app = create_test_app();
+    super::handle_text_paste(&mut app, ordinary.to_string());
+    assert_eq!(
+        app.pasted_contents[0], ordinary,
+        "ordinary paste must survive verbatim"
+    );
+    let expanded = super::expand_paste_placeholders(&app, &app.input);
+    assert!(
+        expanded.contains("array[0]") && expanded.contains("[TODO] fix"),
+        "ordinary paste content must survive: {expanded:?}"
+    );
+}
 /// A focus report has NO parameter bytes: `CSI I` is just `[` + `I`. The
 /// scrub grammar therefore cannot recognise it, and must NOT try to: a bare
 /// `[I` / `[O` is ordinary text the user can type (a list index, a markdown

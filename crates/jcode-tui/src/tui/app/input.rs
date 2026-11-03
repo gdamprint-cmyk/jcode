@@ -552,7 +552,7 @@ pub(super) fn handle_text_paste(app: &mut App, text: String) {
     }
 
     let placeholder = paste_placeholder(&text);
-    app.pasted_contents.push(text);
+    app.pasted_contents.push(strip_terminal_control_sequences(&text).into_owned());
     insert_input_text(app, &placeholder);
 }
 
@@ -586,9 +586,9 @@ fn expand_matching_paste(app: &mut App, text: &str) -> bool {
     app.remember_input_undo_state();
     app.input.replace_range(
         placeholder_start..placeholder_start + placeholder.len(),
-        text,
+        &strip_terminal_control_sequences(text),
     );
-    app.cursor_pos = placeholder_start + text.len();
+    app.cursor_pos = placeholder_start + strip_terminal_control_sequences(text).len();
     app.pasted_contents.remove(content_index);
     app.reset_tab_completion();
     app.sync_model_picker_preview_from_input();
@@ -1253,7 +1253,8 @@ fn expand_paste_placeholders_with(pasted_contents: &[String], input: &str) -> St
     for content in pasted_contents.iter().rev() {
         let placeholder = paste_placeholder(content);
         if let Some(pos) = result.rfind(&placeholder) {
-            result.replace_range(pos..pos + placeholder.len(), content);
+            let content = strip_terminal_control_sequences(content);
+            result.replace_range(pos..pos + placeholder.len(), &content);
         }
     }
     result
