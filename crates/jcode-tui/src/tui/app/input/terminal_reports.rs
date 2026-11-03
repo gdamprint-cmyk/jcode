@@ -114,6 +114,94 @@ pub(in crate::tui::app) fn strip_terminal_control_sequences(
     std::borrow::Cow::Owned(cleaned)
 }
 
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse report format)
+// reference: crates/jcode-tui/src/tui/app/input.rs `scrub_osc_color_replies` (the same
+//   buffer-level scrub pattern: strip a complete reply out of the accumulated draft and
+//   remap the cursor onto the cleaned text)
+/// Length of a report-shaped run that starts at `bytes[0]`, or `None` when the
+/// run could plausibly be text the user typed.
+///
+/// A bare report run is anchored on `[` (the CSI introducer whose ESC was
+/// consumed by a torn read) or on `<` (the SGR mouse tail whose `[` was
+/// consumed).
+fn report_run_length(bytes: &[u8]) -> Option<usize> {
+    match bytes.first()? {
+        b'[' => bare_terminal_report_length(bytes),
+        b'<' => bare_sgr_mouse_tail_length(bytes),
+        _ => None,
+    }
+}
+
+/// How far back a buffered report remnant may start and still be considered
+/// part of the insertion that just happened.
+const BUFFERED_REPORT_LOOKBACK: usize = 256;
+
+/// Remove terminal-report remnants that accumulated in the composer buffer
+/// across several insertions.
+///
+/// `strip_terminal_control_sequences` only sees one insertion at a time, so a
+/// report delivered character by character (a mouse report whose `<` lands in
+/// one key event and whose `35;120M` lands in later ones) is never recognized:
+/// every fragment is text-shaped on its own and the whole-run detector never
+/// fires. The accumulated run, however, is complete in the buffer, so it is
+/// recognized there instead.
+///
+/// Conservative by construction: only a run that includes the text just
+/// inserted is removed, and only when it starts within
+/// `BUFFERED_REPORT_LOOKBACK` bytes of that insertion. Text the user typed
+/// earlier and far away from the insertion point is never rewritten, and a
+/// run that does not include the new text was already complete (and already
+/// sanitized) before this insertion.
+///
+/// Returns the cleaned text and the cursor remapped onto it, or `None` when
+/// nothing matched.
+pub(in crate::tui::app) fn scrub_buffered_terminal_reports(
+    input: &str,
+    cursor: usize,
+    inserted_start: usize,
+) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    // Cheap pre-check: a report run always starts with `[` or `<`.
+    if !bytes.contains(&b'[') && !bytes.contains(&b'<') {
+        return None;
+    }
+    let window_start = super::floor_char_boundary(
+        input,
+        inserted_start.saturating_sub(BUFFERED_REPORT_LOOKBACK),
+    );
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut index = window_start;
+    while index < bytes.len() {
+        if let Some(len) = report_run_length(&bytes[index..]) {
+            let end = index + len;
+            if end > inserted_start {
+                ranges.push((index, end));
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let mut cleaned = String::with_capacity(input.len());
+    let mut new_cursor = cursor;
+    let mut last = 0usize;
+    for (start, end) in ranges {
+        cleaned.push_str(&input[last..start]);
+        if cursor >= end {
+            new_cursor -= end - start;
+        } else if cursor > start {
+            new_cursor -= cursor - start;
+        }
+        last = end;
+    }
+    cleaned.push_str(&input[last..]);
+    Some((cleaned, new_cursor))
+}
+
 /// Length of a CSI run starting at `bytes[0]` (the `[`), including its final
 /// byte, or `None` when the run is unterminated.
 ///
@@ -202,4 +290,3 @@ fn bare_sgr_mouse_tail_length(bytes: &[u8]) -> Option<usize> {
         _ => None,
     }
 }
-

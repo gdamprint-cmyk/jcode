@@ -1,6 +1,7 @@
 // reference: https://sw.kovidgoyal.net/kitty/keyboard-protocol/ (CSI u encoding)
 // reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse reports)
 use super::strip_terminal_control_sequences;
+use crate::tui::app::tests::create_test_app;
 
 /// Remnants of terminal reports must never reach the composer (#540).
 #[test]
@@ -140,4 +141,53 @@ fn borrows_when_nothing_to_strip() {
         strip_terminal_control_sequences("array[0] = 1"),
         std::borrow::Cow::Borrowed(_)
     ));
+}
+
+/// A mouse report delivered character by character must not reach the
+/// composer as literal text.
+///
+/// `strip_terminal_control_sequences` runs per insertion, so no single
+/// insertion ever holds the whole run and the per-string detector cannot
+/// fire. The buffer-level scrub is what keeps the remnant out.
+#[test]
+fn per_character_mouse_report_never_reaches_the_composer() {
+    // Feed the report the way the terminal does: one key event per
+    // character, through the same function the key path uses.
+    let mut app = create_test_app();
+    for ch in "<35;120M".chars() {
+        super::handle_text_input(&mut app, &ch.to_string());
+    }
+    assert_eq!(app.input, "", "the mouse report remnant must be scrubbed");
+    assert_eq!(app.cursor_pos, 0, "the cursor must follow the scrub");
+
+    // The same report behind real text: only the report disappears.
+    let mut app = create_test_app();
+    for ch in "hi<35;120M".chars() {
+        super::handle_text_input(&mut app, &ch.to_string());
+    }
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.cursor_pos, 2);
+
+    // The bracketed-paste and Kitty-report tails have the same per-character
+    // shape and are caught by the same buffer-level scrub.
+    for (report, expected) in [("[200~", ""), ("[101;1:3u", ""), ("<35;120m", "")] {
+        let mut app = create_test_app();
+        for ch in report.chars() {
+            super::handle_text_input(&mut app, &ch.to_string());
+        }
+        assert_eq!(app.input, expected, "report {report:?}");
+    }
+}
+
+/// The buffer-level scrub must never eat text the user actually typed.
+#[test]
+fn per_character_path_preserves_ordinary_text() {
+    for text in ["array[0]", "a<1;b", "list[1] = list[2]", "[TODO] fix this"] {
+        let mut app = create_test_app();
+        for ch in text.chars() {
+            super::handle_text_input(&mut app, &ch.to_string());
+        }
+        assert_eq!(app.input, text, "text {text:?} must survive verbatim");
+        assert_eq!(app.cursor_pos, text.len());
+    }
 }

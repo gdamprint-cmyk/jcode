@@ -651,6 +651,7 @@ impl App {
 }
 
 pub(super) use terminal_reports::strip_terminal_control_sequences;
+use terminal_reports::scrub_buffered_terminal_reports as scrub_buffered_terminal_reports_in_buffer;
 
 /// Remove late OSC 10/11 color replies that the terminal delivered as keys.
 ///
@@ -666,6 +667,28 @@ fn scrub_osc_color_replies(app: &mut App) {
         return;
     }
     let Some((cleaned, cursor)) = strip_osc_color_replies(&app.input, app.cursor_pos) else {
+        return;
+    };
+    app.input = cleaned;
+    app.cursor_pos = cursor;
+}
+
+/// Remove terminal-report remnants that accumulated in the draft across
+/// several insertions.
+///
+/// `strip_terminal_control_sequences` runs per insertion, so a report that the
+/// terminal delivers character by character (a mouse report whose `<` lands
+/// in one key event and whose `35;120M` lands in later ones) is never
+/// recognized: every fragment is text-shaped on its own. The accumulated run
+/// is complete in the buffer, so it is recognized there instead.
+///
+/// Only a run that includes the text just inserted is removed, and only when
+/// it starts close to that insertion, so text the user typed earlier is never
+/// rewritten.
+fn scrub_buffered_terminal_reports(app: &mut App, inserted_start: usize) {
+    let Some((cleaned, cursor)) =
+        scrub_buffered_terminal_reports_in_buffer(&app.input, app.cursor_pos, inserted_start)
+    else {
         return;
     };
     app.input = cleaned;
@@ -814,8 +837,10 @@ fn insert_input_text_with_undo(app: &mut App, text: &str, typed: bool) {
         app.cursor_pos = app.input.len();
     }
 
+    let inserted_start = app.cursor_pos;
     app.input.insert_str(app.cursor_pos, text);
     app.cursor_pos += text.len();
+    scrub_buffered_terminal_reports(app, inserted_start);
     scrub_osc_color_replies(app);
 
     // Typing the final command character immediately arms picker filtering.
