@@ -476,11 +476,15 @@ pub(crate) fn reapply_terminal_modes_to(
         if MOUSE_TRACKING_ENABLED {
             writer.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")?;
         } else {
-            // The VT mouse-tracking modes are NOT enabled on Windows: crossterm
-            // has no escape-sequence mouse parser there, so every report would
-            // arrive as literal text and land in the composer as symbols. The
-            // reset forms are written instead, so a terminal left in
+            // The VT mouse-tracking modes are NOT enabled on Windows. crossterm
+            // has no escape-sequence mouse parser there, so every SGR report
+            // would arrive as literal text and land in the composer as symbols.
+            // The reset forms are written instead, so a terminal left in
             // mouse-tracking mode by an earlier run stops reporting the mouse.
+            //
+            // `EnableMouseCapture` above is unaffected: crossterm routes it
+            // through the console API (ENABLE_MOUSE_INPUT) on Windows, which is
+            // the path crossterm can actually parse.
             writer.write_all(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l")?;
         }
     }
