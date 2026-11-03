@@ -141,6 +141,25 @@ pub(crate) const KITTY_KEYBOARD_SUPPORTED: bool = false;
 #[cfg(not(windows))]
 pub(crate) const KITTY_KEYBOARD_SUPPORTED: bool = true;
 
+/// Whether the VT mouse-tracking modes can be used on this platform.
+///
+/// crossterm parses mouse reports from escape sequences only in its Unix
+/// implementation (`event/sys/unix/parse.rs`); the Windows backend reads Win32
+/// console records and has no escape-sequence mouse parser at all. A terminal
+/// that reports the mouse in SGR form therefore hands the report to the
+/// application as literal text, and the mouse position lands in the composer
+/// as symbols. A multiplexer such as herdr forwards the bytes verbatim, so the
+/// noise appears there in full.
+///
+/// The modes are therefore never enabled on Windows: the reports could not be
+/// parsed there in the first place. Crossterm's own `EnableMouseCapture` uses
+/// the console API (`ENABLE_MOUSE_INPUT`), which is the path a native console
+/// host uses and which crossterm does parse.
+#[cfg(windows)]
+pub(crate) const MOUSE_TRACKING_ENABLED: bool = false;
+#[cfg(not(windows))]
+pub(crate) const MOUSE_TRACKING_ENABLED: bool = true;
+
 /// Clear any Kitty keyboard flags the terminal may still have armed.
 ///
 /// This is the `set` form with an empty flag set, which removes every
@@ -454,10 +473,16 @@ pub(crate) fn reapply_terminal_modes_to(
     }
     if mouse_capture {
         writer.queue(EnableMouseCapture)?;
-        // Crossterm toggles Win32 console mouse input on Windows, but ConPTY
-        // hosts such as VS Code also need the VT tracking modes reasserted.
-        #[cfg(windows)]
-        writer.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")?;
+        if MOUSE_TRACKING_ENABLED {
+            writer.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")?;
+        } else {
+            // The VT mouse-tracking modes are NOT enabled on Windows: crossterm
+            // has no escape-sequence mouse parser there, so every report would
+            // arrive as literal text and land in the composer as symbols. The
+            // reset forms are written instead, so a terminal left in
+            // mouse-tracking mode by an earlier run stops reporting the mouse.
+            writer.write_all(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l")?;
+        }
     }
     if keyboard_enhanced {
         reapply_keyboard_enhancement_to(writer, inside_tmux())?;
@@ -567,7 +592,13 @@ mod terminal_mode_tests {
             &mut output,
             false
         ));
-        assert_eq!(output, b"\x1b[<1u");
+        if super::KITTY_KEYBOARD_SUPPORTED {
+            assert_eq!(output, b"\x1b[<1u");
+        } else {
+            // On Windows the protocol is never armed, so the cleanup clears the
+            // terminal's flags instead of popping a stack entry it does not own.
+            assert_eq!(output, b"\x1b[=0u");
+        }
 
         reset_keyboard_enhancement_ownership_for_test();
     }
@@ -692,7 +723,11 @@ mod terminal_mode_tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\x1b[?2004h"));
         assert!(output.contains("\x1b[?1004h"));
-        assert!(output.contains("\x1b[?1000h"));
+        assert_eq!(
+            output.contains("\x1b[?1000h"),
+            super::MOUSE_TRACKING_ENABLED,
+            "the VT mouse-tracking modes must follow the platform capability"
+        );
         assert!(output.contains("\x1b[="), "must set Kitty keyboard flags");
         assert!(
             !output.contains("\x1b[>7u"),
@@ -722,7 +757,11 @@ mod terminal_mode_tests {
                     !output.contains("\x1b[?1004l"),
                     "must keep focus reporting enabled"
                 );
-                assert_eq!(output.contains("\x1b[?1000h"), mouse_capture);
+                assert_eq!(
+                    output.contains("\x1b[?1000h"),
+                    mouse_capture && super::MOUSE_TRACKING_ENABLED,
+                    "the VT mouse-tracking modes must follow the platform capability"
+                );
                 if super::KITTY_KEYBOARD_SUPPORTED {
                     assert_eq!(output.contains("\x1b[=7u"), keyboard_enhanced);
                 } else {

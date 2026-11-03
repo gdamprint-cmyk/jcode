@@ -1,3 +1,7 @@
+// reference: https://sw.kovidgoyal.net/kitty/keyboard-protocol/ (CSI u encoding)
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse reports)
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event/sys/unix/parse.rs (upstream parser that does decode these forms)
+
 /// Strip terminal escape-sequence remnants from text headed for the composer.
 ///
 /// Mouse reporting, bracketed paste, and focus events all arrive as CSI
@@ -33,7 +37,15 @@ pub(in crate::tui::app) fn strip_terminal_control_sequences(
             *byte == b'[' && bare_terminal_report_length(&bytes[index..]).is_some()
         })
     };
-    if !looks_suspicious && !has_csi_run {
+    // The same torn-read tail, without its introducer: an SGR mouse report. It is
+    // text-shaped, so it is only detectable by its own grammar.
+    let has_bare_tail = {
+        let bytes = text.as_bytes();
+        bytes.iter().enumerate().any(|(index, byte)| {
+            *byte == b'<' && bare_sgr_mouse_tail_length(&bytes[index..]).is_some()
+        })
+    };
+    if !looks_suspicious && !has_csi_run && !has_bare_tail {
         return std::borrow::Cow::Borrowed(text);
     }
 
@@ -71,6 +83,15 @@ pub(in crate::tui::app) fn strip_terminal_control_sequences(
         // A bare report-shaped run left behind by a torn read.
         if byte == b'['
             && let Some(len) = bare_terminal_report_length(&bytes[index..])
+        {
+            index += len;
+            continue;
+        }
+        // A bare SGR mouse-report tail left behind by a torn read: the
+        // introducer and the `[` were consumed by the previous read, so only
+        // `<button;column;rowM` remains.
+        if byte == b'<'
+            && let Some(len) = bare_sgr_mouse_tail_length(&bytes[index..])
         {
             index += len;
             continue;
@@ -128,14 +149,57 @@ fn bare_terminal_report_length(bytes: &[u8]) -> Option<usize> {
     if params.is_empty() {
         return None;
     }
-    // Mouse/paste/cursor/focus reports carry digits, `;`, and an optional
+    // Mouse/paste/cursor/focus reports carry digits, `;`, `:`, and an optional
     // leading `<`. Reject anything with other parameter bytes.
-    if !params
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || *byte == b';' || *byte == b'<')
-    {
+    if !params.iter().all(|byte| {
+        byte.is_ascii_digit() || *byte == b';' || *byte == b':' || *byte == b'<'
+    }) {
         return None;
     }
-    const REPORT_FINALS: [u8; 6] = *b"Mm~RIO";
+    // The finals terminals emit for the reporting modes jcode enables, plus
+    // `u` for the Kitty keyboard protocol's `CSI number;modifiers:event-type u`.
+    const REPORT_FINALS: [u8; 7] = *b"Mm~RIOu";
     REPORT_FINALS.contains(&bytes[len - 1]).then_some(len)
 }
+
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse report format)
+/// Length of a bare SGR mouse-report tail, or `None` when the run could
+/// plausibly be text the user typed.
+///
+/// An SGR mouse report is `CSI < button ; column ; row (M|m)`. When a read
+/// is torn between the introducer and the body, the tail arrives alone: the
+/// `[` may have been consumed by the previous read, leaving `<35;120M` at the
+/// start of the text. The `[`-anchored detector above cannot see that run, so
+/// the mouse position lands in the composer as literal symbols.
+///
+/// This form is unmistakable: a leading `<`, at least one digit, `;`
+/// separators, and a final `M`/`m`. Ordinary text never starts with `<`
+/// followed by digits and ends with `M`, so the match stays narrow.
+fn bare_sgr_mouse_tail_length(bytes: &[u8]) -> Option<usize> {
+    debug_assert_eq!(bytes.first(), Some(&b'<'));
+    let mut index = 1usize;
+    let mut saw_digit = false;
+    let mut saw_separator = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_digit() {
+            saw_digit = true;
+            index += 1;
+            continue;
+        }
+        if byte == b';' {
+            saw_separator = true;
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if !saw_digit || !saw_separator {
+        return None;
+    }
+    match bytes.get(index) {
+        Some(b'M') | Some(b'm') => Some(index + 1),
+        _ => None,
+    }
+}
+

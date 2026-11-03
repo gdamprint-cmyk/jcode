@@ -1,3 +1,5 @@
+// reference: https://sw.kovidgoyal.net/kitty/keyboard-protocol/ (CSI u encoding)
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (SGR 1006 mouse reports)
 use super::strip_terminal_control_sequences;
 
 /// Remnants of terminal reports must never reach the composer (#540).
@@ -9,6 +11,18 @@ fn strips_escape_and_bare_report_remnants() {
         ("[<65;50;24M", ""),
         ("hi[<65;50;24Mthere", "hithere"),
         ("[<65;50;24m", ""),
+
+        // A torn SGR mouse report whose `[` was consumed by the previous read:
+        // the mouse position arrives as bare text and must not reach the
+        // composer.
+        ("<35;120M", ""),
+        ("hi<35;120Mthere", "hithere"),
+        ("<35;120m", ""),
+        // A torn Kitty key report whose `ESC` was consumed by the previous read:
+        // the key tail arrives as bare text.
+        ("[101;1:3u", ""),
+        ("hi[101;1:3u there", "hi there"),
+        ("[97;1u", ""),
         // Bracketed paste markers and cursor/focus reports.
         ("[200~", ""),
         ("[201~", ""),
@@ -27,6 +41,28 @@ fn strips_escape_and_bare_report_remnants() {
             strip_terminal_control_sequences(input),
             expected,
             "input {input:?} should sanitize to {expected:?}"
+        );
+    }
+}
+
+/// The bare-tail detectors must not eat text a user actually typed.
+#[test]
+fn preserves_ordinary_text_that_looks_sgr_like() {
+    for input in [
+        "a < b",
+        "<3",
+        "<3;4",
+        "x<y",
+        "version 1;2u",
+        "3u",
+        "42",
+        "u",
+        "http://example.com/a?b=1;c=2",
+    ] {
+        assert_eq!(
+            strip_terminal_control_sequences(input),
+            input,
+            "input {input:?} must be preserved verbatim"
         );
     }
 }
