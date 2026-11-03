@@ -191,3 +191,25 @@ fn per_character_path_preserves_ordinary_text() {
         assert_eq!(app.cursor_pos, text.len());
     }
 }
+
+/// A focus report has NO parameter bytes: `CSI I` is just `[` + `I`. The
+/// scrub grammar therefore cannot recognise it, and must NOT try to: a bare
+/// `[I` / `[O` is ordinary text the user can type (a list index, a markdown
+/// link, Rust array indexing).
+///
+/// The focus report is stopped at the source instead: on Windows the
+/// focus-reporting mode is never enabled, so the terminal never sends the
+/// report at all. See `FOCUS_REPORTING_ENABLED` in `crate::tui::mod`.
+#[test]
+fn focus_report_shape_is_ordinary_text_and_must_survive() {
+    // The negative control: these are all real text a user can type, and
+    // they must reach the composer verbatim, character by character.
+    for text in ["[I]", "arr[I]", "x[O]", "[TODO]", "[I](https://example.com)"] {
+        let mut app = create_test_app();
+        for ch in text.chars() {
+            super::handle_text_input(&mut app, &ch.to_string());
+        }
+        assert_eq!(app.input, text, "text {text:?} must survive verbatim");
+        assert_eq!(app.cursor_pos, text.len());
+    }
+}

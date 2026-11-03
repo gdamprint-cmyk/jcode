@@ -1,3 +1,7 @@
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event.rs (the terminal-mode commands: EnableFocusChange writes `CSI ?1004h`, EnableMouseCapture routes through the console API on Windows)
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event/sys/unix/parse.rs (the escape-sequence parsers for focus, mouse and Kitty reports that exist only in the Unix backend)
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event/source/windows.rs (the console-API FocusEvent path Windows uses instead)
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (focus reporting mode 1004, SGR 1006 mouse reports)
 pub mod account_picker;
 pub(crate) mod app;
 pub mod justrust_status;
@@ -159,6 +163,61 @@ pub(crate) const KITTY_KEYBOARD_SUPPORTED: bool = true;
 pub(crate) const MOUSE_TRACKING_ENABLED: bool = false;
 #[cfg(not(windows))]
 pub(crate) const MOUSE_TRACKING_ENABLED: bool = true;
+
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event/sys/unix/parse.rs (the focus-report parser that exists only in the Unix backend)
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event/source/windows.rs (the console-API FocusEvent path that Windows uses instead)
+// reference: https://github.com/crossterm-rs/crossterm/blob/master/src/event.rs (EnableFocusChange writes `CSI ?1004h`)
+// reference: https://invisible-island.net/xterm/ctlseqs/ctlseqs.pdf (focus reporting mode 1004)
+/// Whether the VT focus-reporting mode can be used on this platform.
+///
+/// crossterm decodes a focus report (`CSI I` / `CSI O`) from an escape
+/// sequence only in its Unix implementation (`event/sys/unix/parse.rs`);
+/// the Windows backend reads Win32 console records and its escape parser
+/// (`event/sys/windows/parse.rs`) has no `I`/`O` case at all. A terminal that
+/// reports focus in that form therefore hands the report to the application
+/// as literal text, and the tail of the report lands in the composer as
+/// symbols (`[I` or `[O`). A multiplexer such as herdr forwards the bytes
+/// verbatim, so the noise appears there in full.
+///
+/// The mode is therefore never enabled on Windows: the reports could not be
+/// parsed there in the first place, and the focus report has no parameter
+/// bytes, so the tail cannot be told apart from text the user typed. The
+/// reset form is written instead, so a terminal left in focus-reporting mode
+/// by an earlier run stops reporting focus.
+///
+/// Focus events themselves are unaffected: crossterm's Windows backend
+/// delivers them through the console API (`InputRecord::FocusEvent`, see
+/// `event/source/windows.rs`), which is the path crossterm can parse. The
+/// `CSI ?1004h` mode is what makes a terminal send the *escape-sequence*
+/// form that this platform cannot decode.
+#[cfg(windows)]
+pub const FOCUS_REPORTING_ENABLED: bool = false;
+#[cfg(not(windows))]
+pub const FOCUS_REPORTING_ENABLED: bool = true;
+
+/// Write the focus-reporting mode for this platform.
+///
+/// The enable form is `CSI ?1004h` and the reset form is `CSI ?1004l`.
+pub fn write_focus_reporting_mode_to(
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    write_focus_reporting_mode_to_with(writer, FOCUS_REPORTING_ENABLED)
+}
+
+/// Write the focus-reporting mode for the given capability.
+///
+/// Split out from [`write_focus_reporting_mode_to`] so both forms can be
+/// asserted on any host, not only on the platform that selects them.
+pub fn write_focus_reporting_mode_to_with(
+    writer: &mut impl std::io::Write,
+    enabled: bool,
+) -> std::io::Result<()> {
+    if enabled {
+        writer.write_all(b"\x1b[?1004h")
+    } else {
+        writer.write_all(b"\x1b[?1004l")
+    }
+}
 
 /// Clear any Kitty keyboard flags the terminal may still have armed.
 ///
@@ -465,11 +524,15 @@ pub(crate) fn reapply_terminal_modes_to(
     focus_change: bool,
 ) -> std::io::Result<()> {
     use crossterm::QueueableCommand;
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
 
     writer.queue(EnableBracketedPaste)?;
     if focus_change {
-        writer.queue(EnableFocusChange)?;
+        // The VT focus-reporting mode is platform dependent. On Windows the
+        // reset form is written instead of the enable form, because crossterm
+        // cannot decode a focus report from an escape sequence there and the
+        // report's tail would land in the composer as literal text.
+        write_focus_reporting_mode_to(writer)?;
     }
     if mouse_capture {
         writer.queue(EnableMouseCapture)?;
@@ -714,7 +777,16 @@ mod terminal_mode_tests {
         reapply_terminal_modes_to(&mut output, false, true, true).unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("\x1b[?2004h\x1b[?1004h"));
+        // The focus-reporting form follows the platform capability: the
+        // enable form where crossterm can decode a focus report, the reset
+        // form where it cannot (the report tail would otherwise land in the
+        // composer as literal text).
+        let focus_form = if super::FOCUS_REPORTING_ENABLED {
+            "\x1b[?1004h"
+        } else {
+            "\x1b[?1004l"
+        };
+        assert!(output.starts_with(&format!("\x1b[?2004h{focus_form}")));
         assert!(!output.contains("\x1b[?1000h"));
         assert!(output.contains("\x1b[="));
     }
@@ -726,7 +798,11 @@ mod terminal_mode_tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\x1b[?2004h"));
-        assert!(output.contains("\x1b[?1004h"));
+        assert_eq!(
+            output.contains("\x1b[?1004h"),
+            super::FOCUS_REPORTING_ENABLED,
+            "the focus-reporting form must follow the platform capability"
+        );
         assert_eq!(
             output.contains("\x1b[?1000h"),
             super::MOUSE_TRACKING_ENABLED,
@@ -736,6 +812,44 @@ mod terminal_mode_tests {
         assert!(
             !output.contains("\x1b[>7u"),
             "must not push the Kitty keyboard stack"
+        );
+    }
+
+    #[test]
+    fn focus_reporting_writes_the_form_the_platform_can_parse() {
+        // The Windows branch must write the RESET form, so the terminal never
+        // sends a focus report that crossterm cannot decode there, and the
+        // report's tail cannot land in the composer as literal text.
+        let mut windows = Vec::new();
+        super::write_focus_reporting_mode_to_with(&mut windows, false).unwrap();
+        let windows = String::from_utf8(windows).unwrap();
+        assert_eq!(windows, "\x1b[?1004l");
+        assert!(windows.contains("\x1b[?1004l"));
+        assert!(
+            !windows.contains("\x1b[?1004h"),
+            "the Windows branch must not write the focus-reporting enable form"
+        );
+
+        // The Unix branch keeps the enable form, where crossterm does decode a
+        // focus report from an escape sequence.
+        let mut unix = Vec::new();
+        super::write_focus_reporting_mode_to_with(&mut unix, true).unwrap();
+        let unix = String::from_utf8(unix).unwrap();
+        assert_eq!(unix, "\x1b[?1004h");
+        assert!(unix.contains("\x1b[?1004h"));
+        assert!(
+            !unix.contains("\x1b[?1004l"),
+            "the Unix branch must not write the focus-reporting reset form"
+        );
+
+        // The platform-selected helper must agree with the capability const.
+        let mut selected = Vec::new();
+        super::write_focus_reporting_mode_to(&mut selected).unwrap();
+        let selected = String::from_utf8(selected).unwrap();
+        assert_eq!(
+            selected.contains("\x1b[?1004h"),
+            super::FOCUS_REPORTING_ENABLED,
+            "the focus-reporting form must follow the platform capability"
         );
     }
 

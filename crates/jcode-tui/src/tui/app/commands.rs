@@ -3282,7 +3282,7 @@ fn suspend_terminal_for_editor() {
 }
 
 fn resume_terminal_after_editor() {
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
 
     // Defense in depth for the run_interactive_editor_with early return: a
     // termination signal already recorded that the process is exiting, so
@@ -3299,7 +3299,10 @@ fn resume_terminal_after_editor() {
     let policy = crate::perf::tui_policy();
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     if policy.enable_focus_change {
-        let _ = crossterm::execute!(std::io::stdout(), EnableFocusChange);
+        // Platform dependent: on Windows the reset form is written, because a
+        // focus report cannot be decoded there and its tail would land in the
+        // composer as literal text.
+        let _ = crate::tui::write_focus_reporting_mode_to(&mut std::io::stdout());
     }
     if policy.enable_mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);

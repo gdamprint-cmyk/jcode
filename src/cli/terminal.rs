@@ -411,7 +411,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         }
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -435,7 +435,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         };
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
