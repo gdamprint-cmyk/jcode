@@ -909,3 +909,81 @@ fn grok_build_subscription_request_spoofs_grok_cli_and_uses_oidc_bearer() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert!(body.get("reasoning_effort").is_none());
 }
+
+/// MiniMax only separates thinking into `reasoning_content` when
+/// `reasoning_split` is true.
+///
+/// Without the field, MiniMax-M3 and the M2.x family return their thinking
+/// INSIDE `content` wrapped in `<think>` tags. Jcode's stream parser reads only
+/// `delta.reasoning_content`, so the reasoning text was rendered as ordinary
+/// assistant text. MiniMax-M3.1-Flash goes further and REQUIRES
+/// `reasoning_split: true` - `reasoning_split: false` is answered with HTTP 400
+/// "requires reasoning_split=true".
+///
+/// Measured live on 2026-11-03 against api.minimax.io:
+///   M3.1-Flash split=omitted -> reasoning_content=286, no think tags
+///   M3         split=omitted -> reasoning_content=None, 1 think tag
+///   M3         split=true    -> reasoning_content=233, no think tags
+///   M2.7       split=true    -> reasoning_content=189, no think tags
+#[test]
+fn minimax_requests_split_reasoning_into_the_reasoning_content_field() {
+    let _lock = ENV_LOCK.lock();
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let minimax = OpenRouterProvider {
+        api_base,
+        profile_id: Some("minimax".into()),
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+    minimax.set_model("MiniMax-M3.1-Flash").unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut stream = minimax.complete(&[], &[], "test", None).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    });
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        request.contains(r#""reasoning_split":true"#),
+        "the MiniMax profile must ask for split reasoning: {request}"
+    );
+}
+
+/// The `reasoning_split` field belongs to MiniMax only. Another OpenAI-
+/// compatible profile must not receive it, because strict OpenAI-schema
+/// endpoints reject unknown top-level fields.
+#[test]
+fn reasoning_split_is_not_sent_to_other_openai_compatible_profiles() {
+    let _lock = ENV_LOCK.lock();
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let other = OpenRouterProvider {
+        api_base,
+        profile_id: Some("some-other-profile".into()),
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+    other.set_model("some-model").unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut stream = other.complete(&[], &[], "test", None).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    });
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        !request.contains("reasoning_split"),
+        "only the MiniMax profile may send reasoning_split: {request}"
+    );
+}
