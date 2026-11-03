@@ -329,3 +329,43 @@ async fn spawn_target_creates_one_child_session_and_runs_task() {
                 .contains("Spawned session handled task.")
     }));
 }
+
+/// A stopped ambient loop must be revivable without restarting the process.
+///
+/// `stop()` sets the persisted status to `Disabled`. The loop task stays alive
+/// (the loop is infinite), but `ambient_allowed()` is false for `Disabled`, so
+/// no cycle runs. Before the fix, `start()` returned false because the
+/// `running` flag was still true and `trigger()` ignored `Disabled`, so the
+/// only way back was a process restart. Measured 2026-11-03.
+#[tokio::test]
+async fn trigger_revives_a_disabled_ambient_status() {
+    let _guard = crate::storage::lock_test_env();
+    let _cache = ResetConfigCache;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _enabled = EnvVarGuard::unset("JCODE_AMBIENT_ENABLED");
+    let path = Config::path().expect("config path");
+    std::fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
+    std::fs::write(&path, "[ambient]\nenabled = true\n")
+        .expect("write ambient config");
+    Config::invalidate_cache();
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+
+    // Put the runner in the state `stop()` leaves behind.
+    {
+        let mut state = runner.inner.state.write().await;
+        state.status = AmbientStatus::Disabled;
+    }
+    assert!(
+        matches!(runner.state().await.status, AmbientStatus::Disabled),
+        "precondition: the runner must start Disabled"
+    );
+
+    runner.trigger().await;
+
+    assert!(
+        matches!(runner.state().await.status, AmbientStatus::Idle),
+        "trigger() must revive a Disabled ambient status so the loop can run again"
+    );
+}
