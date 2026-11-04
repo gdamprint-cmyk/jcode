@@ -357,7 +357,22 @@ impl NariSession {
                     .await
                     .map_err(handshake_error)?;
             super::timing::mark("nari websocket connected");
-            send(&mut socket, json!({"type":"session.configure", "session":{"model":"qwen3-asr-fast", "turn_detection":null, "language":"en", "prompt":prompt}})).await?;
+            // The provider's `language` field is a TRANSCRIPTION instruction,
+            // not a hint: with "en" it translated Russian speech into English
+            // (measured 2026-11-04, same audio, only this field differed).
+            let language = {
+                let configured = jcode_base::config::config()
+                    .dictation
+                    .language
+                    .trim()
+                    .to_ascii_lowercase();
+                if configured.len() == 2 && configured.bytes().all(|b| b.is_ascii_lowercase()) {
+                    configured
+                } else {
+                    "en".to_string()
+                }
+            };
+            send(&mut socket, json!({"type":"session.configure", "session":{"model":"qwen3-asr-fast", "turn_detection":null, "language":language, "prompt":prompt}})).await?;
             loop {
                 let event = receive(&mut socket).await?;
                 match event["type"].as_str() {

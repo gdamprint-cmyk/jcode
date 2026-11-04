@@ -996,6 +996,13 @@ pub struct DictationConfig {
     /// (Linux evdev nodes, preferably stable `/dev/input/by-id/...` paths).
     /// Empty disables the companion's global voice listener.
     pub global_devices: Vec<std::path::PathBuf>,
+    /// Language of the built-in voice input, as an ISO 639-1 code sent to the
+    /// transcription provider (`ru`, `en`, `de`, ...). Empty means "en".
+    ///
+    /// Measured 2026-11-04: with a hardcoded `language: "en"` the provider
+    /// TRANSLATED Russian speech into English instead of transcribing it. The
+    /// same recording came back English under "en" and Russian under "ru".
+    pub language: String,
 }
 
 impl Default for DictationConfig {
@@ -1008,6 +1015,7 @@ impl Default for DictationConfig {
             vocabulary: Vec::new(),
             recorder: String::new(),
             global_devices: Vec::new(),
+            language: String::new(),
         }
     }
 }
