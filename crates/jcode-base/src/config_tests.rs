@@ -1,3 +1,8 @@
+// reference: no prior art, searched the jcode repo for an existing
+// per-backend memory kill switch; the env-override pattern is the one in
+// crates/jcode-base/src/config/env_overrides.rs, and the sibling test
+// `mermaid_environment_override_uses_standard_boolean_values` below is
+// the shape this test follows.
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
     McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
@@ -207,6 +212,62 @@ fn mermaid_environment_override_uses_standard_boolean_values() {
     assert!(!cfg.features.mermaid);
 
     restore_env_var("JCODE_ENABLE_MERMAID", previous);
+}
+
+/// The Hindsight backend must survive `JCODE_MEMORY_ENABLED=false`.
+///
+/// MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false` in the
+/// user environment. That flag was written for the JEV backend, whose recall
+/// costs a model call per query and was therefore turned off for cost. The
+/// Hindsight backend makes NO model call (local pgvector + BM25 + graph +
+/// a local cross-encoder reranker), so the flag must not disable it.
+///
+/// The symptom this pins: with the flag on, `features.memory` was false, so
+/// `build_memory_prompt_nonblocking_shared` returned early and the memory
+/// pipeline never ran at all. Nothing was injected, nothing was consumed,
+/// and the memory log stayed silent - which reads exactly like "memory
+/// arrives too late and gets ignored".
+#[test]
+fn hindsight_backend_survives_the_jev_era_memory_disabled_flag() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_memory = std::env::var_os("JCODE_MEMORY_ENABLED");
+    let previous_hindsight = std::env::var_os("JCODE_HINDSIGHT_MEMORY_ENABLED");
+
+    crate::env::set_var("JCODE_MEMORY_ENABLED", "false");
+
+    // Hindsight selected + the explicit hindsight switch on: memory must run.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "true");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.features.memory,
+        "the Hindsight backend must run even when the native pipeline is off"
+    );
+
+    // The explicit switch off: memory must not run.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "false");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "JCODE_HINDSIGHT_MEMORY_ENABLED=false must disable the Hindsight backend"
+    );
+
+    // A different backend still follows the global flag: the Hindsight switch
+    // must not silently re-enable the JEV path.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "true");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "jev".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "the JEV backend must still follow JCODE_MEMORY_ENABLED"
+    );
+
+    restore_env_var("JCODE_HINDSIGHT_MEMORY_ENABLED", previous_hindsight);
+    restore_env_var("JCODE_MEMORY_ENABLED", previous_memory);
 }
 
 #[test]

@@ -353,7 +353,38 @@ impl Config {
         // Features
         if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
             if let Some(parsed) = parse_env_bool(&v) {
-                self.features.memory = parsed;
+                // MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false`
+                // in the user environment. That flag was written for the JEV
+                // backend, whose recall costs a model call per query and was
+                // therefore turned off for cost. The Hindsight backend makes NO
+                // model call (local pgvector + BM25 + graph + a local
+                // cross-encoder), so the same flag must not disable it.
+                //
+                // `JCODE_HINDSIGHT_MEMORY_ENABLED` was already present in the
+                // environment but referenced by NO code path, so it had no
+                // effect at all. It is now the explicit switch: `true` keeps
+                // the Hindsight backend running even when the native pipeline
+                // is off; `false` turns it off; unset follows the global flag.
+                let hindsight_selected = self
+                    .agents
+                    .memory_provider
+                    .eq_ignore_ascii_case("hindsight");
+                if hindsight_selected {
+                    match std::env::var("JCODE_HINDSIGHT_MEMORY_ENABLED") {
+                        Ok(hindsight_value) => {
+                            if let Some(hindsight_enabled) = parse_env_bool(&hindsight_value) {
+                                self.features.memory = hindsight_enabled;
+                            } else {
+                                self.features.memory = parsed;
+                            }
+                        }
+                        Err(_) => {
+                            self.features.memory = true;
+                        }
+                    }
+                } else {
+                    self.features.memory = parsed;
+                }
             }
         }
         if let Ok(v) = std::env::var("JCODE_SWARM_ENABLED") {
