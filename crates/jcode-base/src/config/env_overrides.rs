@@ -453,6 +453,14 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_MEMORY_JEV_PROVIDER") {
             self.agents.memory_jev_provider = v.trim().to_ascii_lowercase();
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_PROVIDER") {
+            self.agents.memory_provider = v.trim().to_ascii_lowercase();
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_HINDSIGHT_LIMIT") {
+            if let Ok(limit) = v.trim().parse::<usize>() {
+                self.agents.memory_hindsight_limit = limit;
+            }
+        }
         for (key, target) in [
             ("JCODE_MEMORY_JEV_MODEL", &mut self.agents.memory_jev_model),
             (

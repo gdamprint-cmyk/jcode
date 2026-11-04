@@ -264,10 +264,65 @@ impl MemoryAgent {
         {
             return Ok(());
         }
-        ss.last_query = Some(query);
+        ss.last_query = Some(query.clone());
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
         memory::clear_pending_memory(session_id);
+        // The Hindsight backend replaces the remote Jev model for RECALL.
+        // It is selected here rather than inside MemoryManager because the
+        // two backends produce different things: Jev selects entries from the
+        // LOCAL memory graph, Hindsight returns its own documents, which are
+        // not in that graph. Both end up in the same pending-memory store, so
+        // the injection, dedup and TTL machinery below is unchanged.
+        if crate::memory_hindsight::provider_enabled() {
+            let recall = match crate::memory_hindsight::recall_configured() {
+                Ok(config) => crate::memory_hindsight::recall(&config, query.as_str()),
+                Err(error) => {
+                    crate::memory_log::log_pending_discarded(
+                        session_id,
+                        &format!("hindsight recall config invalid: {error}"),
+                    );
+                    return Ok(());
+                }
+            };
+            match recall {
+                Ok(recall) => {
+                    if let Some(prompt) = crate::memory_hindsight::format_recall_block(&recall) {
+                        let count = recall.facts.len();
+                        let ids: Vec<String> = recall
+                            .facts
+                            .iter()
+                            .map(|fact| fact.id.clone())
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        // EXTERNAL publication: these memories live in the
+                        // Hindsight bank, not in the local graph, so the
+                        // project-scoped path would reject the selection.
+                        memory::set_pending_memory_external(
+                            session_id,
+                            prompt,
+                            count,
+                            ids,
+                            None,
+                            self.sessions
+                                .get(session_id)
+                                .and_then(|state| state.working_dir.as_deref()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::memory_log::log_pending_discarded(
+                        session_id,
+                        &format!("hindsight recall failed: {error}"),
+                    );
+                }
+            }
+            self.sessions
+                .entry(session_id.to_string())
+                .or_default()
+                .failed_at = None;
+            return Ok(());
+        }
         if !memory::memory_runtime_active() {
             return Ok(());
         }

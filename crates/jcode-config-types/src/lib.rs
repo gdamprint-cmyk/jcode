@@ -537,6 +537,23 @@ pub struct AgentsConfig {
     /// aimlapi, or jcode. Auto uses a provider-specific BYOK credential before Jcode.
     #[serde(default = "default_memory_jev_provider")]
     pub memory_jev_provider: String,
+    /// Retrieval backend for automatic memory recall: `jev` (remote Jev model,
+    /// the historical default) or `hindsight` (a self-hosted Hindsight server:
+    /// semantic + BM25 + graph + temporal arms fused by RRF, then a local
+    /// cross-encoder reranker). `hindsight` needs no model credentials and
+    /// makes no per-turn model call.
+    #[serde(default = "default_memory_provider")]
+    pub memory_provider: String,
+    /// Hindsight base URL when `memory_provider = "hindsight"`.
+    /// Unset = `http://127.0.0.1:8888`. Env: `HINDSIGHT_API_URL`.
+    pub memory_hindsight_url: Option<String>,
+    /// Hindsight bank id when `memory_provider = "hindsight"`.
+    /// Unset = `jcode-legacy`. Env: `HINDSIGHT_BANK`.
+    pub memory_hindsight_bank: Option<String>,
+    /// How many recalled facts to inject into the conversation. 0 disables
+    /// automatic recall entirely.
+    #[serde(default = "default_memory_hindsight_limit")]
+    pub memory_hindsight_limit: usize,
     /// Optional model override for memory Jev Decisions.
     pub memory_jev_model: Option<String>,
     /// Optional model override for browser Jev Decisions.
@@ -614,6 +631,14 @@ fn default_memory_jev_provider() -> String {
     "auto".to_string()
 }
 
+fn default_memory_provider() -> String {
+    "jev".to_string()
+}
+
+fn default_memory_hindsight_limit() -> usize {
+    8
+}
+
 fn default_memory_jev_threshold() -> f32 {
     0.8
 }
@@ -646,6 +671,10 @@ impl Default for AgentsConfig {
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
             memory_jev_provider: default_memory_jev_provider(),
+            memory_provider: default_memory_provider(),
+            memory_hindsight_url: None,
+            memory_hindsight_bank: None,
+            memory_hindsight_limit: default_memory_hindsight_limit(),
             memory_jev_model: None,
             browser_jev_model: None,
             voice_jev_model: None,

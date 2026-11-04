@@ -21,6 +21,13 @@ struct QueuedPendingMemory {
 struct PendingBinding {
     project_dir: Option<String>,
     snapshots: HashMap<String, MemorySnapshot>,
+    /// True when the memories come from an EXTERNAL backend (Hindsight) and
+    /// therefore do not exist in the local memory graph. Such a payload is
+    /// still bound to the project (so a session that changes directory does
+    /// not pick it up), but it is NOT re-validated against the local graph:
+    /// the local graph cannot know about a foreign document, and pretending
+    /// otherwise would discard every externally recalled memory.
+    external: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -243,7 +250,9 @@ fn take_pending_memory_inner(
         crate::memory_log::log_pending_discarded(session_id, "stale (>120s)");
         return None;
     }
-    if let Some(binding) = &queued.binding {
+    if let Some(binding) = &queued.binding
+        && !binding.external
+    {
         let valid =
             snapshot_selected_memories(binding.project_dir.as_deref(), &queued.pending.memory_ids)
                 .is_ok_and(|(current, _)| current == binding.snapshots);
@@ -368,6 +377,35 @@ pub fn set_pending_memory_for_project(
     );
 }
 
+/// Publish a memory payload that came from an EXTERNAL backend (Hindsight).
+///
+/// The payload is bound to the project so a session that changes directory
+/// does not pick it up, but it is not validated against the local memory
+/// graph: the documents live in the Hindsight bank, so the local graph
+/// cannot confirm or deny them. The document ids still drive the existing
+/// dedup/TTL bookkeeping, so the same fact is not injected twice.
+pub fn set_pending_memory_external(
+    session_id: &str,
+    prompt: String,
+    count: usize,
+    memory_ids: Vec<String>,
+    display_prompt: Option<String>,
+    project_dir: Option<&str>,
+) {
+    store_pending_memory(
+        session_id,
+        prompt,
+        count,
+        memory_ids,
+        display_prompt,
+        Some(PendingBinding {
+            project_dir: project_dir.map(str::to_owned),
+            snapshots: HashMap::new(),
+            external: true,
+        }),
+    );
+}
+
 /// Automatic publishers must retain the entries actually judged by Jev. A
 /// canonical prompt alone cannot detect tags-only edits while inference was in
 /// flight, because tags are model input but not part of the rendered prompt.
@@ -450,6 +488,7 @@ fn publish_scoped_memory(
         Some(PendingBinding {
             project_dir: project_dir.map(str::to_owned),
             snapshots,
+            external: false,
         }),
     );
 }

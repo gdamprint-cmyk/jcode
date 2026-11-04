@@ -44,7 +44,12 @@ impl Drop for TestEnv {
 #[tokio::test]
 async fn missing_jev_access_clears_pending_without_fallback() {
     let _lock = crate::storage::lock_test_env();
-    let _env = TestEnv::set(&[("JCODE_MEMORY_JEV_PROVIDER", "disabled-for-test")]);
+    // Pin the provider: with `hindsight` selected this test would make a
+    // live HTTP call instead of exercising the Jev fallback path.
+    let _env = TestEnv::set(&[
+        ("JCODE_MEMORY_JEV_PROVIDER", "disabled-for-test"),
+        ("JCODE_MEMORY_PROVIDER", "jev"),
+    ]);
     let sid = "jev-agent-no-fallback";
     memory::set_pending_memory(sid, "stale result".into(), 1);
     let (_, rx) = mpsc::channel(1);
@@ -54,6 +59,62 @@ async fn missing_jev_access_clears_pending_without_fallback() {
         .await
         .unwrap();
     assert!(!memory::has_pending_memory(sid));
+}
+
+/// An externally recalled payload (Hindsight) must survive the project
+/// binding check AND the local-graph re-validation.
+///
+/// MEASURED 2026-11-04: both checks rejected the payload before this fix.
+/// The binding check compared `binding.project_dir` against the session's
+/// directory and found no binding at all on an unscoped publication, and the
+/// re-validation asked the LOCAL memory graph to confirm documents that live
+/// in the Hindsight bank - it cannot know about them, so it reported them as
+/// absent. The symptom was silent: nothing was ever injected.
+#[test]
+fn external_payload_survives_project_binding_and_local_graph_check() {
+    let _lock = crate::storage::lock_test_env();
+    let sid = "external-memory-binding-test";
+    let project = crate::storage::jcode_dir().expect("jcode dir").join("external-bind-test");
+    let project_dir = project.to_string_lossy().to_string();
+
+    // A Hindsight document id: it does NOT exist in the local memory graph.
+    memory::set_pending_memory_external(
+        sid,
+        "# Memory\n\n- the exact value is 42".into(),
+        1,
+        vec!["hindsight-doc-abc".into()],
+        None,
+        Some(&project_dir),
+    );
+
+    let pending = memory::take_pending_memory_for_project(sid, Some(&project_dir))
+        .expect("external payload must be taken for its own project");
+    assert!(pending.prompt.contains("the exact value is 42"));
+    assert_eq!(pending.memory_ids, vec!["hindsight-doc-abc".to_string()]);
+}
+
+/// An external payload is still BOUND to its project: a session that moved
+/// to another directory must not pick it up.
+#[test]
+fn external_payload_is_not_taken_by_a_different_project() {
+    let _lock = crate::storage::lock_test_env();
+    let sid = "external-memory-wrong-project-test";
+    let other = crate::storage::jcode_dir().expect("jcode dir").join("external-bind-other");
+    let other_dir = other.to_string_lossy().to_string();
+
+    memory::set_pending_memory_external(
+        sid,
+        "# Memory\n\n- a fact".into(),
+        1,
+        vec!["hindsight-doc-xyz".into()],
+        None,
+        Some(&other_dir),
+    );
+
+    assert!(
+        memory::take_pending_memory_for_project(sid, Some("C:\\somewhere\\else")).is_none(),
+        "a payload bound to another project must not be taken"
+    );
 }
 
 #[test]
