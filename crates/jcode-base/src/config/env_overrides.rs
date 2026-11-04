@@ -351,40 +351,53 @@ impl Config {
         }
 
         // Features
-        if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
-            if let Some(parsed) = parse_env_bool(&v) {
-                // MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false`
-                // in the user environment. That flag was written for the JEV
-                // backend, whose recall costs a model call per query and was
-                // therefore turned off for cost. The Hindsight backend makes NO
-                // model call (local pgvector + BM25 + graph + a local
-                // cross-encoder), so the same flag must not disable it.
-                //
-                // `JCODE_HINDSIGHT_MEMORY_ENABLED` was already present in the
-                // environment but referenced by NO code path, so it had no
-                // effect at all. It is now the explicit switch: `true` keeps
-                // the Hindsight backend running even when the native pipeline
-                // is off; `false` turns it off; unset follows the global flag.
-                let hindsight_selected = self
-                    .agents
-                    .memory_provider
-                    .eq_ignore_ascii_case("hindsight");
-                if hindsight_selected {
-                    match std::env::var("JCODE_HINDSIGHT_MEMORY_ENABLED") {
-                        Ok(hindsight_value) => {
-                            if let Some(hindsight_enabled) = parse_env_bool(&hindsight_value) {
-                                self.features.memory = hindsight_enabled;
-                            } else {
-                                self.features.memory = parsed;
-                            }
-                        }
-                        Err(_) => {
-                            self.features.memory = true;
-                        }
+        //
+        // reference: ~/.jcode/research/2026-11-04-hindsight-memory-backend-and-refresh.md
+        // reference: no prior art, searched the jcode repo and the Hindsight docs for an existing
+        // provider-scoped enable flag; the global JCODE_MEMORY_ENABLED switch has no per-backend
+        // equivalent, so the split below is the smallest change that keeps the two backends apart.
+        //
+        // MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false` in
+        // the user environment. That flag was written for the JEV backend,
+        // whose recall costs a model call per query and was therefore turned
+        // off for cost. The Hindsight backend makes NO model call (local
+        // pgvector + BM25 + graph + a local cross-encoder), so the same flag
+        // must not disable it.
+        //
+        // `JCODE_HINDSIGHT_MEMORY_ENABLED` was already present in the
+        // environment but referenced by NO code path, so it had no effect at
+        // all. It is now the explicit switch for the Hindsight backend and it
+        // is read INDEPENDENTLY of `JCODE_MEMORY_ENABLED`, so that:
+        //
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=true`  -> memory runs;
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=false` -> memory is off;
+        //   * unset / unparseable                   -> memory runs.
+        //
+        // The unset case means "enabled" on purpose. Falling back to the
+        // global flag would re-open the exact bug this branch fixes: the
+        // global flag is a JEV-cost switch, and a user who set it to false
+        // for that reason never asked for the local backend to be silenced.
+        // The only way to turn the Hindsight backend off is to say so.
+        let hindsight_selected = self
+            .agents
+            .memory_provider
+            .eq_ignore_ascii_case("hindsight");
+        if hindsight_selected {
+            match std::env::var("JCODE_HINDSIGHT_MEMORY_ENABLED") {
+                Ok(hindsight_value) => {
+                    if let Some(hindsight_enabled) = parse_env_bool(&hindsight_value) {
+                        self.features.memory = hindsight_enabled;
+                    } else {
+                        self.features.memory = true;
                     }
-                } else {
-                    self.features.memory = parsed;
                 }
+                Err(_) => {
+                    self.features.memory = true;
+                }
+            }
+        } else if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.memory = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_SWARM_ENABLED") {

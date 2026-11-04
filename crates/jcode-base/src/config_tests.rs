@@ -255,6 +255,36 @@ fn hindsight_backend_survives_the_jev_era_memory_disabled_flag() {
         "JCODE_HINDSIGHT_MEMORY_ENABLED=false must disable the Hindsight backend"
     );
 
+    // The explicit switch off must also work when the global flag is ABSENT,
+    // which is the normal case for a machine that never set the JEV-cost
+    // switch. Reading the Hindsight switch only inside the global-flag branch
+    // would silently ignore it here.
+    //
+    // reference: ~/.jcode/research/2026-11-04-hindsight-memory-backend-and-refresh.md
+    // reference: no prior art, searched the jcode repo for an existing provider-scoped
+    // enable-flag test; the switch is new, so the test states the contract directly.
+    crate::env::remove_var("JCODE_MEMORY_ENABLED");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "JCODE_HINDSIGHT_MEMORY_ENABLED=false must disable the Hindsight backend even when \
+         JCODE_MEMORY_ENABLED is unset"
+    );
+
+    // Unset Hindsight switch + the global flag off: memory still runs. Falling
+    // back to the global flag would re-open the exact bug this test pins.
+    crate::env::set_var("JCODE_MEMORY_ENABLED", "false");
+    crate::env::remove_var("JCODE_HINDSIGHT_MEMORY_ENABLED");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.features.memory,
+        "an unset JCODE_HINDSIGHT_MEMORY_ENABLED must not fall back to the JEV-cost flag"
+    );
+
     // A different backend still follows the global flag: the Hindsight switch
     // must not silently re-enable the JEV path.
     crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "true");
