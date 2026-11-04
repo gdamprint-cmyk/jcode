@@ -99,14 +99,26 @@ impl Agent {
         let session_id = &self.session.id;
 
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
-        let pending = if fresh_user_turn {
-            crate::memory::take_pending_memory_for_project(
-                session_id,
-                self.session.working_dir.as_deref(),
-            )
-        } else {
-            None
-        };
+        // A refresh is also due when the agent has been working for a while
+        // without a user message. MEASURED 2026-11-04: the agent can run for
+        // hours of tool calls with no user turn, and a recall gated purely on
+        // `fresh_user_turn` therefore never arrives during that work.
+        let refresh_every = crate::config::config().agents.memory_refresh_tool_calls;
+        let tool_calls_due = refresh_every > 0
+            && crate::memory::tool_calls_since_refresh(session_id) >= refresh_every;
+
+        // Take the pending payload on EVERY provider iteration, not only at a
+        // fresh user turn. MEASURED 2026-11-04: the recall is prepared in the
+        // background, so a payload raised during autonomous tool work sat in
+        // the queue until the user spoke again - the agent worked for hours
+        // without the memory it had already fetched. The payload is removed
+        // from the queue when taken, and the injected-set/TTL bookkeeping
+        // suppresses repeats, so taking it every iteration cannot duplicate
+        // an injection.
+        let pending = crate::memory::take_pending_memory_for_project(
+            session_id,
+            self.session.working_dir.as_deref(),
+        );
 
         // Use the persistent memory-agent pipeline as the single source of truth.
         // Running both this and the legacy MemoryManager background retrieval path
@@ -117,12 +129,27 @@ impl Agent {
         // for each provider continuation without creating an additional injection
         // opportunity. One update per user turn keeps memory current while avoiding
         // redundant 512-token inference during tool-heavy agent loops.
-        if fresh_user_turn {
+        if tool_calls_due {
+            // Forced: the focused query rarely changes during autonomous
+            // work, and the normal repeat suppression would swallow the
+            // scheduled refresh.
+            crate::memory_agent::update_context_sync_with_dir_forced(
+                session_id,
+                messages,
+                self.session.working_dir.clone(),
+            );
+        } else if fresh_user_turn {
             crate::memory_agent::update_context_sync_with_dir(
                 session_id,
                 messages,
                 self.session.working_dir.clone(),
             );
+        }
+
+        // Reset only when a refresh was actually requested, so the counter
+        // keeps accumulating across iterations until the cadence fires.
+        if tool_calls_due {
+            crate::memory::reset_tool_calls_since_refresh(session_id);
         }
 
         pending

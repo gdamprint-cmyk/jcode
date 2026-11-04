@@ -461,6 +461,11 @@ impl Config {
                 self.agents.memory_hindsight_limit = limit;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_REFRESH_TOOL_CALLS") {
+            if let Ok(calls) = v.trim().parse::<usize>() {
+                self.agents.memory_refresh_tool_calls = calls;
+            }
+        }
         for (key, target) in [
             ("JCODE_MEMORY_JEV_MODEL", &mut self.agents.memory_jev_model),
             (

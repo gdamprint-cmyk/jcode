@@ -554,6 +554,11 @@ pub struct AgentsConfig {
     /// automatic recall entirely.
     #[serde(default = "default_memory_hindsight_limit")]
     pub memory_hindsight_limit: usize,
+    /// How many tool calls trigger a memory refresh when the agent is working
+    /// without user messages. 0 disables the tool-call-paced refresh; the
+    /// user-turn refresh is unaffected.
+    #[serde(default = "default_memory_refresh_tool_calls")]
+    pub memory_refresh_tool_calls: usize,
     /// Optional model override for memory Jev Decisions.
     pub memory_jev_model: Option<String>,
     /// Optional model override for browser Jev Decisions.
@@ -639,6 +644,10 @@ fn default_memory_hindsight_limit() -> usize {
     8
 }
 
+fn default_memory_refresh_tool_calls() -> usize {
+    30
+}
+
 fn default_memory_jev_threshold() -> f32 {
     0.8
 }
@@ -675,6 +684,7 @@ impl Default for AgentsConfig {
             memory_hindsight_url: None,
             memory_hindsight_bank: None,
             memory_hindsight_limit: default_memory_hindsight_limit(),
+            memory_refresh_tool_calls: default_memory_refresh_tool_calls(),
             memory_jev_model: None,
             browser_jev_model: None,
             voice_jev_model: None,

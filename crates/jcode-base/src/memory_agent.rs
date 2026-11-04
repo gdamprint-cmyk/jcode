@@ -131,11 +131,28 @@ impl MemoryAgentHandle {
         messages: Arc<[crate::message::Message]>,
         working_dir: Option<String>,
     ) {
+        self.update_context_sync_with_dir_forced(session_id, messages, working_dir, false);
+    }
+
+    /// Send a context update that bypasses the same-query suppression.
+    ///
+    /// MEASURED 2026-11-04: during long autonomous work the focused query
+    /// often does not change (the tool output is stripped from it), so the
+    /// 30 s repeat suppression blocked every scheduled refresh and the agent
+    /// ran for hours with the memory it started with.
+    pub fn update_context_sync_with_dir_forced(
+        &self,
+        session_id: &str,
+        messages: Arc<[crate::message::Message]>,
+        working_dir: Option<String>,
+        force: bool,
+    ) {
         let msg = AgentMessage::Context {
             session_id: session_id.to_string(),
             messages,
             working_dir,
             timestamp: Instant::now(),
+            force,
         };
         let _ = self.tx.try_send(msg);
     }
@@ -153,6 +170,8 @@ enum AgentMessage {
         messages: Arc<[crate::message::Message]>,
         working_dir: Option<String>,
         timestamp: Instant,
+        /// Bypass the same-query repeat suppression.
+        force: bool,
     },
     Reset,
 }
@@ -197,6 +216,7 @@ impl MemoryAgent {
                     messages,
                     working_dir,
                     timestamp,
+                    force,
                 } => {
                     // A bounded queue must not recall for a context that aged out
                     // while another session's remote provider was unavailable.
@@ -216,7 +236,7 @@ impl MemoryAgent {
                     if let Ok(mut stats) = MEMORY_AGENT_STATS.lock() {
                         stats.turns_processed += 1;
                     }
-                    if let Err(error) = self.process_context(&session_id, &messages).await {
+                    if let Err(error) = self.process_context(&session_id, &messages, force).await {
                         memory::clear_pending_memory(&session_id);
                         self.sessions.entry(session_id).or_default().failed_at =
                             Some(Instant::now());
@@ -234,6 +254,7 @@ impl MemoryAgent {
         &mut self,
         session_id: &str,
         messages: &[crate::message::Message],
+        force: bool,
     ) -> Result<()> {
         let query = memory::format_focused_query_for_relevance(messages);
         if query.trim().is_empty() {
@@ -257,7 +278,8 @@ impl MemoryAgent {
         {
             return Ok(());
         }
-        if ss.last_query.as_deref() == Some(query.as_str())
+        if !force
+            && ss.last_query.as_deref() == Some(query.as_str())
             && ss
                 .last_check
                 .is_some_and(|at| at.elapsed() < REPEAT_SUPPRESSION)
@@ -406,6 +428,28 @@ pub fn update_context_sync_with_dir(
         tokio::spawn(async move {
             if let Ok(handle) = init().await {
                 handle.update_context_sync_with_dir(&sid, messages, working_dir);
+            }
+        });
+    }
+}
+
+/// Force a context update, bypassing the same-query repeat suppression.
+///
+/// Used by the scheduled memory refresh: during long autonomous work the
+/// focused query usually does not change, so the normal suppression window
+/// would silently block every refresh.
+pub fn update_context_sync_with_dir_forced(
+    session_id: &str,
+    messages: Arc<[crate::message::Message]>,
+    working_dir: Option<String>,
+) {
+    if let Some(handle) = get() {
+        handle.update_context_sync_with_dir_forced(session_id, messages, working_dir, true);
+    } else {
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            if let Ok(handle) = init().await {
+                handle.update_context_sync_with_dir_forced(&sid, messages, working_dir, true);
             }
         });
     }

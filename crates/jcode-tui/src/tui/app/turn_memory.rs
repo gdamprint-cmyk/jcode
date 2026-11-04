@@ -101,22 +101,39 @@ impl App {
             return None;
         }
 
-        // Take pending memory if available (computed in background during last turn)
+        // Take pending memory if available (computed in background during last turn).
+        // Taken on EVERY send, not only at a fresh user turn: the recall is
+        // prepared in the background, so a payload raised during autonomous
+        // tool work would otherwise sit in the queue until the user spoke
+        // again. The injected-set/TTL bookkeeping suppresses repeats.
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(messages);
-        let pending = if fresh_user_turn {
-            crate::memory::take_pending_memory_for_project(
-                &self.session.id,
-                self.session.working_dir.as_deref(),
-            )
-        } else {
-            None
-        };
+        let pending = crate::memory::take_pending_memory_for_project(
+            &self.session.id,
+            self.session.working_dir.as_deref(),
+        );
+
+        // Scheduled refresh on a tool-call cadence.
+        let refresh_every = crate::config::config().agents.memory_refresh_tool_calls;
+        let tool_calls_due = refresh_every > 0
+            && crate::memory::tool_calls_since_refresh(&self.session.id) >= refresh_every;
 
         // Send context to memory agent for the NEXT turn (doesn't block current send)
         // Relevance results are consumed only at the start of a fresh user turn.
         // Tool continuations do not provide another injection opportunity, so
         // avoid re-running the local embedding model after every tool result.
-        if fresh_user_turn {
+        if tool_calls_due {
+            // Forced: the focused query rarely changes during autonomous
+            // work, so the normal repeat suppression would swallow the
+            // scheduled refresh.
+            let shared_messages: std::sync::Arc<[crate::message::Message]> =
+                messages.to_vec().into();
+            crate::memory_agent::update_context_sync_with_dir_forced(
+                &self.session.id,
+                shared_messages,
+                self.session.working_dir.clone(),
+            );
+            crate::memory::reset_tool_calls_since_refresh(&self.session.id);
+        } else if fresh_user_turn {
             let shared_messages: std::sync::Arc<[crate::message::Message]> =
                 messages.to_vec().into();
             crate::memory_agent::update_context_sync_with_dir(

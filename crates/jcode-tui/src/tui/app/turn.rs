@@ -1370,6 +1370,11 @@ impl App {
 
             // Execute tools with input handling (non-blocking)
             // SDK may have executed some tools, but custom tools need local execution
+            // Track the tool calls so the memory pipeline can refresh on a
+            // tool-call cadence. MEASURED 2026-11-04: the agent works for hours
+            // with no user message, and a recall gated on a user turn never
+            // arrives during that work.
+            crate::memory::note_tool_calls(&self.session.id, tool_calls.len());
             for tc in tool_calls {
                 self.status = ProcessingStatus::RunningTool(tc.name.clone());
                 self.observe_tool_call(&tc);

@@ -1441,6 +1441,11 @@ impl Agent {
 
             // Execute tools and add results
             let tool_count = tool_calls.len();
+            // Track tool calls so the memory pipeline can refresh on a
+            // tool-call cadence, not only when the user speaks. MEASURED
+            // 2026-11-04: the agent works for hours with no user message, and
+            // a recall gated on a user turn never arrives during that work.
+            crate::memory::note_tool_calls(&self.session.id, tool_count);
             let mut malformed_calls: Vec<MalformedToolCallInfo> = Vec::new();
             let mut executed_valid_call = false;
             let mut tool_results_dirty = false;
