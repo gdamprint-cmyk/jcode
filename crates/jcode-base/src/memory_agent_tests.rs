@@ -59,7 +59,7 @@ async fn missing_jev_access_clears_pending_without_fallback() {
     let (_, rx) = mpsc::channel(1);
     let mut agent = MemoryAgent::new(rx);
     agent
-        .process_context(sid, &[crate::message::Message::user("current query")])
+        .process_context(sid, &[crate::message::Message::user("current query")], false)
         .await
         .unwrap();
     assert!(!memory::has_pending_memory(sid));
@@ -254,6 +254,7 @@ async fn retained_recall_pipeline_uses_jev_http_without_embeddings_or_sidecar() 
             &[crate::message::Message::user(
                 "How do I test this Rust project?",
             )],
+            false,
         )
         .await;
     disabled.unwrap();
@@ -308,27 +309,35 @@ async fn forced_update_bypasses_the_same_query_suppression() {
 
     agent.process_context(sid, &messages, false).await.unwrap();
     let first_check = agent.sessions.get(sid).and_then(|s| s.last_check);
+    assert!(first_check.is_some(), "the first recall must run");
 
     // The second call with the SAME query is suppressed, so it never reaches
     // the point where `last_check` is refreshed.
+    std::thread::sleep(Duration::from_millis(5));
     agent.process_context(sid, &messages, false).await.unwrap();
-    let after_suppressed = agent.sessions.get(sid).and_then(|s| s.last_check);
+    let after_suppressed = agent
+        .sessions
+        .get(sid)
+        .and_then(|s| s.last_check)
+        .expect("last_check");
     assert_eq!(
-        first_check, after_suppressed,
+        first_check,
+        Some(after_suppressed),
         "a repeated identical query must be suppressed"
     );
 
     // The forced call must go through the suppression and refresh the check.
-    let mut forced = MemoryAgent::new(mpsc::channel(4).1);
-    forced.process_context(sid, &messages, true).await.unwrap();
-    let after_forced = forced.sessions.get(sid).and_then(|s| s.last_check);
-    assert!(
-        after_forced.is_some(),
-        "a forced update must reach the recall path"
-    );
+    std::thread::sleep(Duration::from_millis(5));
+    agent.process_context(sid, &messages, true).await.unwrap();
+    let after_forced = agent
+        .sessions
+        .get(sid)
+        .and_then(|s| s.last_check)
+        .expect("last_check");
     assert!(
         after_forced > after_suppressed,
-        "a forced update must bypass the suppression window"
+        "a forced update must bypass the suppression window: \
+         {after_forced:?} must be later than {after_suppressed:?}"
     );
 }
 
