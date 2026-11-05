@@ -848,8 +848,25 @@ async fn run_default_command(args: Args) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let in_jcode_repo = build::is_jcode_repo(&cwd);
+    // A jcode checkout is discoverable from anywhere on this host: the
+    // compile-time manifest directory points at the source tree, and
+    // `JCODE_REPO_DIR` points at it for a published self-dev build. So the
+    // self-dev decision must NOT depend on the directory the session was
+    // opened from. Requiring the cwd to be the repo meant a session opened
+    // from a project directory silently ran as a normal session, even though
+    // the whole host is a self-dev checkout.
+    let selfdev_repo_available = build::get_repo_dir().is_some();
     startup_profile::mark("is_jcode_repo");
     let already_in_selfdev = crate::cli::selfdev::client_selfdev_requested();
+
+    // Record where the checkout is, so self-dev tooling in this session
+    // (build, reload, hot rebuild) finds the source tree instead of failing
+    // on a missing repository. Set it whenever a checkout is known, not only
+    // on the transition into self-dev: a resumed or already-self-dev session
+    // needs the same pointer.
+    if selfdev_repo_available && let Some(repo_dir) = build::get_repo_dir() {
+        crate::env::set_var("JCODE_REPO_DIR", &repo_dir);
+    }
 
     // Record where this interactive launch happened so the system-wide launch
     // hotkeys can reopen jcode in the last project directory (Cmd+') and the
@@ -860,7 +877,12 @@ async fn run_default_command(args: Args) -> Result<()> {
         setup_hints::record_launch_dirs(&cwd, repo_dir.as_deref());
     }
 
-    if in_jcode_repo && !already_in_selfdev && !args.no_selfdev {
+    if should_enable_selfdev(
+        in_jcode_repo,
+        selfdev_repo_available,
+        already_in_selfdev,
+        args.no_selfdev,
+    ) {
         output::stderr_info("📍 Detected jcode repository - enabling self-dev mode");
         output::stderr_info("   Using shared server with self-dev session mode");
         output::stderr_info("   (use --no-selfdev to disable auto-detection)");
@@ -1545,6 +1567,30 @@ async fn run_server_keepalive(
             }
         }
     }
+}
+
+/// Decide whether this session must run in self-dev mode.
+///
+/// The session directory is NOT the deciding factor. A checkout is
+/// discoverable from anywhere on this host (compile-time manifest path, or
+/// `JCODE_REPO_DIR` for a published self-dev build), so a session opened
+/// from an unrelated project directory still has to run self-dev. The old
+/// `is_jcode_repo(cwd)`-only rule silently ran such sessions as normal
+/// sessions.
+///
+/// `repo_available` is `build::get_repo_dir().is_some()`: a checkout was
+/// found. `in_jcode_repo` is `build::is_jcode_repo(cwd)`: the session was
+/// opened inside the checkout itself.
+fn should_enable_selfdev(
+    in_jcode_repo: bool,
+    repo_available: bool,
+    already_in_selfdev: bool,
+    no_selfdev: bool,
+) -> bool {
+    if no_selfdev || already_in_selfdev {
+        return false;
+    }
+    in_jcode_repo || repo_available
 }
 
 #[cfg(test)]

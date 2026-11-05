@@ -402,3 +402,34 @@ auth = "none"
         ProviderChoice::OpenaiCompatible
     ));
 }
+
+/// The regression this guards: a session opened OUTSIDE the checkout used to
+/// run as a normal session, because the decision was `is_jcode_repo(cwd)`
+/// only. A checkout discoverable from anywhere must still yield self-dev.
+#[test]
+fn selfdev_is_enabled_when_a_checkout_is_available_outside_the_cwd() {
+    // Session opened in an unrelated project directory, checkout found
+    // elsewhere on the host.
+    assert!(should_enable_selfdev(false, true, false, false));
+
+    // Session opened inside the checkout: still self-dev.
+    assert!(should_enable_selfdev(true, true, false, false));
+
+    // Session opened inside the checkout but the host has no other checkout
+    // discovery path: still self-dev (the original behaviour).
+    assert!(should_enable_selfdev(true, false, false, false));
+}
+
+#[test]
+fn selfdev_is_not_enabled_without_a_checkout_or_when_explicitly_disabled() {
+    // No checkout anywhere: normal session.
+    assert!(!should_enable_selfdev(false, false, false, false));
+
+    // Explicit opt-out wins even with a checkout available.
+    assert!(!should_enable_selfdev(true, true, false, true));
+    assert!(!should_enable_selfdev(false, true, false, true));
+
+    // Already self-dev: do not re-announce or re-set.
+    assert!(!should_enable_selfdev(true, true, true, false));
+    assert!(!should_enable_selfdev(false, true, true, false));
+}
