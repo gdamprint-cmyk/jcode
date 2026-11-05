@@ -11,6 +11,37 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+/// Truncate a text block for the relevance context, keeping its reminder
+/// structure intact.
+///
+/// MEASURED 2026-11-05: the MCP tool catalogue arrives as one text block of
+/// ~48,000 chars. Plain truncation cut off the closing `</system-reminder>`,
+/// so `focus_query_text` treated the whole rest of the transcript as
+/// reminder content and dropped the user's question. With nothing left to
+/// keep it fell back to the raw context, where the 1,200-char catalogue
+/// excerpt dominated the recall query and the recall answered about MCP
+/// tools instead of the question.
+///
+/// Closing the reminder at the truncation point keeps the block's structure
+/// honest: the excerpt ends where the block was cut, so the skip ends there
+/// too.
+fn truncate_block_for_relevance(text: &str) -> String {
+    let cut = truncate_chars(text, MEMORY_CONTEXT_MAX_BLOCK_CHARS);
+    if cut.chars().count() == text.chars().count() {
+        return cut;
+    }
+    let opens = cut.matches("<system-reminder>").count();
+    let closes = cut.matches("</system-reminder>").count();
+    if opens <= closes {
+        return cut;
+    }
+    let mut out = cut;
+    for _ in 0..(opens - closes) {
+        out.push_str("\n</system-reminder>");
+    }
+    out
+}
+
 fn format_content_block_for_relevance(block: &crate::message::ContentBlock) -> Option<String> {
     match block {
         crate::message::ContentBlock::Text { text, .. } => {
@@ -18,7 +49,7 @@ fn format_content_block_for_relevance(block: &crate::message::ContentBlock) -> O
             if trimmed.is_empty() {
                 None
             } else {
-                Some(truncate_chars(trimmed, MEMORY_CONTEXT_MAX_BLOCK_CHARS))
+                Some(truncate_block_for_relevance(trimmed))
             }
         }
         crate::message::ContentBlock::ToolUse { name, .. } => Some(format!("[Tool: {}]", name)),

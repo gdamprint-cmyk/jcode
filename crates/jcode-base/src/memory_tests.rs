@@ -1010,6 +1010,57 @@ fn focus_query_text_falls_back_when_all_stripped() {
 }
 
 #[test]
+fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
+    // MEASURED 2026-11-05: the MCP tool catalogue arrives as ONE text block
+    // of ~48,000 chars. Truncating it to 1,200 chars used to cut off the
+    // closing `</system-reminder>`, so `focus_query_text` treated the whole
+    // rest of the transcript as reminder content and dropped the user's
+    // question. It then fell back to the raw context, where the catalogue
+    // excerpt dominated the recall query.
+    let catalogue = format!(
+        "<system-reminder>\nNew MCP tools are available.\n{}\n</system-reminder>",
+        "mcp__cgrep__cgrep_agent_expand: expand selected locate IDs with context. ".repeat(60),
+    );
+    assert!(catalogue.chars().count() > 1_200, "the fixture must exceed the cap");
+
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: catalogue,
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "What is the jcode memory verification nonce?".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let focused = format_focused_query_for_relevance(&messages);
+
+    assert!(
+        focused.contains("jcode memory verification nonce"),
+        "the user's question was dropped from the recall query: {focused}"
+    );
+    assert!(
+        focused.starts_with("What is the jcode memory verification nonce?"),
+        "the query should lead with the user's intent: {focused}"
+    );
+    assert!(
+        !focused.contains("cgrep_agent_expand"),
+        "the truncated catalogue leaked into the query: {focused}"
+    );
+}
+
+#[test]
 fn jev_recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
     let mut entries: Vec<MemoryEntry> = (0..2000)
         .map(|i| {
