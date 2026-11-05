@@ -38,7 +38,15 @@ use std::time::Duration;
 /// (2026-11-04): 8.4-12.3 s with the cross-encoder reranker enabled, ~1-3 s
 /// without. The budget is generous enough for the reranked path and short
 /// enough that a hung server cannot stall the agent.
-const RECALL_TIMEOUT: Duration = Duration::from_secs(45);
+///
+/// MEASURED 2026-11-05: 45 s was NOT enough. With the historical corpus
+/// imported (37,918 facts) and Hindsight consolidating in the background
+/// (pending_consolidation 1,947), a live recall took 25.1 s in the calm case
+/// and exceeded 45 s under load, failing with "error sending request for url".
+/// The recall runs on a dedicated thread inside the background memory agent,
+/// so a longer timeout delays a memory update, never the model's turn.
+/// 120 s leaves room for a 4x slow-down and still bounds a hung server.
+const RECALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum characters of a single recalled fact. The upstream harness uses a
 /// similar bound; a fact longer than this is a document, not a fact.
