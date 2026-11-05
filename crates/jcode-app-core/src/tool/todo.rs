@@ -261,15 +261,25 @@ fn record_todo_write_mode(input: &Value) {
 /// one path. `update` changes only the given fields of todos matched by `id`;
 /// `add` appends new todos (or inserts each after its `after` id); `remove`
 /// drops ids. Full replacements and incremental edits are mutually exclusive.
+///
+/// A full write NEVER deletes a stored todo that the write did not mention.
+/// Omission is not a deletion request: an agent that rewrites its plan while
+/// some items are still open must not lose them. Deletion happens only through
+/// an explicit `remove` entry, so the destructive operation is always visible
+/// in the call that performs it.
 fn apply_todo_patch(mut input: Value, stored: impl FnOnce() -> Value) -> Result<Value> {
     names::normalize_containers(&mut input);
     let patching = ["update", "add", "remove"]
         .iter()
         .any(|key| input.get(*key).is_some_and(|value| !value.is_null()));
-    let named_replacement = ["phases", "todos"]
+    // A full write must see the stored list: the merge is what keeps an
+    // unmentioned todo alive, so it cannot be built without it. The old
+    // condition (`uses_names`) skipped the load for a legacy write, which is
+    // exactly the write shape that used to wipe the plan.
+    let has_list = ["phases", "todos"]
         .iter()
-        .any(|key| input.get(*key).is_some_and(names::uses_names));
-    let stored = if patching || named_replacement {
+        .any(|key| input.get(*key).is_some_and(|value| !value.is_null()));
+    let stored = if patching || has_list {
         stored()
     } else {
         json!([])
@@ -286,6 +296,11 @@ fn apply_todo_patch(mut input: Value, stored: impl FnOnce() -> Value) -> Result<
         .iter()
         .any(|key| obj.get(*key).is_some_and(|value| !value.is_null()));
     if !patching {
+        // A full write is a merge, not a wipe: todos the write does not
+        // mention survive it. The merge runs on the flat list, so it applies
+        // to both public shapes (`phases` was flattened above, and a flat
+        // `todos` write is already flat).
+        merge_full_write(obj, stored.as_array().map(Vec::as_slice).unwrap_or(&[]));
         return Ok(input);
     }
     if obj.get("todos").is_some_and(|value| !value.is_null()) {
@@ -433,6 +448,91 @@ fn apply_todo_patch(mut input: Value, stored: impl FnOnce() -> Value) -> Result<
 
     obj.insert("todos".to_string(), Value::Array(todos));
     Ok(input)
+}
+
+/// Merge a full write with the stored list so a rewrite can never delete work
+/// the caller did not mention.
+///
+/// The write is a flat list by this point (`phases` was flattened above), and
+/// both sides carry the same shape: `stored` holds persisted todos (`id`,
+/// `content`, ...), and the write has already been normalized to that shape.
+/// Items are matched by name (`content`) and by id: the write updates the ones
+/// it names, and the stored ones it does not name are kept unchanged.
+///
+/// Deletion therefore requires an explicit `remove` entry. A full write that
+/// names the same items still updates them exactly as before, so ordinary
+/// planning flows are unchanged.
+fn merge_full_write(obj: &mut serde_json::Map<String, Value>, stored: &[Value]) {
+    let Some(Value::Array(written)) = obj.get("todos") else {
+        return;
+    };
+    if written.is_empty() {
+        // An empty full write is a no-op, never a wipe. Removing work is an
+        // explicit `remove`.
+        if !stored.is_empty() {
+            obj.insert("todos".to_string(), Value::Array(stored.to_vec()));
+        }
+        return;
+    }
+    let written_ids: Vec<&str> = written
+        .iter()
+        .filter_map(|todo| todo.get("id").and_then(Value::as_str))
+        .collect();
+    let written_names: Vec<&str> = written
+        .iter()
+        .filter_map(|todo| todo.get("content").and_then(Value::as_str))
+        .collect();
+    let kept: Vec<&Value> = stored
+        .iter()
+        .filter(|todo| {
+            let id = todo.get("id").and_then(Value::as_str);
+            let name = todo.get("content").and_then(Value::as_str);
+            !id.is_some_and(|id| written_ids.contains(&id))
+                && !name.is_some_and(|name| written_names.contains(&name))
+        })
+        .collect();
+    // Stage order follows the stored list's first appearance, so a merge can
+    // never reorder the plan the user already sees. A stage only the write
+    // knows is appended after the stored ones.
+    let mut ranks: Vec<Option<u64>> = Vec::new();
+    for todo in stored.iter().chain(written.iter()) {
+        let stage = stage_of(todo);
+        if !ranks.contains(&stage) {
+            ranks.push(stage);
+        }
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(written.len() + kept.len());
+    for stage in &ranks {
+        for todo in written.iter().filter(|todo| stage_of(todo) == *stage) {
+            merged.push(todo.clone());
+        }
+        for todo in kept.iter().filter(|todo| stage_of(todo) == *stage) {
+            merged.push((*todo).clone());
+        }
+    }
+    obj.insert("todos".to_string(), Value::Array(merged));
+}
+
+/// The execution stage a todo belongs to, across the storage key and its
+/// accepted aliases. `None` means "unstaged", which the layout treats as a
+/// stage of its own.
+fn stage_of(todo: &Value) -> Option<u64> {
+    for key in ["stage", "phase", "wave"] {
+        match todo.get(key) {
+            Some(Value::Number(number)) => {
+                if let Some(stage) = number.as_u64() {
+                    return Some(stage);
+                }
+            }
+            Some(Value::String(raw)) => {
+                if let Ok(stage) = raw.trim().parse::<u64>() {
+                    return Some(stage);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -1245,7 +1345,9 @@ impl Tool for TodoTool {
         // how to target the evaluator instead of reporting an honest assessment.
         "Read or update todos and goal assessments. For multi-step work, write the plan \
          once with `phases` containing lanes containing items. Then use `update` by unique name for status/field changes and `add` \
-         for new work. Reserve full replacement for restructuring; remove rarely. \
+         for new work. A full write MERGES with the stored list: todos you do not mention are \
+         kept, never dropped. To delete a todo, name it in `remove` explicitly; only then is it \
+         removed. \
          Mark work in_progress before starting and completed as soon as it is done. \
          Keep the live list current after meaningful steps. Use unique short names, with \
          longer context in description. IDs are internal. Use rename_to for explicit renames. Organize parallel lanes within sequential phases. \
@@ -1303,7 +1405,7 @@ impl Tool for TodoTool {
                 },
                 "todos": {
                     "type": "array",
-                    "description": "Full todo list; replaces the whole list. Use for the initial plan or a real restructure, otherwise prefer update/add/remove.",
+                    "description": "Full todo list; MERGES with the stored list, so todos you do not mention are kept. Use for the initial plan or a real restructure, otherwise prefer update/add/remove. To delete a todo, list it in `remove`.",
                     "items": {
                         "type": "object",
                         "required": ["name", "status", "priority", "confidence"],
@@ -1596,6 +1698,16 @@ impl Tool for TodoTool {
                     .then(|| plan_change(&stored_plan, &plan))
                     .flatten();
                 save_todos(&ctx.session_id, &todos)?;
+                // A write that carries work items declares the plan for the
+                // request being worked on, which opens the plan-declaration gate
+                // for the rest of this request. A write that only touches the
+                // assessment does not declare anything, so it leaves the gate as
+                // it was.
+                // reference: crates/jcode-todo-policy/src/declaration.rs
+                // (todo_write_declares_plan - the pure decision this mirrors).
+                if crate::todo::declaration::todo_write_declares_plan(&write_mode_input) {
+                    super::plan_declaration::mark_plan_declared(&ctx.session_id);
+                }
                 if previous
                     .iter()
                     .chain(&todos)

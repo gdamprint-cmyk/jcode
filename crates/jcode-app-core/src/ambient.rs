@@ -5,18 +5,24 @@ use std::path::PathBuf;
 
 mod directives;
 mod manager;
-mod paths;
+pub(crate) mod paths;
 mod persistence;
 mod prompt;
 pub mod runner;
 pub mod scheduler;
 mod todo_reviews;
 
+#[cfg(test)]
+#[path = "ambient/counter_regression_tests.rs"]
+mod counter_regression_tests;
+
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
 };
 pub use manager::AmbientManager;
 pub use persistence::{AmbientLock, ScheduledQueue};
+#[cfg(test)]
+pub(crate) use persistence::{StateWrite, reset_state_writes, state_writes_all_for};
 #[cfg(test)]
 pub(crate) use prompt::format_duration_rough;
 pub use prompt::{

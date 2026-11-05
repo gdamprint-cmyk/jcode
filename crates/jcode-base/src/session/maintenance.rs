@@ -63,7 +63,10 @@ fn claim_prune_slot(base: &Path) -> bool {
         return false;
     }
     // Touch (create or refresh) the marker to claim the slot.
-    std::fs::write(&marker, b"").is_ok()
+    // A non-empty payload is required: an empty write never reaches the
+    // filesystem, so the marker mtime would not move and every spawn
+    // would reclaim the slot.
+    storage::touch_stamp(&marker).is_ok()
 }
 
 /// Core of [`prune_old_session_backups`], parameterized on the directory and
@@ -178,6 +181,58 @@ mod tests {
         );
         assert!(recent_json.exists(), "recent .json transcript must survive");
         assert!(journal.exists(), "journals are out of scope");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod stamp_marker_tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::time::{Duration as StdDuration, SystemTime};
+
+    #[test]
+    fn claim_prune_slot_marker_mtime_advances() {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-bak-stamp-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        assert!(claim_prune_slot(&dir), "first claim should win");
+        let marker = dir.join("sessions-bak-prune.stamp");
+        let first = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist");
+
+        std::thread::sleep(StdDuration::from_millis(1100));
+
+        // Age the marker past the interval so the next claim is allowed, then
+        // confirm the claim itself refreshed the mtime.
+        let old = SystemTime::now() - StdDuration::from_secs(PRUNE_INTERVAL_SECS + 60);
+        File::options()
+            .write(true)
+            .open(&marker)
+            .and_then(|f| f.set_modified(old))
+            .expect("age the marker");
+        assert!(
+            claim_prune_slot(&dir),
+            "claim should succeed after interval"
+        );
+
+        let second = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist");
+        assert!(
+            second > first,
+            "claim_prune_slot must advance the marker mtime, otherwise every \
+             spawn reclaims the slot and the prune runs on every spawn"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

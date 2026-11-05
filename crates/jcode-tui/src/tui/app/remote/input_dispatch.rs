@@ -17,6 +17,13 @@ pub(in crate::tui::app) async fn begin_remote_send(
     retry_attempts: u8,
 ) -> Result<u64> {
     app.prepare_cloud_environment(remote).await?;
+    // A real client message is a new request: the plan for it has to be declared
+    // before any work tool runs. A synthetic continuation (auto-poke, reload
+    // recovery, scheduled task) is not a new request and leaves the gate as it
+    // was.
+    // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+    // (note_user_request - the runtime state this arms).
+    crate::tool::plan_declaration::note_user_request(&app.session.id, &content, is_system);
     let recovery = app.cloud_recovery_reminder();
     let system_reminder = match (system_reminder, recovery.as_ref()) {
         (Some(reminder), Some(recovery)) => Some(format!("{reminder}\n\n{recovery}")),

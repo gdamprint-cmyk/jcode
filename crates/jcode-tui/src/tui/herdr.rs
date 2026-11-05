@@ -1,10 +1,11 @@
 //! Native agent-state reporting for the herdr terminal multiplexer.
 //!
 //! When jcode runs inside a herdr pane (`HERDR_ENV=1`), it reports its state
-//! (`idle` / `working`), the command that resumes the current session, and
-//! releases the pane when the user quits. The interactive TUI never blocks a
-//! turn on a user decision, so `blocked` is not reported. See
-//! <https://herdr.dev/docs/add-herdr-support/>.
+//! (`idle` / `working` / `blocked`), the command that resumes the current
+//! session, and releases the pane when the user quits. `blocked` is reported
+//! while the client waits for a user decision (a keypress offer such as a
+//! provider fallback or a merge prompt); the turn itself has already ended at
+//! that point. See <https://herdr.dev/docs/add-herdr-support/>.
 //!
 //! Reports go through `"$HERDR_BIN_PATH" pane report-agent ...` on a single
 //! background thread. Only the latest pending report is kept, every command
@@ -30,6 +31,8 @@ const MAX_RESUME_BYTES: usize = 8 * 1024;
 pub enum AgentState {
     Idle,
     Working,
+    /// The client is waiting for the user to decide something.
+    Blocked,
 }
 
 impl AgentState {
@@ -37,6 +40,15 @@ impl AgentState {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// Short explanation herdr shows next to a blocked agent.
+    fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Blocked => Some("waiting for your decision"),
+            _ => None,
         }
     }
 }
@@ -263,6 +275,10 @@ fn report_args(pane_id: &str, report: &StateReport, seq: u64) -> Vec<String> {
     .map(|s| s.to_string())
     .collect();
     args.push(seq.to_string());
+    if let Some(message) = report.state.message() {
+        args.push("--message".into());
+        args.push(message.to_string());
+    }
     if let Some(session_id) = report.session_id.as_deref() {
         args.push("--agent-session-id".into());
         args.push(session_id.to_string());

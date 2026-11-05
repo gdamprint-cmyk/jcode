@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod await_dependency;
 pub mod completion_report;
+pub mod declaration;
 pub mod followup;
 pub mod store;
 

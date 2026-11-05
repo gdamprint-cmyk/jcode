@@ -92,7 +92,10 @@ fn prune_due(dir: &Path) -> bool {
 }
 
 fn mark_pruned(dir: &Path) {
-    let _ = std::fs::write(dir.join(PRUNE_MARKER), b"");
+    // A non-empty payload is required: an empty write never reaches the
+    // filesystem, so the marker mtime would not move and the daily slot
+    // would never be consumed.
+    let _ = storage::touch_stamp(&dir.join(PRUNE_MARKER));
 }
 
 /// Core of [`prune_stale_scratch`], parameterized for unit testing.
@@ -272,5 +275,46 @@ mod tests {
         assert_eq!(report.removed.len(), 1);
         assert!(!entry.exists());
         assert!(outside.path().join("precious").exists());
+    }
+}
+
+#[cfg(test)]
+mod stamp_marker_tests {
+    use super::*;
+
+    #[test]
+    fn mark_pruned_advances_the_marker_mtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join(PRUNE_MARKER);
+
+        mark_pruned(temp.path());
+        let first = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist after mark_pruned");
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        mark_pruned(temp.path());
+        let second = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist after second mark_pruned");
+
+        assert!(
+            second > first,
+            "mark_pruned must advance the marker mtime, otherwise prune_due() \
+             always reports due and the daily slot is never consumed"
+        );
+    }
+
+    #[test]
+    fn prune_due_is_false_right_after_a_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(prune_due(temp.path()), "no marker means due");
+
+        mark_pruned(temp.path());
+        assert!(
+            !prune_due(temp.path()),
+            "a fresh marker must make the next pass not due"
+        );
     }
 }

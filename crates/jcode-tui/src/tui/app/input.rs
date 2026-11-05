@@ -4095,6 +4095,13 @@ impl App {
             return;
         }
 
+        // A new prompt is a new request: the plan for it has to be declared
+        // before any work tool runs. Synthetic continuations never reach this
+        // path - they are queued, not submitted - so the gate is armed here for
+        // real user input only.
+        // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+        // (note_user_request - the runtime state this arms).
+        crate::tool::plan_declaration::note_user_request(&self.session.id, &input, false);
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
             content: input.clone(),
@@ -4228,6 +4235,18 @@ impl App {
                 merge_turn_reminders(turn_reminder, self.take_cloud_recovery_reminder());
 
             if has_combined {
+                // A queued real prompt is a new request, so it arms the plan
+                // gate. A queue that only holds synthetic continuations (an
+                // auto-poke) is not a new request and leaves the gate alone.
+                // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+                // (note_user_request - the runtime state this arms).
+                for message in &messages {
+                    crate::tool::plan_declaration::note_user_request(
+                        &self.session.id,
+                        message,
+                        false,
+                    );
+                }
                 let combined = crate::prompt::with_swarm_user_message_reminder(
                     &combined,
                     self.provider.reasoning_effort().as_deref(),

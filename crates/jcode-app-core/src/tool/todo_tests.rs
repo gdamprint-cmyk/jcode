@@ -67,7 +67,216 @@ async fn hierarchy_invalid_writes_are_atomic() {
     tool.execute(json!({"phases":[]}), test_ctx(session))
         .await
         .unwrap();
-    assert!(load_todos(session).unwrap().is_empty());
+    // An empty full write is a no-op, never a wipe: removing work is an
+    // explicit `remove`, so an agent that clears its plan by accident keeps
+    // everything it had.
+    assert_eq!(load_todos(session).unwrap(), before);
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// A full write must never delete work it does not mention. Omission is not a
+/// deletion request: only an explicit `remove` deletes a todo.
+#[tokio::test]
+async fn full_write_keeps_unmentioned_todos() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "full-write-keeps-unmentioned";
+    let tool = TodoTool::new();
+
+    tool.execute(
+        json!({"phases":[{"phase":1,"lanes":[{"lane":"work","items":[
+            {"name":"first","status":"pending","priority":"high","confidence":"plausible"},
+            {"name":"second","status":"in_progress","priority":"high","confidence":"plausible"}
+        ]}]}]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(load_todos(session).unwrap().len(), 2);
+
+    // A rewrite that mentions only the first item must not drop the second.
+    tool.execute(
+        json!({"phases":[{"phase":1,"lanes":[{"lane":"work","items":[
+            {"name":"first","status":"completed","priority":"high","confidence":"validated"}
+        ]}]}]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    let stored = load_todos(session).unwrap();
+    assert_eq!(
+        stored.len(),
+        2,
+        "the unmentioned todo must survive a full write, got {:?}",
+        stored
+            .iter()
+            .map(|t| (t.content.clone(), t.status.clone()))
+            .collect::<Vec<_>>()
+    );
+    let first = stored.iter().find(|t| t.content == "first").unwrap();
+    let second = stored.iter().find(|t| t.content == "second").unwrap();
+    assert_eq!(first.status, "completed");
+    assert_eq!(second.status, "in_progress");
+
+    // An explicit remove is the only way a todo disappears.
+    tool.execute(json!({"remove":["second"]}), test_ctx(session))
+        .await
+        .unwrap();
+    let stored = load_todos(session).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].content, "first");
+
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// A legacy full write (internal ids, `content`) must merge too. The old
+/// guard only loaded the stored list for a NAMED write, so the legacy shape -
+/// the one that used to wipe the plan - was left unguarded.
+#[tokio::test]
+async fn legacy_full_write_keeps_unmentioned_todos() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "legacy-full-write-keeps-unmentioned";
+    let tool = TodoTool::new();
+
+    tool.execute(
+        json!({"todos": [
+            {"id": "one", "content": "one", "status": "pending", "priority": "high"},
+            {"id": "two", "content": "two", "status": "pending", "priority": "high"}
+        ]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(load_todos(session).unwrap().len(), 2);
+
+    // A legacy rewrite that mentions only the first todo must keep the second.
+    tool.execute(
+        json!({"todos": [
+            {"id": "one", "content": "one", "status": "completed", "priority": "high"}
+        ]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    let stored = load_todos(session).unwrap();
+    assert_eq!(
+        stored.len(),
+        2,
+        "the legacy full write must keep the todo it did not mention, got {:?}",
+        stored.iter().map(|t| t.content.clone()).collect::<Vec<_>>()
+    );
+    assert!(stored.iter().any(|t| t.content == "two"));
+
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// An empty full write is a no-op, never a wipe.
+#[tokio::test]
+async fn empty_full_write_keeps_everything() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "empty-full-write-keeps-everything";
+    let tool = TodoTool::new();
+
+    tool.execute(
+        json!({"todos": [
+            {"name": "keep me", "status": "pending", "priority": "high", "confidence": "plausible"}
+        ]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    let before = load_todos(session).unwrap();
+
+    tool.execute(json!({"todos": []}), test_ctx(session))
+        .await
+        .unwrap();
+    assert_eq!(load_todos(session).unwrap(), before);
+
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+/// Merging must not reorder the plan. Appending the kept todos after the
+/// written ones inverted the stage order, which both mislaid the plan and
+/// could invalidate a lane dependency that points at an earlier stage.
+#[tokio::test]
+async fn merge_keeps_the_stored_stage_order() {
+    let stored = json!([
+        {"id": "a", "content": "A", "status": "pending", "priority": "high", "stage": 1, "group": "x"},
+        {"id": "b", "content": "B", "status": "pending", "priority": "high", "stage": 2, "group": "x"}
+    ]);
+    // A rewrite that only mentions the SECOND stage todo.
+    let merged = apply_todo_patch(
+        json!({"todos": [{"id": "b", "content": "B", "status": "completed", "priority": "high", "stage": 2, "group": "x"}]}),
+        || stored.clone(),
+    )
+    .unwrap();
+    let todos = parse_todo_input(merged).unwrap().todos.unwrap();
+    assert_eq!(
+        todos.iter().map(|t| t.content.as_str()).collect::<Vec<_>>(),
+        ["A", "B"],
+        "the stored stage order must survive the merge"
+    );
+    assert_eq!(todos[0].stage, Some(1));
+    assert_eq!(todos[1].stage, Some(2));
+}
+
+/// The flat `todos` form must merge the same way the hierarchical form does.
+#[tokio::test]
+async fn flat_full_write_keeps_unmentioned_todos() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", dir.path());
+    let session = "flat-full-write-keeps-unmentioned";
+    let tool = TodoTool::new();
+
+    tool.execute(
+        json!({"todos":[
+            {"name":"alpha","status":"pending","priority":"high","confidence":"plausible"},
+            {"name":"beta","status":"pending","priority":"high","confidence":"plausible"}
+        ]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(load_todos(session).unwrap().len(), 2);
+
+    tool.execute(
+        json!({"todos":[
+            {"name":"alpha","status":"completed","priority":"high","confidence":"validated"}
+        ]}),
+        test_ctx(session),
+    )
+    .await
+    .unwrap();
+    let stored = load_todos(session).unwrap();
+    assert_eq!(
+        stored.len(),
+        2,
+        "the flat write must keep the todo it did not mention, got {:?}",
+        stored.iter().map(|t| t.content.clone()).collect::<Vec<_>>()
+    );
+
     match previous_home {
         Some(home) => crate::env::set_var("JCODE_HOME", home),
         None => crate::env::remove_var("JCODE_HOME"),
@@ -89,8 +298,9 @@ fn hierarchy_flattens_and_clears() {
             .unwrap()
             .is_empty()
     );
-    let flattened =
-        apply_todo_patch(input, || panic!("replacement must not load stored list")).unwrap();
+    // A full write reads the stored list: the merge that keeps unmentioned
+    // todos alive cannot be built without it.
+    let flattened = apply_todo_patch(input, || json!([])).unwrap();
     assert!(flattened.get("phases").is_none());
     assert_eq!(flattened["todos"][0]["stage"], 2);
 }

@@ -47,8 +47,11 @@ impl AmbientManager {
     }
 
     pub fn record_cycle_result(&mut self, result: AmbientCycleResult) -> Result<()> {
-        self.state.record_cycle(&result);
-        self.state.save()?;
+        // NOTE: this method deliberately does NOT persist `state.json`.
+        // The ambient runner is the single writer of the ambient state: it
+        // records the cycle and saves exactly once, when the cycle completes.
+        // Persisting here as well incremented `total_cycles` twice per cycle
+        // and published a transient overcount on disk (measured 2026-11-04).
 
         // If the cycle produced a schedule request, enqueue it
         if let Some(ref req) = result.next_schedule {

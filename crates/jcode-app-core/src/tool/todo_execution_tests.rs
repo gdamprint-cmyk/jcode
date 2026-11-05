@@ -482,6 +482,12 @@ async fn an_ungrouped_goal_does_not_survive_into_a_grouped_next_task() {
     .await
     .expect("second write");
 
+    // The finished task's todo leaves the plan only through an explicit
+    // removal: a full write never deletes what it did not mention.
+    tool.execute(json!({"remove": ["t1"]}), test_ctx(session))
+        .await
+        .expect("explicit removal of the finished task");
+
     let goals = load_goals(session).expect("goals");
     assert!(
         !goals.iter().any(|goal| goal.group.is_none()),
@@ -557,6 +563,13 @@ async fn moving_to_a_new_task_replaces_what_the_todos_panel_shows() {
     )
     .await
     .expect("second task write should succeed");
+
+    // Task one is gone only because it was removed by name. A full write
+    // that merely stops mentioning a todo keeps it, so the panel must not
+    // lose work the agent did not explicitly delete.
+    tool.execute(json!({"remove": ["task one"]}), test_ctx(session))
+        .await
+        .expect("explicit removal of the finished task");
 
     let todos = load_todos(session).expect("todos");
     assert_eq!(todos.len(), 1, "panel must show only the current task");

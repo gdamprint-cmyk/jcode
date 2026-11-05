@@ -32,14 +32,6 @@ pub(super) fn normalize_containers(input: &mut Value) {
     }
 }
 
-pub(super) fn uses_names(value: &Value) -> bool {
-    match value {
-        Value::Object(fields) => fields.contains_key("name") || fields.values().any(uses_names),
-        Value::Array(items) => items.iter().any(uses_names),
-        _ => false,
-    }
-}
-
 fn task_name(todo: &Value) -> Option<&str> {
     todo.get("content").and_then(Value::as_str)
 }

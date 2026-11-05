@@ -1,7 +1,7 @@
 use super::{Tool, ToolContext, ToolOutput};
 use crate::ambient::{
-    AmbientCycleResult, AmbientManager, AmbientState, CycleStatus, Priority, ScheduleRequest,
-    ScheduleTarget, ScheduledItem,
+    AmbientCycleResult, AmbientManager, CycleStatus, Priority, ScheduleRequest, ScheduleTarget,
+    ScheduledItem,
 };
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::safety::{self, PermissionRequest, PermissionResult, SafetySystem, Urgency};
@@ -233,35 +233,22 @@ impl Tool for EndAmbientCycleTool {
         // Store for the ambient runner to pick up
         store_cycle_result(result);
 
-        // Also persist state immediately so a crash after this tool but before
-        // the runner collects won't lose the cycle.
-        if let Ok(mut state) = AmbientState::load() {
-            let next_desc = if let Some(ref sched) = next_schedule {
-                let mins = sched.wake_in_minutes.unwrap_or(30);
-                format!("~{}", crate::ambient::format_minutes_human(mins))
-            } else {
-                "system default".to_string()
-            };
-
-            state.last_run = Some(now);
-            state.last_summary = Some(params.summary.clone());
-            state.last_compactions = Some(params.compactions);
-            state.last_memories_modified = Some(params.memories_modified);
-            state.total_cycles += 1;
-            let _ = state.save();
-
-            Ok(ToolOutput::new(format!(
-                "Ambient cycle ended. Memories modified: {}, compactions: {}. Next wake: {}",
-                params.memories_modified, params.compactions, next_desc
-            ))
-            .with_title("ambient cycle ended".to_string()))
+        // The runner is the ONLY writer of `state.json`: it persists the cycle
+        // exactly once, when the cycle completes. Persisting the cycle here as
+        // well incremented `total_cycles` a second time and published a
+        // transient overcount on disk (measured 2026-11-04).
+        let next_desc = if let Some(ref sched) = next_schedule {
+            let mins = sched.wake_in_minutes.unwrap_or(30);
+            format!("~{}", crate::ambient::format_minutes_human(mins))
         } else {
-            Ok(ToolOutput::new(format!(
-                "Ambient cycle ended (state save failed). Summary: {}",
-                params.summary
-            ))
-            .with_title("ambient cycle ended".to_string()))
-        }
+            "system default".to_string()
+        };
+
+        Ok(ToolOutput::new(format!(
+            "Ambient cycle ended. Memories modified: {}, compactions: {}. Next wake: {}",
+            params.memories_modified, params.compactions, next_desc
+        ))
+        .with_title("ambient cycle ended".to_string()))
     }
 }
 

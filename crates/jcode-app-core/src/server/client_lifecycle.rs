@@ -1111,6 +1111,17 @@ pub(super) async fn handle_client(
                     }
                 }
                 let peer_content = content.clone();
+                // A real client message is a new request: the plan for it has to
+                // be declared before any work tool runs. A synthetic
+                // continuation (auto-poke, reload recovery, scheduled task) is
+                // NOT a new request and leaves the gate as it was.
+                // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+                // (note_user_request - the runtime state this arms).
+                crate::tool::plan_declaration::note_user_request(
+                    &client_session_id,
+                    &content,
+                    false,
+                );
                 start_processing_message(
                     ProcessingMessage {
                         id,

@@ -40,6 +40,7 @@ mod name_suggestions;
 mod open;
 mod panel;
 mod patch;
+pub mod plan_declaration;
 mod read;
 pub(crate) mod sdk;
 pub mod selfdev;
@@ -1066,6 +1067,32 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
+        // Plan-declaration gate: a new request must declare its plan before any
+        // work tool runs. Every execution path (local TUI, streaming server
+        // turn, batch sub-calls, codemode sub-calls, MCP dispatch) goes through
+        // this function, so this is the one place where the gate can hold.
+        //
+        // MEASURED 2026-11-05 over 27 673 real user requests in saved sessions:
+        // the `todo` tool was never called in 21 457 of them (77.54%), so the
+        // rule the user asked for was enforced by nothing but prompt text.
+        //
+        // The gate is armed by a real user request. A session that never got one
+        // (a test harness, a background worker, an SDK client driving the tools
+        // directly) is not gated, and a synthetic auto-poke continuation is not
+        // a new request, so it leaves the gate as it was.
+        if plan_declaration::plan_declaration_state(&ctx.session_id)
+            == plan_declaration::PlanDeclarationState::AwaitingDeclaration
+            && !crate::todo::declaration::tool_allowed_before_plan_declared(
+                resolved_name,
+                false,
+            )
+        {
+            anyhow::bail!(
+                "{}",
+                crate::todo::declaration::plan_declaration_required_error()
+            );
+        }
+
         let working_dir = ctx
             .working_dir
             .as_ref()
@@ -1918,6 +1945,10 @@ impl Registry {
 #[cfg(test)]
 #[path = "registry_mcp_allow_list_tests.rs"]
 mod mcp_allow_list_tests;
+
+#[cfg(test)]
+#[path = "plan_declaration_gate_tests.rs"]
+mod plan_declaration_gate_tests;
 
 #[cfg(test)]
 mod tests;

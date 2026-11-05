@@ -37,6 +37,15 @@ impl Agent {
         let _turn = self.claim_server_turn()?;
         let _runtime_activity =
             crate::runtime_activity::global().try_enter_session(&self.session.id)?;
+        // A real user message is a new request: the plan for it has to be
+        // declared before any work tool runs.
+        // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+        // (note_user_request - the runtime state this arms).
+        crate::tool::plan_declaration::note_user_request(
+            &self.session.id,
+            user_message,
+            false,
+        );
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
         let input_id = self.add_message(
