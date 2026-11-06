@@ -1,5 +1,70 @@
 use super::*;
 
+/// Bounded number of times a single turn may re-issue a provider request
+/// after a transient stream error. The budget is per turn, not per request,
+/// so a provider that fails every time cannot keep the turn alive forever.
+pub(crate) const MAX_STREAM_ERROR_RETRIES: u32 = 3;
+
+/// True when a provider stream error is transient and the turn can be
+/// re-issued instead of dying.
+///
+/// Deterministic failures (bad credentials, quota, policy refusals, context
+/// overflow) must NOT be retried: re-issuing them burns requests and hides
+/// the real cause behind a timeout.
+pub(crate) fn is_transient_stream_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    const FATAL: &[&str] = &[
+        "401",
+        "403",
+        "404",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "invalid x-api-key",
+        "incorrect api key",
+        "insufficient_quota",
+        "quota exceeded",
+        "billing",
+        "content_policy",
+        "content policy",
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "request too large",
+        "model not found",
+        "does not exist",
+    ];
+    if FATAL.iter().any(|marker| lower.contains(marker)) {
+        return false;
+    }
+    if crate::network_retry::classify_message(&lower).is_some() {
+        return true;
+    }
+    const TRANSIENT: &[&str] = &[
+        "empty response",
+        "stream error",
+        "stream_error",
+        "stream interrupted",
+        "overloaded",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "upstream error",
+        "upstream_error",
+        "unexpected eof",
+        "connection closed",
+        "timeout",
+        "timed out",
+        "temporarily",
+        "rate limit",
+    ];
+    TRANSIENT.iter().any(|marker| lower.contains(marker))
+}
+
 /// A tool call that failed schema validation, kept so the correction and
 /// terminal error can repeat exactly what the model did wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]

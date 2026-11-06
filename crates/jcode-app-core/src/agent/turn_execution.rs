@@ -108,7 +108,21 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        // Swarm workers use this path (`server/swarm.rs` calls `run_once_capture`).
+        // Without the lifecycle hooks their turns are invisible to every
+        // external integration that observes turns - Entire.io checkpoints,
+        // status bars, turn counters - so a whole swarm produces no provenance.
+        // Mirror `run_once`, which fires the same pair.
+        self.fire_turn_start_hook("capture");
+        let result = self.run_turn(false).await;
+        let hook_result = match &result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        };
+        self.fire_turn_end_hook(&hook_result, turn_started_at, start_message_index);
+        result
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)

@@ -278,9 +278,14 @@ impl AmbientRunnerHandle {
                 let items = mgr.queue().items();
                 let queue_count = items.len();
                 let next_item = items.iter().min_by_key(|item| item.scheduled_for);
+                // Overdue means "due and not delivered". Ambient-target entries
+                // are write-only: the runner only claims direct-delivery
+                // entries, so an overdue ambient entry is a dead letter, not
+                // pending work. Counting it here reported a permanently
+                // growing backlog that nothing could ever clear.
                 let overdue_queue_count = items
                     .iter()
-                    .filter(|item| item.scheduled_for <= now)
+                    .filter(|item| item.scheduled_for <= now && item.target.is_direct_delivery())
                     .count();
                 let reminder_items: Vec<_> = items
                     .iter()

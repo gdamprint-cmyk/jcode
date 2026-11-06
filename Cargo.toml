@@ -254,7 +254,7 @@ pdf = ["jcode-tui/pdf"]
 jcode-harness-api-server = { path = "crates/jcode-harness-api-server" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 global-hotkey = "0.7"

@@ -1,3 +1,4 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/recall-first-turn.md
 use super::*;
 
 #[test]
@@ -1057,6 +1058,58 @@ fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
     assert!(
         !focused.contains("cgrep_agent_expand"),
         "the truncated catalogue leaked into the query: {focused}"
+    );
+}
+
+#[test]
+fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
+    // MEASURED 2026-11-05: on 20 of 7301 live session files the focused
+    // recall query was "." (or ".\n."), and Hindsight answered HTTP 422
+    // "query must contain at least one word character after normalization,
+    // input: .\n." - so the recall produced nothing at all.
+    let catalogue = format!(
+        "<system-reminder>\nNew MCP tools are available.\n{}\n</system-reminder>",
+        "mcp__cgrep__cgrep_agent_expand: expand selected locate IDs with context. ".repeat(60),
+    );
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "<system-reminder>\n# Session Context\nDate: 2026-11-05\n</system-reminder>"
+                    .to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: catalogue,
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: ".".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let focused = format_focused_query_for_relevance(&messages);
+
+    // A NON-EMPTY query must carry a word character: Hindsight rejects the
+    // rest with 422, so a punctuation-only query is a wasted recall. An
+    // empty query is fine - the callers skip the recall entirely.
+    assert!(
+        focused.trim().is_empty() || focused.chars().any(|c| c.is_alphanumeric()),
+        "a non-empty recall query must contain a word character, got {focused:?}"
     );
 }
 

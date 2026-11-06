@@ -7,6 +7,8 @@
 //! provider fallback or a merge prompt); the turn itself has already ended at
 //! that point. See <https://herdr.dev/docs/add-herdr-support/>.
 //!
+//! reference: https://herdr.dev/docs/add-herdr-support/
+//! reference: https://github.com/1jehuang/jcode
 //! Reports go through `"$HERDR_BIN_PATH" pane report-agent ...` on a single
 //! background thread. Only the latest pending report is kept, every command
 //! has a short timeout, and failures are ignored so herdr can never slow down
@@ -23,6 +25,9 @@ const SOURCE: &str = "jcode";
 const AGENT: &str = "jcode";
 /// Upper bound on a single herdr CLI call.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wait before a failed report is retried. Without it a down herdr would spawn
+/// one CLI per frame; with it the pane still recovers within a second.
+const REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// herdr's resume argv limits.
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_BYTES: usize = 8 * 1024;
@@ -91,12 +96,17 @@ enum Job {
 struct Slot {
     pending: Option<Job>,
     released: bool,
+    /// Earliest time a pending report may be sent again.
+    retry_at: Option<Instant>,
 }
 
+// reference: https://herdr.dev/docs/add-herdr-support/ (report-agent protocol)
 struct Reporter {
     env: HerdrEnv,
     slot: Arc<(Mutex<Slot>, Condvar)>,
-    last_submitted: Mutex<Option<StateReport>>,
+    /// The last report herdr confirmed. Filled only after a successful
+    /// delivery, so an undelivered state is retried instead of suppressed.
+    last_delivered: Arc<Mutex<Option<StateReport>>>,
 }
 
 static REPORTER: OnceLock<Option<Reporter>> = OnceLock::new();
@@ -117,9 +127,11 @@ fn reporter() -> Option<&'static Reporter> {
             let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
             let worker_slot = Arc::clone(&slot);
             let worker_env = env.clone();
+            let last_delivered = Arc::new(Mutex::new(None));
+            let worker_delivered = Arc::clone(&last_delivered);
             let spawned = std::thread::Builder::new()
                 .name("herdr-reporter".into())
-                .spawn(move || worker_loop(worker_env, worker_slot));
+                .spawn(move || worker_loop(worker_env, worker_slot, worker_delivered));
             if let Err(error) = spawned {
                 crate::logging::warn(&format!("herdr: failed to start reporter: {error}"));
                 return None;
@@ -127,7 +139,7 @@ fn reporter() -> Option<&'static Reporter> {
             Some(Reporter {
                 env,
                 slot,
-                last_submitted: Mutex::new(None),
+                last_delivered,
             })
         })
         .as_ref()
@@ -141,7 +153,7 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
         return;
     };
     let report = {
-        let mut last = lock(&reporter.last_submitted);
+        let last = lock(&reporter.last_delivered);
         if last
             .as_ref()
             .is_some_and(|last| last.state == state && last.session_id.as_deref() == session_id)
@@ -154,7 +166,6 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
             resume_argv: session_id
                 .and_then(|id| resume_argv_for_session(id, |key| std::env::var(key).ok())),
         };
-        *last = Some(report.clone());
         report
     };
     let (slot, wake) = &*reporter.slot;
@@ -163,6 +174,9 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
         return;
     }
     slot.pending = Some(Job::Report(report));
+    // A freshly queued report is current content, so it does not wait for the
+    // retry delay of an earlier failed delivery.
+    slot.retry_at = None;
     wake.notify_one();
 }
 
@@ -185,7 +199,11 @@ pub fn release() {
     run_herdr(&reporter.env.bin, &release_args(&reporter.env.pane_id, seq));
 }
 
-fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
+fn worker_loop(
+    env: HerdrEnv,
+    slot: Arc<(Mutex<Slot>, Condvar)>,
+    delivered: Arc<Mutex<Option<StateReport>>>,
+) {
     let (lock_slot, wake) = &*slot;
     loop {
         let job = {
@@ -193,6 +211,17 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
             loop {
                 if guard.released {
                     return;
+                }
+                if let Some(retry_at) = guard.retry_at {
+                    let now = Instant::now();
+                    if retry_at > now {
+                        guard = wake
+                            .wait_timeout(guard, retry_at - now)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                        continue;
+                    }
+                    guard.retry_at = None;
                 }
                 if let Some(job) = guard.pending.take() {
                     break job;
@@ -202,31 +231,45 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
         };
         match job {
             Job::Report(report) => {
-                send_report(&env, report);
+                if send_report(&env, report.clone()) {
+                    *lock(&delivered) = Some(report);
+                } else {
+                    // The report never reached herdr: keep it pending so it is
+                    // retried instead of leaving the pane on a stale frame. A
+                    // newer report already queued by sync() wins over it.
+                    let mut guard = lock(lock_slot);
+                    if !guard.released && guard.pending.is_none() {
+                        guard.pending = Some(Job::Report(report));
+                        guard.retry_at = Some(Instant::now() + REPORT_RETRY_DELAY);
+                    }
+                }
             }
         }
     }
 }
 
-fn send_report(env: &HerdrEnv, mut report: StateReport) {
+/// Send one report. Returns whether herdr confirmed it.
+fn send_report(env: &HerdrEnv, mut report: StateReport) -> bool {
     if RESUME_UNSUPPORTED.load(Ordering::Relaxed) {
         report.resume_argv = None;
     }
     let status = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
     // Only a usage error on a report that carried a resume command means
     // "this herdr predates resume". Timeouts and other failures are retried
-    // naturally by the next state change and must not disable resume.
+    // by the worker and must not disable resume.
     if !(is_usage_error(status) && resume_command(&report).is_some()) {
-        return;
+        return status.is_some_and(|status| status.success());
     }
     report.resume_argv = None;
     let retry = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
-    if retry.is_some_and(|status| status.success()) {
+    let delivered = retry.is_some_and(|status| status.success());
+    if delivered {
         RESUME_UNSUPPORTED.store(true, Ordering::Relaxed);
         crate::logging::info(
             "herdr: this herdr rejects resume commands (needs 0.9.2+), reporting state only",
         );
     }
+    delivered
 }
 
 /// Exit code clap-based CLIs such as herdr use for argument/usage errors.

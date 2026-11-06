@@ -29,6 +29,9 @@ mod compile_remote;
 #[path = "agent_tests/mcp_remote_cache.rs"]
 mod mcp_remote_cache;
 
+#[path = "agent_tests/swarm_lifecycle_hooks.rs"]
+mod swarm_lifecycle_hooks;
+
 struct DelayedProvider {
     open_delay: Duration,
     first_event_delay: Duration,

@@ -241,6 +241,16 @@ pub fn focus_query_text(raw: &str) -> String {
             continue;
         }
 
+        // Drop lines with no word character. MEASURED 2026-11-05: on 20 of
+        // 7301 live session files the focused query was "." or ".\n." and
+        // Hindsight answered HTTP 422 "query must contain at least one word
+        // character after normalization, input: .\n." - every one of those
+        // recalls produced nothing. A punctuation-only line carries no
+        // retrieval signal, so keeping it can only cost the whole recall.
+        if !trimmed.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
+
         kept.push(trimmed.to_string());
         if current_role_is_user {
             last_user = Some(trimmed.to_string());
@@ -256,10 +266,17 @@ pub fn focus_query_text(raw: &str) -> String {
     out.push_str(&kept.join("\n"));
 
     let out = out.trim();
-    if out.is_empty() {
+    if !out.is_empty() {
+        return out.to_string();
+    }
+    // Fall back to the raw relevance context, but only when it can produce a
+    // usable query: Hindsight rejects a query with no word character, so an
+    // empty query is better than a guaranteed 422. The callers skip the
+    // recall entirely on an empty query.
+    if raw.chars().any(|c| c.is_alphanumeric()) {
         raw.to_string()
     } else {
-        out.to_string()
+        String::new()
     }
 }
 

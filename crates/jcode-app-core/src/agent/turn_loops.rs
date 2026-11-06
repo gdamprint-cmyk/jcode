@@ -65,6 +65,9 @@ impl Agent {
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
         let mut consecutive_malformed_tool_rounds = 0u32;
+        // Bounded budget for re-issuing a request after a transient stream
+        // error. Reset whenever a request completes normally.
+        let mut stream_error_retries = 0u32;
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -282,6 +285,7 @@ impl Agent {
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
             let mut retry_after_compaction = false;
+            let mut retry_after_stream_error = false;
             while let Some(event) = stream.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -315,6 +319,30 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
+                            break;
+                        }
+                        // A transport-level failure is transient by
+                        // definition: the request never produced an answer.
+                        // Re-issue it, bounded, instead of ending the turn.
+                        if super::response_recovery::is_transient_stream_error(&err_str)
+                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "blocking".to_string()),
+                                    ("error", err_str.clone()),
+                                    (
+                                        "stream_error_retries",
+                                        stream_error_retries.to_string(),
+                                    ),
+                                ],
+                            );
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -797,6 +825,30 @@ impl Agent {
                             retry_after_compaction = true;
                             break;
                         }
+                        // A transient stream error must not kill the turn: the
+                        // provider failed mid-stream, so the request never
+                        // produced an answer. Re-issue it, bounded.
+                        if super::response_recovery::is_transient_stream_error(&message)
+                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "blocking".to_string()),
+                                    ("error", message.clone()),
+                                    (
+                                        "stream_error_retries",
+                                        stream_error_retries.to_string(),
+                                    ),
+                                ],
+                            );
+                            break;
+                        }
                         log_agent_provider_stream_lifecycle(
                             logging::LogLevel::Error,
                             self,
@@ -819,6 +871,15 @@ impl Agent {
             }
 
             usage_recorder.finish();
+            if retry_after_stream_error {
+                // The request failed mid-stream and produced no answer: drop
+                // the partial turn and re-issue the request from the same
+                // transcript.
+                continue;
+            }
+            // The request completed normally: the budget is refreshed so a
+            // later request in the same turn gets its own retries.
+            stream_error_retries = 0;
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
                     logging::LogLevel::Info,

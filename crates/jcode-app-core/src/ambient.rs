@@ -16,6 +16,10 @@ mod todo_reviews;
 #[path = "ambient/counter_regression_tests.rs"]
 mod counter_regression_tests;
 
+#[cfg(test)]
+#[path = "ambient/ambient_dead_letter_tests.rs"]
+mod ambient_dead_letter_tests;
+
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
 };
@@ -127,6 +131,14 @@ impl ScheduleTarget {
         )
     }
 }
+
+/// The maximum number of entries kept live in the ambient scheduled queue.
+///
+/// Entries whose target is `Ambient` are write-only: the runner only claims
+/// direct-delivery entries, so an ambient entry is never removed from the queue
+/// by production code. Without a bound the queue grows monotonically forever
+/// and every ambient cycle renders the whole list into its system prompt.
+pub const AMBIENT_QUEUE_MAX_LIVE_ENTRIES: usize = 50;
 
 /// A scheduled ambient task
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "client_lifecycle_socket_tests_idle_soft_interrupt.rs"]
+mod idle_soft_interrupt;
+
 #[derive(Clone, Default)]
 struct SdkCallbackProvider {
     calls: Arc<std::sync::atomic::AtomicUsize>,

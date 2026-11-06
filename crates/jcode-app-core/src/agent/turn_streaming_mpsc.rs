@@ -37,6 +37,9 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut consecutive_malformed_tool_rounds = 0u32;
+        // Bounded budget for re-issuing a request after a transient stream
+        // error. Reset whenever a request completes normally.
+        let mut stream_error_retries = 0u32;
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -358,6 +361,7 @@ impl Agent {
                 std::collections::HashMap::new();
 
             let mut retry_after_compaction = false;
+            let mut retry_after_stream_error = false;
             let mut keepalive = stream_keepalive_ticker();
             loop {
                 let next_event = std::pin::pin!(stream.next());
@@ -447,6 +451,30 @@ impl Agent {
                             }
                             retry_after_compaction = true;
                             let _ = event_tx.send(self.take_recovery_compaction_event());
+                            break;
+                        }
+                        // A transport-level failure is transient by
+                        // definition: the request never produced an answer.
+                        // Re-issue it, bounded, instead of ending the turn.
+                        if super::response_recovery::is_transient_stream_error(&err_str)
+                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "mpsc".to_string()),
+                                    ("error", err_str.clone()),
+                                    (
+                                        "stream_error_retries",
+                                        stream_error_retries.to_string(),
+                                    ),
+                                ],
+                            );
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -1055,6 +1083,30 @@ impl Agent {
                             let _ = event_tx.send(self.take_recovery_compaction_event());
                             break;
                         }
+                        // A transient stream error must not kill the turn: the
+                        // provider failed mid-stream, so the request never
+                        // produced an answer. Re-issue it, bounded.
+                        if super::response_recovery::is_transient_stream_error(&message)
+                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "mpsc".to_string()),
+                                    ("error", message.clone()),
+                                    (
+                                        "stream_error_retries",
+                                        stream_error_retries.to_string(),
+                                    ),
+                                ],
+                            );
+                            break;
+                        }
                         log_agent_provider_stream_lifecycle(
                             logging::LogLevel::Error,
                             self,
@@ -1077,6 +1129,15 @@ impl Agent {
             }
 
             usage_recorder.finish();
+            if retry_after_stream_error {
+                // The request failed mid-stream and produced no answer: drop
+                // the partial turn and re-issue the request from the same
+                // transcript.
+                continue;
+            }
+            // The request completed normally: the budget is refreshed so a
+// later request in the same turn gets its own retries.
+            stream_error_retries = 0;
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
                     logging::LogLevel::Info,

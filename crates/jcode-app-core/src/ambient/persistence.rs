@@ -1,3 +1,4 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-dead-letter-fix.md (measured write-only ambient queue: overflow is archived, not dropped)
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -196,7 +197,68 @@ impl ScheduledQueue {
         self.transact(|items| {
             items.push(item);
             Ok(())
-        })
+        })?;
+        self.apply_retention()
+    }
+
+    /// Keep the live queue bounded, archiving the overflow instead of dropping it.
+    ///
+    /// Ambient-target entries are write-only (production code never claims them),
+    /// so an unbounded queue grows forever and every ambient cycle renders the
+    /// whole list into its system prompt. The overflow is written to
+    /// `queue_archive.jsonl` next to `queue.json`, so the carry-forward memory
+    /// stays readable on disk rather than being lost.
+    ///
+    /// Direct-delivery entries are never archived: they are the actionable work
+    /// and the runner claims them, so removing one would lose it.
+    fn apply_retention(&mut self) -> Result<()> {
+        let max_live = super::AMBIENT_QUEUE_MAX_LIVE_ENTRIES;
+        let mut ambient: Vec<ScheduledItem> = self
+            .items
+            .iter()
+            .filter(|item| !item.target.is_direct_delivery())
+            .cloned()
+            .collect();
+        if ambient.len() <= max_live {
+            return Ok(());
+        }
+        ambient.sort_by(|a, b| a.scheduled_for.cmp(&b.scheduled_for));
+        // Archive the OLDEST entries: the newest ones are what the next cycles
+        // still care about, and the prompt renders them in full.
+        let overflow: Vec<ScheduledItem> = ambient.drain(..ambient.len() - max_live).collect();
+        let overflow_ids: std::collections::HashSet<String> =
+            overflow.iter().map(|item| item.id.clone()).collect();
+        // Archive first: if the trim fails, the entries are still live in the
+        // queue. If the archive write fails, nothing is removed either.
+        self.archive_overflow(&overflow)?;
+        self.transact(|items| {
+            items.retain(|item| !overflow_ids.contains(&item.id));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Append the overflow entries to the archive file, one JSON document per line.
+    fn archive_overflow(&self, overflow: &[ScheduledItem]) -> Result<()> {
+        if overflow.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.with_file_name("queue_archive.jsonl");
+        if let Some(parent) = path.parent() {
+            storage::ensure_dir(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        use std::io::Write;
+        for item in overflow {
+            let line = serde_json::to_string(item)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        Ok(())
     }
 
     pub fn push(&mut self, item: ScheduledItem) {
