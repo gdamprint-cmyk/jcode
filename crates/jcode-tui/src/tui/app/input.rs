@@ -1529,6 +1529,22 @@ impl App {
             || self.pending_turn
             || self.has_queued_followups()
         {
+            // The guard runs before every other AUTO_POKE_DECISION site, so a
+            // disabled poke used to leave the log completely silent. Name the
+            // cause here, otherwise "poke is on but never fires" cannot be
+            // diagnosed from the log.
+            let reason = if !self.auto_poke_incomplete_todos {
+                "not_armed"
+            } else if self.pending_queued_dispatch {
+                "pending_queued_dispatch"
+            } else if self.pending_turn {
+                "pending_turn"
+            } else {
+                "queued_followups"
+            };
+            crate::logging::info(&format!(
+                "AUTO_POKE_DECISION action=idle reason=guard_{reason}"
+            ));
             return false;
         }
 
