@@ -92,6 +92,7 @@ export -f cargo
     ) -> Result<TaskResult> {
         let mut cmd = tokio::process::Command::new(&command.program);
         cmd.args(&command.args)
+            .envs(command.env.iter().cloned())
             .current_dir(&repo_dir)
             .env(
                 "JCODE_DEV_CARGO_SCRIPT",
@@ -877,6 +878,7 @@ export -f cargo
                 SelfDevTool::optimized_test_shell_command(&command),
             ],
             display: command.clone(),
+            env: Vec::new(),
         };
         let dedupe_key = format!(
             "test:{}:{}:{}",

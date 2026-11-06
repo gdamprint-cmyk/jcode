@@ -30,6 +30,9 @@ pub struct SelfDevBuildCommand {
     pub program: String,
     pub args: Vec<String>,
     pub display: String,
+    /// Environment variables the build must run with (e.g. `JCODE_BUILD_GIT_HASH`).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
