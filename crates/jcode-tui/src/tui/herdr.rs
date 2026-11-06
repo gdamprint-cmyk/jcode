@@ -28,6 +28,17 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wait before a failed report is retried. Without it a down herdr would spawn
 /// one CLI per frame; with it the pane still recovers within a second.
 const REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How often a live client re-asserts its agent in herdr's registry.
+///
+/// reference: https://herdr.dev/docs/add-herdr-support/ (herdr clears a pane's
+/// agent when the agent process exits without releasing the pane, so a client
+/// restarted in the same pane - which is what a server reload does - has to
+/// register itself again; the report that recreated the agent can still be
+/// undone by the cleanup of the previous process a second later).
+const REPORT_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Delay of the first re-assert. herdr notices a dead agent within a second
+/// or two, so the first re-assert has to happen after that window.
+const REPORT_REASSERT_DELAY: Duration = Duration::from_secs(5);
 /// herdr's resume argv limits.
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_BYTES: usize = 8 * 1024;
@@ -131,7 +142,17 @@ fn reporter() -> Option<&'static Reporter> {
             let worker_delivered = Arc::clone(&last_delivered);
             let spawned = std::thread::Builder::new()
                 .name("herdr-reporter".into())
-                .spawn(move || worker_loop(worker_env, worker_slot, worker_delivered));
+                .spawn(move || {
+                    worker_loop(
+                        worker_env,
+                        worker_slot,
+                        worker_delivered,
+                        Timing::production(),
+                        Arc::new(|env: &HerdrEnv, report: &StateReport| {
+                            send_report(env, report.clone())
+                        }),
+                    )
+                });
             if let Err(error) = spawned {
                 crate::logging::warn(&format!("herdr: failed to start reporter: {error}"));
                 return None;
@@ -203,8 +224,12 @@ fn worker_loop(
     env: HerdrEnv,
     slot: Arc<(Mutex<Slot>, Condvar)>,
     delivered: Arc<Mutex<Option<StateReport>>>,
+    timing: Timing,
+    send: Arc<dyn Fn(&HerdrEnv, &StateReport) -> bool + Send + Sync>,
 ) {
     let (lock_slot, wake) = &*slot;
+    let mut next_heartbeat = Instant::now() + timing.reassert_delay;
+    let mut sent_any = false;
     loop {
         let job = {
             let mut guard = lock(lock_slot);
@@ -226,12 +251,26 @@ fn worker_loop(
                 if let Some(job) = guard.pending.take() {
                     break job;
                 }
-                guard = wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                // herdr drops the agent of a pane whose agent died without
+                // releasing it, so keep re-asserting the last delivered
+                // report even when nothing changed.
+                let now = Instant::now();
+                if now >= next_heartbeat {
+                    if let Some(report) = lock(&delivered).clone() {
+                        break Job::Report(report);
+                    }
+                    next_heartbeat = now + timing.heartbeat;
+                    continue;
+                }
+                guard = wake
+                    .wait_timeout(guard, next_heartbeat - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
         };
         match job {
             Job::Report(report) => {
-                if send_report(&env, report.clone()) {
+                if send(&env, &report) {
                     *lock(&delivered) = Some(report);
                 } else {
                     // The report never reached herdr: keep it pending so it is
@@ -244,6 +283,30 @@ fn worker_loop(
                     }
                 }
             }
+        }
+        next_heartbeat = Instant::now()
+            + if sent_any {
+                timing.heartbeat
+            } else {
+                timing.reassert_delay
+            };
+        sent_any = true;
+    }
+}
+
+/// Timing of the reporter's re-assert loop. Production uses the constants
+/// above; tests use short delays.
+#[derive(Clone, Copy)]
+struct Timing {
+    heartbeat: Duration,
+    reassert_delay: Duration,
+}
+
+impl Timing {
+    fn production() -> Self {
+        Self {
+            heartbeat: REPORT_HEARTBEAT,
+            reassert_delay: REPORT_REASSERT_DELAY,
         }
     }
 }
@@ -578,6 +641,76 @@ mod tests {
                 "session_a",
                 "self-dev"
             ]
+        );
+    }
+
+    #[test]
+    /// The reporter must keep re-asserting its report even when the agent state
+    /// never changes: herdr drops a pane's agent when the agent process dies
+    /// without releasing the pane, which is what a server reload causes. A new
+    /// client in the same pane therefore has to re-register itself instead of
+    /// waiting for the next state change.
+    ///
+    /// reference: https://herdr.dev/docs/add-herdr-support/ (herdr's safety net
+    /// clears the agent and its resume command once the pane is back at its
+    /// idle shell prompt, a second or two after the agent died).
+    fn unchanged_report_is_reasserted_after_the_heartbeat() {
+        use std::sync::atomic::AtomicUsize;
+
+        let env = HerdrEnv {
+            bin: "herdr".into(),
+            pane_id: "p1".into(),
+        };
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        let delivered = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let timing = Timing {
+            heartbeat: Duration::from_millis(20),
+            reassert_delay: Duration::from_millis(20),
+        };
+        let worker_env = env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            worker_loop(
+                worker_env,
+                worker_slot,
+                worker_delivered,
+                timing,
+                Arc::new(move |_: &HerdrEnv, _: &StateReport| {
+                    calls_for_worker.fetch_add(1, Ordering::Relaxed) >= 0
+                }),
+            )
+        });
+
+        // First report: the client registers itself.
+        {
+            let mut guard = lock(&slot.0);
+            guard.pending = Some(Job::Report(StateReport {
+                state: AgentState::Idle,
+                session_id: Some("session_a".into()),
+                resume_argv: Some(vec![
+                    "jcode".into(),
+                    "--resume".into(),
+                    "session_a".into(),
+                ]),
+            }));
+            guard.retry_at = None;
+        }
+
+        // The state never changes again, but the agent must keep being reported.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::Relaxed) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sent = calls.load(Ordering::Relaxed);
+        lock(&slot.0).released = true;
+        let _ = worker.join();
+
+        assert!(
+            sent >= 3,
+            "unchanged report must be re-sent to re-register the agent, got {sent} sends"
         );
     }
 
