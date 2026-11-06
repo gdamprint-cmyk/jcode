@@ -34,8 +34,22 @@ if (-not (Test-Path $script)) { throw "janitor not found: $script" }
 
 $args = @($script, "--prune-lanes", "$PruneDays", "--sweep", "$SweepDays")
 if ($Apply) { $args += "--apply" }
-$action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"& '$Python' $($args -join ' ') *>&1 | Out-File -Encoding utf8 (Join-Path $env:TEMP 'jcode-cargo-janitor.log')`""
+# The task action is a .cmd wrapper rather than an inline PowerShell command.
+# schtasks.exe parses its own /TR argument with cmd.exe quoting rules, and an
+# inline command containing its own quotes is rejected with "Invalid syntax"
+# (measured on this host). A wrapper file keeps the quoting to one level.
+$wrapper = Join-Path $env:TEMP "jcode-cargo-janitor-run.cmd"
+$logFile = Join-Path $env:TEMP "jcode-cargo-janitor.log"
+$pythonArgs = ($args -join " ")
+$wrapperBody = @(
+    "@echo off",
+    "REM Regenerable cargo target cleanup. See scripts/clean_target_windows.py.",
+    "`"$Python`" $pythonArgs >> `"$logFile`" 2>&1"
+) -join "`r`n"
+Set-Content -Path $wrapper -Value $wrapperBody -Encoding ASCII
 
-schtasks.exe /Create /TN $TaskName /TR $action /SC DAILY /ST 04:30 /F | Out-Null
+& schtasks.exe /Create /TN $TaskName /TR $wrapper /SC DAILY /ST 04:30 /F | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "schtasks /Create failed with exit code $LASTEXITCODE" }
 Write-Host "installed task '$TaskName' (daily 04:30, apply=$Apply, prune=${PruneDays}d, sweep=${SweepDays}d)"
+Write-Host "wrapper: $wrapper"
+Write-Host "log:     $logFile"
