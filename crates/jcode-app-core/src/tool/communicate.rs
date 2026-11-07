@@ -589,6 +589,12 @@ impl RunPlanReporter {
         } else {
             format!("{}\n\n--- run log ---\n{}", summary, log)
         };
+        // The summary is model text (LF); the run log may be CRLF. Normalize to
+        // the file's own ending so the report does not mix terminators.
+        let content = jcode_core::eol::normalize_line_endings(
+            &content,
+            jcode_core::eol::resolve_line_ending(path, Some(&log)),
+        );
         let _ = tokio::fs::write(path, content).await;
     }
 }

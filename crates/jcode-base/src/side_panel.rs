@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use jcode_core::eol::{normalize_line_endings, resolve_line_ending};
 use std::io::Read as _;
 
 /// Maximum unencoded PDF payload size.
@@ -237,9 +238,16 @@ fn write_page(
         anyhow::bail!("cannot append Markdown to a PDF panel; use write to replace it");
     }
 
-    let combined_content = if append && page_path.exists() {
-        let mut existing = std::fs::read_to_string(&page_path)
-            .with_context(|| format!("failed to read {}", page_path.display()))?;
+    let existing = if append && page_path.exists() {
+        Some(
+            std::fs::read_to_string(&page_path)
+                .with_context(|| format!("failed to read {}", page_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let combined_content = if let Some(existing) = existing.as_deref() {
+        let mut existing = existing.to_string();
         if !existing.is_empty() && !existing.ends_with('\n') {
             existing.push('\n');
         }
@@ -248,6 +256,10 @@ fn write_page(
     } else {
         content.to_string()
     };
+    let combined_content = normalize_line_endings(
+        &combined_content,
+        resolve_line_ending(&page_path, existing.as_deref()),
+    );
 
     std::fs::write(&page_path, &combined_content)
         .with_context(|| format!("failed to write {}", page_path.display()))?;

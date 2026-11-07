@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::jcode_dir;
+use jcode_core::eol::{normalize_line_endings, resolve_line_ending};
 use std::path::PathBuf;
 
 type TrustedExternalAuthKey = (
@@ -94,6 +95,9 @@ impl Config {
         }
 
         let content = toml::to_string_pretty(self)?;
+        let existing = std::fs::read_to_string(&path).ok();
+        let content =
+            normalize_line_endings(&content, resolve_line_ending(&path, existing.as_deref()));
         std::fs::write(&path, content)?;
         Self::invalidate_cache();
         Ok(())
@@ -509,6 +513,10 @@ impl Config {
         if content.ends_with('\n') {
             new_content.push('\n');
         }
+        // `lines()` dropped the original terminators, so re-apply the file's own
+        // ending instead of rewriting a CRLF config as LF.
+        let new_content =
+            normalize_line_endings(&new_content, resolve_line_ending(&path, Some(&content)));
         match std::fs::write(&path, new_content) {
             Ok(()) => {
                 Self::invalidate_cache();
@@ -594,6 +602,10 @@ impl Config {
         if content.ends_with('\n') {
             new_content.push('\n');
         }
+        // `lines()` dropped the original terminators, so re-apply the file's own
+        // ending instead of rewriting a CRLF config as LF.
+        let new_content =
+            normalize_line_endings(&new_content, resolve_line_ending(&path, Some(&content)));
         match std::fs::write(&path, new_content) {
             Ok(()) => {
                 Self::invalidate_cache();
@@ -920,5 +932,41 @@ reasoning_effort = "max"
 
         assert!(error.to_string().contains("Failed to parse config file"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn saving_a_crlf_config_keeps_its_crlf_ending() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path());
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[features]\r\nmemory = false\r\n[display]\r\ncentered = true\r\n",
+        )
+        .unwrap();
+
+        Config::set_update_channel(super::UpdateChannel::Preview).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.replace("\r\n", "").contains('\n'),
+            "saving a CRLF config must keep CRLF, got {saved:?}"
+        );
+        assert!(saved.contains("\r\n"));
+    }
+
+    #[test]
+    fn saving_an_lf_config_keeps_its_lf_ending() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path());
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[features]\nmemory = false\n").unwrap();
+
+        Config::set_update_channel(super::UpdateChannel::Preview).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains('\r'), "saving an LF config must keep LF");
     }
 }

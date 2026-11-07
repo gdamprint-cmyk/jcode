@@ -127,6 +127,64 @@ fn load_markdown_file_rejects_non_markdown_extensions() {
     assert!(err.to_string().contains("only supports markdown files"));
 }
 
+/// Count line terminators that are not part of a CRLF pair.
+fn bare_lf_count(text: &str) -> usize {
+    text.bytes()
+        .enumerate()
+        .filter(|(index, byte)| {
+            *byte == b'\n' && text.as_bytes().get(index.wrapping_sub(1)) != Some(&b'\r')
+        })
+        .count()
+}
+
+#[test]
+fn side_panel_markdown_page_keeps_the_files_own_line_ending() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let session_id = "ses_side_panel_eol";
+    write_markdown_page(session_id, "notes", Some("Notes"), "# Notes\nbody", true)
+        .expect("write notes");
+
+    let page_path = session_dir(session_id)
+        .expect("session dir")
+        .join("notes.md");
+    let written = std::fs::read_to_string(&page_path).expect("read page");
+    assert_eq!(written, "# Notes\nbody");
+    assert_eq!(
+        bare_lf_count(&written),
+        1,
+        "a new page uses LF, got {written:?}"
+    );
+    assert!(!written.contains('\r'), "a new page must not use CRLF");
+}
+
+#[test]
+fn side_panel_append_preserves_a_crlf_page() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let session_id = "ses_side_panel_crlf";
+    write_markdown_page(session_id, "notes", Some("Notes"), "# Notes", true).expect("write notes");
+
+    let page_path = session_dir(session_id)
+        .expect("session dir")
+        .join("notes.md");
+    std::fs::write(&page_path, "# Notes\r\nfirst\r\n").expect("seed crlf page");
+
+    append_markdown_page(session_id, "notes", None, "second", false).expect("append notes");
+
+    let written = std::fs::read_to_string(&page_path).expect("read page");
+    assert_eq!(
+        bare_lf_count(&written),
+        0,
+        "appending to a CRLF page must keep CRLF, got {written:?}"
+    );
+    assert!(written.contains("second"));
+}
+
 #[test]
 fn status_output_marks_linked_and_managed_pages() {
     let snapshot = SidePanelSnapshot {
