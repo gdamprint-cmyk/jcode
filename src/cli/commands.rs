@@ -2716,6 +2716,11 @@ async fn run_single_message_with_agent(
     // one-shot exit from looking like a stale-PID crash on the next startup
     // (issue #988).
     agent.mark_closed();
+    // The skill review runs detached so it does not hold the answer hostage.
+    // But this process is about to exit, and a detached task dies with the
+    // runtime. Wait for it here, AFTER the answer was printed, so the review
+    // is not silently dropped in the one-shot mode.
+    agent.wait_for_skill_review().await;
     result
 }
 

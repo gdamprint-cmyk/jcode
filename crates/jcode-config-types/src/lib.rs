@@ -1036,6 +1036,33 @@ pub struct AutoJudgeConfig {
     pub model: Option<String>,
 }
 
+/// Post-turn skill review configuration.
+///
+/// The review is a forked model turn that may patch an existing skill or
+/// create a new one. It is the "skills improve during use" half of the
+/// learning loop, and it is opt-in: a fork that writes executable instruction
+/// has to be something the user turned on deliberately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillReviewConfig {
+    /// Enable the skill review for new/resumed sessions (default: false).
+    pub enabled: bool,
+    /// Turns between reviews (default: 15).
+    pub interval_turns: u32,
+    /// Optional model override for the review fork.
+    pub model: Option<String>,
+}
+
+impl Default for SkillReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_turns: 15,
+            model: None,
+        }
+    }
+}
+
 /// Keybinding configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

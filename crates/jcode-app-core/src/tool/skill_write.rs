@@ -115,9 +115,8 @@ pub fn validate_skill_name(raw: &str) -> Result<String> {
     // Windows reserved device names would make the directory unopenable.
     let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-        "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if RESERVED.contains(&stem.as_str()) {
         bail!("skill name is a reserved device name: {name:?}");
@@ -149,14 +148,16 @@ pub fn validate_skill_document(name: &str, content: &str) -> Result<()> {
     let yaml = &rest[..end];
     let declared = frontmatter_string(yaml, "name")
         .ok_or_else(|| anyhow::anyhow!("SKILL.md frontmatter must declare 'name'"))?;
-    let declared = declared.trim().trim_matches('"').trim_matches('\'').to_string();
+    let declared = declared
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
     if declared.is_empty() {
         bail!("SKILL.md frontmatter 'name' must not be empty");
     }
     if declared != name {
-        bail!(
-            "SKILL.md frontmatter name {declared:?} does not match the skill directory {name:?}"
-        );
+        bail!("SKILL.md frontmatter name {declared:?} does not match the skill directory {name:?}");
     }
     let description = frontmatter_string(yaml, "description")
         .ok_or_else(|| anyhow::anyhow!("SKILL.md frontmatter must declare 'description'"))?;
@@ -200,7 +201,9 @@ fn apply_patch(content: &str, old_string: &str, new_string: &str) -> Result<Stri
     }
     let count = content.matches(old_string).count();
     match count {
-        0 => bail!("'old_string' was not found in the file; read the file first and copy the exact text"),
+        0 => bail!(
+            "'old_string' was not found in the file; read the file first and copy the exact text"
+        ),
         1 => Ok(content.replacen(old_string, new_string, 1)),
         n => bail!(
             "'old_string' occurs {n} times in the file; it must match exactly once, so include more surrounding context"
@@ -394,7 +397,11 @@ mod tests {
         patch.old_string = Some("Body".to_string());
         patch.new_string = Some("New body".to_string());
         let outcome = patch_skill(&root, &patch).expect("patch");
-        assert!(std::fs::read_to_string(outcome.path).unwrap().contains("New body"));
+        assert!(
+            std::fs::read_to_string(outcome.path)
+                .unwrap()
+                .contains("New body")
+        );
 
         let mut ambiguous = req("demo");
         ambiguous.old_string = Some("e".to_string());

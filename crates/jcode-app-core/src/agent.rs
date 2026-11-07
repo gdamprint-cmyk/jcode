@@ -15,6 +15,7 @@ mod prompting;
 mod provider;
 mod response_recovery;
 mod runtime_recovery;
+mod skill_review;
 mod status;
 mod streaming;
 #[cfg(test)]
@@ -402,6 +403,31 @@ pub struct Agent {
     announced_skills: HashSet<String>,
     /// Transcript index already scanned for late-skill announcements.
     announced_skills_scan_index: usize,
+    /// Turns completed since the last skill review, and the turn counter at
+    /// which the last review ran. The review is cadence-gated, so this is the
+    /// state that decides whether the next turn triggers one.
+    skill_review_turns_since_last: u32,
+    /// Whether the skill review is enabled for this session. `None` means
+    /// "use the config default".
+    skill_review_enabled: Option<bool>,
+    /// True for a skill-review fork. The fork runs a turn, and a turn's end
+    /// would otherwise trigger another review — an unbounded chain of forks.
+    suppress_skill_review: bool,
+    /// The detached skill-review tasks, if any are running.
+    ///
+    /// The review must not hold the turn, so it runs as a detached task. But
+    /// `jcode run` is a one-shot process: when it returns, the Tokio runtime
+    /// is dropped and every detached task dies with it. The handles are kept
+    /// so the process can WAIT for the review before exiting — otherwise the
+    /// review would be silently dropped in exactly the mode where it is
+    /// easiest to observe.
+    ///
+    /// A `Vec`, not a single handle: two reviews can overlap when the second
+    /// turn's cadence fires before the first fork finished, and dropping a
+    /// `JoinHandle` detaches the task rather than cancelling it, so nothing
+    /// is lost either way. What the drain must not lose is the ability to
+    /// WAIT for both.
+    skill_review_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Whether memory features are enabled for this session
     memory_enabled: bool,
     /// One-step undo snapshot captured before the most recent rewind.
@@ -477,6 +503,7 @@ impl Agent {
             .map(|skill| crate::prompt::SkillInfo {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
+                user_invoked_only: skill.disable_model_invocation,
             })
             .collect()
     }
@@ -548,6 +575,10 @@ impl Agent {
             prompt_skills_snapshot: Vec::new(),
             announced_skills: HashSet::new(),
             announced_skills_scan_index: 0,
+            skill_review_turns_since_last: 0,
+            skill_review_enabled: None,
+            suppress_skill_review: false,
+            skill_review_tasks: Vec::new(),
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
