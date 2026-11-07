@@ -21,6 +21,7 @@ Commit as you go.
 Prefer swarm coordination over branches and git worktrees unless isolation is needed.
 You can't interact with interactive commands. Use non-interactive instead.
 Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or Python scripts in bash.
+Write plain LF content; the file tools keep each file's own line ending (CRLF stays CRLF), so never hand-craft `\r\n` in a template.
 
 ## Dont
 

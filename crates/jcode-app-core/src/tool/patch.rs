@@ -1,6 +1,7 @@
 use super::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_core::eol::{normalize_line_endings, resolve_line_ending};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -412,7 +413,12 @@ async fn prepare_patch(patch: &FilePatch, path: PathBuf) -> Result<PreparedPatch
         "{}: missing hunks; cannot verify contents",
         path.display()
     );
-    let content = render_patch(patch, old.as_deref().unwrap_or(""))?;
+    let mut content = render_patch(patch, old.as_deref().unwrap_or(""))?;
+    if patch.is_new {
+        // A new file has no ending to inherit, so it takes the default for its
+        // kind; an existing file keeps the ending `render_patch` preserved.
+        content = normalize_line_endings(&content, resolve_line_ending(&path, None));
+    }
     anyhow::ensure!(
         !patch.is_delete || content.is_empty(),
         "{}: deletion patch does not cover entire file",

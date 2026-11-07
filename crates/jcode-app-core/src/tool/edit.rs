@@ -1,7 +1,10 @@
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
+// reference: https://github.com/jjant/ini-edit - a syntax-preserving editor that
+// takes the new lines' ending from the document instead of the writer's platform.
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_core::eol::{LineEnding, normalize_line_endings, resolve_line_ending};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -211,7 +214,14 @@ impl Tool for EditTool {
 
         let _lock = super::file_lock::lock(&path).await;
         let content = tokio::fs::read_to_string(&path).await?;
-        let (new_content, applied) = apply_edits(&content, &edits, &params.file_path)?;
+        // The model emits LF while the file on disk may be CRLF. Matching in one
+        // line-ending space lets a multi-line `old_string` find its target no
+        // matter which ending the file uses; the result is written back in the
+        // file's own ending.
+        let ending = resolve_line_ending(&path, Some(&content));
+        let unified = normalize_line_endings(&content, LineEnding::Lf);
+        let (new_content, applied) = apply_edits(&unified, &edits, &params.file_path)?;
+        let new_content = normalize_line_endings(&new_content, ending);
 
         tokio::fs::write(&path, &new_content).await?;
         super::edit_stats::record(&ctx, &content, &new_content, false).await;
@@ -468,6 +478,10 @@ fn generate_diff_summary(old: &str, new: &str) -> String {
 
     output.trim_end().to_string()
 }
+
+#[cfg(test)]
+#[path = "eol_tests.rs"]
+mod eol_tests;
 
 #[cfg(test)]
 mod tests {

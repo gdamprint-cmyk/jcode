@@ -49,6 +49,7 @@ mod session_search;
 pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
+mod skill_write;
 mod todo;
 mod user_response;
 mod webfetch;
