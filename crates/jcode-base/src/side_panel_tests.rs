@@ -186,6 +186,32 @@ fn side_panel_append_preserves_a_crlf_page() {
 }
 
 #[test]
+fn side_panel_write_preserves_a_crlf_page() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let session_id = "ses_side_panel_replace";
+    write_markdown_page(session_id, "notes", Some("Notes"), "# Notes", true).expect("write notes");
+
+    let page_path = session_dir(session_id)
+        .expect("session dir")
+        .join("notes.md");
+    std::fs::write(&page_path, "# Notes\r\nfirst\r\n").expect("seed crlf page");
+
+    write_markdown_page(session_id, "notes", Some("Notes"), "# Replaced\nbody", true)
+        .expect("replace notes");
+
+    let written = std::fs::read_to_string(&page_path).expect("read page");
+    assert_eq!(
+        bare_lf_count(&written),
+        0,
+        "replacing a CRLF page must keep CRLF, got {written:?}"
+    );
+    assert!(written.contains("Replaced"));
+}
+
+#[test]
 fn status_output_marks_linked_and_managed_pages() {
     let snapshot = SidePanelSnapshot {
         focus_revision: 0,

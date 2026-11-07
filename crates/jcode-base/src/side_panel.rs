@@ -238,16 +238,12 @@ fn write_page(
         anyhow::bail!("cannot append Markdown to a PDF panel; use write to replace it");
     }
 
-    let existing = if append && page_path.exists() {
-        Some(
-            std::fs::read_to_string(&page_path)
-                .with_context(|| format!("failed to read {}", page_path.display()))?,
-        )
-    } else {
-        None
-    };
-    let combined_content = if let Some(existing) = existing.as_deref() {
-        let mut existing = existing.to_string();
+    // The existing file's ending is the page's convention, so read it even
+    // when replacing the content. A file that is not valid UTF-8 carries no
+    // usable convention, so it falls back to the default.
+    let existing = std::fs::read_to_string(&page_path).ok();
+    let combined_content = if append {
+        let mut existing = existing.clone().unwrap_or_default();
         if !existing.is_empty() && !existing.ends_with('\n') {
             existing.push('\n');
         }
