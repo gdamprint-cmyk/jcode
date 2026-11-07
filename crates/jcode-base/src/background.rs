@@ -640,7 +640,7 @@ impl BackgroundTaskManager {
         session_id: &str,
         handle: JoinHandle<Result<jcode_tool_types::ToolOutput>>,
     ) -> BackgroundTaskInfo {
-        self.adopt_with_options(tool_name, None, session_id, true, false, handle)
+        self.adopt_with_options(tool_name, None, session_id, true, true, handle)
             .await
     }
 

@@ -413,6 +413,7 @@ async fn wait_many_polling(
     return_on_progress: bool,
     mode: &str,
 ) -> Result<(String, Vec<background::TaskStatusFile>)> {
+    let mut bus_rx = crate::bus::Bus::global().subscribe();
     let deadline = Instant::now() + max_wait;
     let mut last_progress = std::collections::HashMap::new();
     let mut wait_guard = None;
@@ -461,7 +462,48 @@ async fn wait_many_polling(
         wait_guard.get_or_insert_with(|| {
             crate::wait_registry::register(session_id, "Waiting for background tasks")
         });
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Completion is event-driven: the bus wakes this wait the moment a
+        // tracked task finishes. The 1s tick stays only as reconciliation for
+        // detached tasks and missed broadcasts. Only events for the tracked
+        // tasks count, so unrelated bus traffic cannot spin this loop.
+        tokio::select! {
+            _ = wait_for_tracked_bus_event(&mut bus_rx, task_ids) => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Resolve once the bus reports progress or completion for one of `task_ids`.
+async fn wait_for_tracked_bus_event(
+    bus_rx: &mut tokio::sync::broadcast::Receiver<crate::bus::BusEvent>,
+    task_ids: &[String],
+) {
+    loop {
+        let event = match bus_rx.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                // The bus is gone, so no event can arrive. Fall back to the
+                // reconciliation tick instead of spinning.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                return;
+            }
+        };
+        let tracked = match &event {
+            crate::bus::BusEvent::BackgroundTaskCompleted(event) => {
+                task_ids.iter().any(|id| id == &event.task_id)
+            }
+            crate::bus::BusEvent::BackgroundTaskProgress(event) => {
+                task_ids.iter().any(|id| id == &event.task_id)
+            }
+            crate::bus::BusEvent::BackgroundTaskStalled(event) => {
+                task_ids.iter().any(|id| id == &event.task_id)
+            }
+            _ => false,
+        };
+        if tracked {
+            return;
+        }
     }
 }
 

@@ -760,7 +760,13 @@ struct BashInput {
         deserialize_with = "deserialize_bool_or_default::<_, true>"
     )]
     notify: bool,
-    #[serde(default, deserialize_with = "deserialize_bool_or_default::<_, false>")]
+    /// Wake the agent when the background task completes. Defaults to true so a
+    /// finished background job resumes the session immediately instead of waiting
+    /// for an unrelated turn.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_bool_or_default::<_, true>"
+    )]
     wake: bool,
     /// For background runs: wake the agent after this many seconds with no
     /// new output and no progress events. Resets on activity.

@@ -202,7 +202,7 @@ fn bash_optional_nulls_use_omitted_defaults() {
     }))
     .unwrap();
     assert!(nulls.notify);
-    assert!(!nulls.wake);
+    assert!(nulls.wake);
     assert_eq!(nulls.notify, omitted.notify);
     assert_eq!(nulls.wake, omitted.wake);
     assert_eq!(nulls.run_in_background, omitted.run_in_background);

@@ -334,7 +334,7 @@ async fn await_or_background_search(
                     Some(display_name.clone()),
                     &session_id,
                     true,
-                    false,
+                    true,
                     // Transfer, do not cancel: the background manager becomes
                     // the sole owner, including while adoption is awaiting.
                     owner
