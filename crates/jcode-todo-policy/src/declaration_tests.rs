@@ -2,6 +2,13 @@
 // policy test module for this crate, same shape (pure decisions over a plan
 // snapshot, asserted directly).
 use super::*;
+// The three continuation constants live in the crate root, not in the
+// `declaration` module this test file is nested in, so `use super::*` does
+// not bring them into scope.
+use crate::{
+    TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE, TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE,
+    TODO_LONG_SESSION_REVIEW_MESSAGE,
+};
 
 /// MEASURED 2026-11-05 over 27 673 real user requests in saved sessions: the
 /// `todo` tool was never called in 77.54% of them, so the "declare the plan
