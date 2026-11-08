@@ -1,6 +1,16 @@
 //! Model-facing names are resolved at the tool boundary. Storage and swarm keep IDs.
 use super::*;
 
+// reference: no prior art, searched crates/jcode-app-core/src/tool/todo.rs and
+//            crates/jcode-todo-policy/src/stages.rs for an existing
+//            duplicate-name refusal on the add path. The merge-side
+//            disambiguation (`stages.rs::disambiguate_names`) renames silently
+//            and is merge-only; it cannot be reused here because a silent
+//            rename would make the caller address the pre-existing card on
+//            its next call. The refusal shape follows the tool's own precedent
+//            for "this card exists" (`todo.rs`: "todo id {id:?} already
+//            exists; use `update` to change it").
+
 /// Keep the existing leniency for providers that stringify tool arguments.
 pub(super) fn normalize_containers(input: &mut Value) {
     *input = normalize_todo_input(std::mem::take(input));
@@ -34,6 +44,32 @@ pub(super) fn normalize_containers(input: &mut Value) {
 
 fn task_name(todo: &Value) -> Option<&str> {
     todo.get("content").and_then(Value::as_str)
+}
+
+// reference: no prior art, searched crates/jcode-app-core/src/tool/todo.rs and
+//            crates/jcode-todo-policy/src/stages.rs for an existing
+//            duplicate-name refusal on the add path. The merge-side
+//            disambiguation (`stages.rs::disambiguate_names`) renames silently
+//            and is merge-only; it cannot be reused here because a silent
+//            rename would make the caller address the pre-existing card on
+//            its next call. The refusal shape follows the tool's own precedent
+//            for "this card exists" (`todo.rs`: "todo id {id:?} already
+//            exists; use `update` to change it").
+fn reject_existing_name(catalog: &[Value], name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(existing) = catalog.iter().find(|todo| task_name(todo) == Some(name)) else {
+        return Ok(());
+    };
+    let id = existing
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown id>");
+    bail!(
+        "a todo named {name:?} already exists (id {id:?}); give the new card a distinct \
+         name, or use `update` to change the existing card"
+    )
 }
 
 fn resolve_name(todos: &[Value], name: &str) -> Result<String> {
@@ -155,6 +191,12 @@ pub(super) fn normalize_public_input(input: &mut Value, previous: &[Value]) -> R
     if let Some(adds) = input.get_mut("add").and_then(Value::as_array_mut) {
         for item in adds {
             named |= normalize_item(item, &[])?;
+            // `catalog` is `previous ++ already-added-items` here, so this
+            // covers the stored board AND a duplicate inside this same call.
+            // The check runs before the push, so the new card is never
+            // compared against itself.
+            let name = task_name(item).unwrap_or_default().to_string();
+            reject_existing_name(&catalog, &name)?;
             catalog.push(item.clone());
         }
     }

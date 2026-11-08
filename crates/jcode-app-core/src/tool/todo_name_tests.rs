@@ -327,3 +327,90 @@ async fn named_tool_execution_persists_ids_but_returns_public_names() {
         "Implement"
     );
 }
+
+// reference: no prior art, searched crates/jcode-app-core/src/tool/todo.rs and
+//            crates/jcode-todo-policy/src/stages.rs for an existing
+//            duplicate-name refusal on the add path. The merge-side
+//            disambiguation (`stages.rs::disambiguate_names`) renames silently
+//            and is merge-only; it cannot be reused here because a silent
+//            rename would make the caller address the pre-existing card on
+//            its next call. The refusal shape follows the tool's own precedent
+//            for "this card exists" (`todo.rs`: "todo id {id:?} already
+//            exists; use `update` to change it").
+
+/// A coordinator add whose name a worker lane already holds is refused with an
+/// actionable message, and the board stays usable afterwards.
+#[test]
+fn add_with_an_existing_name_is_refused_and_leaves_the_board_usable() {
+    let stored = json!({
+        "todos": [
+            {"id": "w1", "content": "check-brief-consistency", "status": "in_progress", "priority": "high", "stage": 1, "group": "worker"},
+            {"id": "c1", "content": "write-report", "status": "pending", "priority": "high", "stage": 1, "group": "coord"}
+        ]
+    });
+    let error = apply_todo_patch(
+        json!({"add": [{"name": "check-brief-consistency", "phase": 1, "lane": "coord", "status": "pending", "priority": "high"}]}),
+        || stored["todos"].clone(),
+    )
+    .expect_err("a colliding add must be refused")
+    .to_string();
+    // Actionable: names the conflict and points at the alternative.
+    assert!(error.contains("check-brief-consistency"), "{error}");
+    assert!(error.contains("already exists"), "{error}");
+    assert!(error.contains("update"), "{error}");
+
+    // The board is still usable: a later named update on the clean board works.
+    let updated = apply_todo_patch(
+        json!({"update": [{"name": "write-report", "status": "in_progress"}]}),
+        || stored["todos"].clone(),
+    )
+    .expect("the board must stay usable");
+    let todos = parsed(updated);
+    assert_eq!(todos.len(), 2);
+    assert_eq!(todos[1].status, "in_progress");
+}
+
+/// The negative control for the refusal: a non-colliding add succeeds and no
+/// existing card name is rewritten.
+#[test]
+fn add_with_a_distinct_name_leaves_existing_names_untouched() {
+    let stored = json!({
+        "todos": [
+            {"id": "w1", "content": "check-brief-consistency", "status": "in_progress", "priority": "high", "stage": 1, "group": "worker"},
+            {"id": "c1", "content": "write-report", "status": "pending", "priority": "high", "stage": 1, "group": "coord"}
+        ]
+    });
+    let result = apply_todo_patch(
+        json!({"add": [{"name": "ship-notes", "phase": 1, "lane": "coord", "status": "pending", "priority": "high"}]}),
+        || stored["todos"].clone(),
+    )
+    .expect("a distinct name must be accepted");
+    let todos = parsed(result);
+    let names: Vec<&str> = todos.iter().map(|todo| todo.content.as_str()).collect();
+    assert_eq!(
+        names,
+        ["check-brief-consistency", "write-report", "ship-notes"],
+        "existing names must not be renamed: {names:?}"
+    );
+    assert!(
+        todos.iter().all(|todo| !todo.content.contains('(')),
+        "no spurious disambiguation suffix: {names:?}"
+    );
+}
+
+/// Two adds in ONE call that share a name are refused too: the second one
+/// collides with the first, not only with the stored board.
+#[test]
+fn add_with_a_duplicate_name_inside_one_call_is_refused() {
+    let stored = json!({"todos": []});
+    let error = apply_todo_patch(
+        json!({"add": [
+            {"name": "same-name", "phase": 1, "lane": "coord", "status": "pending", "priority": "high"},
+            {"name": "same-name", "phase": 1, "lane": "coord", "status": "pending", "priority": "high"}
+        ]}),
+        || stored["todos"].clone(),
+    )
+    .expect_err("two adds sharing a name must be refused")
+    .to_string();
+    assert!(error.contains("already exists"), "{error}");
+}
