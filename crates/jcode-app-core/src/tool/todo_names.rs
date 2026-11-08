@@ -1,16 +1,6 @@
 //! Model-facing names are resolved at the tool boundary. Storage and swarm keep IDs.
 use super::*;
 
-// reference: no prior art, searched crates/jcode-app-core/src/tool/todo.rs and
-//            crates/jcode-todo-policy/src/stages.rs for an existing
-//            duplicate-name refusal on the add path. The merge-side
-//            disambiguation (`stages.rs::disambiguate_names`) renames silently
-//            and is merge-only; it cannot be reused here because a silent
-//            rename would make the caller address the pre-existing card on
-//            its next call. The refusal shape follows the tool's own precedent
-//            for "this card exists" (`todo.rs`: "todo id {id:?} already
-//            exists; use `update` to change it").
-
 /// Keep the existing leniency for providers that stringify tool arguments.
 pub(super) fn normalize_containers(input: &mut Value) {
     *input = normalize_todo_input(std::mem::take(input));
