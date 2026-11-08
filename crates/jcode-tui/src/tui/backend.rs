@@ -1565,48 +1565,6 @@ impl RemoteConnection {
     }
 }
 
-impl RemoteEventState for ReplayRemoteState {
-    fn handle_tool_start(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_start(id, name);
-    }
-
-    fn handle_tool_input(&mut self, id: Option<&str>, delta: &str) {
-        self.tool_diff.handle_tool_input(id, delta);
-    }
-
-    fn get_tool_input(&self, id: &str) -> serde_json::Value {
-        self.tool_diff.tool_input_json(id)
-    }
-
-    fn handle_tool_exec(&mut self, id: &str, name: &str) {
-        self.tool_diff.handle_tool_exec(id, name);
-    }
-
-    fn handle_tool_done(&mut self, id: &str, name: &str, output: &str) -> String {
-        self.tool_diff.finish_tool(id, name, output)
-    }
-
-    fn clear_pending(&mut self) {
-        self.tool_diff.clear();
-    }
-
-    fn call_output_tokens_seen(&mut self) -> &mut u64 {
-        &mut self.call_output_tokens_seen
-    }
-
-    fn reset_call_output_tokens_seen(&mut self) {
-        self.call_output_tokens_seen = 0;
-    }
-
-    fn set_session_id(&mut self, _id: String) {}
-
-    fn has_loaded_history(&self) -> bool {
-        true
-    }
-
-    fn mark_history_loaded(&mut self) {}
-}
-
 #[cfg(test)]
 #[path = "backend_tests.rs"]
 mod tests;

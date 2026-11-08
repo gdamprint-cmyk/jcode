@@ -35,3 +35,8 @@ captures/
 # re-admits the gitignored graft/ tree for searching.
 /_val4_cfc_files.txt
 /.ignore
+
+# Local tool state written by `entire enable` / `entire graph setup`: the
+# per-user Claude Code SubagentStart hook. Never source, and an untracked
+# path here makes the Entire brain refuse to build repository context.
+/.claude/settings.local.json

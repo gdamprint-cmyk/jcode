@@ -91,11 +91,11 @@ impl RemoteEventState for ReplayRemoteState {
     }
 
     fn call_output_tokens_seen(&mut self) -> &mut u64 {
-        self.tool_diff.call_output_tokens_seen()
+        &mut self.call_output_tokens_seen
     }
 
     fn reset_call_output_tokens_seen(&mut self) {
-        self.tool_diff.reset_call_output_tokens_seen();
+        self.call_output_tokens_seen = 0;
     }
 
     fn set_session_id(&mut self, _id: String) {}
