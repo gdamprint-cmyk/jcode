@@ -10,7 +10,7 @@ use crate::todo::{
 };
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -34,6 +34,10 @@ mod lane_dependency_tests;
 #[cfg(test)]
 #[path = "todo_public_compact_tests.rs"]
 mod public_compact_tests;
+
+#[cfg(test)]
+#[path = "todo_compact_measure_tests.rs"]
+mod compact_measure_tests;
 
 /// A prerequisite edit naming one member applies atomically to its entire lane.
 fn patch_lane_after(todos: &mut [Value], id: &str, value: Value) -> Result<()> {
@@ -1193,6 +1197,58 @@ fn record_reframe_observations(
 /// readable while removing three quarters of the bulk.
 const PUBLIC_DESCRIPTION_MAX_BYTES: usize = 400;
 
+/// Tool-maintained history arrays.
+///
+/// reference: in-repo precedent for field removal at the tool boundary is
+/// `todo_names::public_todos` (crates/jcode-app-core/src/tool/todo_names.rs:279),
+/// which already drops `id` and renames `content`/`details` on the serialized
+/// todo; no prior art for history stripping, searched "confidence_history" and
+/// "strip history" in crates/jcode-app-core/src (only the tool's own merge
+/// helpers and the policy gates).
+///
+/// These are append-only trails the todo tool owns; the model never writes
+/// them and never reads them for a decision. Each entry is one observation,
+/// so they grow without bound as a board is worked on. The gates that use
+/// them (`is_spike`, the completion report) read the STORED structs directly,
+/// so dropping them from the model-facing text costs nothing. The stored
+/// state and the tool metadata keep every entry.
+const TOOL_MAINTAINED_HISTORY_KEYS: &[&str] = &[
+    "confidence_history",
+    "understands_user_intent_history",
+    "closed_feedback_loop_history",
+    "feedback_loop_relevance_history",
+    "feedback_loop_coverage_history",
+    "feedback_loop_traceability_history",
+    "delivery_state_history",
+];
+
+/// Remove every tool-maintained history array from a JSON value, recursively.
+fn strip_tool_maintained_history(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for key in TOOL_MAINTAINED_HISTORY_KEYS {
+                fields.remove(*key);
+            }
+            for nested in fields.values_mut() {
+                strip_tool_maintained_history(nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_tool_maintained_history(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render a value for the model without the tool-maintained history arrays.
+fn model_facing_json<T: Serialize>(value: &T) -> Result<String> {
+    let mut value = serde_json::to_value(value)?;
+    strip_tool_maintained_history(&mut value);
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 /// Build the model-facing todo list.
 ///
 /// The full board can reach hundreds of cards with multi-kilobyte `details`
@@ -1205,47 +1261,60 @@ const PUBLIC_DESCRIPTION_MAX_BYTES: usize = 400;
 /// - the FULL description of a card that is still open, because that is the
 ///   brief the model is working from;
 /// - a truncated description for a completed card, so the outcome stays
-///   visible without re-reading megabytes of finished prose.
+///   visible without re-reading megabytes of finished prose;
+/// - the CURRENT `confidence` and `completion_confidence` states, so the
+///   model still sees how well the work is evidenced.
 ///
-/// The complete board (with every description) stays in the tool's metadata
-/// and in the on-disk store, so nothing is lost - only the model-facing
-/// rendering is compacted.
+/// The tool-maintained history arrays (`confidence_history` and the plan's
+/// `understands_user_intent_history`) are dropped: they are unbounded and
+/// the model never reads them.
+///
+/// The complete board (with every description and every history entry)
+/// stays in the tool's metadata and in the on-disk store, so nothing is lost
+/// - only the model-facing rendering is compacted.
 ///
 /// reference: no prior art, searched "public_todos" and "details truncate" in
 /// crates/jcode-app-core/src (only hit is `todo_names::public_todos` itself).
 fn public_todos_compact(todos: &[TodoItem]) -> Result<Value> {
     let mut value = names::public_todos(todos)?;
-    if let Some(items) = value.as_array_mut() {
-        for item in items {
-            let Some(fields) = item.as_object_mut() else {
-                continue;
-            };
-            let completed = fields
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| status == "completed")
-                .unwrap_or(false);
-            let Some(description) = fields.get("description").and_then(Value::as_str) else {
-                continue;
-            };
-            // An OPEN card's description is the brief the model is working
-            // from - keep it whole. A COMPLETED card's description is finished
-            // prose the model only needs a trace of.
-            if !completed || description.len() <= PUBLIC_DESCRIPTION_MAX_BYTES {
-                continue;
-            }
-            let truncated = crate::util::truncate_str(description, PUBLIC_DESCRIPTION_MAX_BYTES);
-            fields.insert(
-                "description".into(),
-                json!(format!(
-                    "{truncated}\n[truncated: {} bytes total]",
-                    description.len()
-                )),
-            );
-            fields.insert("description_truncated".into(), Value::Bool(true));
-        }
-    }
+    truncate_completed_descriptions(&mut value);
+    strip_tool_maintained_history(&mut value);
     Ok(value)
+}
+
+/// Truncate the description of every COMPLETED card, in place.
+fn truncate_completed_descriptions(value: &mut Value) {
+    let Some(items) = value.as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let Some(fields) = item.as_object_mut() else {
+            continue;
+        };
+        let completed = fields
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|status| status == "completed")
+            .unwrap_or(false);
+        let Some(description) = fields.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        // An OPEN card's description is the brief the model is working
+        // from - keep it whole. A COMPLETED card's description is finished
+        // prose the model only needs a trace of.
+        if !completed || description.len() <= PUBLIC_DESCRIPTION_MAX_BYTES {
+            continue;
+        }
+        let truncated = crate::util::truncate_str(description, PUBLIC_DESCRIPTION_MAX_BYTES);
+        fields.insert(
+            "description".into(),
+            json!(format!(
+                "{truncated}\n[truncated: {} bytes total]",
+                description.len()
+            )),
+        );
+        fields.insert("description_truncated".into(), Value::Bool(true));
+    }
 }
 
 fn build_todo_output(
@@ -1263,19 +1332,19 @@ fn build_todo_output(
     let mut text = serde_json::to_string_pretty(&public_todos_compact(&todos)?)?;
     if plan != TodoPlan::default() {
         text.push_str("\n\nPlan:\n");
-        text.push_str(&serde_json::to_string_pretty(&plan)?);
+        text.push_str(&model_facing_json(&plan)?);
     }
     if !goals.is_empty() {
         text.push_str("\n\nGoals:\n");
-        text.push_str(&serde_json::to_string_pretty(&goals)?);
+        text.push_str(&model_facing_json(&goals)?);
     }
     if let Some(plan_change) = plan_change.as_ref() {
         text.push_str("\n\nPlan updates:\n");
-        text.push_str(&serde_json::to_string_pretty(plan_change)?);
+        text.push_str(&model_facing_json(plan_change)?);
     }
     if let Some(goal_changes) = goal_changes.as_ref().filter(|changes| !changes.is_empty()) {
         text.push_str("\n\nGoal updates:\n");
-        text.push_str(&serde_json::to_string_pretty(goal_changes)?);
+        text.push_str(&model_facing_json(goal_changes)?);
     }
     for continuation in continuations {
         text.push_str("\n\n");
