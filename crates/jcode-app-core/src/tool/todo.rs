@@ -1267,7 +1267,8 @@ fn model_facing_json<T: Serialize>(value: &T) -> Result<String> {
 ///
 /// The tool-maintained history arrays (`confidence_history` and the plan's
 /// `understands_user_intent_history`) are dropped: they are unbounded and
-/// the model never reads them.
+/// the model never reads them. The goal-level history arrays are dropped the
+/// same way.
 ///
 /// The complete board (with every description and every history entry)
 /// stays in the tool's metadata and in the on-disk store, so nothing is lost
