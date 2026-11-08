@@ -100,6 +100,7 @@ fn full_and_split_prompt_builders_use_the_same_one_line_skill_descriptions() {
     let skills = vec![SkillInfo {
         name: "example".to_string(),
         description: format!("First line\n\t{}", "д".repeat(SKILL_DESC_MAX_CHARS + 20)),
+        user_invoked_only: false,
     }];
     let expected = build_available_skills_section(&skills).expect("skills section");
 
@@ -117,6 +118,40 @@ fn full_and_split_prompt_builders_use_the_same_one_line_skill_descriptions() {
         .find(|line| line.starts_with("- `/example `"))
         .expect("example skill entry");
     assert!(entry.ends_with('…'));
+}
+
+#[test]
+fn user_invoked_only_skills_are_absent_from_the_always_on_catalog() {
+    let skills = vec![
+        SkillInfo {
+            name: "auto".to_string(),
+            description: "Loadable on the model's initiative".to_string(),
+            user_invoked_only: false,
+        },
+        SkillInfo {
+            name: "manual".to_string(),
+            description: "User invokes this one explicitly".to_string(),
+            user_invoked_only: true,
+        },
+    ];
+
+    let section = build_available_skills_section(&skills).expect("skills section");
+    assert!(section.contains("/auto "));
+    assert!(
+        !section.contains("/manual "),
+        "a user-invoked-only skill must not be advertised as auto-loadable: {section}"
+    );
+}
+
+#[test]
+fn a_catalog_of_only_user_invoked_skills_renders_no_section() {
+    let skills = vec![SkillInfo {
+        name: "manual".to_string(),
+        description: "User invokes this one explicitly".to_string(),
+        user_invoked_only: true,
+    }];
+
+    assert!(build_available_skills_section(&skills).is_none());
 }
 
 #[test]

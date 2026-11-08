@@ -37,7 +37,10 @@ fn declaring_opens_the_gate_and_a_new_request_closes_it() {
     mark_plan_undeclared(SESSION);
     assert!(!plan_declared(SESSION));
     forget_plan_declaration(SESSION);
-    assert_eq!(plan_declaration_state(SESSION), PlanDeclarationState::NotArmed);
+    assert_eq!(
+        plan_declaration_state(SESSION),
+        PlanDeclarationState::NotArmed
+    );
 }
 
 #[test]

@@ -37,8 +37,7 @@ impl Tool for RecordingWorkTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: ToolContext) -> anyhow::Result<ToolOutput> {
-        self.ran
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(ToolOutput::new("ran"))
     }
 }
@@ -67,8 +66,12 @@ fn registry_with_work_tool(
     Registry {
         tools: Arc::new(tokio::sync::RwLock::new(tools)),
         mcp_policy: Arc::default(),
-        skills: Arc::new(tokio::sync::RwLock::new(crate::skill::SkillRegistry::default())),
-        compaction: Arc::new(tokio::sync::RwLock::new(crate::compaction::CompactionManager::new())),
+        skills: Arc::new(tokio::sync::RwLock::new(
+            crate::skill::SkillRegistry::default(),
+        )),
+        compaction: Arc::new(tokio::sync::RwLock::new(
+            crate::compaction::CompactionManager::new(),
+        )),
     }
 }
 

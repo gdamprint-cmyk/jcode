@@ -152,7 +152,8 @@ async fn status_overdue_queue_count_ignores_ambient_dead_letters() {
     let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
     let status: serde_json::Value = serde_json::from_str(&runner.status_json().await).unwrap();
     assert_eq!(
-        status["overdue_queue_count"], serde_json::json!(1),
+        status["overdue_queue_count"],
+        serde_json::json!(1),
         "overdue_queue_count must count only direct-delivery entries, got {status}"
     );
 }

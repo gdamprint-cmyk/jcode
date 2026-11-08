@@ -62,8 +62,8 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_agent;
 pub mod memory_graph;
-pub mod memory_jev;
 pub mod memory_hindsight;
+pub mod memory_jev;
 pub mod memory_judge_metrics;
 pub mod memory_log;
 pub mod memory_rerank;
@@ -74,6 +74,8 @@ pub mod model_usage;
 pub mod output_style;
 pub mod plan;
 pub mod platform;
+#[cfg(windows)]
+pub mod platform_reparent;
 pub mod power_inhibit;
 pub mod process_memory;
 pub mod process_title;

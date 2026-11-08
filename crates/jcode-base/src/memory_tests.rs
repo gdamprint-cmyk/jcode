@@ -1022,7 +1022,10 @@ fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
         "<system-reminder>\nNew MCP tools are available.\n{}\n</system-reminder>",
         "mcp__cgrep__cgrep_agent_expand: expand selected locate IDs with context. ".repeat(60),
     );
-    assert!(catalogue.chars().count() > 1_200, "the fixture must exceed the cap");
+    assert!(
+        catalogue.chars().count() > 1_200,
+        "the fixture must exceed the cap"
+    );
 
     let messages = vec![
         Message {

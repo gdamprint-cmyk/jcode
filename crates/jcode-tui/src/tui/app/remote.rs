@@ -1344,7 +1344,11 @@ async fn dispatch_pending_server_reload(app: &mut App, remote: &mut RemoteConnec
         } else {
             app.server_auto_reload_attempts += 1;
             app.append_reload_message("Reloading server with newer binary...");
-            if let Err(err) = remote.reload().await {
+            // Automatic stale-server reload is NOT forced: the server must prove
+            // it has a strictly-newer binary to reload into. A forced auto-reload
+            // can force-downgrade a newer daemon and re-enters the reload loop
+            // (issue #277).
+            if let Err(err) = remote.reload_with_force(false).await {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Failed to auto-reload server: {}. Use `/reload` to retry.",
                     err

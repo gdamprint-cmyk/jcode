@@ -39,7 +39,7 @@ pub fn run() -> anyhow::Result<()> {
     cmd.args(args)
         .env_remove(WAIT_ENV)
         .env("JCODE_RELOAD_FAST_START", "1");
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
     Err(anyhow::anyhow!("failed to resume after hibernation: {err}"))
 }
 

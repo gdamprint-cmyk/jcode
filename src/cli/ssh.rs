@@ -215,7 +215,7 @@ async fn run_unix(args: Args) -> Result<()> {
                 .map(|(path, _)| path)
                 .unwrap_or(std::env::current_exe()?);
             let mut command = client_reload_command(&executable, &args, &session_id, &working_dir);
-            let error = crate::platform::replace_process(&mut command);
+            let error = crate::platform::replace_process_reparented(&mut command);
             return Err(anyhow::anyhow!("Failed to reload SSH client: {error}"));
         }
     }

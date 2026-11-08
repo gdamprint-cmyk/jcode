@@ -505,6 +505,33 @@ fn exact_search_file_path(ctx: &ToolContext, path: Option<&str>) -> Option<Strin
         .map(|name| name.to_string_lossy().into_owned())
 }
 
+/// Match a search-result path against the exact file the caller asked for.
+///
+/// The result paths are RELATIVE to the search root (the agentgrep crate's
+/// `display_path`, e.g. `.\util.rs`), while the caller's request is reduced
+/// to the bare FILE NAME. Comparing the two strings directly never matches
+/// for a nested file, so a file-scoped search silently dropped every file and
+/// reported zero matches.
+///
+/// The comparison is on the NORMALISED RELATIVE path, not on the file name:
+/// the root handed to ripgrep is the parent directory of the requested file
+/// and the glob is the bare name, and that glob is recursive - a directory
+/// holding `a.rs` and `sub/a.rs` matches both. Matching on the name alone
+/// would let the unrelated `sub/a.rs` through; matching the relative path
+/// keeps exactly the requested file.
+fn path_matches_exact_file(result_path: &str, exact_file: &str) -> bool {
+    fn normalize(path: &str) -> String {
+        let trimmed = path.trim();
+        let without_prefix = trimmed
+            .strip_prefix("./")
+            .or_else(|| trimmed.strip_prefix(".\\"))
+            .unwrap_or(trimmed);
+        without_prefix.replace('/', "\\")
+    }
+
+    normalize(result_path) == normalize(exact_file)
+}
+
 fn filter_grep_result_to_exact_file(
     mut result: GrepResult,
     exact_file: Option<&str>,
@@ -513,7 +540,9 @@ fn filter_grep_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.total_files = result.files.len();
     result.total_matches = result.files.iter().map(|file| file.matches.len()).sum();
     result
@@ -527,7 +556,9 @@ fn filter_find_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result
 }
 
@@ -539,7 +570,9 @@ fn filter_smart_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.summary.total_files = result.files.len();
     result.summary.total_regions = result.files.iter().map(|file| file.regions.len()).sum();
     result.summary.best_file = result.files.first().map(|file| file.path.clone());
@@ -570,3 +603,7 @@ fn is_match_all_glob(glob: &str) -> bool {
 #[cfg(test)]
 #[path = "agentgrep_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agentgrep_scope_tests.rs"]
+mod scope_tests;

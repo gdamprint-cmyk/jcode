@@ -24,6 +24,7 @@ impl App {
             .map(|s| crate::prompt::SkillInfo {
                 name: s.name.clone(),
                 description: s.description.clone(),
+                user_invoked_only: s.disable_model_invocation,
             })
             .collect();
         let (split, context_info) = crate::prompt::build_system_prompt_split(

@@ -457,7 +457,8 @@ impl Agent {
                         // definition: the request never produced an answer.
                         // Re-issue it, bounded, instead of ending the turn.
                         if super::response_recovery::is_transient_stream_error(&err_str)
-                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
                         {
                             stream_error_retries += 1;
                             retry_after_stream_error = true;
@@ -469,10 +470,7 @@ impl Agent {
                                 vec![
                                     ("mode", "mpsc".to_string()),
                                     ("error", err_str.clone()),
-                                    (
-                                        "stream_error_retries",
-                                        stream_error_retries.to_string(),
-                                    ),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
                                 ],
                             );
                             break;
@@ -1087,7 +1085,8 @@ impl Agent {
                         // provider failed mid-stream, so the request never
                         // produced an answer. Re-issue it, bounded.
                         if super::response_recovery::is_transient_stream_error(&message)
-                            && stream_error_retries < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
                         {
                             stream_error_retries += 1;
                             retry_after_stream_error = true;
@@ -1099,10 +1098,7 @@ impl Agent {
                                 vec![
                                     ("mode", "mpsc".to_string()),
                                     ("error", message.clone()),
-                                    (
-                                        "stream_error_retries",
-                                        stream_error_retries.to_string(),
-                                    ),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
                                 ],
                             );
                             break;
@@ -1136,7 +1132,7 @@ impl Agent {
                 continue;
             }
             // The request completed normally: the budget is refreshed so a
-// later request in the same turn gets its own retries.
+            // later request in the same turn gets its own retries.
             stream_error_retries = 0;
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(

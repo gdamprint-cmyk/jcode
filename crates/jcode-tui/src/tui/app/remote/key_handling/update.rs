@@ -55,6 +55,8 @@ pub(in crate::tui::app) async fn reload_stale_remote_server_before_update(
     }
 
     app.append_reload_message("Reloading stale server before checking for client updates...");
-    remote.reload().await?;
+    // Stale-server reload is automatic, so it must not be forced: the server
+    // only reloads when it can prove a strictly-newer binary exists.
+    remote.reload_with_force(false).await?;
     Ok(true)
 }

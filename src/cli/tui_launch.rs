@@ -712,7 +712,7 @@ pub fn list_sessions() -> Result<()> {
                 session_cwd = std::path::PathBuf::from(dir);
             }
             let (program, args) = build_resume_target_command(&exe, &resolved_target);
-            let err = crate::platform::replace_process(
+            let err = crate::platform::replace_process_reparented(
                 ProcessCommand::new(&program)
                     .args(&args)
                     .current_dir(session_cwd),
@@ -742,7 +742,7 @@ pub fn list_sessions() -> Result<()> {
                     session_cwd = std::path::PathBuf::from(dir);
                 }
                 let (program, args) = build_resume_target_command(&exe, &resolved_target);
-                let err = crate::platform::replace_process(
+                let err = crate::platform::replace_process_reparented(
                     ProcessCommand::new(&program)
                         .args(&args)
                         .current_dir(session_cwd),

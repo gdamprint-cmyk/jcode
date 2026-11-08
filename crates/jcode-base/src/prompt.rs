@@ -175,6 +175,10 @@ impl SplitSystemPrompt {
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    /// The skill is user-invoked only. It must not appear in the always-on
+    /// catalog, because that catalog is the model's list of skills it may
+    /// load on its own initiative.
+    pub user_invoked_only: bool,
 }
 
 const SKILL_DESC_MAX_CHARS: usize = 120;
@@ -198,8 +202,16 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         return None;
     }
 
+    let auto_loadable: Vec<&SkillInfo> = available_skills
+        .iter()
+        .filter(|skill| !skill.user_invoked_only)
+        .collect();
+    if auto_loadable.is_empty() {
+        return None;
+    }
+
     let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-    for skill in available_skills {
+    for skill in auto_loadable {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
             skill.name,

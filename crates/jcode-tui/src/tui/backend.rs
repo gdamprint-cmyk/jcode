@@ -725,11 +725,24 @@ impl RemoteConnection {
         Ok(id)
     }
 
-    /// Request server reload
+    /// Request server reload.
+    ///
+    /// Manual reloads stay forced: the user asked for a restart, so we do it
+    /// even when the server cannot prove a strictly-newer binary exists.
     pub async fn reload(&mut self) -> Result<()> {
+        self.reload_with_force(true).await
+    }
+
+    /// Request server reload with an explicit force flag.
+    ///
+    /// `force: false` asks the server to reload only when it can prove a
+    /// strictly-newer binary is available. Automatic stale-server reloads use
+    /// this so they cannot force-downgrade a newer daemon or feed the reload
+    /// loop (issue #277).
+    pub async fn reload_with_force(&mut self, force: bool) -> Result<()> {
         let request = Request::Reload {
             id: self.next_request_id,
-            force: true,
+            force,
         };
         self.next_request_id += 1;
         self.send_request(request).await

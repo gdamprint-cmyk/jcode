@@ -31,6 +31,10 @@ mod external_blocker_tests;
 #[path = "todo_lane_dependency_tests.rs"]
 mod lane_dependency_tests;
 
+#[cfg(test)]
+#[path = "todo_public_compact_tests.rs"]
+mod public_compact_tests;
+
 /// A prerequisite edit naming one member applies atomically to its entire lane.
 fn patch_lane_after(todos: &mut [Value], id: &str, value: Value) -> Result<()> {
     let typed: Vec<TodoItem> = serde_json::from_value(Value::Array(todos.to_vec()))?;
@@ -1179,6 +1183,71 @@ fn record_reframe_observations(
     (observations, immediate)
 }
 
+/// Longest description kept in the model-facing todo list for a COMPLETED card.
+///
+/// reference: no prior art for this bound; the repo's established tool-output
+/// bounding helper is `crate::util::truncate_str` (used by bash/read/edit/
+/// agentgrep/apply_patch with 600..10000 byte limits). Measured on this host's
+/// 520-card board: 2000 bytes -> 40% of the description bytes saved, 800 ->
+/// 63%, 400 -> 76%, 200 -> 85%. 400 keeps a finished item's conclusion
+/// readable while removing three quarters of the bulk.
+const PUBLIC_DESCRIPTION_MAX_BYTES: usize = 400;
+
+/// Build the model-facing todo list.
+///
+/// The full board can reach hundreds of cards with multi-kilobyte `details`
+/// each (measured on this host: 520 cards, 844 KB, of which 838 KB was
+/// `details` on COMPLETED cards). Returning all of it on every `todo` call
+/// re-fills the context with history the model does not need.
+///
+/// So the model-facing list keeps:
+/// - every card's name, status, priority and dependencies (the plan shape);
+/// - the FULL description of a card that is still open, because that is the
+///   brief the model is working from;
+/// - a truncated description for a completed card, so the outcome stays
+///   visible without re-reading megabytes of finished prose.
+///
+/// The complete board (with every description) stays in the tool's metadata
+/// and in the on-disk store, so nothing is lost - only the model-facing
+/// rendering is compacted.
+///
+/// reference: no prior art, searched "public_todos" and "details truncate" in
+/// crates/jcode-app-core/src (only hit is `todo_names::public_todos` itself).
+fn public_todos_compact(todos: &[TodoItem]) -> Result<Value> {
+    let mut value = names::public_todos(todos)?;
+    if let Some(items) = value.as_array_mut() {
+        for item in items {
+            let Some(fields) = item.as_object_mut() else {
+                continue;
+            };
+            let completed = fields
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| status == "completed")
+                .unwrap_or(false);
+            let Some(description) = fields.get("description").and_then(Value::as_str) else {
+                continue;
+            };
+            // An OPEN card's description is the brief the model is working
+            // from - keep it whole. A COMPLETED card's description is finished
+            // prose the model only needs a trace of.
+            if !completed || description.len() <= PUBLIC_DESCRIPTION_MAX_BYTES {
+                continue;
+            }
+            let truncated = crate::util::truncate_str(description, PUBLIC_DESCRIPTION_MAX_BYTES);
+            fields.insert(
+                "description".into(),
+                json!(format!(
+                    "{truncated}\n[truncated: {} bytes total]",
+                    description.len()
+                )),
+            );
+            fields.insert("description_truncated".into(), Value::Bool(true));
+        }
+    }
+    Ok(value)
+}
+
 fn build_todo_output(
     todos: Vec<TodoItem>,
     plan: TodoPlan,
@@ -1191,7 +1260,7 @@ fn build_todo_output(
         .iter()
         .filter(|todo| todo.status != "completed")
         .count();
-    let mut text = serde_json::to_string_pretty(&names::public_todos(&todos)?)?;
+    let mut text = serde_json::to_string_pretty(&public_todos_compact(&todos)?)?;
     if plan != TodoPlan::default() {
         text.push_str("\n\nPlan:\n");
         text.push_str(&serde_json::to_string_pretty(&plan)?);

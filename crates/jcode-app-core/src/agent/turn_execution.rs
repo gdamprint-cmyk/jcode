@@ -41,11 +41,7 @@ impl Agent {
         // declared before any work tool runs.
         // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
         // (note_user_request - the runtime state this arms).
-        crate::tool::plan_declaration::note_user_request(
-            &self.session.id,
-            user_message,
-            false,
-        );
+        crate::tool::plan_declaration::note_user_request(&self.session.id, user_message, false);
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
         let input_id = self.add_message(
@@ -72,6 +68,7 @@ impl Agent {
         // `jcode run` uses this path, so headless turns fire the same
         // lifecycle hooks as streaming turns (docs/HOOKS.md).
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
         result
     }
 
@@ -233,6 +230,7 @@ impl Agent {
         self.fire_turn_start_hook("chat");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
         result
     }
 
@@ -258,6 +256,7 @@ impl Agent {
         self.fire_turn_start_hook("failover");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
         result
     }
 
@@ -879,7 +878,17 @@ impl Agent {
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            text.push_str(&format!("- `/{} ` - {}\n", skill.name, description));
+            // A user-invoked-only skill must be marked as such here too: this
+            // announcement is how the model learns the skill exists, and
+            // without the marker it would look auto-loadable.
+            if skill.user_invoked_only {
+                text.push_str(&format!(
+                    "- `/{} ` - {} (user-invoked only; load it only when the user asks)\n",
+                    skill.name, description
+                ));
+            } else {
+                text.push_str(&format!("- `/{} ` - {}\n", skill.name, description));
+            }
         }
         text.push_str("</system-reminder>");
         for skill in &fresh {

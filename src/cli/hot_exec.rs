@@ -33,7 +33,7 @@ pub fn execute_requested_action(run_result: &RunResult) -> Result<()> {
     if let Some(ref session_id) = run_result.hibernate_session {
         let mut cmd = super::hibernate_wait::waiter_command(session_id)?;
         crate::logging::info("Hibernating: exec into idle waiter");
-        let err = crate::platform::replace_process(&mut cmd);
+        let err = crate::platform::replace_process_reparented(&mut cmd);
         return Err(anyhow::anyhow!("Failed to exec hibernation waiter: {err}"));
     }
 
@@ -54,7 +54,7 @@ pub fn hot_restart(session_id: &str) -> Result<()> {
         cmd.arg("self-dev");
     }
     cmd.arg("--resume").arg(session_id).current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
 
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
@@ -74,7 +74,7 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
                 .arg("--no-update")
                 .env_remove("JCODE_MIGRATE_BINARY")
                 .current_dir(cwd);
-            let err = crate::platform::replace_process(&mut cmd);
+            let err = crate::platform::replace_process_reparented(&mut cmd);
             return Err(anyhow::anyhow!("Failed to exec {:?}: {}", binary_path, err));
         } else {
             crate::logging::warn(&format!(
@@ -126,7 +126,7 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
             // will repopulate the transcript after reconnect.
             .env("JCODE_RELOAD_FAST_START", "1")
             .current_dir(&cwd);
-        let err = crate::platform::replace_process(&mut cmd);
+        let err = crate::platform::replace_process_reparented(&mut cmd);
 
         if err.kind() == std::io::ErrorKind::NotFound && attempt < 2 {
             crate::logging::warn(&format!(
@@ -189,7 +189,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
                         .arg(session_id)
                         .arg("--no-update")
                         .current_dir(&cwd);
-                    let err = crate::platform::replace_process(&mut cmd);
+                    let err = crate::platform::replace_process_reparented(&mut cmd);
                     return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
                 }
                 Err(e) => {
@@ -228,7 +228,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
         .arg(session_id)
         .arg("--no-update")
         .current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
 
@@ -402,7 +402,7 @@ pub fn run_auto_update() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let err =
-        crate::platform::replace_process(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
+        crate::platform::replace_process_reparented(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
 
     Err(anyhow::anyhow!(
         "Failed to exec new binary {:?}: {}",

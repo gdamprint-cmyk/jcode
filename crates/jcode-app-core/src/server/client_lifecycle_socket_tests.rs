@@ -1,5 +1,7 @@
 use super::*;
 
+// reference: https://github.com/1jehuang/jcode/commit/44af0f00e8838c0d4be053862cfaac6015b10401
+
 #[path = "client_lifecycle_socket_tests_idle_soft_interrupt.rs"]
 mod idle_soft_interrupt;
 
@@ -106,7 +108,30 @@ async fn scoped_and_legacy_socket_subscribers_receive_compatible_turn_streams() 
     sdk_socket_workflow(false, true, true).await;
 }
 
-async fn sdk_socket_workflow(response_only: bool, terminal_race: bool, identity_capability: bool) {
+/// A cancel must complete the interrupted turn with scoped terminal events.
+/// A modern client rejects unscoped terminals, so an unscoped `Interrupted`
+/// leaves the client believing the turn is still running: the next prompt
+/// stays queued forever instead of reaching the model.
+/// reference: https://github.com/1jehuang/jcode/commit/44af0f00e8838c0d4be053862cfaac6015b10401
+#[tokio::test]
+async fn scoped_cancel_socket_immediately_dispatches_next_prompt() {
+    sdk_socket_workflow_inner(false, true, true, true).await;
+}
+
+async fn sdk_socket_workflow(
+    response_only: bool,
+    terminal_race: bool,
+    identity_capability: bool,
+) {
+    sdk_socket_workflow_inner(response_only, terminal_race, identity_capability, false).await;
+}
+
+async fn sdk_socket_workflow_inner(
+    response_only: bool,
+    terminal_race: bool,
+    identity_capability: bool,
+    cancel_first: bool,
+) {
     let _lock = crate::storage::lock_test_env();
     let home = IsolatedReloadRecoveryEnv::new();
     let terminal_provider = TerminalSocketProvider::default();
@@ -260,9 +285,14 @@ async fn sdk_socket_workflow(response_only: bool, terminal_race: bool, identity_
         )
         .await
         .unwrap();
-        terminal_provider.finish_first.notify_one();
+        if cancel_first {
+            send(&mut client_writer, json!({"type":"cancel","id":3})).await;
+        } else {
+            terminal_provider.finish_first.notify_one();
+        }
         let mut active = None;
         let mut scoped_text = false;
+        let mut interrupted = false;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut line = String::new();
@@ -282,7 +312,14 @@ async fn sdk_socket_workflow(response_only: bool, terminal_race: bool, identity_
                             ServerEvent::TextDelta { ref text } if text == "completed" => {
                                 scoped_text = true
                             }
-                            ServerEvent::Done { id: 2 } => break,
+                            ServerEvent::Interrupted => {
+                                interrupted = true;
+                            }
+                            ServerEvent::Done { id: 2 } => {
+                                if !cancel_first || interrupted {
+                                    break;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -297,6 +334,40 @@ async fn sdk_socket_workflow(response_only: bool, terminal_race: bool, identity_
         })
         .await
         .unwrap();
+        if cancel_first {
+            assert!(
+                interrupted,
+                "cancel completion must be scoped, not lost until the UI timeout"
+            );
+            send(
+                &mut client_writer,
+                json!({"type":"message","id":4,"content":"next prompt"}),
+            )
+            .await;
+            until(&mut client_reader, |event| match event {
+                ServerEvent::TurnEvent { identity, event } => {
+                    assert_ne!(Some(identity), active.as_ref());
+                    assert!(!matches!(event.as_ref(), ServerEvent::Error { .. }));
+                    matches!(event.as_ref(), ServerEvent::Done { id: 4 })
+                }
+                _ => false,
+            })
+            .await;
+            assert_eq!(terminal_provider.calls.load(Ordering::SeqCst), 2);
+            sessions.clear_for_test().await;
+            drop(client_writer);
+            drop(client_reader);
+            drop(legacy_writer);
+            drop(legacy_reader);
+            for task in [server_task, legacy_task] {
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            return;
+        }
         assert!(scoped_text);
         let legacy_text = std::cell::Cell::new(false);
         until(&mut legacy_reader, |event| {

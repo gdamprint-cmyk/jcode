@@ -14,6 +14,21 @@ fn test_ctx(root: &Path) -> ToolContext {
     }
 }
 
+/// True when `haystack` contains `path` with either path separator. The
+/// renderer prints the platform-native separator (`src\app.rs` on Windows),
+/// so a literal "src/app.rs" only matches on Unix.
+fn contains_path(haystack: &str, path: &str) -> bool {
+    haystack.contains(path) || haystack.contains(&path.replace('/', "\\"))
+}
+
+/// The path the resolver produces for `rel` under `root`, rendered with the
+/// platform separator. Hard-coding "/tmp/root/src" only holds on Unix: on
+/// Windows `Path::join` renders "\", so the expected value has to be derived
+/// from the same join the code under test performs.
+fn expected_path(root: &Path, rel: &str) -> String {
+    root.join(rel).display().to_string()
+}
+
 fn test_exposure(message_index: usize, total_messages: usize) -> ExposureDescriptor {
     ExposureDescriptor {
         timestamp: Some(Utc::now()),
@@ -353,7 +368,10 @@ fn build_grep_args_includes_scope_flags() {
     assert!(args.paths_only);
     assert!(args.hidden);
     assert!(args.no_ignore);
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/src"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), "src").as_str())
+    );
     assert_eq!(args.glob.as_deref(), Some("src/**/*.rs"));
 }
 
@@ -382,7 +400,10 @@ fn build_grep_args_drops_match_all_glob() {
     let args = build_grep_args(&params, &ctx).unwrap();
     assert_eq!(args.query, "agentgrep");
     assert_eq!(args.file_type.as_deref(), Some("rs"));
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/."));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), ".").as_str())
+    );
     assert_eq!(args.glob, None);
 }
 
@@ -479,7 +500,10 @@ fn build_find_args_allows_glob_only_search() {
 
     let args = build_find_args(&params, &ctx).expect("glob-only find should be valid");
     assert!(args.query_parts.is_empty());
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/."));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), ".").as_str())
+    );
     assert_eq!(args.glob.as_deref(), Some("**/*release*"));
     assert_eq!(args.max_files, 25);
     assert!(args.paths_only);
@@ -551,7 +575,10 @@ fn build_smart_args_uses_terms() {
     assert!(args.debug_plan);
     assert!(args.debug_score);
     assert_eq!(args.file_type.as_deref(), Some("rs"));
-    assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/workspace"), "repo").as_str())
+    );
     assert_eq!(query.subject, "auth_status");
     assert_eq!(query.relation.as_str(), "rendered");
     assert_eq!(query.path_hint.as_deref(), Some("src/tui"));
@@ -699,7 +726,10 @@ fn build_outline_args_accepts_file_field() {
 
     let args = build_outline_args(&params, &ctx, None).unwrap();
     assert_eq!(args.file, "src/tool/agentgrep.rs");
-    assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/workspace"), "repo").as_str())
+    );
 }
 
 #[test]
@@ -800,7 +830,7 @@ async fn execute_runs_linked_grep() {
         .await
         .expect("tool output");
     assert!(output.output.contains("query: auth_status"));
-    assert!(output.output.contains("src/app.rs"));
+    assert!(contains_path(&output.output, "src/app.rs"));
     assert!(output.output.contains("@ 1 pub fn auth_status() {}"));
 }
 

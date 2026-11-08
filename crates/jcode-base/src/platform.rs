@@ -489,6 +489,51 @@ fn spawn_replacement_process(
     cmd.spawn()
 }
 
+/// Replace the current process with a new command, keeping the new process a
+/// child of the current process' parent (Windows only reparenting).
+///
+/// On Unix this is plain `exec()`, which keeps the PID and therefore the
+/// parent. On Windows `Command::spawn()` would record this soon-to-die
+/// process as the parent, which breaks the pane's process tree. This variant
+/// asks Windows for `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` so the replacement
+/// lands directly under our parent.
+///
+/// Never fails because of the reparenting: any error falls back to a plain
+/// spawn and is logged.
+pub fn replace_process_reparented(cmd: &mut std::process::Command) -> std::io::Error {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        crate::logging::error(&format!(
+            "replace_process failed: {} ({})",
+            err,
+            crate::util::process_fd_diagnostic_snapshot()
+        ));
+        err
+    }
+    #[cfg(windows)]
+    {
+        match crate::platform_reparent::spawn_reparented(cmd) {
+            Ok(pid) => {
+                crate::logging::info(&format!(
+                    "replace_process: replacement process {pid} reparented to our parent"
+                ));
+                std::process::exit(0);
+            }
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "replace_process: reparented spawn failed ({e}); falling back to a plain spawn"
+                ));
+                match spawn_replacement_process(cmd) {
+                    Ok(_child) => std::process::exit(0),
+                    Err(e) => e,
+                }
+            }
+        }
+    }
+}
+
 /// Replace the current process with a new command (exec on Unix).
 ///
 /// On Unix, this calls exec() which never returns on success.

@@ -2478,6 +2478,22 @@ impl Server {
         if let Some(binary) = self::util::running_server_binary() {
             crate::logging::info(&format!("Server binary: {}", binary.display()));
         }
+        // Capture the running binary's file identity and mtime NOW, eagerly.
+        //
+        // On Windows a channel update replaces the binary IN PLACE at the same
+        // path (`atomic_symlink_swap` renames the old entry aside and moves the
+        // new one in). If the identity were read lazily - on the first reload
+        // probe - it would describe the NEW file, and the probe would compare
+        // the candidate against itself: it could never advertise an update, and
+        // the self-exec guard could never tell "new build" from "what we run".
+        // Pinning at startup is what makes the comparison meaningful.
+        let snapshot = self::util::running_binary_snapshot();
+        crate::logging::info(&format!(
+            "Server binary snapshot: path={} mtime={:?} identity={:?}",
+            snapshot.path.display(),
+            snapshot.mtime,
+            snapshot.identity
+        ));
         // Ensure socket directory exists (for named sockets like /run/user/1000/jcode/)
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)?;

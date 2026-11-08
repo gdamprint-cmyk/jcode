@@ -1083,10 +1083,7 @@ impl Registry {
         // a new request, so it leaves the gate as it was.
         if plan_declaration::plan_declaration_state(&ctx.session_id)
             == plan_declaration::PlanDeclarationState::AwaitingDeclaration
-            && !crate::todo::declaration::tool_allowed_before_plan_declared(
-                resolved_name,
-                false,
-            )
+            && !crate::todo::declaration::tool_allowed_before_plan_declared(resolved_name, false)
         {
             anyhow::bail!(
                 "{}",

@@ -101,6 +101,29 @@ async fn ssh_readiness_rejects_wrong_id_old_protocol_and_oversized_reply() {
 }
 
 #[tokio::test]
+async fn manual_reload_is_forced_and_automatic_reload_is_not() {
+    // Manual `/reload` must stay forced (the user asked for a restart), while an
+    // automatic stale-server reload must be non-forced so the server only
+    // reloads when it can prove a strictly-newer binary exists.
+    let mut remote = RemoteConnection::dummy();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = BufReader::new(reader);
+
+    remote.reload().await.unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    let request: Request = serde_json::from_str(&line).unwrap();
+    assert!(matches!(request, Request::Reload { force: true, .. }));
+
+    line.clear();
+    remote.reload_with_force(false).await.unwrap();
+    reader.read_line(&mut line).await.unwrap();
+    let request: Request = serde_json::from_str(&line).unwrap();
+    assert!(matches!(request, Request::Reload { force: false, .. }));
+}
+
+#[tokio::test]
 async fn runtime_command_writes_control_request_without_prompt() {
     let mut remote = RemoteConnection::dummy();
     let peer = remote.take_dummy_peer().unwrap();

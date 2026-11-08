@@ -2156,7 +2156,7 @@ pub(crate) fn run_cli(command: super::args::CloudCommand) -> Result<()> {
                 let exe = std::env::current_exe()?;
                 let mut command = Command::new(exe);
                 command.arg("--resume").arg(&report.session_id);
-                let error = crate::platform::replace_process(&mut command);
+                let error = crate::platform::replace_process_reparented(&mut command);
                 bail!("failed to resume locally: {error}");
             }
             Ok(())
@@ -2263,7 +2263,7 @@ fn exec_attach(
     // The bridge still validates the original local lease and expiry. Attaching
     // does not create a new grant or extend the time granted by the migration.
     command.env("JCODE_CLOUD_ENV_SESSION", session_id);
-    let error = crate::platform::replace_process(&mut command);
+    let error = crate::platform::replace_process_reparented(&mut command);
     bail!("failed to attach to `{host}`: {error}")
 }
 
@@ -2618,7 +2618,7 @@ pub(crate) fn take_stashed_handoff() -> Option<crate::tui::CloudHandoff> {
 /// Replace this client with one attached where the session now lives.
 pub(crate) fn exec_handoff(handoff: crate::tui::CloudHandoff) -> Result<()> {
     let mut command = handoff_command(handoff)?;
-    let error = crate::platform::replace_process(&mut command);
+    let error = crate::platform::replace_process_reparented(&mut command);
     bail!("failed to reattach after cloud move: {error}")
 }
 

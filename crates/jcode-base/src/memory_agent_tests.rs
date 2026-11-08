@@ -59,7 +59,11 @@ async fn missing_jev_access_clears_pending_without_fallback() {
     let (_, rx) = mpsc::channel(1);
     let mut agent = MemoryAgent::new(rx);
     agent
-        .process_context(sid, &[crate::message::Message::user("current query")], false)
+        .process_context(
+            sid,
+            &[crate::message::Message::user("current query")],
+            false,
+        )
         .await
         .unwrap();
     assert!(!memory::has_pending_memory(sid));
@@ -78,7 +82,9 @@ async fn missing_jev_access_clears_pending_without_fallback() {
 fn external_payload_survives_project_binding_and_local_graph_check() {
     let _lock = crate::storage::lock_test_env();
     let sid = "external-memory-binding-test";
-    let project = crate::storage::jcode_dir().expect("jcode dir").join("external-bind-test");
+    let project = crate::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("external-bind-test");
     let project_dir = project.to_string_lossy().to_string();
 
     // A Hindsight document id: it does NOT exist in the local memory graph.
@@ -103,7 +109,9 @@ fn external_payload_survives_project_binding_and_local_graph_check() {
 fn external_payload_is_not_taken_by_a_different_project() {
     let _lock = crate::storage::lock_test_env();
     let sid = "external-memory-wrong-project-test";
-    let other = crate::storage::jcode_dir().expect("jcode dir").join("external-bind-other");
+    let other = crate::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("external-bind-other");
     let other_dir = other.to_string_lossy().to_string();
 
     memory::set_pending_memory_external(

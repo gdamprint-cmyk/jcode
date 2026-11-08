@@ -516,7 +516,8 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
             return Some(shared_server);
         }
     } else if let Some(shared_server) = shared_server
-        && shared_server_channel_is_current_enough()
+        && (shared_server_channel_is_current_enough()
+            || shared_server_channel_newer_than_stable())
     {
         return Some(shared_server);
     }
@@ -526,6 +527,42 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
+}
+
+// reference: in-repo prior art - `repair_stale_shared_server_channel` in crates/jcode-build-support/src/lib.rs
+// (same "compare the approved shared-server channel against stable by mtime" decision, applied on the daemon side).
+//
+// True when the approved `shared-server` channel is strictly newer than the
+// `stable` channel on disk.
+//
+// The marker gate ([`shared_server_channel_is_current_enough`]) compares the
+// shared-server version marker against the `stable`/`current` markers. That
+// comparison is wrong whenever a LOCAL build advanced `current` after the
+// shared-server channel was promoted: the markers legitimately disagree, the
+// gate rejects the approved channel, and the selection falls back to `stable` -
+// which on this host is a much older release (v0.84.0). The client then spawns
+// that ancient daemon, sees a server older than its own client, and asks for
+// a reload; the reload execs into `shared-server`, the client reconnects, the
+// next client start spawns the old `stable` daemon again - a reload loop that
+// interrupts every session.
+//
+// mtime is the same directional signal the rest of the reload machinery uses
+// (see `server_has_newer_binary`), so an approved channel that is strictly
+// newer than `stable` must be preferred over the older `stable` fallback. A
+// deliberately pinned OLD self-dev channel stays pinned: it is not newer.
+fn shared_server_channel_newer_than_stable() -> bool {
+    let (Ok(shared), Ok(stable)) = (shared_server_binary_path(), stable_binary_path()) else {
+        return false;
+    };
+    let shared = resolve_binary_payload(&shared);
+    let stable = resolve_binary_payload(&stable);
+    match (binary_mtime(&shared), binary_mtime(&stable)) {
+        (Some(shared), Some(stable)) => shared > stable,
+        // An unreadable stable mtime means we cannot prove the fallback is
+        // older, so keep the approved channel (it was explicitly promoted).
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn shared_server_channel_is_current_enough() -> bool {
