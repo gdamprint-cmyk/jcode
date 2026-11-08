@@ -21,3 +21,17 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# Local tool state. These are generated indexes and scratch trees, never
+# source, and they are large enough to dominate an untracked-file listing.
+# .cgrep/ = the cgrep tantivy index, graft/ = the graft code graph cards,
+# .serena/ = the serena project config.
+/.cgrep/
+/graft/
+/.serena/
+/nul)
+
+# Local scratch from earlier validation runs, and a ripgrep-only config that
+# re-admits the gitignored graft/ tree for searching.
+/_val4_cfc_files.txt
+/.ignore
