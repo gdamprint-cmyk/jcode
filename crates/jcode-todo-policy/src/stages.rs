@@ -9,6 +9,18 @@
 //!   lane that runs in list order. Different lanes run in parallel. An
 //!   ungrouped todo is a lane of its own.
 
+// reference: ~/.jcode/research/2026-11-09-todo-name-collision.md (the measured
+//           defect, the fix and its behavioural control). The name-collision fix
+//           in `merge_worker_lane` extends this file's OWN prior art - the
+//           function already resolved colliding card IDs with
+//           `format!("{worker}:{id}")` (merge_worker_lane, stages.rs:294) but
+//           not colliding card NAMES, which is what the todo tool resolves a
+//           card by (`task_name()` reads `content`, todo_names.rs:35). No
+//           external implementation was consulted: searched the web for
+//           "rust disambiguate duplicate item names when merging two lists" and
+//           the repo for `unique_name`; the only relevant precedent is the
+//           in-repo ID-collision handling.
+
 use crate::TodoItem;
 
 #[cfg(test)]
@@ -324,7 +336,44 @@ pub fn merge_worker_lane(
             merged.push(todo.clone());
         }
     }
+    disambiguate_names(&mut merged);
     (merged != coordinator_todos).then_some(merged)
+}
+
+/// Keep card names unique across the merged board.
+///
+/// The todo tool resolves a card by its NAME, which is the card's `content`, and
+/// refuses to operate on a board that holds two cards with the same name
+/// (`duplicate todo name ...; names must be unique within the plan`,
+/// crates/jcode-app-core/src/tool/todo_names.rs). A worker's card is mirrored
+/// into the coordinator's board by name, so two workers that each create a card
+/// called `write-artifact` poison the coordinator's board: EVERY later todo
+/// update by the coordinator fails until one card is renamed. Merging already
+/// resolved colliding card IDs; names need the same treatment.
+fn disambiguate_names(todos: &mut [TodoItem]) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for todo in todos.iter_mut() {
+        if todo.content.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(todo.content.clone()) {
+            continue;
+        }
+        let owner = todo
+            .assigned_to
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .unwrap_or("todo")
+            .to_string();
+        let base = todo.content.clone();
+        let mut candidate = format!("{base} ({owner})");
+        let mut counter = 2;
+        while !seen.insert(candidate.clone()) {
+            candidate = format!("{base} ({owner} {counter})");
+            counter += 1;
+        }
+        todo.content = candidate;
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +433,73 @@ mod lane_sync_tests {
         };
         let worker = vec![item("renamed", "completed", Some(1), None)];
         assert_eq!(merge_worker_lane(&coordinator, &link, &worker), None);
+    }
+
+    // reference: ~/.jcode/research/2026-11-09-todo-name-collision.md - the
+    //           measured defect (two workers whose cards share a name poison the
+    //           coordinator's board) and the fix's behavioural control.
+    /// Two workers whose cards carry the SAME name must not poison the
+    /// coordinator's board. The todo tool resolves a card by its name (the
+    /// card's `content`) and refuses to operate on a board holding two cards
+    /// with the same name, so a collision between workers would break EVERY
+    /// later todo update by the coordinator.
+    #[test]
+    fn merge_disambiguates_names_colliding_across_workers() {
+        let mut coordinator = vec![
+            item("p1", "pending", Some(1), Some("parser")),
+            item("u1", "pending", Some(1), Some("ui")),
+        ];
+        let parser = LaneLink {
+            coordinator: "boss".into(),
+            worker: "fox".into(),
+            lane: "lane:1:parser".into(),
+        };
+        let ui = LaneLink {
+            coordinator: "boss".into(),
+            worker: "lynx".into(),
+            lane: "lane:1:ui".into(),
+        };
+        let mut fox = vec![item("p1", "pending", Some(1), Some("parser"))];
+        fox[0].content = "write-artifact".into();
+        let mut lynx = vec![item("u1", "pending", Some(1), Some("ui"))];
+        lynx[0].content = "write-artifact".into();
+
+        coordinator = merge_worker_lane(&coordinator, &parser, &fox).expect("parser lane merged");
+        coordinator = merge_worker_lane(&coordinator, &ui, &lynx).expect("ui lane merged");
+
+        let mut names: Vec<&str> = coordinator.iter().map(|todo| todo.content.as_str()).collect();
+        names.sort_unstable();
+        let mut unique = names.clone();
+        unique.dedup();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "merged board must hold unique card names, got {names:?}"
+        );
+        assert!(names.contains(&"write-artifact"), "first name is kept verbatim");
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("write-artifact (")),
+            "the colliding name is disambiguated, got {names:?}"
+        );
+    }
+
+    /// A merge that introduces no collision must not rename anything.
+    #[test]
+    fn merge_keeps_names_untouched_without_a_collision() {
+        let coordinator = vec![item("p1", "pending", Some(1), Some("parser"))];
+        let parser = LaneLink {
+            coordinator: "boss".into(),
+            worker: "fox".into(),
+            lane: "lane:1:parser".into(),
+        };
+        let mut fox = vec![item("p1", "pending", Some(1), Some("parser"))];
+        fox[0].content = "write-minimax-quota-artifact".into();
+        let merged = merge_worker_lane(&coordinator, &parser, &fox).expect("merged");
+        let names: Vec<&str> = merged.iter().map(|todo| todo.content.as_str()).collect();
+        assert!(names.contains(&"write-minimax-quota-artifact"), "got {names:?}");
+        assert!(!names.iter().any(|name| name.contains('(')), "got {names:?}");
     }
 
     #[test]
