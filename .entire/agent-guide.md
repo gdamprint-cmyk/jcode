@@ -1,12 +1,37 @@
-# Entire repository agent guide — Brain
+# Entire repository agent guide — Graph and Brain
 
-Use Brain for task context and retained knowledge. Begin substantive tasks needing
-orientation with:
+Use Graph EVERY time you need to find code or a code relationship, not only at the
+start. Both tools run, in this order, and neither replaces the other:
 
-    entire brain brief "<task>" --json
+    1. entire brain brief "<task>" --json
+    2. entire graph query --repo . --profile full --head --format agent --max-context-bytes 4096 --query "<task>"
 
-Run it before deciding the task does not need it: what the brief adds is the part
-you do not already know about.
+The brief answers why, and what was decided; the query answers where, and what
+depends on it. Step 2 holds for small edits, follow-up work, and tasks that already
+name the file: a named file answers where code is, not what else depends on it. Do
+not skip either step on the grounds that the available context feels sufficient, and
+do not treat having done one as having done the other.
+Each later locate or relationship question MUST also go through Graph:
+
+    entire graph query --repo . --profile full --head --format agent --max-context-bytes 4096 --query "<task>"
+    entire graph def --repo . --head --max-context-bytes 4096 <Name>
+    entire graph neighbors --repo . --head --format agent --max-context-bytes 4096 --symbol <Name> --direction in
+    entire graph impact --repo . --head --max-context-bytes 4096 --symbol <Name>
+
+query finds the code for a description. def shows what a named symbol is.
+neighbors lists callers (--direction in) or callees (--direction out). impact gives
+the blast radius before you change a symbol. Use these, not grep, for definitions,
+callers, references and dependents. Use grep/rg only for literal strings, config
+keys, environment-variable names and file names.
+
+--head reads the committed tree from a cache. Drop --head only when the answer
+depends on uncommitted edits. The first call in a large repository can take tens of
+seconds while that cache loads; later calls take about a second. Run the command
+directly: it needs no timeout wrapper, and macOS has no timeout command.
+A Coverage or Completeness line lists files Graph could not parse, often minified or
+generated ones. It does not mean the results are partial; only a failure in the
+language you asked about can hide a fact, and then you check that one relation in
+source. Static relations can be incomplete: an empty result is not proof of no callers.
 
 Questions about why something is the way it is, what was decided, or what was
 tried before are answered by durable memories. Retrieve them directly; the brief's
@@ -27,17 +52,33 @@ when you learn something durable that the code does not already state:
 
 Categories are architecture, constraints, preferences, project and workflow.
 Omitting --path classifies the memory for you, which requires a supported coding
-agent on PATH. Over MCP the same write is the brain_remember tool, which
-requires path. Retrieve with recall, and re-check anchors with verify.
+agent on PATH. Retrieve with recall, and re-check anchors with verify.
 
 Use Brain entities history to connect code changes to earlier checkpoints and
 sessions. Use Brain memory-informed review and workspace
 capabilities when relevant. Brain semantic answers refer to a stored index, which
 may differ from current working-tree source.
 
-Use Brain's code inspection tools for relevant code questions.
+The Graph obligation holds when the brief has already reported locations: a brief
+reports where code is, not what depends on it. A Graph query after a brief is not
+redundant. Do not ask both tools the SAME question without an identified gap.
+Use Graph diff, commit, and checkpoint for semantic comparisons of code revisions.
+Brain semantic answers refer to a stored index; Graph without --head reads the
+working tree.
 
-Read focused source around useful locations before editing. Check related contracts
+Inspect the source Graph displays at useful locations before editing. A result marked [complete]
+certifies a structurally whole displayed body, unchanged by rendering, for the source
+view observed by that query. It does not certify dependencies, later source freshness,
+or task resolution. Do not reread the same unchanged span merely to duplicate it.
+The marker never waives a read your editing tool requires before it changes a file:
+when the tool requires one, perform that read. If you cannot establish that a span is
+unchanged since the query, treat it as changed and read it.
+An unmarked result is not certified: it may be a partial window or a whole body whose
+marker did not fit. Retrieve only the specific additional span, surrounding context,
+caller, contract, or second site required for the task. If edits, formatting, generation,
+checkout, or another writer may have changed the relevant source, verify that current
+span before reusing remembered output. A --head result does not cover working-tree
+changes absent from that snapshot. Check related contracts
 and make the smallest complete change. VERIFY before stopping: execute focused tests,
 a reproduction, or the most relevant build. If execution is unavailable, disclose
 that limit and perform a bounded source check. Prefer precise queries and line ranges,
@@ -55,46 +96,4 @@ If a Graph or Brain query fails, report the failure and fall back to direct sour
 inspection FOR THAT QUERY ONLY. One failure does not retire the tool: ask the next
 question through it. Do not automatically install, configure, or repair tools.
 
-Retrieval (query takes --json/--format json|cli/--limit/-n/--branch,
-get/multi-get take --json/--format json|cli/--branch):
-  entire brain query "<query>" --json       # hybrid (lexical+vector, RRF) — the default
-  entire brain query --keyword "<query>" --json      # lexical keyword over memories + history + docs (BM25 for history/docs)
-  entire brain query --semantic "<query>" --json     # vector/semantic over memories + docs (+ history/conversation with a Gemma-class embedder)
-  entire brain get <id> --json              # fetch one item by id (fact:… | history:… | doc:…)
-  entire brain multi-get <id>... --json     # fetch several by id
-
-Small top-level surface:
-  entire brain status [repo] --json         # sources, memories+verification, semantic coverage/freshness/blind spots, live state
-  entire brain status --fail-on release     # CI gate: nonzero when freshness is not ok or blind spots exist (also: unsafe, degraded, blind-spots)
-  entire brain overview [repo] --json
-  entire brain brief "<task>" --json
-  entire brain show <id> --json
-  entire brain agent-guide
-  entire brain path [repo]
-
-Durable memories (curated, provenance-anchored repo knowledge):
-  entire brain distill --dry-run --json
-  entire brain recall "<query>" [--scope local|cross-cutting] [--expand] --json
-  entire brain remember "<memory>" [--path category.sub.type] --json
-  entire brain verify [<memory-id | query>] --json
-  entire brain memories tree [--path <prefix>] [--depth N]
-  entire brain memories retract <memory-id> --json
-  entire brain inspect blame <memory-id> --json # source anchors a memory was derived from
-
-Specialist tools (symbol graph + regression analysis — what the verbs can't do):
-  entire brain inspect code "<query>" --json        # find a symbol in the graph
-  entire brain inspect search-graph "<query>" --json
-  entire brain inspect query-graph "type:CALLS <query>" --json
-  entire brain inspect graph-ui semantic-graph.html
-  entire brain inspect snippet <symbol-or-id> --json
-  entire brain inspect trace-path <from-symbol> <to-symbol> --json
-  entire brain inspect dead-code --json
-  entire brain inspect ingest-traces <json-or-ndjson-file> --json
-  entire brain inspect context <symbol-or-id> --json
-  entire brain inspect impact <symbol-or-file> --json
-  entire brain inspect changes --json
-  entire brain inspect tests "<query>" --json
-  entire brain inspect boundaries --kind route|tool|workflow --json
-  entire brain inspect regressions "<query>" --location-only [--include-deletions] --json
-
-<!-- entire-agent-activation: {"schema_version":1,"enabled":["brain"]} -->
+<!-- entire-agent-activation: {"schema_version":1,"enabled":["graph","brain"]} -->
