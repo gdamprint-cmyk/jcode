@@ -36,7 +36,8 @@ captures/
 /_val4_cfc_files.txt
 /.ignore
 
-# Local tool state written by `entire enable` / `entire graph setup`: the
-# per-user Claude Code SubagentStart hook. Never source, and an untracked
-# path here makes the Entire brain refuse to build repository context.
+# Local Claude Code settings written by `entire enable` / `entire graph setup`
+# (the SubagentStart hook). Tool state, never source. Also listed in
+# .brainignore, but the Brain repository-context seed gates on git status, so
+# the file has to be ignored by git itself for the seed to build.
 /.claude/settings.local.json
