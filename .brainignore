@@ -6,4 +6,7 @@
 # (the SubagentStart hook). It is local tool state, never source, and leaving it
 # untracked made the brain refuse to build repository context from a "dirty"
 # worktree.
-/.claude/settings.local.json
+#
+# No leading slash: the Brain matcher compares the pattern against the git
+# path (".claude/settings.local.json"), and a rooted pattern never matches.
+.claude/settings.local.json
