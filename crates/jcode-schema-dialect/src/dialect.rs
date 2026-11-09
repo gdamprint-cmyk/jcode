@@ -62,6 +62,32 @@ pub struct DialectTransforms {
     /// depth. Needed by validators that accept `allOf` syntactically without
     /// intersecting it.
     pub merge_all_of_branches: bool,
+    /// Rewrite a union `type` (`["array", "null"]`) into the dialect's own
+    /// nullability spelling.
+    ///
+    /// JSON Schema lets `type` be a list of alternatives. Gemini's Schema proto
+    /// models `type` as a SINGLE enum plus a separate `nullable` boolean, so a
+    /// list is rejected while parsing the payload ("Unknown name \"type\" ...
+    /// Proto field is not repeating, cannot start list"). The union is
+    /// rewritten to the non-null member plus `nullable: true`, which is the
+    /// same constraint in the dialect's vocabulary.
+    ///
+    /// A union with no `null` member, or with more than one non-null member,
+    /// has no faithful single-type spelling. Those are left alone: silently
+    /// narrowing the accepted instances would change what the tool accepts,
+    /// and the schema's own validation keyword is not the authority on what the
+    /// tool will actually accept at execution time.
+    ///
+    /// reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+    /// (the `Schema` resource: `type` is `enum (Type)`, `nullable` is a
+    /// separate `boolean`; the `Type` enum lists NULL as a member but the JSON
+    /// representation of `type` is one value, not a list). The same failure is
+    /// reported publicly against other Gemini clients in
+    /// https://github.com/n8n-io/n8n/issues/15553 (identical error text,
+    /// "union-style nullability like type: [\"string\",\"null\"]" named as a
+    /// rejected form) and against LangChain's Gemini binding in
+    /// https://github.com/langchain-ai/langchainjs/issues/9691.
+    pub union_type_as_nullable: bool,
 }
 
 /// A provider's accepted JSON Schema subset plus the rewrites needed to reach
@@ -248,6 +274,9 @@ fn walk(schema: &Value, spec: &DialectSpec, quirks: &LearnedQuirks) -> Value {
             if spec.transforms.merge_all_of_branches {
                 merge_all_of_branches(&mut out);
             }
+            if spec.transforms.union_type_as_nullable {
+                rewrite_union_types(&mut out);
+            }
             if spec.transforms.require_properties_on_objects && is_object_typed(&out) {
                 out.entry("properties".to_string())
                     .or_insert_with(|| Value::Object(Map::new()));
@@ -265,6 +294,31 @@ fn is_object_typed(map: &Map<String, Value>) -> bool {
         Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("object")),
         _ => false,
     }
+}
+
+/// Rewrite `type: ["<T>", "null"]` as `type: "<T>"` plus `nullable: true`.
+///
+/// Gemini's Schema proto models `type` as a single enum and nullability as a
+/// separate boolean, so the JSON Schema union form has no proto spelling and
+/// the whole request is rejected while parsing the payload. The union is only
+/// rewritten when it has exactly one non-null member, so the constraint the
+/// model is told about does not change.
+fn rewrite_union_types(out: &mut Map<String, Value>) {
+    let Some(Value::Array(types)) = out.get("type") else {
+        return;
+    };
+    let mut non_null: Vec<&str> = types
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|t| *t != "null")
+        .collect();
+    let has_null = types.iter().filter_map(Value::as_str).any(|t| t == "null");
+    if !has_null || non_null.len() != 1 {
+        return;
+    }
+    let only = non_null.remove(0);
+    out.insert("type".into(), Value::String(only.to_string()));
+    out.insert("nullable".into(), Value::Bool(true));
 }
 
 /// Drop `required` names the same object does not declare (#655).
