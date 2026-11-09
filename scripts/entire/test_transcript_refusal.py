@@ -3,7 +3,7 @@
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # source repo: entire-agent-jcode @ 3aaae7b
-#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
+#                ("fix(adapter): the stdout cap is 10 MiB for read-transcript, 67.7 MiB for compact-transcript")
 # ---------------------------------------------------------------------------
 """Regression tests for the adapter's refusal to substitute data (B7.1, B7.2).
 
