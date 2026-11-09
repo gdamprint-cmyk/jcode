@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ addf2a9
-#                ("fix(adapter): refuse to substitute data for a transcript")
+# source repo: entire-agent-jcode @ 26a19cc
+#                ("fix(hook): retry when Entire's plugin discovery drops the adapter")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/lifecycle
@@ -26,6 +26,24 @@ import sys
 from datetime import datetime
 
 AGENT_NAME = "jcode"
+
+# How many times to attempt the `entire hooks` call when the CLI reports that
+# it could not discover this plugin. The failure is a discovery timeout, not a
+# hook error, so a second attempt (with a fresh 5s discovery budget) is a
+# genuine retry rather than a repeat of a broken call.
+#
+# Bounded at 3: the hook subprocess already has a 30s ceiling, and each
+# attempt costs up to ~5s of discovery plus the hook body.
+_DISCOVERY_ATTEMPTS = 3
+
+# The exact message the CLI emits when discovery did not register the plugin
+# (cmd/entire/cli/hooks_cmd.go:63).
+_UNKNOWN_AGENT_ERROR = 'unknown agent "%s"' % AGENT_NAME
+
+
+def _is_unknown_agent_error(stderr: str | None) -> bool:
+    """Report whether the CLI's stderr says it could not discover the plugin."""
+    return bool(stderr) and _UNKNOWN_AGENT_ERROR in stderr
 
 # Windows: CREATE_NO_WINDOW (0x08000000).
 #
@@ -125,6 +143,44 @@ def main() -> int:
     except subprocess.TimeoutExpired:
         sys.stderr.write("[entire-agent-jcode-hook] entire CLI timed out; skipping\n")
         return 0
+
+    # The CLI discovers external plugins under a 5 SECOND budget
+    # (cmd/entire/cli/hooks_cmd.go:47) and runs each plugin's `info`
+    # SUBPROCESS inside it. When the budget expires mid-scan the plugin is
+    # silently dropped and the CLI reports:
+    #   unknown agent "jcode" (not found as built-in or external plugin)
+    # The upstream comment at hooks_cmd.go:56-57 names this case exactly:
+    # "not taken when that plugin is installed but discovery missed it
+    #  (a timeout)".
+    #
+    # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/hooks_cmd.go
+    # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/discovery.go
+    # measured: ~/.jcode/research/2026-11-09-entire-implementation/prove_discovery_budget_drop.py
+    #
+    # Measured on this host: 6 such failures, all inside a 2-minute window
+    # (2026-11-09 05:42:27-05:44:39 local) while the host was heavily loaded
+    # (a turn-start in the same window took 12.7s). A deliberately slow stub
+    # plugin on $PATH reproduces the byte-identical message.
+    #
+    # The retry is safe because the error is raised BEFORE the hook body runs
+    # (hooks_cmd.go:52-63 returns before executeAgentHook at :66), so a
+    # dropped-plugin failure leaves no partial state to duplicate.
+    if _is_unknown_agent_error(completed.stderr) and _DISCOVERY_ATTEMPTS > 1:
+        for _attempt in range(1, _DISCOVERY_ATTEMPTS):
+            try:
+                completed = subprocess.run(
+                    [entire, "hooks", AGENT_NAME, hook_name],
+                    input=hook_input,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    cwd=run_cwd,
+                    **_SUBPROCESS_FLAGS,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                break
+            if not _is_unknown_agent_error(completed.stderr):
+                break
 
     if completed.returncode != 0:
         # A failing Entire hook must never break the agent turn.

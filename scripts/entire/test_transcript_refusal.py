@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ addf2a9
-#                ("fix(adapter): refuse to substitute data for a transcript")
+# source repo: entire-agent-jcode @ 26a19cc
+#                ("fix(hook): retry when Entire's plugin discovery drops the adapter")
 # ---------------------------------------------------------------------------
 """Regression tests for the adapter's refusal to substitute data (B7.1, B7.2).
 
