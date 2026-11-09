@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 26a19cc
-#                ("fix(hook): retry when Entire's plugin discovery drops the adapter")
+# source repo: entire-agent-jcode @ fb54426
+#                ("fix(adapter): refuse an oversized transcript instead of letting the CLI truncate it")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
@@ -43,6 +43,21 @@ import sys
 from pathlib import Path
 
 AGENT_NAME = "jcode"
+
+# The Entire CLI caps an external agent's stdout at 10 MiB and aborts with
+# "output exceeded 10485760 byte limit" when a command exceeds it
+# (cmd/entire/cli/agent/external/external.go:530). The cap is hardcoded: no
+# environment variable and no CLI flag overrides it.
+#
+# The adapter uses this constant to REFUSE rather than truncate a transcript
+# that would exceed the cap. Truncating would be worse than the error it
+# replaces: the CLI writes the stored sidecar after this read
+# (cmd/entire/cli/lifecycle.go:882), so a truncated answer overwrites a
+# complete stored copy with a partial one and moves the growth baseline into
+# the truncated coordinate.
+#
+# reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
+_CLI_STDOUT_LIMIT_BYTES = 10 * 1024 * 1024
 
 # Version reported on the ``cli_version`` field of every emitted transcript
 # line. It identifies the producer of the line, not the agent.
@@ -1015,6 +1030,31 @@ def cmd_read_transcript(args) -> int:
     data = _session_transcript_bytes(path)
     if data is None:
         sys.stderr.write("[entire-agent-jcode] read-transcript: not a transcript\n")
+        return 1
+    # The CLI caps an external agent's stdout at 10 MiB
+    # (cmd/entire/cli/agent/external/external.go:530). A transcript above that
+    # limit makes the CLI abort with "output exceeded 10485760 byte limit".
+    #
+    # REFUSING here rather than truncating is deliberate. The CLI writes the
+    # stored sidecar AFTER this read
+    # (cmd/entire/cli/lifecycle.go:882), so a truncated answer would OVERWRITE
+    # the sidecar with a partial copy, and the growth baseline
+    # (state.CheckpointTranscriptSize) would then be measured in the
+    # truncated coordinate - which stops the condensation from seeing growth.
+    # A refusal leaves the sidecar untouched: the CLI keeps the last complete
+    # copy and the checkpoint path (which reads the sidecar FILE, not this
+    # pipe) still holds the full history.
+    #
+    # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
+    # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
+    if len(data) > _CLI_STDOUT_LIMIT_BYTES:
+        sys.stderr.write(
+            "[entire-agent-jcode] read-transcript: transcript is "
+            f"{len(data)} bytes, above the Entire CLI's stdout limit of "
+            f"{_CLI_STDOUT_LIMIT_BYTES} bytes; refusing rather than truncating "
+            "(a truncated transcript would overwrite the stored copy with a "
+            "partial one)\n"
+        )
         return 1
     sys.stdout.buffer.write(data)
     if data and not data.endswith(b"\n"):

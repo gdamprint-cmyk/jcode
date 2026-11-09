@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 26a19cc
-#                ("fix(hook): retry when Entire's plugin discovery drops the adapter")
+# source repo: entire-agent-jcode @ fb54426
+#                ("fix(adapter): refuse an oversized transcript instead of letting the CLI truncate it")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/lifecycle
