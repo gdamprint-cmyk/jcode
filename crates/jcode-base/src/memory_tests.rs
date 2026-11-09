@@ -928,7 +928,7 @@ fn hybrid_excludes_superseded_memories() {
 }
 
 #[test]
-fn focus_query_text_strips_noise_and_leads_with_user_intent() {
+fn focus_query_text_strips_noise_and_keeps_only_the_user_intent() {
     let raw = "\
 <system-reminder>\n# Session Context\nDate: 2026-06-14\n</system-reminder>\n\
 User:\n\
@@ -957,13 +957,19 @@ The bug is in the mouse delta calc.";
     // Role markers are gone.
     assert!(!focused.contains("User:"));
     assert!(!focused.contains("Assistant:"));
-    // Real prose is kept.
+    // The user's own words are the query.
     assert!(focused.contains("scroll bug in navigation.rs"));
-    assert!(focused.contains("mouse delta calc"));
-    // Leads with the latest user intent.
+    assert_eq!(focused, "how do I fix the scroll bug in navigation.rs");
+    // The assistant's prose is NOT part of the query.
+    //
+    // MEASURED 2026-11-09 on bank `jcode-legacy`: appending the assistant's
+    // prose made the recall worse in all three measured queries - it lifted
+    // the agent's own implementation chatter to the top of the results and
+    // pushed the owner's statements down. The cross-encoder scores
+    // (query, candidate) PAIRS, so the transcript is not a query.
     assert!(
-        focused.starts_with("how do I fix the scroll bug in navigation.rs"),
-        "should lead with latest user message: {focused}"
+        !focused.contains("mouse delta calc"),
+        "assistant prose leaked into the query: {focused}"
     );
 }
 

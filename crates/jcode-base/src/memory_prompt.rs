@@ -1,3 +1,8 @@
+// reference: vectorize-io/hindsight-coding-agents, dist/dcode-hook.js
+//   :2189 boundRecallQuery and :2214 injectRecall - upstream sends the USER'S
+//   PROMPT (bounded) as the recall query, not the transcript. The local
+//   builder below now matches that shape; see the MEASURED note on
+//   format_focused_query_for_relevance.
 const MEMORY_CONTEXT_MAX_CHARS: usize = 8_000;
 const MEMORY_CONTEXT_MAX_MESSAGES: usize = 12;
 const MEMORY_CONTEXT_MAX_BLOCK_CHARS: usize = 1_200;
@@ -183,11 +188,34 @@ pub fn format_context_for_relevance(messages: &[crate::message::Message]) -> Str
 /// score relevance. This builder:
 ///   - drops `<system-reminder>...</system-reminder>` blocks (session boilerplate),
 ///   - drops tool-call / tool-result lines,
-///   - keeps human/assistant prose,
-///   - over-weights the most recent user message (the strongest intent signal)
-///     by placing it first.
+///   - uses ONLY the most recent user message when there is one.
 ///
-/// Falls back to the raw relevance context if stripping leaves nothing.
+/// The last rule is the one that matters, and it is MEASURED, not assumed.
+///
+/// MEASURED 2026-11-09 on bank `jcode-legacy`, same scoped recall, same
+/// 10%-of-top cutoff, narrow = the user's own words, wide = the user's words
+/// plus the assistant prose that follows (what this builder used to send):
+///   "блок который называется просто memory теперь лишний релевантность"
+///     narrow: 3 of 11 kept, top = the owner's own complaint (ratio 1.000)
+///     wide:   8 of 13 kept, top = the same complaint, but the tail fills with
+///             the assistant's own past reasoning about the tooling
+///   "не забудь всегда применять точное значение из памяти"
+///     narrow: top = the PINEAPPLE-7429 verification (ratio 1.000)
+///     wide:   top = "The Rust implementation sets MIN_RELATIVE_SCORE = 0.10"
+///             - the agent's own source code, not the owner's instruction
+///   "собери бэклог и приоритизируй"
+///     narrow: top = "Приоритет - точность и подтверждённый реальный статус"
+///             (ratio 1.000), the owner's stated priority
+///     wide:   top = "POST /banks/{bank}/recall returns 404" - a diagnostics
+///             detail from a past session, with the owner nowhere in the head
+/// The wide query is WORSE in every case: it drags the agent's own
+/// implementation chatter to the top and pushes the owner's statements down.
+/// The user's words alone carry the intent; the transcript is not a query.
+///
+/// This also matches the upstream harness, which sends the user's prompt
+/// (bounded) as the recall query - see the file header.
+///
+/// Falls back to the retained prose if there is no user message at all.
 pub fn format_focused_query_for_relevance(messages: &[crate::message::Message]) -> String {
     let raw = format_context_for_relevance(messages);
     focus_query_text(&raw)
@@ -258,12 +286,23 @@ pub fn focus_query_text(raw: &str) -> String {
     }
 
     let mut out = String::new();
-    // Lead with the most recent user intent so the query is anchored on it.
+    // The USER'S WORDS ARE THE QUERY. The retained prose is the fallback, not
+    // the addition.
+    //
+    // MEASURED 2026-11-09 (see the note on
+    // format_focused_query_for_relevance): appending the assistant's prose
+    // after the user's message made the recall WORSE in all three measured
+    // queries - it lifted the agent's own implementation chatter to the top
+    // and pushed the owner's statements down. The cross-encoder scores
+    // (query, candidate) PAIRS, so every extra word in the query is another
+    // chance to match the wrong thing.
     if let Some(user) = last_user {
         out.push_str(&user);
-        out.push('\n');
+    } else {
+        // No user message in the window (an autonomous turn, or a session that
+        // starts mid-stream). The retained prose is all the intent there is.
+        out.push_str(&kept.join("\n"));
     }
-    out.push_str(&kept.join("\n"));
 
     let out = out.trim();
     if !out.is_empty() {

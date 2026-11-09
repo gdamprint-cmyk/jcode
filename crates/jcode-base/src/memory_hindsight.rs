@@ -1,3 +1,6 @@
+// reference: https://github.com/vectorize-io/hindsight
+//   (hindsight_api 0.10.2 OpenAPI: POST /v1/default/banks/{bank_id}/memories/recall
+//   and GET /v1/default/banks/{bank_id}/mental-models?detail=content)
 // reference: vectorize-io/hindsight-coding-agents, dist/dcode-hook.js
 //   buildSystemInjection (:1947) and formatRecallFallback (:1942), vendored at
 //   C:/Users/WorkShop1/.hindsight/coding-agents-0.8.2/dist/dcode-hook.js; and
@@ -46,11 +49,58 @@ use std::time::Duration;
 /// The recall runs on a dedicated thread inside the background memory agent,
 /// so a longer timeout delays a memory update, never the model's turn.
 /// 120 s leaves room for a 4x slow-down and still bounds a hung server.
+// reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+//   (RecallRequest.min_scores, budget levels, tags_match) and
+//   https://hindsight.vectorize.io/0.10/developer/api/mental-models
+//   (GET .../mental-models?detail=content). The relative-cutoff rule and the
+//   per-section budget are this host's own measurements - see the MEASURED
+//   notes on each constant below.
 const RECALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum characters of a single recalled fact. The upstream harness uses a
 /// similar bound; a fact longer than this is a document, not a fact.
 const MAX_FACT_CHARS: usize = 600;
+
+/// Maximum characters of one mental model excerpt.
+const MAX_MODEL_CHARS: usize = 600;
+
+/// How many mental models to deliver alongside the facts.
+///
+/// MEASURED 2026-11-09 on bank `jcode-legacy`: the bank holds 15 models, six of
+/// them stale daily models whose content is 4k-100k chars of accumulated raw
+/// history. Three is the useful slice; the rest is noise the model must read
+/// past to reach the one that matters.
+const MAX_MODELS: usize = 3;
+
+/// A recalled fact is kept when its score is at least this fraction of the
+/// TOP score for the same query.
+///
+/// MEASURED 2026-11-09 (bank `jcode-legacy`, 5 queries x 2 budgets): the score
+/// distribution is sharply bimodal. Relevant hits land at 0.93-1.11 and the
+/// irrelevant tail at 0.0001-0.17 - a three-order-of-magnitude gap. A
+/// RELATIVE cutoff at 10% of the top score separates them exactly: it keeps
+/// every relevant hit and drops the whole tail.
+///
+/// A FIXED floor was measured and rejected, twice. The useful Russian
+/// paraphrase "не забудь прочитать протокол встречи с командой безопасности"
+/// scores 0.0000832, so any fixed floor above that deletes a genuinely
+/// relevant cross-lingual hit; and an earlier bank measurement (2026-10-25)
+/// found that adding an instruction to the query rescales the reranker so
+/// that relevant records score 0.001-0.012 while irrelevant ones score
+/// 0.004-0.055 - the ordering is not stable across queries, so no fixed
+/// threshold can be trusted. The gap is relative, so the cutoff is relative.
+const MIN_RELATIVE_SCORE: f64 = 0.10;
+
+/// Character budget per SECTION of the delivered block.
+///
+/// MEASURED 2026-11-09: the python delivery path truncated its whole block at
+/// 3,000 chars AFTER rendering 8 facts of up to 500 chars each, so the mental
+/// models it had already fetched were never delivered at all - in 8 of 13
+/// saved session caches every model heading was gone, and in a re-measurement
+/// over the 8 most recent caches, 10 of 10 fetched models were lost to
+/// truncation. Budgeting per section means one section cannot starve the other.
+const MAX_FACTS_CHARS: usize = 2_400;
+const MAX_MODELS_CHARS: usize = 1_800;
 
 #[derive(Debug, Clone)]
 pub struct HindsightConfig {
@@ -133,9 +183,29 @@ pub struct HindsightFact {
     pub score: Option<f64>,
 }
 
+/// One mental model excerpt as Hindsight returned it.
+#[derive(Debug, Clone)]
+pub struct HindsightModel {
+    pub id: String,
+    pub name: String,
+    pub text: String,
+    /// Newer memories exist in this model's scope than its last refresh saw.
+    ///
+    /// Upstream (`hindsight.vectorize.io/0.10/developer/mental-models`): "A
+    /// model that has fallen behind is still shown, but it no longer
+    /// short-circuits retrieval, and the agent is expected to check it
+    /// against the layers below rather than trust it blindly." So a stale
+    /// model is DELIVERED with a marker, never dropped.
+    pub is_stale: bool,
+    /// Whether this model is one of the curated, owner-facing models.
+    pub is_curated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct HindsightRecall {
     pub facts: Vec<HindsightFact>,
+    /// Mental models relevant to the query, newest synthesis first.
+    pub models: Vec<HindsightModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,14 +230,54 @@ struct RecallScores {
     r#final: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MentalModelsResponse {
+    #[serde(default)]
+    items: Vec<MentalModelItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MentalModelItem {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    /// A stale model has newer input than its last refresh.
+    ///
+    /// MEASURED 2026-11-09 on bank `jcode-legacy`: ALL SIX curated models
+    /// (`active-work`, `user-profile`, `decisions-ledger`, `machine-hazards`,
+    /// `incidents-and-fixes`, `agent-coordination`) reported `is_stale: true`
+    /// right after a successful rebuild, and the bank is written to
+    /// continuously, so a model goes stale minutes later. Dropping stale
+    /// models therefore delivered NOTHING for exactly the topics the models
+    /// exist to answer: MEASURED 15 models in the bank, 0 delivered, so the
+    /// "Synthesized context" section was always empty.
+    ///
+    /// Upstream is explicit that a stale model is still shown. It is delivered
+    /// and MARKED instead.
+    #[serde(default)]
+    is_stale: Option<bool>,
+}
+
 /// Recall facts for `query` from the configured bank.
 ///
 /// Fails soft by returning an empty result on any transport or parse error:
 /// a memory system that can break a turn is worse than no memory system.
+// reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+//   (RecallRequest fields: query, budget, max_tokens, prefer_observations) and
+//   https://hindsight.vectorize.io/0.10/developer/api/mental-models
+//   (GET .../mental-models?detail=content&limit=N).
 pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> {
     let query = query.trim();
     if query.is_empty() {
-        return Ok(HindsightRecall { facts: Vec::new() });
+        return Ok(HindsightRecall {
+            facts: Vec::new(),
+            models: Vec::new(),
+        });
     }
     // The server truncates long queries itself; keep the request bounded so a
     // pathological transcript cannot produce a multi-megabyte request body.
@@ -184,12 +294,43 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         // Observations supersede the raw facts they were consolidated from,
         // so the agent sees one consolidated fact instead of its ingredients.
         "prefer_observations": true,
+        // SCOPE. Without this, recall draws from the whole bank: 78,013
+        // memories of which 29,940 are `origin:hermes`, 943 `origin:opencode`,
+        // plus unrelated projects. MEASURED 2026-11-09 on the owner's own
+        // complaint about memory delivery, same query, same endpoint:
+        //   - unscoped: the top hits were agent chatter about an old
+        //     truncation bug, a Chinese-language passage from another
+        //     project, and a UOB printer incident. None were about the
+        //     owner's question.
+        //   - scoped to this workspace's own tags: the owner's actual
+        //     complaint was the top hit.
+        // The scope is the jcode workspace: this agent's own writes, the
+        // owner's own statements, and the turns this workspace auto-retained.
+        // Hermes and OpenCode write to the same bank as collaborators, but
+        // their memories are another agent's perspective, not the owner's
+        // standing context, and admitting them measurably diluted the set.
+        "tag_groups": [{
+            "or": [
+                { "tags": ["origin:jcode"], "match": "any_strict" },
+                { "tags": ["owner:primary"], "match": "any_strict" },
+                { "tags": ["auto-retained"], "match": "any_strict" },
+            ]
+        }],
     });
 
     let text = post_json(&url, &body)?;
 
     let parsed: RecallResponse = serde_json::from_str(&text)
         .with_context(|| format!("parse Hindsight recall response from {url}"))?;
+
+    // The cutoff is RELATIVE to the top score, because the absolute scale of
+    // the reranker is not stable across queries. See MIN_RELATIVE_SCORE.
+    let top_score = parsed
+        .results
+        .iter()
+        .filter_map(|item| item.scores.as_ref().and_then(|s| s.r#final))
+        .fold(0.0f64, f64::max);
+    let cutoff = top_score * MIN_RELATIVE_SCORE;
 
     let mut facts = Vec::new();
     for item in parsed.results {
@@ -198,55 +339,283 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         if cleaned.is_empty() {
             continue;
         }
+        let score = item.scores.and_then(|s| s.r#final);
+        // A result with no score at all cannot be judged, so it is kept: the
+        // server omitting a score is not evidence of irrelevance.
+        if let Some(score) = score
+            && top_score > 0.0
+            && score < cutoff
+        {
+            continue;
+        }
         facts.push(HindsightFact {
             id: item.id.unwrap_or_default(),
             text: cleaned,
-            score: item.scores.and_then(|s| s.r#final),
+            score,
         });
         if facts.len() >= config.limit {
             break;
         }
     }
-    Ok(HindsightRecall { facts })
+
+    let models = match fetch_models(config, &query) {
+        Ok(models) => models,
+        // A model fetch failure must not lose the facts: the facts are the
+        // primary payload, the models are an enrichment.
+        Err(error) => {
+            crate::logging::info(&format!("Hindsight mental models unavailable: {error}"));
+            Vec::new()
+        }
+    };
+
+    Ok(HindsightRecall { facts, models })
 }
 
-/// Render recalled facts as the memory block the agent receives.
+/// Fetch the mental models that bear on `query`.
 ///
-/// The wording is deliberately close to the upstream Hindsight harness
-/// (coding-agents dist/dcode-hook.js buildSystemInjection): the model applies
-/// a fact AS GIVEN, and says so visibly when it does. A block that only
-/// lists facts is a block the model treats as background noise.
+/// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
+///   (GET .../mental-models?detail=content -> id, name, tags, is_stale,
+///   content; "detail=content" is REQUIRED, the default "metadata" returns
+///   content: null) and
+///   https://hindsight.vectorize.io/0.10/developer/mental-models
+///   ("A model that has fallen behind is still shown, but it no longer
+///   short-circuits retrieval").
+/// reference: no prior art for the SELECTION rule below - searched
+///   hindsight-coding-agents 0.8.2 (vendored at
+///   C:/Users/WorkShop1/.hindsight/coding-agents-0.8.2/dist/*.js) for any
+///   mental-model fetching, and found none: upstream's hooks recall facts
+///   only and never call the mental-models endpoint. The curated-vs-query
+///   rule below is therefore jcode's own, derived from the bank layout
+///   MEASURED below.
+///
+/// MEASURED 2026-11-09 on bank `jcode-legacy`: `detail=content` is REQUIRED -
+/// the default `detail=metadata` returns `content: null` for every model, so a
+/// client that omits it silently gets nothing.
+///
+/// Selection has two parts, and BOTH are needed:
+///
+/// 1. Curated owner-facing models (tagged `scope:*`) are always eligible. They
+///    are the standing answers the owner asked for - profile, goals,
+///    decisions, hazards - and they are relevant to almost any query about
+///    this workspace. MEASURED: with a title-token match only, a query about
+///    "hindsight memory retain hook" matched NONE of them, so the section was
+///    empty even though the models existed and were fresh.
+///
+/// 2. Everything else must match the query, judged by its CONTENT rather than
+///    its title. MEASURED: the older models carry `knowledge:feature-work`
+///    and `subject:*` tags and titles that never mention the words a query
+///    uses, but their bodies do.
+///
+/// Stale models are NOT dropped (see [`MentalModelItem::is_stale`]).
+fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightModel>> {
+    let url = format!(
+        "{}/v1/default/banks/{}/mental-models?detail=content&limit=100",
+        config.base_url, config.bank
+    );
+    let text = get_json(&url)?;
+    let parsed: MentalModelsResponse = serde_json::from_str(&text)
+        .with_context(|| format!("parse Hindsight mental models response from {url}"))?;
+
+    let mut out = Vec::new();
+    for item in parsed.items {
+        let content = item.content.unwrap_or_default();
+        let body = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            continue;
+        }
+        let name = item.name.unwrap_or_default();
+        let id = item.id.unwrap_or_default();
+        let is_curated = is_curated_model(&id);
+        if !is_curated && !model_matches_query(&name, &id, &body, query) {
+            continue;
+        }
+        out.push(HindsightModel {
+            id,
+            name,
+            text: body,
+            is_stale: item.is_stale.unwrap_or(false),
+            is_curated,
+        });
+    }
+
+    // Curated first, then freshest first inside each group. The curated models
+    // are the standing answers; the rest are topic-specific and only win when
+    // there is room left.
+    out.sort_by(|a, b| {
+        b.is_curated
+            .cmp(&a.is_curated)
+            .then_with(|| a.is_stale.cmp(&b.is_stale))
+    });
+    out.truncate(MAX_MODELS);
+    Ok(out)
+}
+
+/// The curated, owner-facing mental models of this bank.
+///
+/// reference: no prior art - these ids are this workspace's own curated set,
+///   installed under the plan in
+///   C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/
+///   jcode-hindsight-implementation.md (section 3, the model roster table).
+///   Upstream's coding-agents package never fetches mental models at all
+///   (searched hindsight-coding-agents 0.8.2 dist/*.js, found none).
+///
+/// These are the STANDING ANSWERS the owner asked for: profile, goals,
+/// decisions, incidents, hazards, coordination. They are relevant to almost
+/// any query about this workspace, so they are always eligible - no query
+/// match required.
+///
+/// They are identified by ID, not by a `scope:` tag, because the tag now has
+/// to do real work: it selects the DATA the model reads. A model tagged
+/// `owner:primary` reads the owner's own statements; a model tagged
+/// `auto-retained` reads this workspace's turn digests. Adding a `scope:`
+/// tag alongside would break that: `all_strict` requires a memory to carry
+/// EVERY tag, and no memory carries `scope:*`.
+const CURATED_MODEL_IDS: &[&str] = &[
+    "user-profile",
+    "active-work",
+    "decisions-ledger",
+    "incidents-and-fixes",
+    "machine-hazards",
+    "agent-coordination",
+];
+
+/// Whether a mental model is one of the curated, owner-facing models.
+fn is_curated_model(id: &str) -> bool {
+    CURATED_MODEL_IDS.contains(&id)
+}
+
+/// Whether a mental model is worth delivering for this query.
+///
+/// A model is kept when the query shares a word with its name, its id, or -
+/// the decisive part - its CONTENT. MEASURED 2026-11-09: a title-only match
+/// rejected every model for a query about "hindsight memory retain hook",
+/// because the curated models are titled "Active work and open threads" and
+/// "User profile and working preferences" while their bodies talk about
+/// retain hooks and memory.
+///
+/// The token floor of 4 characters keeps the match from firing on noise.
+fn model_matches_query(name: &str, id: &str, content: &str, query: &str) -> bool {
+    let haystack = format!("{name} {id} {content}").to_lowercase();
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|token| token.chars().count() >= 4)
+        .any(|token| haystack.contains(token))
+}
+
+// reference: vectorize-io/hindsight-coding-agents, dist/dcode-hook.js
+//   buildSystemInjection (:1947) - the upstream injection contract this block
+//   follows, and the section shape it uses (a bulleted fact list).
+/// Render recalled facts and models as the memory block the agent receives.
+///
+/// The header is deliberately SHORT. The owner's own reading of the earlier
+/// six-line version (2026-11-09): "the block called just `memory` is now
+/// redundant - it only holds a service description". A preamble that spends
+/// more tokens describing the delivery than the delivery itself is worth is
+/// noise the model has to read past.
+///
+/// What survives is only the two rules that change BEHAVIOUR:
+///   - a literal value in a fact is applied as given (not "re-derived"), and
+///   - a fact that informed the answer is attributed visibly.
+///
+/// The rest of upstream's eight-line contract (hindsight-coding-agents
+/// dist/dcode-hook.js buildSystemInjection :1947) is DROPPED on purpose:
+/// "judge relevance and ignore it" duplicates the relative-score cutoff that
+/// already dropped the irrelevant tail; "it is a record of the PAST, it never
+/// assigns you tasks" is a role instruction that belongs in the system
+/// prompt, not in every recall block; and the "correct the record" clause
+/// names a tool this client does not expose.
+///
+/// The two sections have SEPARATE budgets, because a single shared budget
+/// starves whichever section comes second. MEASURED 2026-11-09: the python
+/// delivery path shared one 3,000-char budget across 8 facts and 3 models, and
+/// 10 of 10 fetched models were cut before reaching the model.
 pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
-    if recall.facts.is_empty() {
+    if recall.facts.is_empty() && recall.models.is_empty() {
         return None;
     }
     let mut out = String::from(
         "# Memory\n\n\
-         Retrieved from this workspace's own memory (Hindsight bank). Real memory, but \
-         retrieval is heuristic: it may or may not bear on the current task.\n\
-         If a fact states an exact rule or literal values (specific strings, numbers, \
-         set members, mappings), apply it AS GIVEN rather than substituting a plausible \
-         alternative, and verify it against the current state before acting. When a fact \
-         informs part of your answer, attribute it visibly, starting with:\n\
-         > \u{1F9E0} **From memory** — <the specific facts you drew on>\n\
-         Never attribute memory that did not contribute. If a fact turns out to be wrong \
-         or outdated, correct the record instead of propagating it.\n\n",
+         A fact stating an exact rule or literal values is to be applied AS GIVEN, \
+         verified against the current state first. When a fact informs part of your \
+         answer, attribute it visibly:\n\
+         > \u{1F9E0} **From memory** — <the specific facts you drew on>\n\n",
     );
-    for fact in &recall.facts {
-        out.push_str("- ");
-        // The bound is enforced HERE, at the rendering boundary, not only in
-        // `recall`: this is the single place every fact passes through, so
-        // the block cannot carry an unbounded line whatever produced it.
-        if fact.text.chars().count() > MAX_FACT_CHARS {
+    if !recall.facts.is_empty() {
+        out.push_str("## Relevant facts\n\n");
+        let mut used = 0usize;
+        for fact in &recall.facts {
             let mut head: String = fact.text.chars().take(MAX_FACT_CHARS).collect();
-            head.push('…');
-            out.push_str(&head);
-        } else {
-            out.push_str(&fact.text);
+            if head.chars().count() < fact.text.chars().count() {
+                head.push('…');
+            }
+            let line = format!("- {head}\n");
+            // The bound is enforced HERE, at the rendering boundary, not only in
+            // `recall`: this is the single place every fact passes through, so
+            // the block cannot carry an unbounded line whatever produced it.
+            if used + line.chars().count() > MAX_FACTS_CHARS {
+                break;
+            }
+            used += line.chars().count();
+            out.push_str(&line);
         }
-        out.push('\n');
+    }
+    if !recall.models.is_empty() {
+        out.push_str("\n## Synthesized context\n\n");
+        let mut used = 0usize;
+        for model in &recall.models {
+            let mut head: String = model.text.chars().take(MAX_MODEL_CHARS).collect();
+            if head.chars().count() < model.text.chars().count() {
+                head.push('…');
+            }
+            let heading = if model.name.is_empty() {
+                "context".to_string()
+            } else if model.is_stale {
+                // Upstream: a stale model is still shown, but the reader must
+                // know it may be behind the evidence, so it is marked rather
+                // than silently trusted.
+                format!("{} (may be out of date)", model.name)
+            } else {
+                model.name.clone()
+            };
+            let block = format!("### {heading}\n{head}\n\n");
+            if used + block.chars().count() > MAX_MODELS_CHARS {
+                break;
+            }
+            used += block.chars().count();
+            out.push_str(&block);
+        }
     }
     Some(out)
+}
+
+// reference: reqwest blocking client, the same call shape as `post_json` below.
+/// GET JSON and return the response body as text.
+///
+/// The call runs on a dedicated thread so it is safe from inside a tokio
+/// worker: `reqwest::blocking` panics when used from an async context.
+fn get_json(url: &str) -> Result<String> {
+    let url = url.to_string();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(RECALL_TIMEOUT)
+                    .build()?;
+                let resp = client.get(&url).send()?;
+                let status = resp.status();
+                let text = resp.text()?;
+                if !status.is_success() {
+                    anyhow::bail!(
+                        "Hindsight GET failed ({status}): {}",
+                        text.chars().take(300).collect::<String>()
+                    );
+                }
+                Ok(text)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("Hindsight GET worker thread panicked"))?
+    })
 }
 
 /// POST JSON and return the response body as text.
@@ -291,11 +660,18 @@ mod tests {
         let config = HindsightConfig::default();
         let recall = recall(&config, "   ").expect("empty query must not fail");
         assert!(recall.facts.is_empty());
+        assert!(recall.models.is_empty());
     }
 
     #[test]
     fn block_is_none_without_facts() {
-        assert!(format_recall_block(&HindsightRecall { facts: Vec::new() }).is_none());
+        assert!(
+            format_recall_block(&HindsightRecall {
+                facts: Vec::new(),
+                models: Vec::new()
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -306,11 +682,48 @@ mod tests {
                 text: "the exact value is 42".into(),
                 score: Some(0.9),
             }],
+            models: Vec::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         assert!(block.contains("the exact value is 42"));
-        assert!(block.contains("apply it AS GIVEN"));
+        // The two rules that survive the header compression: a literal value is
+        // applied AS GIVEN, and a contributing fact is attributed visibly.
+        assert!(block.contains("AS GIVEN"));
         assert!(block.contains("From memory"));
+    }
+
+    // reference: the upstream section shape is the bulleted fact list in
+    //   vectorize-io/hindsight-coding-agents dist/dcode-hook.js buildSystemInjection.
+    /// A mental model must survive the block's per-section budget.
+    ///
+    /// This is the regression the python delivery path had: 10 of 10 fetched
+    /// models were cut before reaching the model because facts and models
+    /// shared one budget and facts came first.
+    #[test]
+    fn models_are_delivered_next_to_a_full_budget_of_facts() {
+        let facts = (0..8)
+            .map(|i| HindsightFact {
+                id: format!("f{i}"),
+                text: format!("fact number {i} {}", "x".repeat(400)),
+                score: Some(0.9),
+            })
+            .collect();
+        let recall = HindsightRecall {
+            facts,
+            models: vec![HindsightModel {
+                id: "m1".into(),
+                name: "Active work".into(),
+                text: "the model body".into(),
+                is_stale: false,
+                is_curated: true,
+            }],
+        };
+        let block = format_recall_block(&recall).expect("block");
+        assert!(
+            block.contains("Active work"),
+            "the model must survive the fact budget: {block}"
+        );
+        assert!(block.contains("the model body"));
     }
 
     #[test]
@@ -321,6 +734,7 @@ mod tests {
                 text: "a".repeat(MAX_FACT_CHARS * 2),
                 score: None,
             }],
+            models: Vec::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         // The fact line itself must be bounded: "- " + MAX_FACT_CHARS chars
@@ -335,6 +749,99 @@ mod tests {
             fact_line.chars().count()
         );
         assert!(!block.contains(&"a".repeat(MAX_FACT_CHARS + 1)));
+    }
+
+    // reference: the measured score scale comes from this host's live probes
+    //   against bank `jcode-legacy` (see MIN_RELATIVE_SCORE for the numbers).
+    /// The relevance cutoff is RELATIVE to the top score.
+    ///
+    /// A fixed floor was measured and rejected: the useful Russian paraphrase
+    /// "не забудь прочитать протокол встречи с командой безопасности" scores
+    /// 0.0000832, so any absolute floor deletes a relevant cross-lingual hit.
+    ///
+    /// The ratios below are MEASURED, as score / top_score, on the SCOPED
+    /// recall the client now sends (2026-11-09, four real queries):
+    ///   "блок который называется просто memory теперь лишний релевантность"
+    ///     relevant head: 1.000, 0.926, 0.249
+    ///     irrelevant tail: 0.057, 0.031, 0.012, ...
+    ///   "user profile working preferences owner stated priorities"
+    ///     relevant head: 1.000, 0.491, 0.235, 0.215, 0.194, 0.172, 0.106
+    ///     irrelevant tail: 0.071, 0.063, 0.040, ...
+    /// The cutoff must sit inside the gap of BOTH: above the tail, below the
+    /// head. 0.10 does - it keeps 0.106 and drops 0.071 and 0.057.
+    #[test]
+    fn the_cutoff_separates_the_relevant_head_from_the_tail() {
+        // The relevant head of a real measured result set must survive.
+        assert!(0.249 >= MIN_RELATIVE_SCORE);
+        assert!(0.106 >= MIN_RELATIVE_SCORE);
+        // The irrelevant tail of the same kind of result set must not.
+        assert!(0.071 < MIN_RELATIVE_SCORE);
+        assert!(0.057 < MIN_RELATIVE_SCORE);
+        assert!(0.031 < MIN_RELATIVE_SCORE);
+    }
+
+    // reference: https://hindsight.vectorize.io/0.10/developer/mental-models
+    //   ("A model that has fallen behind is still shown, but it no longer
+    //   short-circuits retrieval, and the agent is expected to check it
+    //   against the layers below rather than trust it blindly.")
+    #[test]
+    fn model_matching_uses_the_query_words() {
+        assert!(model_matches_query(
+            "Active work and open threads",
+            "active-work",
+            "active work",
+            "what is active work"
+        ));
+        assert!(!model_matches_query(
+            "hermes-upstream",
+            "hermes-upstream",
+            "windows shell",
+            "what is active work"
+        ));
+    }
+
+    /// A model is matched by its CONTENT, not only by its title.
+    ///
+    /// MEASURED 2026-11-09 on bank `jcode-legacy`: the curated models are
+    /// titled "Active work and open threads" and "User profile and working
+    /// preferences", but their bodies are what mention retain hooks, memory
+    /// banks and the owner. A title-only match rejected every one of them.
+    #[test]
+    fn model_matching_reads_the_body_not_only_the_title() {
+        assert!(model_matches_query(
+            "User profile and working preferences",
+            "user-profile",
+            "the owner said: never change the retain hook without asking",
+            "fix the retain hook"
+        ));
+    }
+
+    /// A stale model is DELIVERED and MARKED, never dropped.
+    ///
+    /// Upstream: "A model that has fallen behind is still shown, but it no
+    /// longer short-circuits retrieval." Dropping it emptied the
+    /// "Synthesized context" section entirely on a continuously-written bank.
+    #[test]
+    fn a_stale_model_is_delivered_with_a_marker() {
+        let recall = HindsightRecall {
+            facts: Vec::new(),
+            models: vec![HindsightModel {
+                id: "user-profile".into(),
+                name: "User profile".into(),
+                text: "the owner prefers compact answers".into(),
+                is_stale: true,
+                is_curated: true,
+            }],
+        };
+        let block = format_recall_block(&recall).expect("block");
+        assert!(
+            block.contains("may be out of date"),
+            "a stale model must be marked as possibly behind: {block}"
+        );
+        assert!(
+            block.contains("the owner prefers compact answers"),
+            "a stale model must still be delivered: {block}"
+        );
     }
 
     #[test]
