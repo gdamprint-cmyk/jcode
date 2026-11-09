@@ -7,20 +7,25 @@ use super::parse_manual_subagent_spec;
 // vocabulary these tests pin: trim + case-insensitive, both the "inherit"
 // and "coordinator" spellings.
 //
-// These tests deliberately do NOT mutate `JCODE_HOME`: the variable is
-// process-global, and other tests in this crate read the model catalog from
-// it, so a temporary home here would race with them. `create_test_app()`
-// already prepares the test home, exactly like the neighbouring
-// `test_subagent_model_command_sets_and_resets_session_preference`.
+// These tests deliberately avoid BOTH process-global dependencies, because the
+// full `jcode-tui --lib` suite runs them in parallel with other tests:
+//
+// 1. `dispatch_local_command` is gated on the global `JCODE_SSH_REMOTE` env
+//    var, which other tests in this crate set and restore. Under a parallel
+//    run the command can be swallowed by the SSH notice, so these tests call
+//    `handle_session_command` directly, exactly like the neighbouring
+//    `test_subagent_model_command_sets_and_resets_session_preference`.
+// 2. `Session::set_agent_model_override` WRITES a file under the current
+//    `JCODE_HOME`, which other tests swap out from under us (that produced
+//    `os error 5`). These tests set the in-memory `agent_model_overrides`
+//    field instead; `effective_agent_model` falls back to that field when the
+//    per-session metadata file does not exist, and the session id is unique
+//    per test app.
 
 /// The `/subagent-model` reset must accept EVERY spelling of the inherit
 /// sentinel, not just the exact lowercase literal. The sentinel vocabulary is
 /// owned by `AgentsConfig::is_swarm_inherit_sentinel`, which trims and compares
 /// case-insensitively, and also accepts the "coordinator" spelling.
-// reference: crates/jcode-config-types/src/lib.rs -
-// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
-// vocabulary this test pins: trim + case-insensitive, both the "inherit"
-// and "coordinator" spellings.
 #[test]
 fn subagent_model_reset_accepts_every_sentinel_spelling() {
     let mut app = crate::tui::app::tests::create_test_app();
@@ -34,10 +39,7 @@ fn subagent_model_reset_accepts_every_sentinel_spelling() {
     ] {
         app.session.subagent_model = Some("gpt-5.3-codex".to_string());
         assert!(
-            crate::tui::app::commands_dispatch::dispatch_local_command(
-                &mut app,
-                &format!("/subagent-model {sentinel}")
-            ),
+            super::handle_session_command(&mut app, &format!("/subagent-model {sentinel}")),
             "/subagent-model must be handled: {sentinel}"
         );
         assert_eq!(
@@ -48,14 +50,11 @@ fn subagent_model_reset_accepts_every_sentinel_spelling() {
 }
 
 /// A concrete model name must still be PINNED, not treated as a sentinel.
-// reference: crates/jcode-config-types/src/lib.rs -
-// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
-// vocabulary this test pins; a concrete model name must NOT be one.
 #[test]
 fn subagent_model_pins_a_concrete_model_name() {
     let mut app = crate::tui::app::tests::create_test_app();
     app.session.subagent_model = None;
-    assert!(crate::tui::app::commands_dispatch::dispatch_local_command(
+    assert!(super::handle_session_command(
         &mut app,
         "/subagent-model gpt-5.3-codex"
     ));
@@ -67,10 +66,6 @@ fn subagent_model_pins_a_concrete_model_name() {
 
 /// The review/judge overrides must treat every sentinel spelling as "no
 /// explicit override", exactly like the server-side spawn resolver does.
-// reference: crates/jcode-config-types/src/lib.rs -
-// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
-// vocabulary this test pins: the TUI review/judge overrides must drop every
-// spelling of the sentinel, exactly like the server-side spawn resolver.
 #[test]
 fn review_and_judge_overrides_treat_every_sentinel_spelling_as_absent() {
     let mut app = crate::tui::app::tests::create_test_app();
@@ -82,11 +77,11 @@ fn review_and_judge_overrides_treat_every_sentinel_spelling_as_absent() {
         "Coordinator",
     ] {
         app.session
-            .set_agent_model_override("review", Some(sentinel.to_string()))
-            .unwrap();
+            .agent_model_overrides
+            .insert("review".to_string(), sentinel.to_string());
         app.session
-            .set_agent_model_override("judge", Some(sentinel.to_string()))
-            .unwrap();
+            .agent_model_overrides
+            .insert("judge".to_string(), sentinel.to_string());
         assert_eq!(
             super::current_autoreview_model_override(&app),
             None,
@@ -99,9 +94,10 @@ fn review_and_judge_overrides_treat_every_sentinel_spelling_as_absent() {
         );
     }
 
-    app.session
-        .set_agent_model_override("review", Some("openai-api:session-worker".into()))
-        .unwrap();
+    app.session.agent_model_overrides.insert(
+        "review".to_string(),
+        "openai-api:session-worker".to_string(),
+    );
     assert_eq!(
         super::current_autoreview_model_override(&app).as_deref(),
         Some("openai-api:session-worker"),
