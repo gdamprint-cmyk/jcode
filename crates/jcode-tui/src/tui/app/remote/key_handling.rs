@@ -1462,7 +1462,13 @@ pub(in crate::tui::app) async fn submit_prepared_remote_enter_input(
                         )));
                 return Ok(());
             }
-            if matches!(rest, "inherit" | "reset" | "clear") {
+            // reference: crates/jcode-config-types/src/lib.rs -
+            // AgentsConfig::is_swarm_inherit_sentinel is the single source of
+            // truth for the sentinel vocabulary; the local and remote
+            // /subagent-model paths must agree on which spellings reset it.
+            if matches!(rest, "reset" | "clear")
+                || crate::config::AgentsConfig::is_swarm_inherit_sentinel(rest)
+            {
                 let current_model = app
                     .remote_provider_model
                     .clone()

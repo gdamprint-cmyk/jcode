@@ -409,7 +409,11 @@ fn current_autoreview_model_summary(app: &App) -> String {
 pub(super) fn current_autoreview_model_override(app: &App) -> Option<String> {
     app.session
         .effective_agent_model("review", crate::config::Config::load().autoreview.model)
-        .filter(|model| model != "inherit")
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary, so the TUI cannot disagree with the
+        // server about which spellings mean "no explicit override".
+        .filter(|model| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model))
 }
 
 fn current_autojudge_model_summary(app: &App) -> String {
@@ -421,7 +425,10 @@ fn current_autojudge_model_summary(app: &App) -> String {
 pub(super) fn current_autojudge_model_override(app: &App) -> Option<String> {
     app.session
         .effective_agent_model("judge", crate::config::Config::load().autojudge.model)
-        .filter(|model| model != "inherit")
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary.
+        .filter(|model| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model))
 }
 
 pub(super) fn autoreview_status_message(app: &App) -> String {
@@ -645,7 +652,14 @@ fn feedback_model_override(
     configured: Option<String>,
 ) -> (Option<String>, Option<String>) {
     if let Some(choice) = app.session.effective_agent_model(role, configured) {
-        return ((choice != "inherit").then_some(choice), None);
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary: any spelling of the sentinel means
+        // "no explicit override", never a concrete reviewer model.
+        return ((
+            !crate::config::AgentsConfig::is_swarm_inherit_sentinel(&choice)
+        )
+        .then_some(choice), None);
     }
     preferred_one_shot_review_override()
         .map(|(model, provider_key)| (Some(model), Some(provider_key)))

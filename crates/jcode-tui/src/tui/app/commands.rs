@@ -788,7 +788,13 @@ fn handle_subagent_model_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    if matches!(rest, "inherit" | "reset" | "clear") {
+    // reference: crates/jcode-config-types/src/lib.rs -
+    // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth for
+    // the sentinel vocabulary, so this command and the server-side spawn
+    // resolver cannot disagree about which spellings mean "inherit".
+    if matches!(rest, "reset" | "clear")
+        || crate::config::AgentsConfig::is_swarm_inherit_sentinel(rest)
+    {
         app.session.subagent_model = None;
         let _ = app.session.save();
         app.push_display_message(DisplayMessage::system(format!(
