@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 091a3ac
-#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
+# source repo: entire-agent-jcode @ 88fd2c7
+#                ("fix(adapter): the stdout cap is 10 MiB for read-transcript, 67.7 MiB for compact-transcript")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
@@ -48,6 +48,14 @@ AGENT_NAME = "jcode"
 # "output exceeded 10485760 byte limit" when a command exceeds it
 # (cmd/entire/cli/agent/external/external.go:530). The cap is hardcoded: no
 # environment variable and no CLI flag overrides it.
+#
+# ONE EXCEPTION: compact-transcript gets a much higher cap -
+# base64.StdEncoding.EncodedLen(agent.MaxChunkSize) + 1 MiB = 70 953 644 bytes
+# (67.7 MiB), enough for a 50 MiB raw transcript as base64
+# (external.go:531-534). This guard therefore applies to read-transcript ONLY;
+# compact-transcript must not be refused, and it is not. Measured on this host:
+# a 28.5 MB session yields 38 022 402 bytes of compact-transcript output,
+# which is over the 10 MiB cap and under the 67.7 MiB one.
 #
 # The adapter uses this constant to REFUSE rather than truncate a transcript
 # that would exceed the cap.
@@ -1104,8 +1112,8 @@ def cmd_read_transcript(args) -> int:
             "[entire-agent-jcode] read-transcript: transcript is "
             f"{len(data)} bytes, above the Entire CLI's stdout limit of "
             f"{_CLI_STDOUT_LIMIT_BYTES} bytes; refusing rather than truncating "
-            "(a truncated transcript would overwrite the stored copy with a "
-            "partial one)\n"
+            "(the CLI discards an oversized reply and would report only the "
+            "limit, not this transcript's actual size)\n"
         )
         return 1
     sys.stdout.buffer.write(data)
