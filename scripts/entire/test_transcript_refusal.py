@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ f4573ad
+# source repo: entire-agent-jcode @ addf2a9
 #                ("fix(adapter): refuse to substitute data for a transcript")
 # ---------------------------------------------------------------------------
 """Regression tests for the adapter's refusal to substitute data (B7.1, B7.2).
@@ -28,6 +28,7 @@ reason is caught.
 Run: python test_transcript_refusal.py
 """
 
+import base64
 import importlib.util
 import json
 import os
@@ -340,6 +341,147 @@ def test_chunk_transcript_refuses_garbage():
 # Negative control: the OLD behaviour would have passed the data checks
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# B7.3: --path is a dead flag for read-transcript and compact-transcript
+# reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
+# ---------------------------------------------------------------------------
+
+def _path_flag_fixture(tmp):
+    """A readable session, a valid ETF sidecar, and a garbage file.
+
+    Returns (session_json, sidecar_jsonl, garbage_jsonl, missing_jsonl).
+    The session holds a marker string so a leaked foreign transcript is
+    detectable in the output.
+    """
+    sessions = os.path.join(tmp, "sessions")
+    os.makedirs(sessions)
+    session = os.path.join(sessions, "session_hog_1.json")
+    with open(session, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": "MARKER-SESSION"}]}]},
+            handle,
+        )
+    sidecar = os.path.join(tmp, "valid.etf.jsonl")
+    with open(sidecar, "wb") as handle:
+        handle.write(
+            b'{"v":1,"type":"user","agent":"jcode","content":"MARKER-SIDECAR"}\n'
+        )
+    garbage = os.path.join(tmp, "garbage.jsonl")
+    with open(garbage, "wb") as handle:
+        handle.write(b"this is not a transcript at all\n")
+    missing = os.path.join(tmp, "definitely-missing.jsonl")
+    return session, sidecar, garbage, missing
+
+
+def test_path_flag_is_rejected_by_read_transcript():
+    """read-transcript must refuse --path instead of ignoring it.
+
+    Negative control: the old behaviour ACCEPTED --path and answered with
+    the newest session on disk, exiting 0. So a passing "the output is not
+    the requested transcript" check alone would not prove a refusal: the
+    exit code is the discriminator, and the marker check proves no foreign
+    transcript was substituted.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        session, sidecar, garbage, missing = _path_flag_fixture(tmp)
+        env = dict(os.environ)
+        env["JCODE_HOME"] = tmp
+
+        for label, candidate in (
+            ("valid", sidecar),
+            ("garbage", garbage),
+            ("missing", missing),
+        ):
+            proc = subprocess.run(
+                [sys.executable, ADAPTER, "read-transcript", "--path", candidate],
+                capture_output=True, env=env,
+            )
+            check(f"read-transcript rejects --path ({label})", proc.returncode != 0,
+                  f"rc={proc.returncode}")
+            check(f"read-transcript emits no bytes for --path ({label})",
+                  proc.stdout == b"", f"bytes={len(proc.stdout)}")
+            check(f"read-transcript explains the --path refusal ({label})",
+                  b"--path" in proc.stderr, proc.stderr[:200].decode("utf-8", "replace"))
+            check(f"read-transcript leaks no foreign transcript for --path ({label})",
+                  b"MARKER-SESSION" not in proc.stdout and b"MARKER-SIDECAR" not in proc.stdout)
+
+        # The control: the same session named the supported way still works.
+        proc = subprocess.run(
+            [sys.executable, ADAPTER, "read-transcript", "--session-ref", session],
+            capture_output=True, env=env,
+        )
+        check("read-transcript still accepts --session-ref", proc.returncode == 0,
+              f"rc={proc.returncode}")
+        check("read-transcript still returns the named session",
+              b"MARKER-SESSION" in proc.stdout, f"bytes={len(proc.stdout)}")
+
+
+def test_path_flag_is_rejected_by_compact_transcript():
+    """compact-transcript must refuse --path instead of ignoring it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        session, sidecar, garbage, missing = _path_flag_fixture(tmp)
+        env = dict(os.environ)
+        env["JCODE_HOME"] = tmp
+
+        for label, candidate in (
+            ("valid", sidecar),
+            ("garbage", garbage),
+            ("missing", missing),
+        ):
+            proc = subprocess.run(
+                [sys.executable, ADAPTER, "compact-transcript", "--path", candidate],
+                capture_output=True, env=env,
+            )
+            check(f"compact-transcript rejects --path ({label})", proc.returncode != 0,
+                  f"rc={proc.returncode}")
+            check(f"compact-transcript emits no transcript for --path ({label})",
+                  proc.stdout == b"", f"bytes={len(proc.stdout)}")
+            check(f"compact-transcript explains the --path refusal ({label})",
+                  b"--path" in proc.stderr, proc.stderr[:200].decode("utf-8", "replace"))
+
+        proc = subprocess.run(
+            [sys.executable, ADAPTER, "compact-transcript", "--session-ref", session],
+            capture_output=True, env=env,
+        )
+        check("compact-transcript still accepts --session-ref", proc.returncode == 0,
+              f"rc={proc.returncode}")
+        # compact-transcript returns the transcript base64-encoded, so the
+        # marker is only visible after decoding.
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+            decoded = base64.b64decode(payload.get("transcript", ""), validate=True)
+        except Exception:
+            decoded = b""
+        check("compact-transcript still returns the named session",
+              b"MARKER-SESSION" in decoded, f"bytes={len(proc.stdout)}")
+
+
+def test_path_flag_still_works_for_the_commands_that_use_it():
+    """--path must keep working for the commands that DO read it.
+
+    A negative control for the rejection itself: if --path were refused
+    everywhere, the CLI could not read a transcript at a position, and the
+    growth baseline would break.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        session, sidecar, garbage, missing = _path_flag_fixture(tmp)
+        env = dict(os.environ)
+        env["JCODE_HOME"] = tmp
+
+        proc = subprocess.run(
+            [sys.executable, ADAPTER, "get-transcript-position", "--path", sidecar],
+            capture_output=True, env=env,
+        )
+        check("get-transcript-position still accepts --path", proc.returncode == 0,
+              f"rc={proc.returncode}")
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+        except Exception:
+            payload = {}
+        check("get-transcript-position reports a position", payload.get("position", 0) >= 1,
+              f"payload={payload}")
+
+
 def test_negative_control_old_behaviour_would_have_passed_through():
     """The old code returned the garbage bytes; the new code refuses.
 
@@ -386,6 +528,9 @@ def main():
     test_output_is_stable_between_runs()
     test_named_session_ref_is_honoured()
     test_chunk_transcript_refuses_garbage()
+    test_path_flag_is_rejected_by_read_transcript()
+    test_path_flag_is_rejected_by_compact_transcript()
+    test_path_flag_still_works_for_the_commands_that_use_it()
     test_negative_control_old_behaviour_would_have_passed_through()
     print()
     if FAILURES:

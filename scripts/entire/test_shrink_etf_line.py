@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ f4573ad
+# source repo: entire-agent-jcode @ addf2a9
 #                ("fix(adapter): refuse to substitute data for a transcript")
 # ---------------------------------------------------------------------------
 """Regression tests for the ETF line trimming in entire-agent-jcode.py.

@@ -2,14 +2,14 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ f4573ad
+# source repo: entire-agent-jcode @ addf2a9
 #                ("fix(adapter): refuse to substitute data for a transcript")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/types.go
 # reference: https://raw.githubusercontent.com/entireio/cli/main/transcript/README.md
-"""entire-agent-jcode вЂ” External Agent Protocol adapter for Jcode.
+"""entire-agent-jcode — External Agent Protocol adapter for Jcode.
 
 Implements the Entire Agent Integration Protocol so that Jcode sessions are
 captured as Entire sessions + checkpoints. Drop this binary (named
@@ -23,7 +23,7 @@ subcommands, same JSON shapes, same argparse layout); the data source differs:
   ``<JCODE_HOME>/sessions/session_<name>_<ts>_<hash>.json``, with the message
   list in ``messages`` and per-message ``token_usage``.
 
-Stdlib only вЂ” no external dependencies.
+Stdlib only — no external dependencies.
 
 Subcommands (per the Agent Integration Protocol):
   info, detect, get-session-id, get-session-dir, resolve-session-file,
@@ -1000,6 +1000,10 @@ def cmd_write_session(args) -> int:
 
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
 def cmd_read_transcript(args) -> int:
+    error = _reject_dead_path_flag(args, "read-transcript")
+    if error is not None:
+        sys.stderr.write(error)
+        return 1
     path, error = _resolve_transcript_path(args)
     if error is not None:
         sys.stderr.write(error)
@@ -1020,6 +1024,10 @@ def cmd_read_transcript(args) -> int:
 
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
 def cmd_compact_transcript(args) -> int:
+    error = _reject_dead_path_flag(args, "compact-transcript")
+    if error is not None:
+        sys.stderr.write(error)
+        return 1
     path, error = _resolve_transcript_path(args)
     if error is not None:
         sys.stderr.write(error)
@@ -1037,6 +1045,32 @@ def cmd_compact_transcript(args) -> int:
         return 1
     print(json.dumps({"transcript": base64.b64encode(data).decode("ascii"), "assets": []}))
     return 0
+
+
+# reference: https://docs.entire.io/agents/agent-integration-protocol/commands
+def _reject_dead_path_flag(args, command: str) -> str | None:
+    """An error message when ``--path`` was given to a command that has no
+    use for it, and None otherwise.
+
+    ``--path`` names a transcript file for the commands that read a
+    transcript AT A POSITION: get-transcript-position, extract-modified-files
+    and extract-prompts. The CLI never passes it to read-transcript or
+    compact-transcript, which are named with ``--session-ref``.
+
+    The flag used to be accepted and ignored by these two commands, so a
+    caller that passed it got the transcript of a DIFFERENT session (the
+    newest one on disk) and a zero exit code. The measured difference on
+    this host was 60444 bytes of a foreign session instead of 793526 bytes
+    of the requested one. A dead flag that silently answers with another
+    session's data is worse than a refusal, so it is refused.
+    """
+    path = getattr(args, "path", None)
+    if not path:
+        return None
+    return (
+        f"[entire-agent-jcode] {command}: --path is not supported; "
+        f"this command reads the transcript named by --session-ref\n"
+    )
 
 
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands

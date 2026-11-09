@@ -2,12 +2,12 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ f4573ad
+# source repo: entire-agent-jcode @ addf2a9
 #                ("fix(adapter): refuse to substitute data for a transcript")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/lifecycle
-"""entire-agent-jcode-hook вЂ” Jcode lifecycle hook -> Entire bridge.
+"""entire-agent-jcode-hook — Jcode lifecycle hook -> Entire bridge.
 
 Jcode fires its `[hooks]` observers with the event described in environment
 variables (``JCODE_HOOK_EVENT``, ``JCODE_HOOK_SESSION_ID``,
