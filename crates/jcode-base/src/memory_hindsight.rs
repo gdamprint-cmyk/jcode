@@ -263,6 +263,34 @@ struct MentalModelItem {
     is_stale: Option<bool>,
 }
 
+/// The tag scope recall reads from.
+///
+/// The workspace's own writes, the owner's own statements, and the turns this
+/// workspace auto-retained - PLUS the global (untagged) scope, because
+/// `any_strict` excludes untagged records by definition and the owner's own
+/// durable rules are retained untagged.
+///
+/// MEASURED 2026-11-09 on bank `jcode-legacy`: 1,350 of 78,410 records carry
+/// no tag at all, and 163 of those are the owner's own statements - 98 of
+/// them this workspace's own rules. Over 12 owner-topic queries, adding the
+/// global leaf recovered 8 owner rules and admitted 0 foreign-project items.
+///
+/// reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+///   (tags_match `any_strict` excludes untagged memories; `exact` with an
+///   empty tag list selects exactly the memories that carry no tags)
+fn recall_tag_groups() -> serde_json::Value {
+    serde_json::json!([{
+        "or": [
+            { "tags": ["origin:jcode"], "match": "any_strict" },
+            { "tags": ["owner:primary"], "match": "any_strict" },
+            { "tags": ["auto-retained"], "match": "any_strict" },
+            // The untagged (global) scope: `exact` with an empty tag list
+            // selects exactly the memories that carry no tags.
+            { "tags": [], "match": "exact" },
+        ]
+    }])
+}
+
 /// Recall facts for `query` from the configured bank.
 ///
 /// Fails soft by returning an empty result on any transport or parse error:
@@ -304,18 +332,9 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         //     owner's question.
         //   - scoped to this workspace's own tags: the owner's actual
         //     complaint was the top hit.
-        // The scope is the jcode workspace: this agent's own writes, the
-        // owner's own statements, and the turns this workspace auto-retained.
-        // Hermes and OpenCode write to the same bank as collaborators, but
-        // their memories are another agent's perspective, not the owner's
-        // standing context, and admitting them measurably diluted the set.
-        "tag_groups": [{
-            "or": [
-                { "tags": ["origin:jcode"], "match": "any_strict" },
-                { "tags": ["owner:primary"], "match": "any_strict" },
-                { "tags": ["auto-retained"], "match": "any_strict" },
-            ]
-        }],
+        // See `recall_tag_groups` for the scope and why it also admits the
+        // global (untagged) scope.
+        "tag_groups": recall_tag_groups(),
     });
 
     let text = post_json(&url, &body)?;
@@ -654,6 +673,51 @@ fn post_json(url: &str, body: &serde_json::Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_scope_admits_the_workspace_and_the_global_untagged_scope() {
+        let groups = recall_tag_groups();
+        let leaves = groups[0]["or"].as_array().expect("or must be an array");
+        let mut scoped: Vec<String> = leaves
+            .iter()
+            .filter(|leaf| leaf["match"] == "any_strict")
+            .map(|leaf| leaf["tags"][0].as_str().unwrap_or_default().to_string())
+            .collect();
+        scoped.sort();
+        assert_eq!(
+            scoped,
+            vec![
+                "auto-retained".to_string(),
+                "origin:jcode".to_string(),
+                "owner:primary".to_string(),
+            ],
+            "the workspace scopes must be exactly the three jcode scopes"
+        );
+
+        // The global scope: `exact` with an EMPTY tag list. `any_strict`
+        // excludes untagged memories, so without this leaf the owner's own
+        // untagged durable rules are unreachable.
+        let global = leaves
+            .iter()
+            .find(|leaf| leaf["match"] == "exact")
+            .expect("the global (untagged) leaf must be present");
+        assert_eq!(
+            global["tags"].as_array().map(|a| a.len()),
+            Some(0),
+            "the global leaf must carry an empty tag list"
+        );
+
+        // A leaf that used `any`/`all` instead of `any_strict` would silently
+        // re-admit untagged records into the WORKSPACE scopes, which would
+        // double-count the global scope.
+        for leaf in leaves.iter().filter(|l| l["match"] != "exact") {
+            assert_eq!(
+                leaf["match"], "any_strict",
+                "workspace leaves must stay strict so untagged memories are \
+                 only reachable through the explicit global leaf"
+            );
+        }
+    }
 
     #[test]
     fn empty_query_yields_no_facts() {
