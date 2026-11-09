@@ -1,5 +1,83 @@
 use super::*;
 
+/// Isolate a timing-sensitive test from the user's global hook configuration.
+///
+/// The handoff tests assert exact elapsed times on a paused virtual clock. The
+/// user's `config.toml` can configure `pre_tool_transform`, `pre_tool`,
+/// `post_tool` and `post_tool_feedback` hooks. Each one spawns a subprocess
+/// inside the measured path and contributes its own timeout to the measured
+/// elapsed time, so the measurement would describe the hook configuration
+/// rather than the behaviour under test.
+///
+/// Measured on this host (`config.toml` with 1 transformer, 8 pre_tool gates
+/// and 4 feedback hooks):
+///
+/// ```text
+/// 1 x  500ms (pre_tool_transform)  =  0.5s
+/// 8 x 5000ms (pre_tool)            = 40.0s
+///      8s    (the tool under test) =  8.0s
+/// 4 x 10000ms(post_tool_feedback)  = 40.0s
+///                                  = 88.5s   (the asserted value was 8s)
+/// ```
+///
+/// Why the subprocess time lands in the measurement: with a paused clock,
+/// tokio auto-advances virtual time to the next timer deadline whenever the
+/// runtime has no other work to do. A spawned hook process is not a timer, so
+/// the runtime looks idle and the clock jumps straight to the hook's timeout
+/// deadline. Each configured hook therefore adds its full timeout to the
+/// measured elapsed time, even though the hook itself finishes in ~100ms of
+/// real time.
+///
+/// `JCODE_HOOKS_DISABLED` is the same switch a hook process receives so nested
+/// jcode calls do not recurse, so it suppresses every hook event without
+/// touching the config cache.
+///
+/// Reference: tokio 1.50.0 `src/time/clock.rs:354` (`can_auto_advance`) and
+/// `src/runtime/time/mod.rs:259` (`park_thread_timeout`) for the auto-advance
+/// rule; `docs.rs/tokio/latest/tokio/attr.test.html` for `start_paused`.
+struct HookIsolationGuard {
+    _env: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl HookIsolationGuard {
+    fn new() -> Self {
+        // Hold the shared test-env lock: sibling tests mutate the environment
+        // (JCODE_HOME, the hook env vars) under it.
+        let env = crate::storage::lock_test_env();
+        let previous = std::env::var_os("JCODE_HOOKS_DISABLED");
+        crate::env::set_var("JCODE_HOOKS_DISABLED", "1");
+        let guard = Self {
+            _env: env,
+            previous,
+        };
+        // The guard exists so that no hook can reach the measured path. Check
+        // that here, so a broken suppression mechanism fails loudly instead of
+        // silently inflating a measurement.
+        for event in [
+            "pre_tool_transform",
+            "pre_tool",
+            "post_tool",
+            "post_tool_feedback",
+        ] {
+            assert!(
+                !crate::hooks::hook_configured(event),
+                "hook isolation failed: '{event}' is still configured"
+            );
+        }
+        guard
+    }
+}
+
+impl Drop for HookIsolationGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => crate::env::set_var("JCODE_HOOKS_DISABLED", value),
+            None => crate::env::remove_var("JCODE_HOOKS_DISABLED"),
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn configured_streaming_budget_and_disabled_handoff() {
     for budget in [Duration::from_millis(25), Duration::from_secs(12)] {
@@ -31,6 +109,7 @@ async fn configured_streaming_budget_and_disabled_handoff() {
 #[tokio::test(start_paused = true)]
 async fn callback_paths_honor_custom_and_disabled_budgets() {
     // SDK and nonstreaming calls share execute_with_background_budget.
+    let _isolation = HookIsolationGuard::new();
     for (budget, action, backgrounded) in [
         (Duration::from_millis(1250), "status", true),
         (Duration::from_secs(12), "status", false),
@@ -93,6 +172,7 @@ struct WaitProbe;
 
 #[tokio::test(start_paused = true)]
 async fn ask_user_waits_past_budget_and_returns_its_answer() {
+    let _isolation = HookIsolationGuard::new();
     let registry = Registry::empty();
     registry
         .register("ask_user".into(), Arc::new(WaitProbe))
@@ -164,6 +244,7 @@ impl crate::tool::Tool for WaitProbe {
 
 #[tokio::test(start_paused = true)]
 async fn nonstreaming_background_wait_returns_original_result_after_budget() {
+    let _isolation = HookIsolationGuard::new();
     let registry = Registry::empty();
     registry.register("bg".into(), Arc::new(WaitProbe)).await;
     let ctx = ToolContext {
