@@ -1674,6 +1674,121 @@ async fn explicit_provider_pin_is_persisted_and_reapplied_on_restore() {
     assert_eq!(restored_agent.provider_model(), "z-ai/glm-5.2@Novita");
 }
 
+// reference: no prior art for this regression test, searched this repo for an
+// existing instance-scoped provider-identity test (crates/jcode-base/src/
+// session_tests/provider_identity_tests.rs covers the env-derived key only) and
+// the Rust trait-object dispatch guidance at
+// https://siddharthqs.com/design-patterns-in-rust (dynamic dispatch through a
+// trait object; avoid global mutable state).
+#[derive(Clone)]
+struct InstanceProfileProvider {
+    model: String,
+    profile_id: Option<String>,
+}
+
+impl InstanceProfileProvider {
+    fn new(model: &str, profile_id: Option<&str>) -> Self {
+        Self {
+            model: model.to_string(),
+            profile_id: profile_id.map(str::to_string),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for InstanceProfileProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unreachable!("InstanceProfileProvider does not complete requests")
+    }
+
+    fn name(&self) -> &str {
+        "openrouter"
+    }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        self.profile_id.clone()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Regression: a session's persisted `provider_key` must come from the runtime
+/// INSTANCE, not from process-global env state.
+///
+/// A named provider profile's constructor sets `JCODE_OPENROUTER_CACHE_NAMESPACE`
+/// process-wide. When a swarm worker ran on the `nous-free` profile, an ambient
+/// cycle created right after it inherited that namespace and persisted
+/// `provider_key=nous-free` while its model was `MiniMax-M3.1-Flash` (the
+/// minimax profile's model). The two were never cross-checked, so the persisted
+/// pair named two different providers.
+///
+/// Before the fix this session would persist `provider_key=nous-free`.
+#[tokio::test]
+async fn new_session_provider_key_uses_instance_profile_not_process_env_namespace() {
+    let _guard = crate::storage::lock_test_env();
+
+    // Simulate the pollution left behind by another session's model switch to
+    // the `nous-free` named profile.
+    let previous_namespace = std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE").ok();
+    let previous_runtime = std::env::var("JCODE_RUNTIME_PROVIDER").ok();
+    crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "nous-free");
+    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-compatible");
+
+    // The runtime instance actually serves the minimax profile.
+    let provider: Arc<dyn Provider> =
+        Arc::new(InstanceProfileProvider::new("MiniMax-M3.1-Flash", Some("minimax")));
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Agent::new(provider, registry);
+
+    assert_eq!(
+        agent.session_provider_key().as_deref(),
+        Some("minimax"),
+        "the session must persist the profile its own runtime serves, not the \
+         process-global namespace another session left behind"
+    );
+    assert_eq!(agent.session.model.as_deref(), Some("MiniMax-M3.1-Flash"));
+
+    // Negative control: a runtime that serves NO direct OpenAI-compatible
+    // profile must not invent one, and must keep the previous fallback.
+    //
+    // The pollution is cleared FIRST, so the control measures the fallback
+    // path in isolation instead of re-observing the same dirty namespace.
+    crate::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
+    let plain: Arc<dyn Provider> =
+        Arc::new(InstanceProfileProvider::new("anthropic/claude-sonnet-4", None));
+    let plain_registry = Registry::new(plain.clone()).await;
+    let plain_agent = Agent::new(plain, plain_registry);
+    assert_eq!(
+        plain_agent.session_provider_key().as_deref(),
+        Some("openrouter"),
+        "a runtime without a direct profile must keep the previous fallback"
+    );
+
+    if let Some(value) = previous_namespace {
+        crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", value);
+    } else {
+        crate::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    }
+    if let Some(value) = previous_runtime {
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", value);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
+    }
+}
+
 #[tokio::test]
 async fn restore_session_rehydrates_injected_memory_ids() {
     let _guard = crate::storage::lock_test_env();

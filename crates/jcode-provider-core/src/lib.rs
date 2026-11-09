@@ -446,6 +446,24 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// The OpenAI-compatible profile that owns `model` on this runtime
+    /// instance, independent of any process-global environment state.
+    ///
+    /// A named provider profile's constructor sets `JCODE_OPENROUTER_CACHE_NAMESPACE`
+    /// process-wide, so a *different* session's model switch can leave the
+    /// namespace pointing at that profile while this runtime still serves
+    /// another profile. A session's persisted provider identity must come from
+    /// the runtime instance, not from the environment.
+    // reference: no prior art, searched this repo for an instance-scoped
+    // profile resolver (crates/jcode-base/src/provider/mod.rs
+    // openai_compatible_profile_owning_model, crates/jcode-base/src/provider/
+    // selection.rs default_model_selection_from_route) and the Rust trait-object
+    // dispatch guidance at https://siddharthqs.com/design-patterns-in-rust
+    // (dynamic dispatch through a trait object; avoid global mutable state).
+    fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// The explicit upstream-provider pin for the current model, when the
     /// user pinned one on an aggregator runtime.
     fn explicit_provider_pin_for_current_model(&self) -> Option<String> {

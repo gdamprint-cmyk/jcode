@@ -1846,6 +1846,58 @@ impl Provider for MultiProvider {
         }
     }
 
+    /// The OpenAI-compatible profile that owns `model` on the *active runtime
+    /// instance*.
+    ///
+    /// Deliberately instance-scoped: the process-global
+    /// `JCODE_OPENROUTER_CACHE_NAMESPACE` is rewritten by every named-profile
+    /// provider construction, so another session's model switch can leave it
+    /// naming a profile this runtime does not serve. A session's persisted
+    /// provider identity must come from the runtime instance, not from the
+    /// environment. The route catalog is per-instance state and records which
+    /// profile actually serves each model id.
+    // reference: no prior art, searched this repo for an instance-scoped
+    // profile resolver (crates/jcode-base/src/provider/mod.rs
+    // openai_compatible_profile_owning_model, crates/jcode-base/src/provider/
+    // selection.rs default_model_selection_from_route) and the Rust trait-object
+    // dispatch guidance at https://siddharthqs.com/design-patterns-in-rust
+    // (dynamic dispatch through a trait object; avoid global mutable state).
+    fn openai_compatible_profile_id_for_model(&self, model: &str) -> Option<String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let execution = self.active_openrouter_execution_provider()?;
+        if let Some(profile_id) = execution.openai_compatible_profile_id_for_model(model) {
+            return Some(profile_id);
+        }
+        // The active runtime does not claim the model (e.g. a generic
+        // OpenRouter runtime). Fall back to the instance route catalog.
+        let active_profile_id = ProviderRegistry::new(self).active_compatible_profile_id();
+        let mut fallback: Option<String> = None;
+        for route in self.fresh_routes_memo_entry().routes {
+            if !route.available || route.model != model {
+                continue;
+            }
+            let Some(profile_id) = route
+                .api_method
+                .strip_prefix("openai-compatible:")
+                .map(str::trim)
+                .filter(|profile_id| !profile_id.is_empty())
+            else {
+                continue;
+            };
+            if active_profile_id.as_deref() == Some(profile_id) {
+                fallback = Some(profile_id.to_string());
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(profile_id.to_string());
+            }
+        }
+        fallback
+    }
+
     fn explicit_provider_pin_for_current_model(&self) -> Option<String> {
         matches!(self.active_provider(), ActiveProvider::OpenRouter)
             .then(|| self.active_openrouter_execution_provider())

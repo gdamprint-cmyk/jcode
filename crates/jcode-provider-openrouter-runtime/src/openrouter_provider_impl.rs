@@ -17,6 +17,10 @@ impl Provider for OpenRouterProvider {
         OpenRouterProvider::direct_openai_compatible_route_parts(self)
     }
 
+    fn openai_compatible_profile_id_for_model(&self, model: &str) -> Option<String> {
+        OpenRouterProvider::openai_compatible_profile_id_for_model(self, model)
+    }
+
     fn explicit_provider_pin_for_current_model(&self) -> Option<String> {
         OpenRouterProvider::explicit_provider_pin_for_current_model(self)
     }

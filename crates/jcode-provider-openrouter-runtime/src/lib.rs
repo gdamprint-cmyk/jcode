@@ -1394,6 +1394,25 @@ impl OpenRouterProvider {
         "OpenRouter".to_string()
     }
 
+    /// The OpenAI-compatible profile this runtime instance actually serves.
+    ///
+    /// Read from the instance's own `profile_id`, never from
+    /// `JCODE_OPENROUTER_CACHE_NAMESPACE`: a named profile's constructor sets
+    /// that variable process-wide, so another session's model switch can leave
+    /// it pointing at a profile this runtime does not serve.
+    // reference: no prior art, searched this repo for an instance-scoped
+    // profile resolver (crates/jcode-base/src/provider/mod.rs
+    // openai_compatible_profile_owning_model) and the Rust trait-object dispatch
+    // guidance at https://siddharthqs.com/design-patterns-in-rust (dynamic
+    // dispatch through a trait object; avoid global mutable state).
+    pub fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        self.profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile_id| !profile_id.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
         if self.supports_provider_features {
             return None;

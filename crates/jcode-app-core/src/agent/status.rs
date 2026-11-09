@@ -233,6 +233,29 @@ impl Agent {
             );
         }
 
+        // A direct OpenAI-compatible profile owns this session's provider
+        // identity, and only the runtime INSTANCE knows which profile serves
+        // the model. The process-global `JCODE_OPENROUTER_CACHE_NAMESPACE` is
+        // rewritten by every named-profile provider construction, so another
+        // session's model switch could otherwise stamp this session with a
+        // foreign profile (e.g. an ambient cycle on minimax persisting
+        // `provider_key=nous-free` because a swarm worker had just switched to
+        // the nous-free profile).
+        // reference: no prior art, searched this repo for an instance-scoped
+        // profile resolver (crates/jcode-base/src/provider/mod.rs
+        // openai_compatible_profile_owning_model) and the Rust trait-object
+        // dispatch guidance at https://siddharthqs.com/design-patterns-in-rust
+        // (dynamic dispatch through a trait object; avoid global mutable state).
+        let model = self.provider_model();
+        if let Some(profile_id) = self
+            .provider
+            .openai_compatible_profile_id_for_model(&model)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        {
+            return Some(profile_id);
+        }
+
         crate::session::derive_session_provider_key(self.provider.name())
     }
 
