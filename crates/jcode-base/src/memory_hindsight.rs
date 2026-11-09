@@ -420,8 +420,22 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
 ///    about "hindsight memory retain hook" matched NONE of them (0 of 6), so
 ///    the section was empty even though the models existed and were fresh.
 ///    They are keyed by ID, not by a `scope:` tag - see `CURATED_MODEL_IDS`.
-///    Re-measured 2026-11-09 on the live bank: all six are present, all six
-///    are `is_stale=False`, and NONE of them carries a `scope:` tag.
+///    Re-measured 2026-11-09 on the live bank: all six are present, and NONE
+///    of them carries a `scope:` tag.
+///
+///    `is_stale=False` is NOT a durable state for every model, and that is
+///    upstream's design, not a defect. MEASURED 2026-11-09 at 22:12: the
+///    three models whose scope includes `owner:primary` (user-profile,
+///    decisions-ledger, agent-coordination) were `is_stale=True`, the three
+///    scoped to measured-stable tags were `False`. The upstream rule is
+///    scope-relative (`memory_engine.py:20600-20663`: a memory IN the
+///    model's resolved scope written since `last_memory_seen_at`), and
+///    `owner:primary` holds the OWNER'S OWN STATEMENTS - so a model that
+///    reflects what the owner said is re-staled by the owner's next
+///    statement. Upstream is explicit that a stale model is still SHOWN
+///    ("A model that has fallen behind is still shown, but it no longer
+///    short-circuits retrieval"), which is what this path does: the marker
+///    says the content may lag, and the content is still delivered.
 ///
 /// 2. Everything else must match the query, judged by its CONTENT rather than
 ///    its title. MEASURED: the older models carry `knowledge:feature-work`
