@@ -435,6 +435,14 @@ pub(super) fn autoreview_status_message(app: &App) -> String {
     let default_enabled = crate::config::config().autoreview.enabled;
     let config_model = crate::config::config().autoreview.model.as_deref();
     let model_line = match config_model {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel is NOT a model override, so
+        // the status line must say the same thing the resolver decides.
+        Some(model) if crate::config::AgentsConfig::is_swarm_inherit_sentinel(model) => format!(
+            "Reviewer model: inherit current session ({})",
+            current_autoreview_model_summary(app)
+        ),
         Some(model) => format!("Reviewer model override: {}", model),
         None => format!(
             "Reviewer model: inherit current session ({})",
@@ -461,6 +469,14 @@ pub(super) fn autojudge_status_message(app: &App) -> String {
     let default_enabled = crate::config::config().autojudge.enabled;
     let config_model = crate::config::config().autojudge.model.as_deref();
     let model_line = match config_model {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel is NOT a model override, so
+        // the status line must say the same thing the resolver decides.
+        Some(model) if crate::config::AgentsConfig::is_swarm_inherit_sentinel(model) => format!(
+            "Judge model: inherit current session ({})",
+            current_autojudge_model_summary(app)
+        ),
         Some(model) => format!("Judge model override: {}", model),
         None => format!(
             "Judge model: inherit current session ({})",
@@ -644,8 +660,10 @@ pub(super) fn preferred_one_shot_review_override() -> Option<(String, String)> {
     }
 }
 
-/// Any explicit choice, session or saved global (including "inherit"), wins
-/// over the built-in preferred reviewer. Only an unconfigured role uses it.
+/// Any explicit choice, session or saved global, wins over the built-in
+/// preferred reviewer. The inherit sentinel is NOT an explicit choice: it
+/// means "no override", so it falls through to the preferred reviewer.
+/// Only an unconfigured role uses the preferred reviewer.
 fn feedback_model_override(
     app: &App,
     role: &str,

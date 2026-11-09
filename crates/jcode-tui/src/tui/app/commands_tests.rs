@@ -105,6 +105,75 @@ fn review_and_judge_overrides_treat_every_sentinel_spelling_as_absent() {
     );
 }
 
+// reference: crates/jcode-config-types/src/lib.rs -
+// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
+// vocabulary this test pins: the status text must agree with the resolver.
+// A sentinel is NOT a model override, so it must not be printed as one.
+//
+// This test WRITES the config file, so it takes the shared state lock and
+// restores the original reviewer/judge models afterwards, exactly like the
+// neighbouring `with_clean_config` helper does for the colour palette.
+#[test]
+fn review_status_text_does_not_print_a_sentinel_as_an_override() {
+    let _lock = crate::storage::lock_test_env();
+    let original = {
+        let config = crate::config::Config::load();
+        (config.autoreview.model.clone(), config.autojudge.model.clone())
+    };
+    struct Restore(Option<String>, Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mut config = crate::config::Config::load();
+            config.autoreview.model = self.0.clone();
+            config.autojudge.model = self.1.clone();
+            let _ = config.save();
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = Restore(original.0.clone(), original.1.clone());
+
+    let app = crate::tui::app::tests::create_test_app();
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        " Inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        let mut config = crate::config::Config::load();
+        config.autoreview.model = Some(sentinel.to_string());
+        config.autojudge.model = Some(sentinel.to_string());
+        config.save().unwrap();
+        crate::config::Config::invalidate_cache();
+
+        let autoreview = super::autoreview_status_message(&app);
+        assert!(
+            !autoreview.contains("Reviewer model override:"),
+            "{sentinel} must not be printed as a reviewer override: {autoreview}"
+        );
+        let autojudge = super::autojudge_status_message(&app);
+        assert!(
+            !autojudge.contains("Judge model override:"),
+            "{sentinel} must not be printed as a judge override: {autojudge}"
+        );
+    }
+
+    // A concrete model IS an override and must still be printed as one.
+    let mut config = crate::config::Config::load();
+    config.autoreview.model = Some("openai-api:global-review".into());
+    config.autojudge.model = Some("openai-api:global-judge".into());
+    config.save().unwrap();
+    crate::config::Config::invalidate_cache();
+    assert!(
+        super::autoreview_status_message(&app).contains("Reviewer model override:"),
+        "a concrete reviewer model must be printed as an override"
+    );
+    assert!(
+        super::autojudge_status_message(&app).contains("Judge model override:"),
+        "a concrete judge model must be printed as an override"
+    );
+}
+
 #[test]
 fn parse_diff_mode_name_maps_known_aliases() {
     use crate::config::DiffDisplayMode;
