@@ -42,6 +42,7 @@ mod panel;
 mod patch;
 pub mod plan_declaration;
 mod read;
+pub mod research_gate;
 pub(crate) mod sdk;
 pub mod selfdev;
 pub(crate) mod serde_coerce;
@@ -1141,9 +1142,36 @@ impl Registry {
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
         );
 
+        // Research-first gate: a substantial new source file may not be written
+        // until a real research lookup (`websearch` / `webfetch`) happened this
+        // turn. It runs BEFORE the tool executes and fails open on any error, so
+        // a broken policy can never wedge the host.
+        //
+        // The external `reference_first.py` hook already refuses a file with no
+        // `// reference:` declaration; this is the half that a declaration cannot
+        // fake - proof that a lookup actually happened.
+        if let Some(reason) = research_gate::should_require_research(
+            resolved_name,
+            &input,
+            &ctx.session_id,
+        ) {
+            let mut fields =
+                Self::tool_lifecycle_fields("blocked", name, resolved_name, &input, &ctx);
+            fields.push(("block_reason".to_string(), reason.clone()));
+            crate::logging::event_warn("TOOL_LIFECYCLE", fields);
+            return Err(anyhow::anyhow!("Tool call blocked: {reason}"));
+        }
+
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+        // A completed research lookup clears the research-first gate for the rest
+        // of this turn. Recorded after execution so a failed search does not
+        // credit the session, and only for the configured tool names.
+        if result.is_ok() {
+            research_gate::note_research_lookup(&ctx.session_id, resolved_name);
+        }
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &input, &ctx, &result, latency_ms);
@@ -1947,6 +1975,10 @@ mod mcp_allow_list_tests;
 #[cfg(test)]
 #[path = "plan_declaration_gate_tests.rs"]
 mod plan_declaration_gate_tests;
+
+#[cfg(test)]
+#[path = "research_gate_tests.rs"]
+mod research_gate_tests;
 
 #[cfg(test)]
 mod tests;

@@ -1050,6 +1050,47 @@ impl Default for HooksConfig {
     }
 }
 
+/// Research-first gate configuration.
+///
+/// A substantial new source file may not be written until a qualifying research
+/// lookup (`websearch` / `webfetch` / their aliases) happened in the current
+/// turn. The gate is ON by default; the external `reference_first.py` hook
+/// already covers the declaration half, so this one covers the lookup half.
+// reference: ~/.jcode/decisions/reference_first.py - the floors this section
+// mirrors (`MIN_BYTES`, `MIN_LINES`, `WRITE_TOOLS`).
+// reference: C:\Users\WorkShop1\AppData\Local\hermes\hermes-agent\agent\tool_guardrails.py
+// - the per-turn controller shape this gate ports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResearchGateConfig {
+    /// Master switch. `false` allows everything.
+    pub enabled: bool,
+    /// New content at or above this many bytes is substantial. Default 2000.
+    pub min_bytes: usize,
+    /// New content at or above this many non-empty lines is substantial.
+    /// Default 60.
+    pub min_lines: usize,
+    /// Tool names that count as a qualifying research lookup. Empty falls back
+    /// to the built-in default list.
+    pub required_tools: Vec<String>,
+}
+
+impl Default for ResearchGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_bytes: 2000,
+            min_lines: 60,
+            required_tools: vec![
+                "websearch".to_string(),
+                "webfetch".to_string(),
+                "web_search".to_string(),
+                "web_extract".to_string(),
+            ],
+        }
+    }
+}
+
 /// Automatic end-of-turn code review configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

@@ -10,7 +10,8 @@ pub use jcode_config_types::{
     GatewayConfig, HookCommands, HooksConfig, KeybindingsConfig, LatexRenderingMode,
     LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
     NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
-    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, ResearchGateConfig,
+    SafetyConfig,
     SessionConfig, SessionPickerResumeAction, SkillReviewConfig, SponsorsConfig, SwarmSpawnMode,
     SwarmStripLayout, TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
@@ -700,6 +701,10 @@ pub struct Config {
 
     /// Compaction configuration
     pub compaction: CompactionConfig,
+
+    /// Research-first gate: a substantial new source file may not be written
+    /// until a qualifying research lookup happened this turn.
+    pub research_gate: ResearchGateConfig,
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
