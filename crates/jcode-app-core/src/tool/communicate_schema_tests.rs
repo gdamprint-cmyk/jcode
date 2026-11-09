@@ -40,11 +40,39 @@ fn schema_only_exposes_exact_allowlisted_worker_models_when_enabled() {
     super::super::apply_swarm_model_policy(&mut schema, &agents);
     assert_eq!(
         schema["properties"]["model"]["enum"],
-        json!(["openai:gpt-5.5"])
+        json!(["inherit", "openai:gpt-5.5"])
     );
     agents.swarm_model_allowlist.clear();
     super::super::apply_swarm_model_policy(&mut schema, &agents);
     assert!(schema["properties"].get("model").is_none());
+}
+
+#[test]
+fn swarm_model_schema_offers_the_inherit_sentinel_and_the_allowlist_routes() {
+    let mut schema = CommunicateTool::new().parameters_schema();
+    let mut agents = crate::config::AgentsConfig {
+        swarm_model_allowlist: vec!["nous-free:beam".to_string()],
+        swarm_model_selection: true,
+        ..Default::default()
+    };
+    super::super::apply_swarm_model_policy(&mut schema, &agents);
+    let routes = schema["properties"]["model"]["enum"]
+        .as_array()
+        .expect("model enum")
+        .clone();
+    assert!(
+        routes.contains(&json!("inherit")),
+        "the inherit sentinel must be offered: {routes:?}"
+    );
+    assert!(
+        routes.contains(&json!("nous-free:beam")),
+        "the allowlisted route must be offered: {routes:?}"
+    );
+    // A route outside the allowlist is never offered.
+    assert!(
+        !routes.contains(&json!("nous-free:guessed")),
+        "an unlisted route must not be offered: {routes:?}"
+    );
 }
 
 #[test]
@@ -82,6 +110,12 @@ fn spawning_actions_cannot_bypass_worker_model_policy() {
             agents
                 .validate_swarm_model_request(Some("claude-api:claude-opus-4-8"))
                 .is_err()
+        );
+        // The inherit sentinel requests no route override, so it stays valid.
+        assert!(
+            agents
+                .validate_swarm_model_request(Some("inherit"))
+                .is_ok()
         );
         agents.swarm_model_selection = false;
     }

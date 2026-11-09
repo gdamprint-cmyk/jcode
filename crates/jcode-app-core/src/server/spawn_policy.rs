@@ -36,8 +36,10 @@ pub(in crate::server) fn resolve_swarm_spawn_mode(
 }
 
 pub(in crate::server) fn is_inherit_sentinel(model: &str) -> bool {
-    let trimmed = model.trim();
-    trimmed.eq_ignore_ascii_case("inherit") || trimmed.eq_ignore_ascii_case("coordinator")
+    // reference: crates/jcode-config-types/src/lib.rs - AgentsConfig::is_swarm_inherit_sentinel
+    // is the single source of truth for the sentinel vocabulary, shared with the
+    // config validator so the two cannot disagree about it.
+    crate::config::AgentsConfig::is_swarm_inherit_sentinel(model)
 }
 
 /// Selection that inherits the coordinator's model, provider key, and route.

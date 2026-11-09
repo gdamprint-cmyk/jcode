@@ -706,15 +706,46 @@ impl Default for AgentsConfig {
 }
 
 impl AgentsConfig {
+    // reference: crates/jcode-app-core/src/server/spawn_policy.rs:38 - the existing
+    // `is_inherit_sentinel` helper is the mechanism consolidated here, so the
+    // validator and the spawn resolver cannot disagree about it.
+    /// Whether a requested swarm model is the "inherit the coordinator's model"
+    /// sentinel rather than a concrete route.
+    ///
+    /// The sentinel is semantically identical to omitting `model` entirely: the
+    /// spawn path resolves it to the coordinator's own model, provider key and
+    /// route (`resolve_swarm_spawn_selection`). It is therefore NOT a route
+    /// override and must not be checked against `swarm_model_allowlist`.
+    ///
+    /// This lives here, in the crate both the config layer and the server
+    /// depend on, so the validator and the spawn resolver cannot disagree
+    /// about which strings are sentinels.
+    pub fn is_swarm_inherit_sentinel(model: &str) -> bool {
+        let trimmed = model.trim();
+        trimmed.eq_ignore_ascii_case("inherit") || trimmed.eq_ignore_ascii_case("coordinator")
+    }
+
     /// Validate an agent-supplied override before resolving any provider route.
     /// Matching is exact: a bare model never authorizes another provider's route.
-    pub fn validate_swarm_model_request(&self, model: Option<&str>) -> Result<(), &'static str> {
+    ///
+    /// The error names the requested model and every allowed route, so a
+    /// coordinator that guessed a route string learns the exact set it may use
+    /// instead of hitting a dead end.
+    pub fn validate_swarm_model_request(&self, model: Option<&str>) -> Result<(), String> {
         let Some(model) = model else {
             return Ok(());
         };
+        // The inherit sentinel requests no override at all, so it needs neither
+        // an allowlist entry nor the agent-selection opt-in. It is checked
+        // FIRST: it means "use the user-configured default", exactly like
+        // omitting `model`.
+        if Self::is_swarm_inherit_sentinel(model) {
+            return Ok(());
+        }
         if !self.swarm_model_selection {
             return Err(
-                "Agent-selected swarm models are disabled. Omit model to use the user-configured default.",
+                "Agent-selected swarm models are disabled. Omit model to use the user-configured default."
+                    .to_string(),
             );
         }
         if model.trim().is_empty()
@@ -723,9 +754,23 @@ impl AgentsConfig {
                 .iter()
                 .any(|allowed| allowed == model)
         {
-            return Err(
-                "Requested swarm model is not in agents.swarm_model_allowlist. Omit model to use the user-configured default.",
-            );
+            let allowed = if self.swarm_model_allowlist.is_empty() {
+                "agents.swarm_model_allowlist is empty - no agent-selected model is permitted."
+                    .to_string()
+            } else {
+                format!(
+                    "Allowed swarm models: {}.",
+                    self.swarm_model_allowlist
+                        .iter()
+                        .map(|route| route.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(format!(
+                "Requested swarm model '{model}' is not in agents.swarm_model_allowlist. {allowed} \
+                 Use one of those routes exactly, or omit model to use the user-configured default."
+            ));
         }
         Ok(())
     }

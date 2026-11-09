@@ -522,20 +522,24 @@ fn test_env_override_swarm_model() {
     restore_env_var("JCODE_SWARM_MODEL", prev);
 }
 
+// reference: crates/jcode-config-types/src/lib.rs - AgentsConfig::validate_swarm_model_request
+// and AgentsConfig::is_swarm_inherit_sentinel are the mechanism under test here.
 #[test]
 fn swarm_model_selection_defaults_off_even_with_an_allowlist() {
     let agents = Config::default().agents;
     assert!(!agents.swarm_model_selection);
     assert!(agents.swarm_model_allowlist.is_empty());
     assert!(agents.validate_swarm_model_request(None).is_ok());
-    for model in [
-        "inherit",
-        "coordinator",
-        "",
-        "  ",
-        "claude-api:claude-opus-4-8",
-    ] {
+    for model in ["", "  ", "claude-api:claude-opus-4-8"] {
         assert!(agents.validate_swarm_model_request(Some(model)).is_err());
+    }
+    // The inherit sentinel requests no override, so it is accepted even while
+    // agent-selected models are disabled: it means "use the default".
+    for model in ["inherit", "coordinator", "INHERIT", " inherit "] {
+        assert!(
+            agents.validate_swarm_model_request(Some(model)).is_ok(),
+            "{model:?}"
+        );
     }
     let cfg: Config =
         toml::from_str("[agents]\nswarm_model_allowlist = [\"claude-api:claude-opus-4-8\"]\n")
@@ -545,6 +549,30 @@ fn swarm_model_selection_defaults_off_even_with_an_allowlist() {
             .validate_swarm_model_request(Some("claude-api:claude-opus-4-8"))
             .is_err()
     );
+}
+
+#[test]
+fn swarm_model_rejection_names_the_requested_model_and_allowed_routes() {
+    let cfg: Config = toml::from_str(
+        "[agents]\nswarm_model_selection = true\nswarm_model_allowlist = [\"nous-free:beam\", \"opencode-go:beam-free\"]\n"
+    )
+    .unwrap();
+    let error = cfg
+        .agents
+        .validate_swarm_model_request(Some("nous-free:wrong"))
+        .expect_err("a route outside the allowlist must be refused");
+    assert!(error.contains("nous-free:wrong"), "{error}");
+    assert!(error.contains("nous-free:beam"), "{error}");
+    assert!(error.contains("opencode-go:beam-free"), "{error}");
+
+    let empty: Config =
+        toml::from_str("[agents]\nswarm_model_selection = true\nswarm_model_allowlist = []\n")
+            .unwrap();
+    let error = empty
+        .agents
+        .validate_swarm_model_request(Some("nous-free:beam"))
+        .expect_err("an empty allowlist refuses every concrete route");
+    assert!(error.contains("allowlist is empty"), "{error}");
 }
 
 #[test]
@@ -563,7 +591,6 @@ fn swarm_model_selection_requires_opt_in_and_exact_route_match() {
         "claude-opus-4-8",
         "Claude:claude-opus-4-8",
         "claude:claude-opus-4-8 ",
-        "inherit",
         "",
         "  ",
     ] {
