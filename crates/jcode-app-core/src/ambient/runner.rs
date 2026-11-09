@@ -543,7 +543,9 @@ impl AmbientRunnerHandle {
                 child.route_api_method = parent.route_api_method.clone();
                 child.model = parent
                     .effective_agent_model("ambient", crate::config::Config::load().ambient.model)
-                    .filter(|model| model != "inherit")
+                    .filter(|model| {
+                        !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model)
+                    })
                     .or_else(|| parent.model.clone());
                 child.agent_model_overrides = parent.agent_model_overrides.clone();
                 child.subagent_model = parent.subagent_model.clone();

@@ -1761,3 +1761,51 @@ mod reasoning_display_defaults_tests {
         assert!(!display.show_thinking);
     }
 }
+
+#[cfg(test)]
+mod swarm_inherit_sentinel_tests {
+    use super::*;
+
+    /// The sentinel helper is the single source of truth for "this model means
+    /// inherit from the coordinator". Every call site - the swarm allowlist
+    /// validator, the spawn resolver, the ambient runner and the memory
+    /// sidecar - must agree with it, so the matching semantics are pinned here.
+    #[test]
+    fn sentinel_matching_is_trimmed_and_case_insensitive_for_both_spellings() {
+        for model in [
+            "inherit",
+            "INHERIT",
+            "Inherit",
+            " inherit ",
+            "\tinherit\n",
+            "coordinator",
+            "COORDINATOR",
+            "Coordinator",
+            " coordinator ",
+        ] {
+            assert!(
+                AgentsConfig::is_swarm_inherit_sentinel(model),
+                "{model:?} must be recognised as the inherit sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_model_is_never_a_sentinel() {
+        for model in [
+            "",
+            " ",
+            "inherits",
+            "inherit-me",
+            "coordinators",
+            "minimax-m3.1-flash",
+            "nous-free:meituan/longcat-2.5:free",
+            "opencode-go:beam-free",
+        ] {
+            assert!(
+                !AgentsConfig::is_swarm_inherit_sentinel(model),
+                "{model:?} must not be treated as the inherit sentinel"
+            );
+        }
+    }
+}

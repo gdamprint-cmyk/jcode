@@ -162,7 +162,9 @@ impl Sidecar {
     pub fn for_session(session: &crate::session::Session) -> Self {
         let model = session
             .effective_agent_model("memory", crate::config::Config::load().agents.memory_model);
-        let inherit = model.as_deref() == Some("inherit");
+        let inherit = model
+            .as_deref()
+            .is_some_and(crate::config::AgentsConfig::is_swarm_inherit_sentinel);
         let model = if inherit {
             session.model.clone()
         } else {
