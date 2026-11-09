@@ -43,6 +43,7 @@ mod patch;
 pub mod plan_declaration;
 mod read;
 pub mod research_gate;
+pub mod loop_guardrails;
 pub(crate) mod sdk;
 pub mod selfdev;
 pub(crate) mod serde_coerce;
@@ -1162,6 +1163,41 @@ impl Registry {
             return Err(anyhow::anyhow!("Tool call blocked: {reason}"));
         }
 
+        // Tool-loop guardrail: a call that is a REPLAY of one that already
+        // failed (or that returned the same result again and again) is refused
+        // before it runs, and the model is told to change the approach. The
+        // counters are per turn, so a legitimate multi-turn session is never
+        // starved. Fails open: any error allows the call.
+        //
+        // reference: C:\Users\WorkShop1\AppData\Local\hermes\hermes-agent\agent\tool_guardrails.py
+        //   (the per-turn controller this ports: `before_call` decides BEFORE the
+        //   call, `after_call` updates the counters, and a successful mutating
+        //   call is progress that resets the failure streaks)
+        // reference: crates/jcode-app-core/src/tool/loop_guardrails.rs
+        //   (the module that owns the counters and the decisions)
+        let guardrail_config = loop_guardrails::config_from_section(
+            &crate::config::config().tool_loop_guardrails,
+        );
+        let guardrail_decision = loop_guardrails::before_call(
+            &ctx.session_id,
+            resolved_name,
+            &input,
+            &guardrail_config,
+        );
+        if guardrail_decision.action == loop_guardrails::GuardrailAction::Block {
+            let mut fields =
+                Self::tool_lifecycle_fields("blocked", name, resolved_name, &input, &ctx);
+            fields.push((
+                "block_reason".to_string(),
+                guardrail_decision.message.clone(),
+            ));
+            crate::logging::event_warn("TOOL_LIFECYCLE", fields);
+            return Err(anyhow::anyhow!(
+                "Tool call blocked by the tool-loop guardrail: {}",
+                guardrail_decision.message
+            ));
+        }
+
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -1172,6 +1208,48 @@ impl Registry {
         if result.is_ok() {
             research_gate::note_research_lookup(&ctx.session_id, resolved_name);
         }
+
+        // Feed the tool-loop guardrail the outcome, and record any warning.
+        // The warning reaches the model through the tool output, which is
+        // where the model already looks for the consequences of its call.
+        //
+        // reference: C:\Users\WorkShop1\AppData\Local\hermes\hermes-agent\agent\tool_guardrails.py
+        //   (`after_call` returns the warning; Hermes injects it into the tool
+        //   result so the model self-corrects)
+        let guardrail_outcome = match &result {
+            Ok(output) => loop_guardrails::after_call(
+                &ctx.session_id,
+                resolved_name,
+                &input,
+                &output.output,
+                false,
+                &guardrail_config,
+            ),
+            Err(_) => loop_guardrails::after_call(
+                &ctx.session_id,
+                resolved_name,
+                &input,
+                "",
+                true,
+                &guardrail_config,
+            ),
+        };
+        if guardrail_outcome.action == loop_guardrails::GuardrailAction::Warn {
+            crate::logging::event_warn(
+                "TOOL_LIFECYCLE",
+                vec![
+                    ("guardrail".to_string(), guardrail_outcome.code.to_string()),
+                    ("tool_name".to_string(), resolved_name.to_string()),
+                    ("count".to_string(), guardrail_outcome.count.to_string()),
+                ],
+            );
+        }
+        let guardrail_warning = if guardrail_outcome.action == loop_guardrails::GuardrailAction::Warn
+        {
+            Some(guardrail_outcome.message.clone())
+        } else {
+            None
+        };
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &input, &ctx, &result, latency_ms);
@@ -1200,6 +1278,17 @@ impl Registry {
             }
             output.output.push_str("\n[pre_tool context]\n");
             output.output.push_str(context);
+        }
+        // The guardrail warning must reach the MODEL, not only the log: the
+        // model is the only actor that can change the next call. It travels
+        // inside the tool output, which is the channel the model already reads
+        // for the consequences of its own call.
+        if let Some(warning) = guardrail_warning.as_deref() {
+            if !output.output.is_empty() && !output.output.ends_with('\n') {
+                output.output.push('\n');
+            }
+            output.output.push_str("\n[tool-loop guardrail]\n");
+            output.output.push_str(warning);
         }
         Self::apply_post_tool_feedback(resolved_name, &input, &ctx, latency_ms, &mut output).await;
 

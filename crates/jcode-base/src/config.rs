@@ -11,9 +11,9 @@ pub use jcode_config_types::{
     LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
     NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
     NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, ResearchGateConfig,
-    SafetyConfig,
-    SessionConfig, SessionPickerResumeAction, SkillReviewConfig, SponsorsConfig, SwarmSpawnMode,
-    SwarmStripLayout, TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
+    SafetyConfig, SessionConfig, SessionPickerResumeAction, SkillReviewConfig, SponsorsConfig,
+    SwarmSpawnMode, SwarmStripLayout, TerminalConfig, ToolLoopGuardrailsConfig, UpdateChannel,
+    WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -705,6 +705,10 @@ pub struct Config {
     /// Research-first gate: a substantial new source file may not be written
     /// until a qualifying research lookup happened this turn.
     pub research_gate: ResearchGateConfig,
+
+    /// Tool-loop guardrails: per-turn counters that stop the model from
+    /// repeating the same failing or no-progressing tool call.
+    pub tool_loop_guardrails: ToolLoopGuardrailsConfig,
 
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
