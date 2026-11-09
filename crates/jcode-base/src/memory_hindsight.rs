@@ -413,17 +413,21 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
 ///
 /// Selection has two parts, and BOTH are needed:
 ///
-/// 1. Curated owner-facing models (tagged `scope:*`) are always eligible. They
-///    are the standing answers the owner asked for - profile, goals,
-///    decisions, hazards - and they are relevant to almost any query about
-///    this workspace. MEASURED: with a title-token match only, a query about
-///    "hindsight memory retain hook" matched NONE of them, so the section was
-///    empty even though the models existed and were fresh.
+/// 1. Curated owner-facing models (the six ids in `CURATED_MODEL_IDS`) are always
+///    eligible. They are the standing answers the owner asked for - profile,
+///    goals, decisions, hazards - and they are relevant to almost any query
+///    about this workspace. MEASURED: with a title-token match only, a query
+///    about "hindsight memory retain hook" matched NONE of them (0 of 6), so
+///    the section was empty even though the models existed and were fresh.
+///    They are keyed by ID, not by a `scope:` tag - see `CURATED_MODEL_IDS`.
+///    Re-measured 2026-11-09 on the live bank: all six are present, all six
+///    are `is_stale=False`, and NONE of them carries a `scope:` tag.
 ///
 /// 2. Everything else must match the query, judged by its CONTENT rather than
 ///    its title. MEASURED: the older models carry `knowledge:feature-work`
 ///    and `subject:*` tags and titles that never mention the words a query
-///    uses, but their bodies do.
+///    uses, but their bodies do. Re-measured 2026-11-09: 9 of the 9
+///    non-curated models in the bank carry a `knowledge:`/`subject:` tag.
 ///
 /// Stale models are NOT dropped (see [`MentalModelItem::is_stale`]).
 fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightModel>> {
