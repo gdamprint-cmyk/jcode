@@ -76,6 +76,41 @@ fn swarm_model_schema_offers_the_inherit_sentinel_and_the_allowlist_routes() {
 }
 
 #[test]
+fn swarm_model_schema_does_not_repeat_the_inherit_sentinel_when_the_user_allowlists_it() {
+    // reference: crates/jcode-app-core/src/tool/swarm_model_schema.rs - the enum is
+    // built as "inherit" plus the allowlist, so an allowlist that already
+    // contains the sentinel would otherwise emit a duplicate entry.
+    let mut schema = CommunicateTool::new().parameters_schema();
+    let mut agents = crate::config::AgentsConfig {
+        swarm_model_allowlist: vec![
+            "inherit".to_string(),
+            "Coordinator".to_string(),
+            "nous-free:beam".to_string(),
+        ],
+        swarm_model_selection: true,
+        ..Default::default()
+    };
+    super::super::apply_swarm_model_policy(&mut schema, &agents);
+    let routes = schema["properties"]["model"]["enum"]
+        .as_array()
+        .expect("model enum")
+        .clone();
+    let inherit_count = routes.iter().filter(|r| *r == &json!("inherit")).count();
+    assert_eq!(
+        inherit_count, 1,
+        "the sentinel must appear exactly once: {routes:?}"
+    );
+    assert!(
+        !routes.contains(&json!("Coordinator")),
+        "the allowlist spelling of the sentinel must not be echoed: {routes:?}"
+    );
+    assert!(
+        routes.contains(&json!("nous-free:beam")),
+        "the concrete route must survive: {routes:?}"
+    );
+}
+
+#[test]
 fn spawning_actions_cannot_bypass_worker_model_policy() {
     let mut agents = crate::config::AgentsConfig {
         swarm_model_allowlist: vec!["claude:claude-opus-4-8".to_string()],

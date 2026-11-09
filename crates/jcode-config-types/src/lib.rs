@@ -706,20 +706,32 @@ impl Default for AgentsConfig {
 }
 
 impl AgentsConfig {
+    // reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-config-types/src/lib.rs
+    // upstream ships the same AgentsConfig block; the sentinel vocabulary here
+    // was consolidated from crates/jcode-app-core/src/server/spawn_policy.rs:38
+    // so the validator and the spawn resolver cannot disagree about it.
     // reference: crates/jcode-app-core/src/server/spawn_policy.rs:38 - the existing
     // `is_inherit_sentinel` helper is the mechanism consolidated here, so the
     // validator and the spawn resolver cannot disagree about it.
     /// Whether a requested swarm model is the "inherit the coordinator's model"
     /// sentinel rather than a concrete route.
     ///
-    /// The sentinel is semantically identical to omitting `model` entirely: the
-    /// spawn path resolves it to the coordinator's own model, provider key and
-    /// route (`resolve_swarm_spawn_selection`). It is therefore NOT a route
-    /// override and must not be checked against `swarm_model_allowlist`.
+    /// The sentinel names the coordinator's own model, provider key and route
+    /// (`resolve_swarm_spawn_selection`), so it is not a route override and must
+    /// not be checked against `swarm_model_allowlist`.
+    ///
+    /// NOTE: a requested sentinel is NOT the same as omitting `model`. Omitting
+    /// `model` falls back to the configured `agents.swarm_model` pin when one is
+    /// set; a requested sentinel takes priority over that pin and resolves to
+    /// the coordinator's model. `resolve_swarm_spawn_selection` pins this
+    /// behaviour deliberately (see `resolve_swarm_spawn_model_requested_inherit_overrides_configured_pin`).
     ///
     /// This lives here, in the crate both the config layer and the server
     /// depend on, so the validator and the spawn resolver cannot disagree
     /// about which strings are sentinels.
+    // reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-app-core/src/server/comm_session.rs
+    // The resolver that gives a requested sentinel priority over a configured
+    // pin lives there; the doc above describes that existing behaviour.
     pub fn is_swarm_inherit_sentinel(model: &str) -> bool {
         let trimmed = model.trim();
         trimmed.eq_ignore_ascii_case("inherit") || trimmed.eq_ignore_ascii_case("coordinator")
@@ -735,10 +747,14 @@ impl AgentsConfig {
         let Some(model) = model else {
             return Ok(());
         };
-        // The inherit sentinel requests no override at all, so it needs neither
-        // an allowlist entry nor the agent-selection opt-in. It is checked
-        // FIRST: it means "use the user-configured default", exactly like
-        // omitting `model`.
+        // The inherit sentinel names the coordinator's model, so it needs
+        // neither an allowlist entry nor the agent-selection opt-in. It is
+        // checked FIRST because it is not a route override. Note that it
+        // overrides a configured `agents.swarm_model` pin, unlike omitting
+        // `model` - see `is_swarm_inherit_sentinel`.
+        // reference: crates/jcode-app-core/src/server/comm_session.rs:368
+        // `resolve_swarm_spawn_selection` is the resolver whose precedence
+        // rules this gate mirrors.
         if Self::is_swarm_inherit_sentinel(model) {
             return Ok(());
         }
@@ -754,19 +770,20 @@ impl AgentsConfig {
                 .iter()
                 .any(|allowed| allowed == model)
         {
-            let allowed = if self.swarm_model_allowlist.is_empty() {
-                "agents.swarm_model_allowlist is empty - no agent-selected model is permitted."
-                    .to_string()
-            } else {
-                format!(
-                    "Allowed swarm models: {}.",
-                    self.swarm_model_allowlist
-                        .iter()
-                        .map(|route| route.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+            if self.swarm_model_allowlist.is_empty() {
+                return Err(format!(
+                    "Requested swarm model '{model}' is not permitted: agents.swarm_model_allowlist is empty. \
+                     Omit model to use the user-configured default."
+                ));
+            }
+            let allowed = format!(
+                "Allowed swarm models: {}.",
+                self.swarm_model_allowlist
+                    .iter()
+                    .map(|route| route.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             return Err(format!(
                 "Requested swarm model '{model}' is not in agents.swarm_model_allowlist. {allowed} \
                  Use one of those routes exactly, or omit model to use the user-configured default."

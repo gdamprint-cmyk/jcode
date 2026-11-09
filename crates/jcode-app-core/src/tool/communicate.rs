@@ -1633,7 +1633,7 @@ fn format_swarm_model_list(
         out.push_str("\nNo model routes reported. Omit model to use the configured default.");
         return out;
     }
-    out.push_str("\nModel routes (informational only, overrides require agents.swarm_model_selection and an exact agents.swarm_model_allowlist entry):\n");
+    out.push_str("\nModel routes (informational only; a concrete route override requires agents.swarm_model_selection and an exact agents.swarm_model_allowlist entry, while 'inherit' selects the coordinator's own model):\n");
     for route in model_routes {
         let availability = if route.available {
             ""
@@ -1779,7 +1779,12 @@ struct CommunicateInput {
     /// threshold.
     #[serde(default)]
     tldr: Option<String>,
-    /// Optional model override, authorized by the user's opt-in and exact allowlist.
+    /// Optional model override. A concrete route is authorized by the user's
+    /// opt-in and an exact allowlist entry; the `inherit`/`coordinator` sentinel
+    /// selects the coordinator's own model and overrides any configured
+    /// default.
+    // reference: crates/jcode-config-types/src/lib.rs - AgentsConfig::validate_swarm_model_request
+    // is the gate that decides which values are accepted here.
     #[serde(default)]
     model: Option<String>,
     /// Short human-readable label for a spawned agent shown in swarm UI.

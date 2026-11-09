@@ -10,16 +10,27 @@ pub(super) fn apply_swarm_model_policy(schema: &mut Value, agents: &crate::confi
     if !agents.swarm_model_selection || agents.swarm_model_allowlist.is_empty() {
         properties.remove("model");
     } else {
-        // The inherit sentinel is always offered: it means "use the
-        // user-configured default", which is a different thing from naming a
-        // concrete route. Without it the schema would forbid the one value
-        // that asks for the default.
+        // The inherit sentinel is always offered: it names the coordinator's
+        // own model, which is a different thing from naming a concrete route.
+        // Without it the schema would forbid the one value that asks for the
+        // coordinator's model. Note that a requested sentinel overrides a
+        // configured `agents.swarm_model` pin, unlike omitting the field.
+        // reference: crates/jcode-config-types/src/lib.rs - AgentsConfig::is_swarm_inherit_sentinel
+        // is the single source of truth for the sentinel spelling.
         let mut routes = vec!["inherit".to_string()];
-        routes.extend(agents.swarm_model_allowlist.iter().cloned());
+        // A user may put the sentinel itself in the allowlist; do not emit a
+        // duplicate enum entry.
+        routes.extend(
+            agents
+                .swarm_model_allowlist
+                .iter()
+                .filter(|route| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(route))
+                .cloned(),
+        );
         properties.insert("model".to_string(), json!({
             "type": "string",
             "enum": routes,
-            "description": "Optional worker model. Only exact user-allowlisted routes are permitted, plus 'inherit' for the configured default. Omit to use the configured default."
+            "description": "Optional worker model. Only exact user-allowlisted routes are permitted, plus 'inherit' for the coordinator's own model (which overrides any configured default). Omit to use the configured default."
         }));
     }
 }
