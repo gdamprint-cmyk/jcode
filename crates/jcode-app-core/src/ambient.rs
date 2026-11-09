@@ -5,11 +5,20 @@ use std::path::PathBuf;
 
 mod directives;
 mod manager;
-mod paths;
+pub(crate) mod paths;
 mod persistence;
 mod prompt;
 pub mod runner;
 pub mod scheduler;
+mod todo_reviews;
+
+#[cfg(test)]
+#[path = "ambient/counter_regression_tests.rs"]
+mod counter_regression_tests;
+
+#[cfg(test)]
+#[path = "ambient/ambient_dead_letter_tests.rs"]
+mod ambient_dead_letter_tests;
 
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
@@ -17,11 +26,16 @@ pub use directives::{
 pub use manager::AmbientManager;
 pub use persistence::{AmbientLock, ScheduledQueue};
 #[cfg(test)]
+pub(crate) use persistence::{StateWrite, reset_state_writes, state_writes_all_for};
+#[cfg(test)]
 pub(crate) use prompt::format_duration_rough;
 pub use prompt::{
     MemoryGraphHealth, RecentSessionInfo, ResourceBudget, build_ambient_system_prompt,
     format_minutes_human, format_scheduled_session_message, gather_feedback_memories,
     gather_memory_graph_health, gather_recent_sessions,
+};
+pub use todo_reviews::{
+    reconcile_stored_todo_reviews, reconcile_todo_reviews, scheduled_todo_review_is_current,
 };
 
 use crate::storage;
@@ -99,18 +113,35 @@ pub enum ScheduleTarget {
     Ambient,
     /// Deliver the reminder back into a specific interactive session.
     Session { session_id: String },
+    /// Internal todo review. Validate the exact blocker again before delivery.
+    TodoReview {
+        session_id: String,
+        todo_id: String,
+        blocker: crate::todo::TodoExternalBlocker,
+    },
     /// Spawn a single new session derived from the originating session.
     Spawn { parent_session_id: String },
 }
 
 impl ScheduleTarget {
     pub fn is_direct_delivery(&self) -> bool {
-        matches!(self, Self::Session { .. } | Self::Spawn { .. })
+        matches!(
+            self,
+            Self::Session { .. } | Self::Spawn { .. } | Self::TodoReview { .. }
+        )
     }
 }
 
+/// The maximum number of entries kept live in the ambient scheduled queue.
+///
+/// Entries whose target is `Ambient` are write-only: the runner only claims
+/// direct-delivery entries, so an ambient entry is never removed from the queue
+/// by production code. Without a bound the queue grows monotonically forever
+/// and every ambient cycle renders the whole list into its system prompt.
+pub const AMBIENT_QUEUE_MAX_LIVE_ENTRIES: usize = 50;
+
 /// A scheduled ambient task
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledItem {
     pub id: String,
     pub scheduled_for: DateTime<Utc>,

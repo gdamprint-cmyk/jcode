@@ -52,10 +52,12 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
     let target_id = target.lock().await.session_id().to_string();
     let target_queue = target.lock().await.soft_interrupt_queue();
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([
-        (sender_id.clone(), sender.clone()),
-        (target_id.clone(), target.clone()),
-    ])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (sender_id.clone(), sender.clone()),
+            (target_id.clone(), target.clone()),
+        ]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
 
     let (sender_event_tx, _sender_event_rx) = mpsc::unbounded_channel();
@@ -155,6 +157,8 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
         None,
         None,
         None,
+        None,
+        false,
         &client_event_tx,
         &sessions,
         &soft_interrupt_queues,
@@ -210,10 +214,12 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
     let target_id = target.lock().await.session_id().to_string();
     let target_queue = target.lock().await.soft_interrupt_queue();
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([
-        (sender_id.clone(), sender.clone()),
-        (target_id.clone(), target.clone()),
-    ])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (sender_id.clone(), sender.clone()),
+            (target_id.clone(), target.clone()),
+        ]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     crate::server::register_session_interrupt_queue(
         &soft_interrupt_queues,
@@ -317,6 +323,8 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
             Some(CommDeliveryMode::Wake),
             None,
             None,
+            None,
+            false,
             &client_event_tx,
             &sessions,
             &soft_interrupt_queues,
@@ -437,10 +445,12 @@ async fn comm_list_includes_member_status_and_detail() {
         HashSet::from([requester_id.clone(), peer_id.clone()]),
     )])));
     let file_touch = crate::server::FileTouchService::new();
-    let sessions = Arc::new(RwLock::new(HashMap::from([
-        (requester_id.clone(), requester.clone()),
-        (peer_id.clone(), peer.clone()),
-    ])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (requester_id.clone(), requester.clone()),
+            (peer_id.clone(), peer.clone()),
+        ]),
+    ));
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
 
     handle_comm_list(
@@ -478,10 +488,12 @@ async fn comm_message_accepts_friendly_name_dm_target() {
     let target_id = target.lock().await.session_id().to_string();
     let swarm_id = "swarm-test".to_string();
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([
-        (sender_id.clone(), sender.clone()),
-        (target_id.clone(), target.clone()),
-    ])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (sender_id.clone(), sender.clone()),
+            (target_id.clone(), target.clone()),
+        ]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
 
     let (sender_event_tx, _sender_event_rx) = mpsc::unbounded_channel();
@@ -560,6 +572,8 @@ async fn comm_message_accepts_friendly_name_dm_target() {
         Some(CommDeliveryMode::Notify),
         None,
         None,
+        None,
+        false,
         &client_event_tx,
         &sessions,
         &soft_interrupt_queues,
@@ -611,11 +625,13 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
     let target_two_id = target_two.lock().await.session_id().to_string();
     let swarm_id = "swarm-test".to_string();
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([
-        (sender_id.clone(), sender.clone()),
-        (target_one_id.clone(), target_one.clone()),
-        (target_two_id.clone(), target_two.clone()),
-    ])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (sender_id.clone(), sender.clone()),
+            (target_one_id.clone(), target_one.clone()),
+            (target_two_id.clone(), target_two.clone()),
+        ]),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
 
     let (sender_event_tx, _sender_event_rx) = mpsc::unbounded_channel();
@@ -724,6 +740,8 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
         None,
         None,
         None,
+        None,
+        false,
         &client_event_tx,
         &sessions,
         &soft_interrupt_queues,
@@ -816,7 +834,9 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
             "outsider".to_string(),
         ]),
     )])));
-    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::new(),
+    ));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
     let event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>> =
@@ -835,6 +855,8 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         None,
         None,
+        None,
+        false,
         &client_event_tx,
         &sessions,
         &soft_interrupt_queues,
@@ -876,6 +898,8 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         None,
         None,
         None,
+        None,
+        false,
         &client_event_tx,
         &sessions,
         &soft_interrupt_queues,
@@ -900,4 +924,161 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         child_rx.try_recv(),
         Ok(ServerEvent::Notification { .. })
     ));
+}
+
+/// Cross-swarm DMs: `to_swarm` resolves a label (or id) of another live
+/// swarm. Without `to_session` the DM lands on that swarm's coordinator; with
+/// it, on the named agent. Without `to_swarm`, DMs stay swarm-local.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // serializes tests sharing the global swarm label registry
+async fn comm_message_cross_swarm_dm_by_label() {
+    let _labels_guard = crate::server::swarm_labels::SWARM_LABELS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::server::swarm_labels::reset_swarm_labels_for_test();
+
+    fn member(
+        session_id: &str,
+        role: &str,
+        swarm_id: &str,
+    ) -> (SwarmMember, mpsc::UnboundedReceiver<ServerEvent>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        (
+            SwarmMember {
+                session_id: session_id.to_string(),
+                event_tx,
+                event_txs: HashMap::new(),
+                working_dir: None,
+                swarm_id: Some(swarm_id.to_string()),
+                swarm_enabled: true,
+                status: "ready".to_string(),
+                detail: None,
+                friendly_name: Some(session_id.to_string()),
+                report_back_to_session_id: None,
+                latest_completion_report: None,
+                role: role.to_string(),
+                joined_at: Instant::now(),
+                last_status_change: Instant::now(),
+                is_headless: true,
+                output_tail: None,
+                todo_progress: None,
+                todo_items: Vec::new(),
+                runtime: crate::protocol::SwarmMemberRuntime::default(),
+                task_label: None,
+            },
+            event_rx,
+        )
+    }
+
+    let (alpha, _alpha_rx) = member("alpha", "coordinator", "swarm-a");
+    let (beta_coord, mut beta_coord_rx) = member("beta-coord", "coordinator", "swarm-b");
+    let (beta_worker, mut beta_worker_rx) = member("beta-worker", "agent", "swarm-b");
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        ("alpha".to_string(), alpha),
+        ("beta-coord".to_string(), beta_coord),
+        ("beta-worker".to_string(), beta_worker),
+    ])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([
+        ("swarm-a".to_string(), HashSet::from(["alpha".to_string()])),
+        (
+            "swarm-b".to_string(),
+            HashSet::from(["beta-coord".to_string(), "beta-worker".to_string()]),
+        ),
+    ])));
+    let live: HashSet<String> = ["swarm-a", "swarm-b"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    crate::server::swarm_labels::set_swarm_label("swarm-b", "Backend", &live).unwrap();
+
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::new(),
+    ));
+    let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>> =
+        Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(0));
+    let (swarm_event_tx, _) = broadcast::channel(16);
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    macro_rules! send {
+        ($id:expr, $to_session:expr, $to_swarm:expr) => {
+            handle_comm_message(
+                $id,
+                "alpha".to_string(),
+                "hello from alpha".to_string(),
+                $to_session,
+                None,
+                Some(CommDeliveryMode::Notify),
+                None,
+                None,
+                $to_swarm,
+                false,
+                &client_event_tx,
+                &sessions,
+                &soft_interrupt_queues,
+                &swarm_members,
+                &swarms_by_id,
+                &channel_subscriptions,
+                &event_history,
+                &event_counter,
+                &swarm_event_tx,
+                &client_connections,
+            )
+            .await
+        };
+    }
+
+    // Without to_swarm, a session in another swarm is unreachable.
+    send!(1, Some("beta-worker".to_string()), None);
+    assert!(matches!(
+        client_event_rx.recv().await,
+        Some(ServerEvent::Error { id: 1, .. })
+    ));
+    assert!(beta_worker_rx.try_recv().is_err());
+
+    // Label only: delivered to the other swarm's coordinator.
+    send!(2, None, Some("backend".to_string()));
+    assert!(matches!(
+        client_event_rx.recv().await,
+        Some(ServerEvent::Done { id: 2 })
+    ));
+    match beta_coord_rx.try_recv() {
+        Ok(ServerEvent::Notification {
+            message,
+            notification_type: NotificationType::Message { scope, .. },
+            ..
+        }) => {
+            assert_eq!(scope.as_deref(), Some("dm"));
+            assert!(message.starts_with("Cross-swarm DM from alpha (swarm 'swarm-a')"));
+        }
+        other => panic!("expected cross-swarm DM, got {other:?}"),
+    }
+    assert!(beta_worker_rx.try_recv().is_err());
+
+    // Label + friendly name: delivered to that agent.
+    send!(
+        3,
+        Some("beta-worker".to_string()),
+        Some("swarm-b".to_string())
+    );
+    assert!(matches!(
+        client_event_rx.recv().await,
+        Some(ServerEvent::Done { id: 3 })
+    ));
+    assert!(matches!(
+        beta_worker_rx.try_recv(),
+        Ok(ServerEvent::Notification { .. })
+    ));
+
+    // Unknown swarm label is rejected.
+    send!(4, None, Some("nope".to_string()));
+    assert!(matches!(
+        client_event_rx.recv().await,
+        Some(ServerEvent::Error { id: 4, .. })
+    ));
+
+    crate::server::swarm_labels::reset_swarm_labels_for_test();
 }

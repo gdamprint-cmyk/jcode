@@ -1,21 +1,12 @@
+use super::response_recovery::MalformedToolCallInfo;
+use super::streaming::StreamUsageRecorder;
 use super::*;
 use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_println as println};
 
-impl Agent {
-    /// Speculatively prewarm the provider while a newly created session is idle.
-    ///
-    /// This deliberately bypasses `tool_definitions`, whose cache lock is only
-    /// appropriate once an actual turn starts. Late MCP registration or user
-    /// customization can therefore still change the foreground tool snapshot;
-    /// the provider is responsible for discarding an incompatible warmup.
-    pub(crate) async fn prewarm_provider_idle(&self) {
-        let tools = self.tool_definitions_for_debug().await;
-        let split_prompt = self.build_system_prompt_split(None);
-        self.provider
-            .prewarm(&tools, &split_prompt.static_part)
-            .await;
-    }
+#[path = "provider_prewarm.rs"]
+mod provider_prewarm;
 
+impl Agent {
     /// Run turns until no more tool calls
     /// Maximum number of context-limit compaction retries before giving up.
     pub(super) const MAX_CONTEXT_LIMIT_RETRIES: u32 = 5;
@@ -29,7 +20,6 @@ impl Agent {
     pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
-
     fn update_sequential_tool_rounds(current: u32, tool_count: usize, used_batch: bool) -> u32 {
         if tool_count == 1 && !used_batch {
             current.saturating_add(1)
@@ -46,11 +36,14 @@ impl Agent {
         notice: &crate::subscription_notice::QuotaExceeded,
     ) -> String {
         format!(
-            "<system-reminder>Jcode plan limit: {notice} Briefly tell the user this in your reply, including the upgrade link if one is given. Do not open checkout or purchase anything. Continue the task without that feature.</system-reminder>"
+            "<system-reminder>Jcode plan limit: {notice} An upgrade card with a button is already shown to the user in the chat. Mention the limit in one short sentence, including the upgrade link if one is given. Do not open checkout or purchase anything. Continue the task without that feature.</system-reminder>"
         )
     }
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
+        self.ensure_session_lease()?;
         self.set_log_context();
         let usage_turn_id = self.model_usage_turn_id();
         crate::session_metrics::record_turn(&self.session.id);
@@ -71,6 +64,10 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
+        let mut consecutive_malformed_tool_rounds = 0u32;
+        // Bounded budget for re-issuing a request after a transient stream
+        // error. Reset whenever a request completes normally.
+        let mut stream_error_retries = 0u32;
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -78,6 +75,12 @@ impl Agent {
             // (issue #732, regression of #428).
             if self.is_graceful_shutdown() {
                 logging::info("Cancel observed at turn-loop head - not starting another request");
+                break;
+            }
+            if let Some(block) = self.session.migration_lease_block() {
+                logging::info(&format!(
+                    "Session migrated mid-turn - stopping local turn loop: {block}"
+                ));
                 break;
             }
             let repaired = self.repair_missing_tool_outputs();
@@ -99,6 +102,7 @@ impl Agent {
             if let Some(event) = compaction_event {
                 // Reset cache tracker and tool lock on compaction since the message history changes
                 self.cache_tracker.reset();
+                self.kv_cache_monitor.reset();
                 self.locked_tools = None;
                 if print_output {
                     let tokens_str = event
@@ -158,7 +162,14 @@ impl Agent {
             // Background features (memory recall) can hit a plan limit with no
             // visible failure. Surface it once through the agent so every UI
             // shows the upgrade prompt instead of silently degrading.
-            if let Some(notice) = crate::subscription_notice::take() {
+            // Agents without memory (auth smoke tests, headless probes) leave
+            // the notice for a user-facing session.
+            if let Some(notice) = self
+                .memory_enabled
+                .then(crate::subscription_notice::take)
+                .flatten()
+            {
+                crate::subscription_notice::show_upgrade_card(&notice, &self.session.id);
                 messages_with_memory.push(Message::user(&Self::plan_limit_reminder(&notice)));
             }
 
@@ -183,7 +194,8 @@ impl Agent {
             let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
-            let mut stream = match self
+            self.provider.set_session_id(&self.session.id);
+            let completion = self
                 .provider
                 .complete_split(
                     send_messages,
@@ -192,10 +204,12 @@ impl Agent {
                     &split_prompt.dynamic_part,
                     self.provider_session_id.as_deref(),
                 )
-                .await
-            {
+                .await;
+            self.sync_bound_account_route();
+            let mut stream = match completion {
                 Ok(stream) => stream,
                 Err(e) => {
+                    self.record_failed_account_route(&e.to_string());
                     if self.try_auto_compact_after_context_limit(&e.to_string()) {
                         context_limit_retries += 1;
                         if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
@@ -251,6 +265,7 @@ impl Agent {
             let mut usage_output: Option<u64> = None;
             let mut usage_cache_read: Option<u64> = None;
             let mut usage_cache_creation: Option<u64> = None;
+            let mut usage_recorder = StreamUsageRecorder::new(&self.session.id);
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
             let mut _thinking_start: Option<Instant> = None;
@@ -260,17 +275,24 @@ impl Agent {
             let mut reasoning_content = String::new();
             let mut reasoning_signature = String::new();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
+            // Provider-executed tool items (e.g. native web search), stored
+            // verbatim at their position in the response for exact replay.
+            let mut provider_native_items =
+                jcode_message_types::provider_native::ProviderNativeItems::default();
             // Track tool results from provider (already executed by Claude Code CLI)
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
             let mut retry_after_compaction = false;
+            let mut retry_after_stream_error = false;
             while let Some(event) = stream.next().await {
                 let event = match event {
                     Ok(event) => event,
                     Err(e) => {
                         let err_str = e.to_string();
+                        self.record_failed_account_route(&err_str);
+                        usage_recorder.finish();
                         if self.try_auto_compact_after_context_limit(&err_str) {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
@@ -297,6 +319,28 @@ impl Agent {
                                 ));
                             }
                             retry_after_compaction = true;
+                            break;
+                        }
+                        // A transport-level failure is transient by
+                        // definition: the request never produced an answer.
+                        // Re-issue it, bounded, instead of ending the turn.
+                        if super::response_recovery::is_transient_stream_error(&err_str)
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "blocking".to_string()),
+                                    ("error", err_str.clone()),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
+                                ],
+                            );
                             break;
                         }
                         log_agent_provider_stream_lifecycle(
@@ -350,6 +394,19 @@ impl Agent {
                             io::stdout().flush()?;
                         }
                         text_content.push_str(&text);
+                    }
+                    StreamEvent::TextSuffixReplace { old_text, new_text } => {
+                        if provider_native_items.replace_text_suffix(
+                            &mut text_content,
+                            &old_text,
+                            &new_text,
+                        ) && print_output
+                        {
+                            // Plain stdout cannot retract already printed deltas.
+                            // Still surface the real source links to CLI users.
+                            crate::terminal_print!("\n{}", new_text);
+                            io::stdout().flush()?;
+                        }
                     }
                     StreamEvent::ToolUseStart { id, name } => {
                         if streaming_tools.contains_key(&id)
@@ -525,6 +582,16 @@ impl Agent {
                         if cache_creation_input_tokens.is_some() {
                             usage_cache_creation = cache_creation_input_tokens;
                         }
+                        usage_recorder.observe(
+                            self.provider.name(),
+                            &self.provider.model(),
+                            [
+                                usage_input,
+                                usage_output,
+                                usage_cache_read,
+                                usage_cache_creation,
+                            ],
+                        );
                         if let Some(input) = usage_input {
                             self.update_compaction_usage_from_stream(
                                 input,
@@ -560,6 +627,11 @@ impl Agent {
                         }
                         self.last_status_detail = Some(detail);
                     }
+                    StreamEvent::ServiceTier { tier, .. } => {
+                        if trace {
+                            eprintln!("[trace] provider_service_tier={tier}");
+                        }
+                    }
                     StreamEvent::RetryRollback { attempt, max } => {
                         // Transient transport fault mid-stream; the provider is
                         // replaying the request. Discard this attempt's partial
@@ -586,9 +658,29 @@ impl Agent {
                         reasoning_content.clear();
                         reasoning_signature.clear();
                         openai_reasoning_items.clear();
+                        provider_native_items.clear();
                         openai_native_compaction = None;
                         saw_message_end = false;
                         stop_reason = None;
+                    }
+                    StreamEvent::ProviderNative { provider, item } => {
+                        if print_output
+                            && let Some(display) =
+                                jcode_message_types::provider_native::provider_native_display(
+                                    &provider, &item,
+                                )
+                        {
+                            match display.output {
+                                None => print!("\n[{}] ", display.name),
+                                Some(output) => println!(
+                                    "\n[{}] {}",
+                                    display.name,
+                                    crate::util::truncate_str(&output, 200)
+                                ),
+                            }
+                            io::stdout().flush()?;
+                        }
+                        provider_native_items.push(text_content.len(), provider, item);
                     }
                     StreamEvent::TextDone => {}
                     StreamEvent::MessageEnd {
@@ -676,10 +768,13 @@ impl Agent {
                             execution_mode: ToolExecutionMode::AgentTurn,
                         };
                         crate::telemetry::record_tool_call();
-                        let tool_result = self
-                            .registry
-                            .execute(&tool_name, ToolCall::normalize_input_to_object(input), ctx)
-                            .await;
+                        let tool_result = super::turn_streaming_mpsc::execute_with_background(
+                            self.registry.clone(),
+                            tool_name.clone(),
+                            ToolCall::normalize_input_to_object(input),
+                            ctx,
+                        )
+                        .await;
                         if tool_result.is_err() {
                             crate::telemetry::record_tool_failure();
                         }
@@ -699,6 +794,7 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] stream_error {}", message);
                         }
+                        usage_recorder.finish();
                         if self.try_auto_compact_after_context_limit(&message) {
                             log_agent_provider_stream_lifecycle(
                                 logging::LogLevel::Warn,
@@ -727,6 +823,28 @@ impl Agent {
                             retry_after_compaction = true;
                             break;
                         }
+                        // A transient stream error must not kill the turn: the
+                        // provider failed mid-stream, so the request never
+                        // produced an answer. Re-issue it, bounded.
+                        if super::response_recovery::is_transient_stream_error(&message)
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "blocking".to_string()),
+                                    ("error", message.clone()),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
+                                ],
+                            );
+                            break;
+                        }
                         log_agent_provider_stream_lifecycle(
                             logging::LogLevel::Error,
                             self,
@@ -748,6 +866,16 @@ impl Agent {
                 }
             }
 
+            usage_recorder.finish();
+            if retry_after_stream_error {
+                // The request failed mid-stream and produced no answer: drop
+                // the partial turn and re-issue the request from the same
+                // transcript.
+                continue;
+            }
+            // The request completed normally: the budget is refreshed so a
+            // later request in the same turn gets its own retries.
+            stream_error_retries = 0;
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
                     logging::LogLevel::Info,
@@ -794,6 +922,15 @@ impl Agent {
                     usage_cache_read,
                     usage_cache_creation,
                 );
+                let output = usage_output.unwrap_or(0);
+                let total = self
+                    .effective_context_tokens_from_usage(
+                        usage_input.unwrap_or(0),
+                        usage_cache_read,
+                        usage_cache_creation,
+                    )
+                    .saturating_add(output);
+                crate::session_metrics::record_token_usage(&self.session.id, total, output);
             }
 
             if print_output
@@ -829,8 +966,6 @@ impl Agent {
                 cache_creation_input_tokens: usage_cache_creation,
             };
 
-            self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
-
             let visible_text_is_empty = text_content.trim().is_empty();
 
             // Add assistant message to history. Avoid persisting whitespace-only text as a
@@ -838,7 +973,9 @@ impl Agent {
             // cleanly with only spaces despite non-zero output tokens. Persisting that makes the
             // UI look like the agent stopped after tools with no explanation.
             let mut content_blocks = Vec::new();
-            if !text_content.is_empty() && !visible_text_is_empty {
+            if !provider_native_items.is_empty() {
+                content_blocks.extend(provider_native_items.interleave(&text_content));
+            } else if !text_content.is_empty() && !visible_text_is_empty {
                 content_blocks.push(ContentBlock::Text {
                     text: text_content.clone(),
                     cache_control: None,
@@ -882,7 +1019,7 @@ impl Agent {
             };
 
             if let Some((encrypted_content, compacted_count)) = openai_native_compaction.take() {
-                self.apply_openai_native_compaction(encrypted_content, compacted_count)?;
+                let _ = self.apply_openai_native_compaction(encrypted_content, compacted_count)?;
             }
 
             // If stop_reason indicates truncation (e.g. max_tokens), discard tool calls
@@ -990,6 +1127,13 @@ impl Agent {
             }
 
             // Execute tools and add results
+            // Track the tool calls so the memory pipeline can refresh on a
+            // tool-call cadence. MEASURED 2026-11-04: the agent works for hours
+            // with no user message, and a recall gated on a user turn never
+            // arrives during that work.
+            crate::memory::note_tool_calls(&self.session.id, tool_calls.len());
+            let mut malformed_calls: Vec<MalformedToolCallInfo> = Vec::new();
+            let mut executed_valid_call = false;
             let mut tool_results_dirty = false;
             for tc in tool_calls {
                 let message_id = assistant_message_id
@@ -997,6 +1141,10 @@ impl Agent {
                     .unwrap_or_else(|| self.session.id.clone());
 
                 if let Some(error_msg) = tc.validation_error() {
+                    malformed_calls.push(MalformedToolCallInfo {
+                        name: tc.name.clone(),
+                        error: error_msg.clone(),
+                    });
                     logging::warn(&error_msg);
                     Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                         session_id: self.session.id.clone(),
@@ -1022,6 +1170,10 @@ impl Agent {
                     continue;
                 }
 
+                // A call that passed validation is genuinely valid even if
+                // the tool itself later fails: it resets the malformed-round
+                // bound in handle_malformed_tool_round below.
+                executed_valid_call = true;
                 self.validate_tool_allowed(&tc.name)?;
 
                 let is_native_tool = JCODE_NATIVE_TOOLS.contains(&tc.name.as_str());
@@ -1120,7 +1272,13 @@ impl Agent {
                     model: Some(self.provider.model()),
                 }));
 
-                let result = self.registry.execute(&tc.name, tc.input.clone(), ctx).await;
+                let result = super::turn_streaming_mpsc::execute_with_background(
+                    self.registry.clone(),
+                    tc.name.clone(),
+                    tc.input.clone(),
+                    ctx,
+                )
+                .await;
                 crate::telemetry::record_tool_call();
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
@@ -1213,6 +1371,17 @@ impl Agent {
                 self.session.save()?;
             }
 
+            // Bounded recovery for repeated malformed tool calls (e.g. a
+            // model emitting null arguments): correct with the expected
+            // schema, then end the turn with an actionable error instead of
+            // retrying the same malformed round forever.
+            self.handle_malformed_tool_round(
+                &malformed_calls,
+                executed_valid_call,
+                &mut consecutive_malformed_tool_rounds,
+                &tools,
+            )?;
+
             if print_output {
                 println!();
             }
@@ -1231,124 +1400,8 @@ impl Agent {
 
         Ok(final_text)
     }
-
-    pub(super) fn messages_end_with_tool_result(messages: &[Message]) -> bool {
-        messages.iter().rev().any(|message| {
-            if !matches!(message.role, Role::User) {
-                return false;
-            }
-            if message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-            {
-                return true;
-            }
-            message.content.iter().any(|block| match block {
-                ContentBlock::Text { text, .. } => text.trim().starts_with("<system-reminder>"),
-                _ => false,
-            })
-        })
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn user_text(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-    fn tool_result(id: &str, content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-                is_error: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: Some(1),
-        }
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_detects_tool_continuation_context() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            tool_result("functions.agentgrep:4", "desktop source summary"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_allows_memory_after_tool_results() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            user_text("<system-reminder>Relevant memory</system-reminder>"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_ignores_plain_user_prompt() {
-        let messages = vec![user_text("hello")];
-
-        assert!(!Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn sequential_tool_rounds_trigger_after_three_single_calls() {
-        let mut rounds = 0;
-        for _ in 0..3 {
-            rounds = Agent::update_sequential_tool_rounds(rounds, 1, false);
-        }
-
-        assert_eq!(rounds, Agent::SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE);
-    }
-
-    #[test]
-    fn parallel_or_batch_calls_reset_sequential_tool_rounds() {
-        assert_eq!(Agent::update_sequential_tool_rounds(2, 2, false), 0);
-        assert_eq!(Agent::update_sequential_tool_rounds(2, 1, true), 0);
-        assert_eq!(Agent::update_sequential_tool_rounds(2, 0, false), 0);
-    }
-
-    #[test]
-    fn pending_nudge_is_injected_only_when_batch_is_available() {
-        assert!(Agent::should_inject_batch_nudge(true, true));
-        assert!(!Agent::should_inject_batch_nudge(false, true));
-        assert!(!Agent::should_inject_batch_nudge(true, false));
-        assert!(Agent::BATCH_NUDGE.contains("use the batch tool"));
-        assert!(Agent::BATCH_NUDGE.contains("result is required"));
-    }
-
-    #[test]
-    fn plan_limit_reminder_relays_upgrade_link_without_purchasing() {
-        let reminder = Agent::plan_limit_reminder(&crate::subscription_notice::QuotaExceeded {
-            feature: "memory".into(),
-            tier: Some("plus".into()),
-            upgrade_tier: Some("pro".into()),
-            upgrade_url: Some("https://jcode.sh/pricing".into()),
-            resets_at: None,
-        });
-        assert!(reminder.starts_with("<system-reminder>"));
-        assert!(reminder.contains("Daily memory recall limit reached on your Plus plan"));
-        assert!(reminder.contains("Upgrade to Pro"));
-        assert!(reminder.contains("https://jcode.sh/pricing"));
-        assert!(reminder.contains("Do not open checkout"));
-    }
-}
+#[path = "turn_loops_tests.rs"]
+mod tests;

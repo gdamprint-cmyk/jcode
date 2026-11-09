@@ -47,8 +47,11 @@ impl AmbientManager {
     }
 
     pub fn record_cycle_result(&mut self, result: AmbientCycleResult) -> Result<()> {
-        self.state.record_cycle(&result);
-        self.state.save()?;
+        // NOTE: this method deliberately does NOT persist `state.json`.
+        // The ambient runner is the single writer of the ambient state: it
+        // records the cycle and saves exactly once, when the cycle completes.
+        // Persisting here as well incremented `total_cycles` twice per cycle
+        // and published a transient overcount on disk (measured 2026-11-04).
 
         // If the cycle produced a schedule request, enqueue it
         if let Some(ref req) = result.next_schedule {
@@ -71,12 +74,26 @@ impl AmbientManager {
 
     /// Add a schedule request to the queue. Returns the item ID.
     pub fn schedule(&mut self, request: ScheduleRequest) -> Result<String> {
-        let id = format!("sched_{:08x}", rand::random::<u32>());
+        let item = Self::scheduled_item(request);
+        let id = item.id.clone();
+        self.queue.try_push(item)?;
+        Ok(id)
+    }
+
+    pub(super) fn transact_queue<T>(
+        &mut self,
+        update: impl FnOnce(&mut Vec<ScheduledItem>) -> Result<T>,
+    ) -> Result<T> {
+        self.queue.transact(update)
+    }
+
+    pub(super) fn scheduled_item(request: ScheduleRequest) -> ScheduledItem {
+        let id = format!("sched_{:032x}", rand::random::<u128>());
         let scheduled_for = request.wake_at.unwrap_or_else(|| {
             Utc::now() + chrono::Duration::minutes(request.wake_in_minutes.unwrap_or(30) as i64)
         });
 
-        let item = ScheduledItem {
+        ScheduledItem {
             id: id.clone(),
             scheduled_for,
             context: request.context,
@@ -89,10 +106,7 @@ impl AmbientManager {
             relevant_files: request.relevant_files,
             git_branch: request.git_branch,
             additional_context: request.additional_context,
-        };
-
-        self.queue.push(item);
-        Ok(id)
+        }
     }
 
     /// Cancel a queued scheduled item by ID.

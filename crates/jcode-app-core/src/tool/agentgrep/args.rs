@@ -61,6 +61,8 @@ pub(super) fn build_grep_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
         paths_only: params.paths_only.unwrap_or(false),
         hidden: params.hidden.unwrap_or(false),
         no_ignore: params.no_ignore.unwrap_or(false),
+        // Keep following symlinks (pre-v0.1.7 behavior); the guardrail is opt-in.
+        no_follow: false,
         path: scope.root,
         glob: scope.glob,
     })
@@ -93,6 +95,8 @@ pub(super) fn build_find_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
         max_files: params.max_files.unwrap_or(10),
         hidden: params.hidden.unwrap_or(false),
         no_ignore: params.no_ignore.unwrap_or(false),
+        // Keep following symlinks (pre-v0.1.7 behavior); the guardrail is opt-in.
+        no_follow: false,
         path: scope.root,
         glob: scope.glob,
     })
@@ -232,9 +236,22 @@ fn resolved_root_string(ctx: &ToolContext, path: Option<&str>) -> Option<String>
 }
 
 pub(super) fn resolve_search_root(ctx: &ToolContext, path: Option<&str>) -> Result<PathBuf> {
-    path.map(PathBuf::from)
+    let root = path
+        .map(PathBuf::from)
         .or_else(|| ctx.working_dir.clone())
-        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))
+        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))?;
+    // The search root must be an existing DIRECTORY: the agentgrep crate runs
+    // ripgrep with `current_dir(root)`, so a root that does not exist (or that
+    // is a file) fails with the raw OS error 267 ("Неверно задано имя папки" =
+    // "the directory name is invalid"), which reads like a broken tool rather
+    // than a bad argument.
+    if !root.is_dir() {
+        return Err(anyhow::anyhow!(
+            "agentgrep search path does not exist or is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
 }
 
 pub(super) fn summarize_agentgrep_request(

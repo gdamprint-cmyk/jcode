@@ -1,6 +1,15 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-dead-letter-fix.md (measured write-only ambient queue: the prompt collapses the never-delivered ambient entries instead of rendering every one in full)
 use chrono::{DateTime, Utc};
 
 use super::{AmbientState, Priority, ScheduleTarget, ScheduledItem, take_pending_directives};
+
+/// How many of the newest ambient entries are rendered in full in the ambient
+/// system prompt. Older ones are collapsed into a bounded summary block.
+pub const AMBIENT_PROMPT_FULL_ENTRIES: usize = 5;
+
+/// How many characters of the context each collapsed ambient entry contributes
+/// to the ambient system prompt.
+pub const AMBIENT_PROMPT_COLLAPSED_CHARS: usize = 240;
 
 // ---------------------------------------------------------------------------
 // Ambient System Prompt Builder
@@ -322,7 +331,23 @@ pub fn build_ambient_system_prompt(
     if queue.is_empty() {
         prompt.push_str("Empty -- do general ambient work.\n");
     } else {
-        for item in queue {
+        // Ambient-target entries are write-only: the runner only claims
+        // direct-delivery entries, so an ambient entry is never removed from
+        // the queue and the list grows without bound. Rendering one full block
+        // per entry therefore inflates every cycle's system prompt. Render the
+        // newest few ambient entries in full and collapse the rest into one
+        // bounded summary block whose full text stays readable on disk.
+        let (mut ambient, direct): (Vec<&ScheduledItem>, Vec<&ScheduledItem>) = queue
+            .iter()
+            .partition(|item| !item.target.is_direct_delivery());
+        ambient.sort_by_key(|item| item.scheduled_for);
+        let split_at = ambient.len().saturating_sub(AMBIENT_PROMPT_FULL_ENTRIES);
+        let (collapsed, ambient_full) = ambient.split_at(split_at);
+        let rendered: Vec<&ScheduledItem> = direct
+            .into_iter()
+            .chain(ambient_full.iter().copied())
+            .collect();
+        for item in rendered {
             let age = Utc::now() - item.created_at;
             let priority = match item.priority {
                 Priority::Low => "low",
@@ -340,6 +365,15 @@ pub fn build_ambient_system_prompt(
                 ScheduleTarget::Ambient => {}
                 ScheduleTarget::Session { session_id } => {
                     prompt.push_str(&format!("  Target session: {}\n", session_id));
+                }
+                ScheduleTarget::TodoReview {
+                    session_id,
+                    todo_id,
+                    ..
+                } => {
+                    prompt.push_str(&format!(
+                        "  Review todo {todo_id} in session: {session_id}\n"
+                    ));
                 }
                 ScheduleTarget::Spawn { parent_session_id } => {
                     prompt.push_str(&format!("  Spawn from session: {}\n", parent_session_id));
@@ -361,6 +395,35 @@ pub fn build_ambient_system_prompt(
                 for line in ctx.lines() {
                     prompt.push_str(&format!("  {}\n", line));
                 }
+            }
+        }
+
+        if !collapsed.is_empty() {
+            prompt.push_str(&format!(
+                "- ({} older ambient entr{} collapsed into one summary; full text stays on disk in ~/.jcode/ambient/queue.json and queue_archive.jsonl)\n",
+                collapsed.len(),
+                if collapsed.len() == 1 { "y" } else { "ies" },
+            ));
+            for item in collapsed.iter().copied() {
+                let age = Utc::now() - item.created_at;
+                let priority = match item.priority {
+                    Priority::Low => "low",
+                    Priority::Normal => "normal",
+                    Priority::High => "HIGH",
+                };
+                let summary: String = item
+                    .context
+                    .replace('\n', " ")
+                    .chars()
+                    .take(AMBIENT_PROMPT_COLLAPSED_CHARS)
+                    .collect();
+                prompt.push_str(&format!(
+                    "  [{}] {} (scheduled {} ago, priority: {})\n",
+                    item.id,
+                    summary,
+                    format_duration_rough(age),
+                    priority,
+                ));
             }
         }
     }
@@ -521,6 +584,9 @@ pub fn build_ambient_system_prompt(
 }
 
 pub fn format_scheduled_session_message(item: &ScheduledItem) -> String {
+    if matches!(item.target, ScheduleTarget::TodoReview { .. }) {
+        return item.context.clone();
+    }
     let mut lines = vec![
         "[Scheduled task]".to_string(),
         "A scheduled task for this session is now due.".to_string(),

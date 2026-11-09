@@ -30,168 +30,6 @@ fn test_session_exists_roundtrip() -> Result<()> {
 }
 
 #[test]
-fn derive_session_provider_key_prefers_runtime_identity_over_transport() {
-    let _lock = lock_env();
-    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "azure-openai");
-    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "azure-cache");
-    let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
-
-    assert_eq!(
-        derive_session_provider_key("openrouter").as_deref(),
-        Some("azure-openai")
-    );
-}
-
-#[test]
-fn derive_session_provider_key_falls_back_to_openrouter_namespace() {
-    let _lock = lock_env();
-    let _runtime = EnvVarGuard::remove("JCODE_RUNTIME_PROVIDER");
-    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "azure-openai");
-    let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
-
-    assert_eq!(
-        derive_session_provider_key("openrouter").as_deref(),
-        Some("azure-openai")
-    );
-}
-
-#[test]
-fn derive_session_provider_key_keeps_openai_compatible_profile_namespace() {
-    let _lock = lock_env();
-    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "openai-compatible");
-    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "zai");
-    let _active = EnvVarGuard::set("JCODE_ACTIVE_PROVIDER", "openrouter");
-
-    assert_eq!(
-        derive_session_provider_key("openrouter").as_deref(),
-        Some("zai")
-    );
-}
-
-#[test]
-fn save_label_becomes_the_session_title() {
-    let mut session = Session::create_with_id(
-        "session_save_label_123".to_string(),
-        None,
-        Some("Generated title".to_string()),
-    );
-    session.mark_saved(None);
-    assert_eq!(session.display_title(), Some("Generated title"));
-
-    session.mark_saved(Some("  yc mcp  ".to_string()));
-    assert_eq!(session.save_label.as_deref(), Some("yc mcp"));
-    assert_eq!(session.custom_title.as_deref(), Some("yc mcp"));
-    assert_eq!(session.display_title(), Some("yc mcp"));
-
-    // Legacy bookmarks saved a label without setting the title.
-    session.custom_title = None;
-    assert_eq!(session.display_title(), Some("yc mcp"));
-    session.unmark_saved();
-    assert_eq!(session.display_title(), Some("Generated title"));
-}
-
-#[test]
-fn rename_title_preserves_generated_title_for_clear() {
-    let mut session = Session::create_with_id(
-        "session_rename_clear_123".to_string(),
-        None,
-        Some("Generated first prompt title".to_string()),
-    );
-
-    assert_eq!(
-        session.display_title(),
-        Some("Generated first prompt title")
-    );
-    session.rename_title(Some("Custom planning name".to_string()));
-    assert_eq!(
-        session.title.as_deref(),
-        Some("Generated first prompt title")
-    );
-    assert_eq!(
-        session.custom_title.as_deref(),
-        Some("Custom planning name")
-    );
-    assert_eq!(session.display_title(), Some("Custom planning name"));
-
-    session.rename_title(None);
-    assert_eq!(
-        session.title.as_deref(),
-        Some("Generated first prompt title")
-    );
-    assert!(session.custom_title.is_none());
-    assert_eq!(
-        session.display_title(),
-        Some("Generated first prompt title")
-    );
-
-    session.custom_title = Some("   ".to_string());
-    assert_eq!(
-        session.display_title(),
-        Some("Generated first prompt title")
-    );
-}
-
-#[test]
-fn test_debug_memory_profile_reports_messages_and_provider_cache() {
-    let mut session = Session::create_with_id(
-        "session_memory_profile_test".to_string(),
-        None,
-        Some("Memory profile".to_string()),
-    );
-    session.add_message(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "hello world".to_string(),
-            cache_control: None,
-        }],
-    );
-    session.add_message(
-        Role::Assistant,
-        vec![
-            ContentBlock::ToolUse {
-                id: "tool_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "echo hi"}),
-                thought_signature: None,
-            },
-            ContentBlock::ToolResult {
-                tool_use_id: "tool_1".to_string(),
-                content: "hi".to_string(),
-                is_error: None,
-            },
-        ],
-    );
-
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "summary".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 7,
-        original_turn_count: 9,
-        compacted_count: 7,
-    });
-
-    let _ = session.provider_messages();
-    let profile = session.debug_memory_profile();
-
-    assert_eq!(profile["messages"]["count"], 2);
-    assert_eq!(profile["messages"]["memory"]["text_blocks"], 1);
-    assert_eq!(profile["messages"]["memory"]["tool_use_blocks"], 1);
-    assert_eq!(profile["messages"]["memory"]["tool_result_blocks"], 1);
-    assert!(profile["messages"]["json_bytes"].as_u64().unwrap_or(0) > 0);
-    assert_eq!(profile["provider_messages_cache"]["count"], 2);
-    assert_eq!(profile["compaction"]["present"], true);
-    assert_eq!(profile["compaction"]["covers_up_to_turn"], 7);
-    assert_eq!(profile["compaction"]["original_turn_count"], 9);
-    assert_eq!(profile["compaction"]["compacted_count"], 7);
-    assert!(
-        profile["provider_messages_cache"]["json_bytes"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0
-    );
-}
-
-#[test]
 fn released_provider_message_cache_rebuilds_from_canonical_history() {
     let mut session = Session::create_with_id(
         "session_provider_cache_release_test".to_string(),
@@ -930,6 +768,103 @@ fn test_save_persists_reasoning_effort() -> Result<()> {
 }
 
 #[test]
+fn context_cap_survives_snapshot_journal_and_startup_loaders() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "session_context_cap_persist_test";
+    let mut session = Session::create_with_id(id.into(), None, Some("cap test".into()));
+    session.context_cap = Some(40_000);
+    // Large metadata changes use the journal rather than rewriting a snapshot.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "x".repeat(2 * 1024 * 1024),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    let assert_loaders = |cap| -> Result<()> {
+        assert_eq!(Session::load(id)?.context_cap, cap);
+        assert_eq!(Session::load_startup_stub(id)?.context_cap, cap);
+        assert_eq!(Session::load_for_remote_startup(id)?.context_cap, cap);
+        Ok(())
+    };
+    assert_loaders(Some(40_000))?;
+    session.context_cap = Some(80_000);
+    session.save()?;
+    assert!(session_journal_path(id)?.exists());
+    assert_loaders(Some(80_000))?;
+    session.context_cap = None;
+    session.save()?;
+    assert_loaders(None)?;
+    // Force a full snapshot after clearing the override.
+    session.replace_messages(session.messages.clone());
+    session.save()?;
+    assert_loaders(None)?;
+    Ok(())
+}
+
+#[test]
+fn original_working_dir_survives_snapshot_journal_and_startup_loaders() -> Result<()> {
+    let _env_lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().as_os_str());
+    let id = "session_original_working_dir_test";
+    let mut session = Session::create_with_id(id.into(), None, None);
+    session.working_dir = Some("/projects/start".into());
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "x".repeat(2 * 1024 * 1024),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    session.original_working_dir = session.working_dir.clone();
+    session.working_dir = Some("/projects/current".into());
+    session.save()?;
+    assert!(session_journal_path(id)?.exists());
+    for loaded in [
+        Session::load(id)?,
+        Session::load_startup_stub(id)?,
+        Session::load_for_remote_startup(id)?,
+    ] {
+        assert_eq!(
+            loaded.original_working_dir.as_deref(),
+            Some("/projects/start")
+        );
+        assert_eq!(loaded.working_dir.as_deref(), Some("/projects/current"));
+    }
+    Ok(())
+}
+
+#[test]
+fn context_cap_missing_is_backward_compatible_for_all_snapshot_types() -> Result<()> {
+    let session = Session::create_with_id("session_context_cap_legacy".into(), None, None);
+    let value = serde_json::to_value(&session)?;
+    assert!(value.get("context_cap").is_none());
+    assert_eq!(
+        serde_json::from_value::<Session>(value.clone())?.context_cap,
+        None
+    );
+    let stub = serde_json::from_value::<SessionStartupStub>(value.clone())?;
+    assert_eq!(Session::session_from_startup_stub(stub).context_cap, None);
+    let snapshot = serde_json::from_value::<RemoteStartupSessionSnapshot>(value)?;
+    assert_eq!(
+        Session::session_from_remote_startup_snapshot(snapshot).context_cap,
+        None
+    );
+    let mut meta = serde_json::to_value(session.journal_meta())?;
+    meta.as_object_mut().unwrap().remove("context_cap");
+    assert_eq!(
+        serde_json::from_value::<SessionJournalMeta>(meta)?.context_cap,
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn test_save_appends_journal_and_load_replays_it() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()
@@ -1084,6 +1019,111 @@ fn test_journal_replay_skips_corrupt_line_and_keeps_tail() -> Result<()> {
     let remote = Session::load_for_remote_startup(session_id)?;
     assert_eq!(remote.messages.len(), 2);
     assert_eq!(remote.messages[1].content_preview(), "third");
+    Ok(())
+}
+
+fn text_block(text: &str) -> ContentBlock {
+    ContentBlock::Text {
+        text: text.to_string(),
+        cache_control: None,
+    }
+}
+
+/// #1632: a process killed between writing the checkpoint snapshot and
+/// deleting the journal must not duplicate the journaled messages on the next
+/// load, and later genuinely-new journal entries must still replay.
+#[test]
+fn test_interrupted_checkpoint_does_not_duplicate_journal_messages() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-interrupted-checkpoint-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_interrupted_checkpoint_test";
+    let mut session = Session::create_with_id(session_id.to_string(), None, Some("t".into()));
+    session.add_message(Role::User, vec![text_block("start")]);
+    session.save()?;
+
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }],
+    );
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".into(),
+            content: "ok".into(),
+            is_error: None,
+        }],
+    );
+    session.save()?;
+
+    let journal_path = session_journal_path(session_id)?;
+    let stale_journal = std::fs::read_to_string(&journal_path)?;
+    assert_eq!(stale_journal.lines().count(), 2);
+
+    // Checkpoint, then put the journal back as if the delete never happened.
+    session.mark_messages_full_dirty();
+    session.save()?;
+    assert!(!journal_path.exists());
+    std::fs::write(&journal_path, &stale_journal)?;
+
+    let loaded = Session::load(session_id)?;
+    assert_eq!(
+        loaded.messages.len(),
+        3,
+        "journal replay duplicated messages"
+    );
+    let remote = Session::load_for_remote_startup(session_id)?;
+    assert_eq!(remote.messages.len(), 3);
+
+    // A genuinely new entry after the stale prefix still replays.
+    let mut resumed = loaded;
+    resumed.add_message(Role::Assistant, vec![text_block("after restart")]);
+    resumed.save()?;
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.messages.len(), 4);
+    assert_eq!(reloaded.messages[3].content_preview(), "after restart");
+    let mut ids: Vec<_> = reloaded.messages.iter().map(|m| m.id.clone()).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), 4);
+    Ok(())
+}
+
+/// #1632: snapshots that were already written with duplicated messages (by
+/// builds before idempotent replay) are repaired on load and on the next save.
+#[test]
+fn test_load_repairs_snapshot_with_duplicated_message_ids() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-duplicate-ids-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_duplicate_ids_test";
+    let mut session = Session::create_with_id(session_id.to_string(), None, Some("t".into()));
+    session.add_message(Role::User, vec![text_block("one")]);
+    session.add_message(Role::Assistant, vec![text_block("two")]);
+    let dup = session.messages[1].clone();
+    session.messages.push(dup);
+    session.mark_messages_full_dirty();
+    session.save()?;
+
+    let mut loaded = Session::load(session_id)?;
+    assert_eq!(loaded.messages.len(), 2);
+    loaded.save()?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(session_path(session_id)?)?)?;
+    assert_eq!(raw["messages"].as_array().map(Vec::len), Some(2));
     Ok(())
 }
 
@@ -1260,6 +1300,43 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
 }
 
 #[test]
+fn test_redacted_for_export_redacts_provider_native_items_only_in_copy() -> Result<()> {
+    let mut session = Session::create_with_id(
+        "session_redact_native_test".to_string(),
+        None,
+        Some("redaction test".to_string()),
+    );
+    let item = serde_json::json!({
+        "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+        "input": {"query": "why does ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 fail"}
+    });
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ProviderNative {
+            provider: "anthropic".to_string(),
+            item: item.clone(),
+        }],
+    );
+
+    let persisted = session.redacted_for_export();
+    let ContentBlock::ProviderNative { item: exported, .. } = &persisted.messages[0].content[0]
+    else {
+        return Err(anyhow!("expected provider-native block"));
+    };
+    assert!(
+        !exported
+            .to_string()
+            .contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123")
+    );
+    // The live session keeps the item verbatim for replay.
+    let ContentBlock::ProviderNative { item: stored, .. } = &session.messages[0].content[0] else {
+        return Err(anyhow!("expected provider-native block"));
+    };
+    assert_eq!(stored, &item);
+    Ok(())
+}
+
+#[test]
 fn test_redacted_for_export_redacts_replay_events() -> Result<()> {
     let mut session = Session::create_with_id(
         "session_redacted_replay_events_test".to_string(),
@@ -1366,6 +1443,131 @@ fn test_summarize_tool_calls_includes_tool_only_assistant_messages() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].tool_name, "bash");
     assert!(summaries[0].brief_output.contains("pwd"));
+}
+
+#[test]
+fn failed_wake_error_survives_roundtrip_without_provider_context_pollution() {
+    let mut session = Session::create(None, None);
+    session.add_message_with_display_role(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "wake worker".into(),
+            cache_control: None,
+        }],
+        Some(StoredDisplayRole::System),
+    );
+    let wake_time = session.messages[0].timestamp.unwrap();
+    let error =
+        "request failed: invalid_request_error: No tool call found for function call output";
+    session.record_replay_display_message("error", None, error);
+    session.replay_events[0].timestamp = wake_time + chrono::Duration::seconds(1);
+
+    let reloaded: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+    assert_eq!(reloaded.messages.len(), 1);
+    let rendered = render_messages(&reloaded);
+    assert_eq!(rendered.len(), 2);
+    assert_eq!(rendered[0].content, "wake worker");
+    assert_eq!(rendered[1].role, "error");
+    assert_eq!(rendered[1].content, error);
+    assert_eq!(rendered[1].stored_index, None);
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "next turn".into(),
+            cache_control: None,
+        }],
+    );
+    session.messages[1].timestamp = Some(wake_time + chrono::Duration::seconds(2));
+    session.record_replay_display_message("error", None, "second failure");
+    session.replay_events[1].timestamp = wake_time + chrono::Duration::seconds(3);
+    // Unrelated replay records must not get duplicated into ordinary history.
+    session.record_replay_display_message("system", None, "replay-only notice");
+    let rendered = render_messages(&session);
+    assert_eq!(
+        rendered
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wake worker", error, "next turn", "second failure"]
+    );
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn failed_wake_errors_follow_compacted_history_window() {
+    let mut session = Session::create(None, None);
+    let start = chrono::Utc::now();
+    for turn in 0..20 {
+        for response in 0..5 {
+            let index = session.messages.len();
+            session.add_message(
+                if response == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                vec![ContentBlock::Text {
+                    text: format!("turn {turn} message {response}"),
+                    cache_control: None,
+                }],
+            );
+            session.messages[index].timestamp =
+                Some(start + chrono::Duration::seconds(index as i64));
+        }
+        if matches!(turn, 0 | 18) {
+            session.record_replay_display_message("error", None, format!("failure {turn}"));
+            session.replay_events.last_mut().unwrap().timestamp = start
+                + chrono::Duration::seconds(session.messages.len() as i64 - 1)
+                + chrono::Duration::milliseconds(500);
+        }
+    }
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "current wake".into(),
+            cache_control: None,
+        }],
+    );
+    session.messages[100].timestamp = Some(start + chrono::Duration::seconds(100));
+    session.record_replay_display_message("error", None, "current failure");
+    session.replay_events.last_mut().unwrap().timestamp = start + chrono::Duration::seconds(101);
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "older context".into(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 20,
+        original_turn_count: 20,
+        compacted_count: 100,
+    });
+    let (limited, _, info) = render_messages_and_images_with_compacted_history(&session, 10);
+    assert!(info.unwrap().remaining_messages > 0);
+    assert!(!limited.iter().any(|message| message.content == "failure 0"));
+    let visible_failure = limited
+        .iter()
+        .position(|message| message.content == "failure 18")
+        .unwrap();
+    assert_eq!(limited[visible_failure - 1].content, "turn 18 message 4");
+    assert_eq!(limited[visible_failure + 1].content, "turn 19 message 0");
+    assert_eq!(limited.last().unwrap().content, "current failure");
+    assert_eq!(limited[limited.len() - 2].content, "current wake");
+
+    let (expanded, _, info) =
+        render_messages_and_images_with_compacted_history(&session, usize::MAX);
+    assert_eq!(info.unwrap().remaining_messages, 0);
+    assert_eq!(
+        expanded
+            .iter()
+            .filter(|message| message.role == "error")
+            .count(),
+        3
+    );
+    let old_failure = expanded
+        .iter()
+        .position(|message| message.content == "failure 0")
+        .unwrap();
+    assert_eq!(expanded[old_failure - 1].content, "turn 0 message 4");
+    assert_eq!(expanded[old_failure + 1].content, "turn 1 message 0");
+    assert_eq!(session.messages.len(), 101);
 }
 
 #[test]
@@ -2815,3 +3017,426 @@ fn first_visible_user_prompt_becomes_the_generated_title() {
     session.rename_title(Some("Custom".into()));
     assert_eq!(session.display_title(), Some("Custom"));
 }
+
+/// Resuming a long session records an env snapshot. Past the retention cap
+/// that used to force a full rewrite of a tens-of-MB snapshot on every
+/// resume. It must append to the journal instead, and trim only when a
+/// checkpoint rewrites the snapshot anyway.
+#[test]
+fn env_snapshot_past_cap_appends_instead_of_rewriting_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-env-snapshot-append-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_env_snapshot_append";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg_env_1".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    let snapshot = |reason: &str| EnvSnapshot {
+        captured_at: Utc::now(),
+        reason: reason.to_string(),
+        session_id: session_id.to_string(),
+        working_dir: None,
+        provider: "openai".to_string(),
+        model: "gpt-5.4".to_string(),
+        jcode_version: "test".to_string(),
+        jcode_git_hash: None,
+        jcode_git_dirty: None,
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        pid: 1,
+        is_selfdev: false,
+        is_debug: false,
+        is_canary: false,
+        testing_build: None,
+        working_git: None,
+    };
+    for i in 0..MAX_ENV_SNAPSHOTS {
+        session.record_env_snapshot(snapshot(&format!("fill{i}")));
+    }
+    session.save()?;
+
+    let snapshot_path = storage_paths::session_path(session_id)?;
+    let journal_path = session_journal_path_from_snapshot(&snapshot_path);
+    let snapshot_bytes = std::fs::read(&snapshot_path)?;
+
+    session.record_env_snapshot(snapshot("resume"));
+    session.save()?;
+
+    assert_eq!(
+        std::fs::read(&snapshot_path)?,
+        snapshot_bytes,
+        "recording one env snapshot past the cap must not rewrite the snapshot"
+    );
+    assert!(journal_path.exists(), "the new env snapshot is journaled");
+
+    let loaded = Session::load(session_id)?;
+    assert_eq!(
+        loaded.env_snapshots.last().map(|s| s.reason.as_str()),
+        Some("resume")
+    );
+    Ok(())
+}
+
+/// Resuming a large session changes metadata (status, pid). That used to
+/// rewrite the whole multi-MB snapshot on every resume. It must journal the
+/// change instead, and both full and startup-stub loads must see it.
+#[test]
+fn metadata_change_on_large_session_is_journaled_not_rewritten() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-meta-journal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_meta_journal_large";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    let big = "x".repeat(64 * 1024);
+    for i in 0..24 {
+        session.append_stored_message(StoredMessage {
+            id: format!("msg_{i}"),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: big.clone(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    }
+    session.save()?;
+    let snapshot_path = storage_paths::session_path(session_id)?;
+    let before = std::fs::read(&snapshot_path)?;
+    assert!(before.len() as u64 >= 1024 * 1024, "fixture must be large");
+
+    session.custom_title = Some("renamed".to_string());
+    session.status = SessionStatus::Closed;
+    session.save()?;
+
+    assert_eq!(
+        std::fs::read(&snapshot_path)?,
+        before,
+        "a metadata change must not rewrite a large snapshot"
+    );
+    let full = Session::load(session_id)?;
+    assert_eq!(full.custom_title.as_deref(), Some("renamed"));
+    assert!(matches!(full.status, SessionStatus::Closed));
+    let stub = Session::load_startup_stub(session_id)?;
+    assert_eq!(stub.custom_title.as_deref(), Some("renamed"));
+    assert!(matches!(stub.status, SessionStatus::Closed));
+    Ok(())
+}
+
+fn assert_persisted_route(session_id: &str, expected: Option<&str>) -> Result<()> {
+    assert_eq!(
+        Session::load(session_id)?.route_api_method.as_deref(),
+        expected
+    );
+    assert_eq!(
+        Session::load_startup_stub(session_id)?
+            .route_api_method
+            .as_deref(),
+        expected
+    );
+    assert_eq!(
+        Session::load_for_remote_startup(session_id)?
+            .route_api_method
+            .as_deref(),
+        expected
+    );
+    Ok(())
+}
+
+fn route_journal_roundtrip(large: bool) -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+    let session_id = "session_route_journal";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.provider_key = Some("openai".into());
+    session.model = Some("same-model".into());
+    session.route_api_method = Some("account:first".into());
+    session.append_stored_message(StoredMessage {
+        id: "message".into(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "x".repeat(if large { 2 * 1024 * 1024 } else { 10 }),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?;
+    let path = storage_paths::session_path(session_id)?;
+    let before = std::fs::read(&path)?;
+    for route in [Some("account:second"), Some("account:third"), None] {
+        session.route_api_method = route.map(str::to_string);
+        session.save()?;
+        assert_persisted_route(session_id, route)?;
+        if large {
+            assert_eq!(std::fs::read(&path)?, before);
+            assert!(session_journal_path(session_id)?.exists());
+        } else {
+            // Small metadata updates keep the snapshot self-contained.
+            let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            assert_eq!(snapshot["route_api_method"].as_str(), route);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn route_journal_small_session_roundtrip() -> Result<()> {
+    route_journal_roundtrip(false)
+}
+
+#[test]
+fn route_journal_large_session_roundtrip() -> Result<()> {
+    route_journal_roundtrip(true)
+}
+
+#[test]
+fn route_journal_legacy_entries_preserve_snapshot_and_prior_journal_route() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+    let session_id = "session_route_legacy_journal";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.route_api_method = Some("account:snapshot".into());
+    session.title = Some("legacy route test".into());
+    session.save()?;
+    // Metadata-only entries at or before the checkpoint timestamp are stale.
+    session.updated_at += chrono::Duration::seconds(1);
+    let mut legacy = serde_json::to_value(session.journal_meta())?;
+    legacy.as_object_mut().unwrap().remove("route_api_method");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("route_api_method_present");
+    let legacy_line = serde_json::json!({"meta": legacy}).to_string();
+    let path = session_journal_path(session_id)?;
+    std::fs::write(&path, format!("{legacy_line}\n"))?;
+    assert_persisted_route(session_id, Some("account:snapshot"))?;
+
+    session.route_api_method = Some("account:journal".into());
+    let current_line = serde_json::json!({"meta": session.journal_meta()}).to_string();
+    // A downgraded writer can append legacy metadata after new metadata.
+    std::fs::write(&path, format!("{current_line}\n{legacy_line}\n"))?;
+    assert_persisted_route(session_id, Some("account:journal"))?;
+
+    session.route_api_method = None;
+    let cleared_line = serde_json::json!({"meta": session.journal_meta()}).to_string();
+    std::fs::write(
+        &path,
+        format!("{current_line}\n{cleared_line}\n{legacy_line}\n"),
+    )?;
+    assert_persisted_route(session_id, None)?;
+    Ok(())
+}
+
+fn big_compaction(tag: &str) -> crate::session::StoredCompactionState {
+    crate::session::StoredCompactionState {
+        summary_text: String::new(),
+        openai_encrypted_content: Some(format!("{tag}{}", "e".repeat(300 * 1024))),
+        covers_up_to_turn: 3,
+        original_turn_count: 3,
+        compacted_count: 3,
+    }
+}
+
+/// Multi-MB compaction state must not be repeated in every journal entry
+/// (that overflowed the journal cap on each save and forced full rewrites),
+/// yet every load path must still see the current compaction.
+#[test]
+fn journal_entries_elide_unchanged_compaction_but_loads_keep_it() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-compaction-elide-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_compaction_elide";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    let msg = |i: usize| StoredMessage {
+        id: format!("m{i}"),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: format!("hello {i}"),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    };
+    session.append_stored_message(msg(0));
+    session.compaction = Some(big_compaction("A"));
+    session.save()?; // first save: snapshot carries compaction
+
+    let snapshot_path = storage_paths::session_path(session_id)?;
+    let journal_path = session_journal_path_from_snapshot(&snapshot_path);
+    for i in 1..6 {
+        session.append_stored_message(msg(i));
+        session.save()?;
+    }
+    let journal_len = std::fs::metadata(&journal_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        journal_len > 0 && journal_len < 64 * 1024,
+        "unchanged compaction must be elided from journal entries (journal {journal_len} bytes)"
+    );
+
+    let full = Session::load(session_id)?;
+    assert_eq!(full.messages.len(), 6);
+    assert_eq!(full.compaction, Some(big_compaction("A")));
+    let stub = Session::load_startup_stub(session_id)?;
+    assert_eq!(stub.compaction, Some(big_compaction("A")));
+    let remote = Session::load_for_remote_startup(session_id)?;
+    assert_eq!(remote.compaction, Some(big_compaction("A")));
+
+    // A changed compaction is written and wins on reload.
+    session.compaction = Some(big_compaction("B"));
+    session.append_stored_message(msg(6));
+    session.save()?;
+    session.append_stored_message(msg(7));
+    session.save()?;
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.compaction, Some(big_compaction("B")));
+    assert_eq!(reloaded.messages.len(), 8);
+
+    // Clearing compaction is persisted too (not mistaken for "unchanged").
+    let mut cleared = reloaded;
+    cleared.compaction = None;
+    cleared.append_stored_message(msg(8));
+    cleared.save()?;
+    assert_eq!(Session::load(session_id)?.compaction, None);
+    Ok(())
+}
+
+/// Journals written before the elision flag existed carry the full
+/// compaction in every entry and must still load unchanged.
+#[test]
+fn legacy_journal_entries_with_inline_compaction_still_load() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-compaction-legacy-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+    let session_id = "session_compaction_legacy";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "m0".into(),
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hi".into(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?;
+    let snapshot_path = storage_paths::session_path(session_id)?;
+    let journal_path = session_journal_path_from_snapshot(&snapshot_path);
+    // Hand-write a legacy-format entry (no compaction_unchanged field).
+    let mut meta = serde_json::to_value(session.journal_meta())?;
+    meta["compaction"] = serde_json::to_value(big_compaction("L"))?;
+    meta.as_object_mut().unwrap().remove("compaction_unchanged");
+    // Replay ignores entries not newer than the snapshot.
+    meta["updated_at"] = serde_json::to_value(Utc::now() + chrono::Duration::seconds(5))?;
+    let line = serde_json::json!({ "meta": meta });
+    std::fs::write(&journal_path, format!("{line}\n"))?;
+    assert_eq!(
+        Session::load(session_id)?.compaction,
+        Some(big_compaction("L"))
+    );
+    assert_eq!(
+        Session::load_startup_stub(session_id)?.compaction,
+        Some(big_compaction("L"))
+    );
+    Ok(())
+}
+
+/// Fixture writer for the old-binary compatibility check. Writes a session
+/// with large compaction followed by journal entries that elide it. Runs only
+/// when JCODE_COMPAT_FIXTURE_HOME is set.
+#[test]
+#[ignore]
+fn write_compaction_elision_compat_fixture() -> Result<()> {
+    let Some(home) = std::env::var_os("JCODE_COMPAT_FIXTURE_HOME") else {
+        return Ok(());
+    };
+    let _env_lock = lock_env();
+    let _home = EnvVarGuard::set("JCODE_HOME", &home);
+    let mut session = Session::create_with_id("session_compat_fixture_1".to_string(), None, None);
+    for i in 0..4 {
+        session.append_stored_message(StoredMessage {
+            id: format!("m{i}"),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("compat {i}"),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: Some(Utc::now()),
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+        if i == 0 {
+            session.compaction = Some(big_compaction("C"));
+        }
+        session.save()?;
+    }
+    Ok(())
+}
+
+/// Reader half of the compatibility check: after an older binary has loaded
+/// and re-saved the fixture, every message must still be present.
+#[test]
+#[ignore]
+fn read_compaction_elision_compat_fixture() -> Result<()> {
+    let Some(home) = std::env::var_os("JCODE_COMPAT_FIXTURE_HOME") else {
+        return Ok(());
+    };
+    let _env_lock = lock_env();
+    let _home = EnvVarGuard::set("JCODE_HOME", &home);
+    let session = Session::load("session_compat_fixture_1")?;
+    let ids: Vec<_> = session.messages.iter().map(|m| m.id.clone()).collect();
+    for i in 0..4 {
+        assert!(ids.contains(&format!("m{i}")), "message m{i} lost: {ids:?}");
+    }
+    println!(
+        "COMPAT messages={} compaction_present={}",
+        session.messages.len(),
+        session.compaction.is_some()
+    );
+    Ok(())
+}
+
+#[path = "provider_identity_tests.rs"]
+mod provider_identity;
+
+#[path = "memory_profile_tests.rs"]
+mod memory_profile;

@@ -21,6 +21,13 @@ struct QueuedPendingMemory {
 struct PendingBinding {
     project_dir: Option<String>,
     snapshots: HashMap<String, MemorySnapshot>,
+    /// True when the memories come from an EXTERNAL backend (Hindsight) and
+    /// therefore do not exist in the local memory graph. Such a payload is
+    /// still bound to the project (so a session that changes directory does
+    /// not pick it up), but it is NOT re-validated against the local graph:
+    /// the local graph cannot know about a foreign document, and pretending
+    /// otherwise would discard every externally recalled memory.
+    external: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -34,8 +41,6 @@ struct MemorySnapshot {
 static LAST_INJECTED_PROMPT_SIGNATURE: Mutex<Option<HashMap<String, (String, Instant)>>> =
     Mutex::new(None);
 
-/// Recently injected memory ID sets per session.
-/// Used to suppress near-duplicate re-injection even when formatting differs.
 static LAST_INJECTED_MEMORY_SET: Mutex<Option<LastInjectedMemorySetBySession>> = Mutex::new(None);
 
 /// Memory IDs that have already been injected into the conversation, with the
@@ -43,6 +48,51 @@ static LAST_INJECTED_MEMORY_SET: Mutex<Option<LastInjectedMemorySetBySession>> =
 /// re-injected on subsequent turns while it is still fresh in the transcript.
 /// Keyed by session ID.
 static INJECTED_MEMORY_IDS: Mutex<Option<InjectedMemoryIdsBySession>> = Mutex::new(None);
+
+/// Tool calls observed since the last memory refresh, per session.
+///
+/// The agent can work for a long time without a user message, and a recall
+/// that only fires on a user turn therefore never arrives during that work.
+/// This counter lets the caller ask for a refresh after N tool calls.
+static TOOL_CALLS_SINCE_REFRESH: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// Record that `count` tool calls completed for this session.
+pub fn note_tool_calls(session_id: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        let entry = map.entry(session_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(count);
+    }
+}
+
+/// Tool calls observed since the last refresh, without resetting.
+///
+/// Separate from the reset because the refresh decision is evaluated on
+/// EVERY provider iteration. A combined take-and-reset would clear the
+/// counter each iteration, so the threshold could only ever be reached by a
+/// single iteration making N tool calls at once, and the cadence would
+/// never fire in a normal agent loop.
+pub fn tool_calls_since_refresh(session_id: &str) -> usize {
+    let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() else {
+        return 0;
+    };
+    guard
+        .as_mut()
+        .and_then(|map| map.get(session_id).copied())
+        .unwrap_or(0)
+}
+
+/// Reset the refresh counter for this session.
+pub fn reset_tool_calls_since_refresh(session_id: &str) {
+    if let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.remove(session_id);
+        }
+    }
+}
 
 /// Guard to ensure only one memory check runs at a time, per session.
 /// Keyed by session ID.
@@ -243,7 +293,9 @@ fn take_pending_memory_inner(
         crate::memory_log::log_pending_discarded(session_id, "stale (>120s)");
         return None;
     }
-    if let Some(binding) = &queued.binding {
+    if let Some(binding) = &queued.binding
+        && !binding.external
+    {
         let valid =
             snapshot_selected_memories(binding.project_dir.as_deref(), &queued.pending.memory_ids)
                 .is_ok_and(|(current, _)| current == binding.snapshots);
@@ -368,6 +420,35 @@ pub fn set_pending_memory_for_project(
     );
 }
 
+/// Publish a memory payload that came from an EXTERNAL backend (Hindsight).
+///
+/// The payload is bound to the project so a session that changes directory
+/// does not pick it up, but it is not validated against the local memory
+/// graph: the documents live in the Hindsight bank, so the local graph
+/// cannot confirm or deny them. The document ids still drive the existing
+/// dedup/TTL bookkeeping, so the same fact is not injected twice.
+pub fn set_pending_memory_external(
+    session_id: &str,
+    prompt: String,
+    count: usize,
+    memory_ids: Vec<String>,
+    display_prompt: Option<String>,
+    project_dir: Option<&str>,
+) {
+    store_pending_memory(
+        session_id,
+        prompt,
+        count,
+        memory_ids,
+        display_prompt,
+        Some(PendingBinding {
+            project_dir: project_dir.map(str::to_owned),
+            snapshots: HashMap::new(),
+            external: true,
+        }),
+    );
+}
+
 /// Automatic publishers must retain the entries actually judged by Jev. A
 /// canonical prompt alone cannot detect tags-only edits while inference was in
 /// flight, because tags are model input but not part of the rendered prompt.
@@ -450,6 +531,7 @@ fn publish_scoped_memory(
         Some(PendingBinding {
             project_dir: project_dir.map(str::to_owned),
             snapshots,
+            external: false,
         }),
     );
 }

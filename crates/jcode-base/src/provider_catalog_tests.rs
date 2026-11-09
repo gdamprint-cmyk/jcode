@@ -250,6 +250,7 @@ fn resolved_named_profile_suggests_newest_cached_live_release() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_700_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "newer-model".to_string(),
@@ -257,6 +258,7 @@ fn resolved_named_profile_suggests_newest_cached_live_release() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_800_000_000),
+                ..Default::default()
             },
         ],
         Some(CEREBRAS_PROFILE.api_base),
@@ -287,6 +289,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_700_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "newer-chat-model".to_string(),
@@ -294,6 +297,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_800_000_000),
+                ..Default::default()
             },
             // Newest of all, but a non-chat (TTS) model that must be skipped.
             jcode_provider_openrouter::ModelInfo {
@@ -302,6 +306,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_900_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "whisper-large-v3".to_string(),
@@ -309,6 +314,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_950_000_000),
+                ..Default::default()
             },
         ],
         Some(CEREBRAS_PROFILE.api_base),
@@ -324,7 +330,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
 }
 
 #[test]
-fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
+fn minimax_token_plan_keys_resolve_to_international_endpoint() {
     let _lock = crate::storage::lock_test_env();
     let _guard = EnvGuard::save(&["JCODE_HOME", "MINIMAX_API_KEY", "OPENAI_API_KEY"]);
     let home = tempfile::tempdir().expect("temporary JCODE_HOME");
@@ -343,13 +349,16 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
         MINIMAX_PROFILE,
         Some("sk-cp-test-token"),
     );
-    assert_eq!(china.api_base, MINIMAX_CHINA_API_BASE);
-    assert_eq!(china.setup_url, MINIMAX_CHINA_SETUP_URL);
+    assert_eq!(china.api_base, "https://api.minimax.io/v1");
+    assert_eq!(
+        china.setup_url,
+        "https://platform.minimax.io/docs/guides/text-generation"
+    );
 
     crate::env::set_var("OPENAI_API_KEY", "sk-cp-legacy-token");
     let legacy = resolve_openai_compatible_profile(MINIMAX_PROFILE);
     assert_eq!(legacy.api_key_env, "OPENAI_API_KEY");
-    assert_eq!(legacy.api_base, MINIMAX_CHINA_API_BASE);
+    assert_eq!(legacy.api_base, "https://api.minimax.io/v1");
 }
 
 #[test]
@@ -1145,6 +1154,7 @@ fn newest_release_picker_prefers_strongest_tier_over_newest_cheap() {
         context_length: None,
         pricing: Default::default(),
         created: Some(created),
+        ..Default::default()
     };
 
     // A heterogeneous proxy catalog (like OpenCode Zen): the NEWEST model is a
@@ -1167,6 +1177,55 @@ fn newest_release_picker_prefers_strongest_tier_over_newest_cheap() {
     );
 }
 
+/// The default-model ranking is memoized per catalog content (each provider
+/// fork resolves it). A rewritten catalog must take effect immediately, even
+/// within the same second, and repeated calls must keep returning the answer.
+#[test]
+fn newest_release_picker_memo_follows_catalog_changes() {
+    use jcode_provider_openrouter::ModelInfo;
+    let _lock = crate::storage::lock_test_env();
+    let _env = EnvGuard::save(&["JCODE_HOME"]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mk = |id: &str, created: u64| ModelInfo {
+        id: id.to_string(),
+        name: String::new(),
+        context_length: None,
+        pricing: Default::default(),
+        created: Some(created),
+        ..Default::default()
+    };
+    let save = |models: &[ModelInfo]| {
+        jcode_provider_openrouter::save_disk_cache_with_source_for_namespace(
+            "deepseek",
+            models,
+            Some("https://api.deepseek.com"),
+        )
+    };
+
+    save(&[
+        mk("deepseek-v3", 1_700_000_000),
+        mk("deepseek-v4", 1_900_000_000),
+    ]);
+    for _ in 0..3 {
+        assert_eq!(
+            newest_released_model_for_openai_compatible_profile("deepseek").as_deref(),
+            Some("deepseek-v4")
+        );
+    }
+
+    save(&[
+        mk("deepseek-v4", 1_900_000_000),
+        mk("deepseek-v5", 1_950_000_000),
+    ]);
+    assert_eq!(
+        newest_released_model_for_openai_compatible_profile("deepseek").as_deref(),
+        Some("deepseek-v5"),
+        "a newer catalog must not be answered from the old memo entry"
+    );
+}
+
 #[test]
 fn newest_release_picker_uses_recency_within_a_tier() {
     use jcode_provider_openrouter::ModelInfo;
@@ -1181,6 +1240,7 @@ fn newest_release_picker_uses_recency_within_a_tier() {
         context_length: None,
         pricing: Default::default(),
         created: Some(created),
+        ..Default::default()
     };
 
     // All same (bare frontier) tier: recency decides.

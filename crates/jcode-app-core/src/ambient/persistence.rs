@@ -1,3 +1,4 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-dead-letter-fix.md (measured write-only ambient queue: overflow is archived, not dropped)
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -5,6 +6,71 @@ use std::path::PathBuf;
 use super::paths::{lock_path, state_path};
 use super::{AmbientCycleResult, AmbientState, AmbientStatus, CycleStatus, ScheduledItem};
 use crate::storage;
+
+#[cfg(test)]
+#[path = "queue_transaction_tests.rs"]
+mod queue_transaction_tests;
+
+// `total_cycles` values written by `AmbientState::save()` on this thread.
+//
+// Test-only instrument for the single-writer invariant of the ambient state:
+// "exactly one incrementing `state.json` write per completed cycle, and the
+// written value never exceeds the number of completed cycles". The file
+// contents alone cannot show this, because the previous value is preserved
+// as `state.bak` and the intermediate values are gone.
+//
+// Thread-local, so concurrently running tests cannot pollute the log.
+#[cfg(test)]
+std::thread_local! {
+    static STATE_WRITES: std::cell::RefCell<Vec<StateWrite>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One recorded `state.json` write.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct StateWrite {
+    /// The resolved `state.json` path the write went to.
+    pub path: String,
+    /// The `total_cycles` value that was written.
+    pub total_cycles: u64,
+    /// The writer that performed the save.
+    pub writer: &'static str,
+}
+
+/// All `state.json` writes performed on this thread for a specific path,
+/// regardless of which writer performed them.
+///
+/// The write log is thread-local, and cargo REUSES worker threads across
+/// tests, so a write recorded by an earlier test on the same thread would
+/// otherwise show up in a later test's assertions. Conversely, `JCODE_HOME` is
+/// process-global, so a background task leaked by another test can resolve
+/// `state_path()` against the `JCODE_HOME` that is current at ITS save time —
+/// which may be this test's temp home.
+///
+/// Filtering by the target path scopes the instrument to the writes of one
+/// state file. There is deliberately NO per-writer variant: a label-filtered
+/// view is blind to any writer that uses the plain `AmbientState::save()`
+/// (logged as `"unlabelled"`), which is exactly how the pre-fix defect hid
+/// from the tests (measured 2026-11-05, report
+/// `revalidate-ambient-counter-fix.md` §5, control experiment C4).
+#[cfg(test)]
+pub(crate) fn state_writes_all_for(path: &std::path::Path) -> Vec<StateWrite> {
+    let wanted = path.display().to_string();
+    STATE_WRITES.with(|writes| {
+        writes
+            .borrow()
+            .iter()
+            .filter(|write| write.path == wanted)
+            .cloned()
+            .collect()
+    })
+}
+
+/// Forget the recorded `state.json` writes on this thread.
+#[cfg(test)]
+pub(crate) fn reset_state_writes() {
+    STATE_WRITES.with(|writes| writes.borrow_mut().clear());
+}
 
 // ---------------------------------------------------------------------------
 // AmbientState persistence
@@ -21,7 +87,34 @@ impl AmbientState {
     }
 
     pub fn save(&self) -> Result<()> {
-        storage::write_json(&state_path()?, self)
+        let path = state_path()?;
+        #[cfg(test)]
+        STATE_WRITES.with(|writes| {
+            writes.borrow_mut().push(StateWrite {
+                path: path.display().to_string(),
+                total_cycles: self.total_cycles,
+                writer: "unlabelled",
+            })
+        });
+        storage::write_json(&path, self)
+    }
+
+    /// Persist the state, recording `writer` as the author of the write.
+    ///
+    /// The label is test-only instrumentation: it makes the write log
+    /// attributable to a specific writer, so an assertion about one writer
+    /// cannot be confused with a concurrent write from another.
+    #[cfg(test)]
+    pub(crate) fn save_as(&self, writer: &'static str) -> Result<()> {
+        let path = state_path()?;
+        STATE_WRITES.with(|writes| {
+            writes.borrow_mut().push(StateWrite {
+                path: path.display().to_string(),
+                total_cycles: self.total_cycles,
+                writer,
+            })
+        });
+        storage::write_json(&path, self)
     }
 
     pub fn record_cycle(&mut self, result: &AmbientCycleResult) {
@@ -69,80 +162,151 @@ impl ScheduledQueue {
         Self { items, path }
     }
 
-    pub fn save(&self) -> Result<()> {
-        storage::write_json(&self.path, &self.items)
+    /// Lock a separate stable inode: atomic JSON replacement must not replace
+    /// the inode carrying the lock. Reload under lock, and publish only after
+    /// the entire mutation was durably saved. Never write a cached snapshot.
+    pub(super) fn transact<T>(
+        &mut self,
+        update: impl FnOnce(&mut Vec<ScheduledItem>) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(parent) = self.path.parent() {
+            storage::ensure_dir(parent)?;
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.path.with_extension("json.lock"))?;
+        lock.lock()?;
+        let mut latest = if self.path.exists() {
+            storage::read_json::<Vec<ScheduledItem>>(&self.path)?
+        } else {
+            Vec::new()
+        };
+        let before = latest.clone();
+        let result = update(&mut latest)?;
+        if latest != before {
+            storage::write_json(&self.path, &latest)?;
+        }
+        self.items = latest;
+        Ok(result)
+    }
+
+    pub fn try_push(&mut self, item: ScheduledItem) -> Result<()> {
+        self.transact(|items| {
+            items.push(item);
+            Ok(())
+        })?;
+        self.apply_retention()
+    }
+
+    /// Keep the live queue bounded, archiving the overflow instead of dropping it.
+    ///
+    /// Ambient-target entries are write-only (production code never claims them),
+    /// so an unbounded queue grows forever and every ambient cycle renders the
+    /// whole list into its system prompt. The overflow is written to
+    /// `queue_archive.jsonl` next to `queue.json`, so the carry-forward memory
+    /// stays readable on disk rather than being lost.
+    ///
+    /// Direct-delivery entries are never archived: they are the actionable work
+    /// and the runner claims them, so removing one would lose it.
+    fn apply_retention(&mut self) -> Result<()> {
+        let max_live = super::AMBIENT_QUEUE_MAX_LIVE_ENTRIES;
+        let mut ambient: Vec<ScheduledItem> = self
+            .items
+            .iter()
+            .filter(|item| !item.target.is_direct_delivery())
+            .cloned()
+            .collect();
+        if ambient.len() <= max_live {
+            return Ok(());
+        }
+        ambient.sort_by(|a, b| a.scheduled_for.cmp(&b.scheduled_for));
+        // Archive the OLDEST entries: the newest ones are what the next cycles
+        // still care about, and the prompt renders them in full.
+        let overflow: Vec<ScheduledItem> = ambient.drain(..ambient.len() - max_live).collect();
+        let overflow_ids: std::collections::HashSet<String> =
+            overflow.iter().map(|item| item.id.clone()).collect();
+        // Archive first: if the trim fails, the entries are still live in the
+        // queue. If the archive write fails, nothing is removed either.
+        self.archive_overflow(&overflow)?;
+        self.transact(|items| {
+            items.retain(|item| !overflow_ids.contains(&item.id));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Append the overflow entries to the archive file, one JSON document per line.
+    fn archive_overflow(&self, overflow: &[ScheduledItem]) -> Result<()> {
+        if overflow.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.with_file_name("queue_archive.jsonl");
+        if let Some(parent) = path.parent() {
+            storage::ensure_dir(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        use std::io::Write;
+        for item in overflow {
+            let line = serde_json::to_string(item)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        Ok(())
     }
 
     pub fn push(&mut self, item: ScheduledItem) {
-        self.items.push(item);
-        let _ = self.save();
+        if let Err(error) = self.try_push(item) {
+            crate::logging::warn(&format!("Failed to persist scheduled item: {error:#}"));
+        }
     }
 
-    /// Remove a scheduled item by ID, persisting the queue when found.
     pub fn remove_by_id(&mut self, id: &str) -> Result<Option<ScheduledItem>> {
-        let Some(index) = self.items.iter().position(|item| item.id == id) else {
-            return Ok(None);
-        };
-
-        let item = self.items.remove(index);
-        self.save()?;
-        Ok(Some(item))
+        self.transact(|items| {
+            Ok(items
+                .iter()
+                .position(|item| item.id == id)
+                .map(|index| items.remove(index)))
+        })
     }
 
-    /// Pop items whose `scheduled_for` is in the past, sorted by priority
-    /// (highest first) then by time (earliest first).
+    fn take_ready(&mut self, direct_only: bool) -> Result<Vec<ScheduledItem>> {
+        self.transact(|items| {
+            let now = Utc::now();
+            let (mut ready, remaining): (Vec<_>, Vec<_>) =
+                std::mem::take(items).into_iter().partition(|item| {
+                    item.scheduled_for <= now && (!direct_only || item.target.is_direct_delivery())
+                });
+            *items = remaining;
+            ready.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.scheduled_for.cmp(&b.scheduled_for))
+            });
+            Ok(ready)
+        })
+    }
+
     pub fn pop_ready(&mut self) -> Vec<ScheduledItem> {
-        let now = Utc::now();
-        let (ready, remaining): (Vec<_>, Vec<_>) =
-            self.items.drain(..).partition(|i| i.scheduled_for <= now);
-
-        self.items = remaining;
-
-        let mut ready = ready;
-        // Sort: highest priority first, then earliest scheduled_for
-        ready.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| a.scheduled_for.cmp(&b.scheduled_for))
-        });
-
-        if !ready.is_empty() {
-            let _ = self.save();
-        }
-
-        ready
+        self.take_ready(false).unwrap_or_else(|error| {
+            crate::logging::warn(&format!("Failed to claim scheduled items: {error:#}"));
+            Vec::new()
+        })
     }
 
-    /// Remove and return ready items targeted at a specific direct-delivery session,
-    /// leaving ambient-targeted queue items intact for the ambient agent to process.
     pub fn take_ready_direct_items(&mut self) -> Vec<ScheduledItem> {
-        let now = Utc::now();
-        let mut ready_direct = Vec::new();
-        let mut remaining = Vec::with_capacity(self.items.len());
-
-        for item in self.items.drain(..) {
-            let is_ready = item.scheduled_for <= now;
-            let is_direct_target = item.target.is_direct_delivery();
-            if is_ready && is_direct_target {
-                ready_direct.push(item);
-            } else {
-                remaining.push(item);
-            }
-        }
-
-        self.items = remaining;
-
-        if !ready_direct.is_empty() {
-            let _ = self.save();
-        }
-
-        ready_direct.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| a.scheduled_for.cmp(&b.scheduled_for))
-        });
-
-        ready_direct
+        self.take_ready(true).unwrap_or_else(|error| {
+            crate::logging::warn(&format!(
+                "Failed to claim direct scheduled items: {error:#}"
+            ));
+            Vec::new()
+        })
     }
 
     pub fn peek_next(&self) -> Option<&ScheduledItem> {
@@ -171,6 +335,22 @@ pub struct AmbientLock {
 }
 
 impl AmbientLock {
+    /// Read-only probe: which live process, if any, still holds the lock?
+    ///
+    /// The lock file records the pid of the process that acquired it, so a
+    /// dead pid means the holder is gone and the lock file is a leftover.
+    /// Callers use this to tell a genuinely in-flight cycle from a status
+    /// persisted by a process that has since exited.
+    ///
+    /// Returns `None` when the lock file is missing, unreadable, malformed, or
+    /// names a pid that is no longer running.
+    pub fn live_holder_pid() -> Option<u32> {
+        let path = lock_path().ok()?;
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let pid = contents.trim().parse::<u32>().ok()?;
+        is_pid_alive(pid).then_some(pid)
+    }
+
     /// Try to acquire the ambient lock.
     /// Returns `Ok(Some(lock))` if acquired, `Ok(None)` if another instance
     /// already holds it, or `Err` on I/O failure.

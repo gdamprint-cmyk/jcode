@@ -1,7 +1,10 @@
+#[path = "state_ui_count_format.rs"]
+mod count_format;
 use super::state_ui_storage::infer_spawned_session_startup_hints;
 use super::*;
 use crate::tui::ui::tools_ui;
 use crate::tui::{TuiState, backend};
+use count_format::*;
 
 pub(super) struct RestoredReloadInput {
     pub input: String,
@@ -9,6 +12,7 @@ pub(super) struct RestoredReloadInput {
     pub pending_images: Vec<(String, String)>,
     pub submit_on_restore: bool,
     pub queued_messages: Vec<String>,
+    pub queued_commands: Vec<String>,
     pub hidden_queued_system_messages: Vec<String>,
     pub startup_status_notice: Option<String>,
     pub startup_display_message: Option<(String, String)>,
@@ -25,9 +29,50 @@ pub(super) struct RestoredReloadInput {
     pub todo_confidence_spike_challenged: bool,
     pub last_todo_ownership_fingerprint: Option<String>,
     pub final_response_todo_fingerprint: Option<String>,
+    pub last_auto_poke_fingerprint: Option<String>,
+    pub auto_poke_attempts: u8,
 }
 
 impl App {
+    /// Publish attachments immediately, without waiting for a history refresh.
+    /// The user prompt must already have been echoed into the transcript.
+    pub(super) fn publish_user_image_previews(&mut self, images: &[(String, String)]) {
+        let Some(ordinal) = self
+            .display_messages
+            .iter()
+            .filter(|message| {
+                message.effective_role() == "user"
+                    && !crate::session::is_attached_image_label_text(&message.content)
+            })
+            .count()
+            .checked_sub(1)
+        else {
+            return;
+        };
+        let anchor = Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal });
+        let previews = images
+            .iter()
+            .filter(|(media_type, data)| {
+                !media_type.is_empty()
+                    && !data.is_empty()
+                    && !self.remote_side_pane_images.iter().any(|existing| {
+                        existing.anchor == anchor
+                            && existing.media_type == *media_type
+                            && existing.data == *data
+                    })
+            })
+            .map(|(media_type, data)| crate::session::RenderedImage {
+                media_type: media_type.clone(),
+                data: data.clone(),
+                label: None,
+                source: crate::session::RenderedImageSource::UserInput,
+                anchor: anchor.clone(),
+                history_message_index: None,
+            })
+            .collect();
+        self.append_live_inline_images(previews);
+    }
+
     pub(super) fn append_live_inline_images(
         &mut self,
         images: Vec<crate::session::RenderedImage>,
@@ -123,13 +168,14 @@ impl App {
             return;
         }
 
-        if crate::dictation::remember_last_focused_session(&session_id).is_ok() {
+        if crate::client_focus::remember_last_focused_session(&session_id).is_ok() {
             self.last_client_focus_recorded_at = Some(Instant::now());
             self.last_client_focus_session_id = Some(session_id);
         }
     }
 
     pub(super) fn note_client_interaction(&mut self) {
+        self.wake_idle_hibernation();
         // Every key/mouse/paste event routes through here, which makes this the
         // one place that reliably knows the user is actively driving the UI.
         self.last_user_interaction = Some(std::time::Instant::now());
@@ -219,6 +265,7 @@ impl App {
     /// recompute counters. Callers that have already maintained the cached
     /// counters incrementally (e.g. a single append) use this to stay O(1).
     pub(super) fn bump_display_messages_version_no_stats(&mut self) {
+        self.wake_idle_hibernation();
         self.display_messages_version = self.display_messages_version.wrapping_add(1);
         self.bump_context_revision();
         self.refresh_split_view_if_needed();
@@ -248,6 +295,7 @@ impl App {
         if self.input.is_empty()
             && self.pending_images.is_empty()
             && self.queued_messages.is_empty()
+            && self.queued_commands.is_empty()
             && self.hidden_queued_system_messages.is_empty()
             && self.interleave_message.is_none()
             && self.pending_soft_interrupts.is_empty()
@@ -260,6 +308,7 @@ impl App {
             && !self.todo_confidence_spike_challenged
             && self.last_todo_ownership_fingerprint.is_none()
             && self.final_response_todo_fingerprint.is_none()
+            && self.last_auto_poke_fingerprint.is_none()
         {
             // Nothing to save, but a stale file from an earlier run could
             // still hold old queued messages/input. Leaving it behind would
@@ -338,6 +387,7 @@ impl App {
                 })).collect::<Vec<_>>(),
                 "submit_on_restore": resume_prompt.is_some(),
                 "queued_messages": queued_messages,
+                "queued_commands": self.queued_commands,
                 "hidden_queued_system_messages": hidden_queued_system_messages,
                 "interleave_message": self.interleave_message,
                 "pending_soft_interrupts": self.pending_soft_interrupts,
@@ -352,6 +402,8 @@ impl App {
                 "todo_confidence_spike_challenged": self.todo_confidence_spike_challenged,
                 "last_todo_ownership_fingerprint": self.last_todo_ownership_fingerprint,
                 "final_response_todo_fingerprint": self.final_response_todo_fingerprint,
+                "last_auto_poke_fingerprint": self.last_auto_poke_fingerprint,
+                "auto_poke_attempts": self.auto_poke_attempts,
             });
             let _ = std::fs::write(&path, data.to_string());
         }
@@ -434,6 +486,16 @@ impl App {
                 .unwrap_or(false);
             let queued_messages = value
                 .get("queued_messages")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let queued_commands = value
+                .get("queued_commands")
                 .and_then(|v| v.as_array())
                 .map(|items| {
                     items
@@ -579,6 +641,7 @@ impl App {
                 pending_images,
                 submit_on_restore,
                 queued_messages,
+                queued_commands,
                 hidden_queued_system_messages,
                 startup_status_notice,
                 startup_display_message,
@@ -597,6 +660,15 @@ impl App {
                     .get("final_response_todo_fingerprint")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
+                last_auto_poke_fingerprint: value
+                    .get("last_auto_poke_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                auto_poke_attempts: value
+                    .get("auto_poke_attempts")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .min(u8::MAX as u64) as u8,
                 last_todo_ownership_fingerprint: value
                     .get("last_todo_ownership_fingerprint")
                     .and_then(|v| v.as_str())
@@ -613,6 +685,7 @@ impl App {
             pending_images: Vec::new(),
             submit_on_restore: false,
             queued_messages: Vec::new(),
+            queued_commands: Vec::new(),
             hidden_queued_system_messages: Vec::new(),
             startup_status_notice: None,
             startup_display_message: None,
@@ -629,6 +702,8 @@ impl App {
             todo_confidence_spike_challenged: false,
             last_todo_ownership_fingerprint: None,
             final_response_todo_fingerprint: None,
+            last_auto_poke_fingerprint: None,
+            auto_poke_attempts: 0,
         })
     }
 
@@ -678,21 +753,26 @@ impl App {
         } else {
             snapshot
         };
-        let mut snapshot = if self.observe_mode_enabled {
+        let snapshot = if self.observe_mode_enabled {
             self.decorate_side_panel_with_observe(snapshot, focus_observe)
         } else {
             snapshot
         };
-        if self.side_panel_user_hidden && snapshot.focused_page_id.is_some() {
-            snapshot.focused_page_id = None;
-        }
         self.apply_side_panel_snapshot(snapshot);
     }
 
     pub(super) fn apply_side_panel_snapshot(
         &mut self,
-        snapshot: crate::side_panel::SidePanelSnapshot,
+        mut snapshot: crate::side_panel::SidePanelSnapshot,
     ) {
+        // Local app panels refresh through this path too. Content updates must
+        // not undo a user dismissal or replace the saved selection.
+        if self.side_panel_user_hidden {
+            snapshot.focused_page_id = None;
+        }
+        if snapshot != self.side_panel {
+            self.wake_idle_hibernation();
+        }
         let focused_before = self.side_panel.focused_page_id.clone();
         let focused_after = snapshot.focused_page_id.clone();
         let focused_changed = focused_before != focused_after;
@@ -706,6 +786,9 @@ impl App {
         }
         self.last_side_panel_refresh = None;
         self.side_panel = snapshot;
+        if self.side_panel.focused_page().is_none() {
+            self.side_panel_fullscreen = false;
+        }
         self.note_runtime_memory_event("side_panel_updated", "side_panel_snapshot_applied");
         if focused_changed {
             self.diff_pane_scroll = 0;
@@ -823,6 +906,9 @@ impl App {
     }
 
     fn prewarm_focused_side_panel(&self) {
+        if self.idle_hibernation.frame.is_some() {
+            return;
+        }
         let Ok((terminal_width, terminal_height)) = crossterm::terminal::size() else {
             return;
         };
@@ -988,89 +1074,6 @@ impl App {
     pub fn debug_socket_path() -> std::path::PathBuf {
         crate::storage::runtime_dir().join("jcode-debug.sock")
     }
-}
-
-fn cache_ratio_pct(numerator: u64, denominator: u64) -> u8 {
-    if denominator == 0 {
-        0
-    } else {
-        ((numerator as f64 / denominator as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as u8
-    }
-}
-
-fn grouped_u64(value: u64) -> String {
-    let raw = value.to_string();
-    let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
-    for (index, ch) in raw.chars().enumerate() {
-        if index > 0 && (raw.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
-    grouped
-}
-
-fn trim_decimal_zeros(mut value: String) -> String {
-    if value.contains('.') {
-        while value.ends_with('0') {
-            value.pop();
-        }
-        if value.ends_with('.') {
-            value.pop();
-        }
-    }
-    value
-}
-
-fn compact_count(value: u64) -> String {
-    let Some((unit, suffix)) = [(1_000_000_000_u64, "b"), (1_000_000, "m"), (1_000, "k")]
-        .into_iter()
-        .find(|(unit, _)| value >= *unit)
-    else {
-        return value.to_string();
-    };
-
-    let scaled = value as f64 / unit as f64;
-    let decimals = if scaled >= 10.0 { 1 } else { 2 };
-    format!(
-        "{}{}",
-        trim_decimal_zeros(format!("{scaled:.decimals$}")),
-        suffix
-    )
-}
-
-fn human_count(value: u64) -> String {
-    if value < 1_000 {
-        value.to_string()
-    } else {
-        format!("{} ({})", compact_count(value), grouped_u64(value))
-    }
-}
-
-fn bold_count(value: u64) -> String {
-    human_count(value).to_string()
-}
-
-fn bold_count_usize(value: usize) -> String {
-    bold_count(value as u64)
-}
-
-fn opt_u64(value: Option<u64>) -> String {
-    value.map(human_count).unwrap_or_else(|| "None".to_string())
-}
-
-fn opt_usize(value: Option<usize>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "None".to_string())
-}
-
-fn opt_string(value: Option<&str>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "None".to_string())
 }
 
 fn push_cache_signature(

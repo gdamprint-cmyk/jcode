@@ -30,6 +30,51 @@ fn spawn_models_server(body: &'static str) -> String {
 use crate::*;
 
 #[test]
+fn grok_subscription_discovers_models_in_its_own_cache_namespace() {
+    let provider = OpenRouterProvider::new_grok_build_subscription("grok-4.6");
+    assert!(provider.supports_model_catalog);
+    assert_eq!(
+        provider.foreground_cache_namespace().as_deref(),
+        Some("grok-build")
+    );
+    provider.models_cache.blocking_write().models = vec![jcode_provider_openrouter::ModelInfo {
+        id: "grok-future-release".into(),
+        context_length: Some(900_000),
+        ..Default::default()
+    }];
+    provider.models_cache.blocking_write().fetched = true;
+    assert!(
+        provider
+            .available_models_display()
+            .contains(&"grok-future-release".into())
+    );
+}
+
+#[tokio::test]
+async fn static_only_named_profile_refresh_never_resolves_auth_or_fetches() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let _key = EnvVarGuard::set("TEST_STATIC_ONLY_KEY", "test-key");
+    let profile = jcode_base::config::NamedProviderConfig {
+        base_url: "http://127.0.0.1:1/v1".to_string(),
+        api_key_env: Some("TEST_STATIC_ONLY_KEY".to_string()),
+        model_catalog: false,
+        default_model: Some("configured-model".to_string()),
+        ..Default::default()
+    };
+    let mut provider = OpenRouterProvider::new_named_openai_compatible("static-only", &profile)
+        .expect("static-only profile initializes");
+    provider.auth = Arc::new(|| anyhow::bail!("catalog must not resolve credentials"));
+    assert!(provider.refresh_models().await.unwrap().is_empty());
+    let summary = provider.refresh_model_catalog().await.unwrap();
+    assert_eq!(
+        provider.available_models_display(),
+        vec!["configured-model"]
+    );
+    let _ = summary;
+}
+
+#[test]
 fn named_profile_static_models_survive_live_catalog_refresh() {
     let _lock = ENV_LOCK.lock();
     let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
@@ -62,6 +107,7 @@ fn named_profile_static_models_survive_live_catalog_refresh() {
             context_length: Some(128_000),
             pricing: Default::default(),
             created: None,
+            ..Default::default()
         }];
         cache.fetched = true;
         cache.cached_at = Some(1);
@@ -173,6 +219,60 @@ context_window = 128000
     assert!(
         models.iter().any(|m| m == "vendor-live-model"),
         "live catalog models must still be offered: {models:?}"
+    );
+}
+
+/// A pinned `<model>@<Provider>` variant is routing syntax, not the catalog id.
+/// OpenRouter's `/models` lists `stealth/space-bunny-alpha` while the pinned runtime
+/// model is `stealth/space-bunny-alpha@Stealth`. Matching only the pinned form missed
+/// every catalog entry, so `context_window()` fell through to the 200K default even
+/// though the catalog entry carries `context_length` 1000000. Measured live: the panel
+/// reported 200K while the on-disk catalog already carried the correct number.
+#[tokio::test]
+async fn pinned_variant_suffix_still_matches_the_catalog_entry() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let temp = tempfile::tempdir().expect("temp jcode home");
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path().to_str().expect("utf8 temp path"));
+
+    let api_base = spawn_models_server(
+        r#"{
+            "object": "list",
+            "data": [
+                {"id": "stealth/space-bunny-alpha", "object": "model", "context_length": 1000000}
+            ]
+        }"#,
+    );
+
+    let toml_src = format!(
+        r#"
+base_url = "{api_base}"
+auth = "none"
+model_catalog = true
+default_model = "stealth/space-bunny-alpha"
+"#
+    );
+    let profile: jcode_base::config::NamedProviderConfig =
+        toml::from_str(&toml_src).expect("config.toml profile should parse");
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("orvariant", &profile)
+        .expect("named profile should initialize");
+
+    provider
+        .fetch_models()
+        .await
+        .expect("live catalog fetch should succeed");
+
+    // The pinned form the runtime actually carries.
+    {
+        let mut model = provider.model.try_write().expect("model lock");
+        *model = "stealth/space-bunny-alpha@Stealth".to_string();
+    }
+
+    assert_eq!(
+        provider.context_window(),
+        1_000_000,
+        "a pinned @Provider suffix must not hide the model from the catalog"
     );
 }
 

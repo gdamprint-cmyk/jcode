@@ -1,97 +1,22 @@
+#[path = "debug_picker_state.rs"]
+mod picker_state;
 use super::*;
 
 impl App {
-    pub(in crate::tui::app) fn debug_picker_state_json(
-        &self,
-        visible_limit: Option<usize>,
-    ) -> String {
-        let Some(picker) = self.inline_interactive_state.as_ref() else {
-            return serde_json::json!({
-                "open": false,
-                "input": self.input,
-                "cursor_pos": self.cursor_pos,
-            })
-            .to_string();
-        };
-
-        let filtered_count = picker.filtered.len();
-        let total_count = picker.entries.len();
-        let list_height = visible_limit.unwrap_or_else(|| filtered_count.min(40));
-        let selected = picker.selected.min(filtered_count.saturating_sub(1));
-        let start = if filtered_count == 0 || list_height == 0 {
-            0
-        } else {
-            let half = list_height / 2;
-            if selected <= half {
-                0
-            } else if selected + list_height - half > filtered_count {
-                filtered_count.saturating_sub(list_height)
-            } else {
-                selected - half
-            }
-        };
-        let end = if list_height == 0 {
-            start
-        } else {
-            (start + list_height).min(filtered_count)
-        };
-
-        let rows: Vec<serde_json::Value> = picker
-            .filtered
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .filter_map(|(visible_index, entry_index)| {
-                let entry = picker.entries.get(*entry_index)?;
-                let route = entry.active_option();
-                let filter_text = picker.filter_text(entry);
-                Some(serde_json::json!({
-                    "visible_index": visible_index,
-                    "entry_index": entry_index,
-                    "selected": visible_index == selected,
-                    "name": entry.name,
-                    "provider": route.map(|r| r.provider.as_str()).unwrap_or(""),
-                    "api_method": route.map(|r| r.api_method.as_str()).unwrap_or(""),
-                    "available": route.map(|r| r.available).unwrap_or(false),
-                    "detail": route.map(|r| r.detail.as_str()).unwrap_or(""),
-                    "filter_text": filter_text,
-                    "fuzzy_score": if picker.filter.is_empty() {
-                        None
-                    } else {
-                        Self::picker_fuzzy_score(&picker.filter, &filter_text)
-                    },
-                    "recommended": entry.recommended,
-                    "current": entry.is_current,
-                    "default": entry.is_default,
-                    "old": entry.old,
-                    "created_date": entry.created_date,
-                }))
-            })
-            .collect();
-
-        serde_json::to_string_pretty(&serde_json::json!({
-            "open": true,
-            "kind": format!("{:?}", picker.kind),
-            "preview": picker.preview,
-            "input": self.input,
-            "cursor_pos": self.cursor_pos,
-            "filter": picker.filter,
-            "selected": picker.selected,
-            "column": picker.column,
-            "total_count": total_count,
-            "filtered_count": filtered_count,
-            "visible_start": start,
-            "visible_end": end,
-            "visible_count": rows.len(),
-            "visible_limit": visible_limit,
-            "rows": rows,
-        }))
-        .unwrap_or_else(|_| "{}".to_string())
-    }
-
     pub(in crate::tui::app) fn handle_debug_command(&mut self, cmd: &str) -> String {
         let cmd = cmd.trim();
+        if cmd == "hibernate" {
+            return self.request_debug_hibernation();
+        }
+        if cmd == "hibernation" {
+            return self.debug_hibernation_state();
+        }
+        if cmd.starts_with("message:")
+            || cmd.starts_with("scroll:")
+            || cmd.starts_with("set_input:")
+        {
+            self.note_client_interaction();
+        }
         if cmd == "frame" {
             return self.handle_debug_command("screen-json");
         }
@@ -263,6 +188,15 @@ impl App {
                 "OK: mouse {kind} at {col},{row} (status: {:?})",
                 self.status_notice.as_ref().map(|(text, _)| text.as_str())
             )
+        } else if cmd == "quota-limit-fixture" {
+            self.is_remote = true;
+            self.remote_provider_name = Some("OpenAI".into());
+            self.remote_provider_model = Some("gpt-5.4".into());
+            self.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
+            self.remote_provider_oauth_email = None;
+            self.remote_provider_oauth_account_label = None;
+            self.refresh_openai_usage_after_quota_error("usage_limit_reached");
+            serde_json::json!({"ok": true, "fixture": "quota-limit"}).to_string()
         } else if cmd.starts_with("image-click-target:") {
             // Probe the inline-image expand badge hit-test at screen coords.
             let raw = cmd.strip_prefix("image-click-target:").unwrap_or("");
@@ -275,7 +209,7 @@ impl App {
             let image_id = crate::tui::ui::inline_image_expand_target_from_screen(col, row);
             let body_id =
                 crate::tui::ui::inline_image_body_target_from_screen(col, row, self.centered);
-            let link = crate::tui::ui::link_target_from_screen(col, row);
+            let link = crate::tui::ui::link_target_from_screen_with_state(col, row, self);
             serde_json::json!({
                 "col": col,
                 "row": row,
@@ -288,6 +222,36 @@ impl App {
             // Dump the current chat snapshot's inline-image regions and label
             // lines so a driver can compute real badge click coordinates.
             crate::tui::ui::debug_chat_image_regions_json()
+        } else if cmd == "login-progress-fixture" {
+            self.show_openai_login_progress(
+                "fixture",
+                "https://example.invalid/oauth/authorize?client_id=jcode-fixture&state=fixture-not-a-secret&code_challenge=fixture",
+                true,
+                true,
+                "Fixture only. No real browser, listener, or credentials. Full URL is available for copying here.",
+            );
+            self.pending_login = Some(PendingLogin::OpenAiAccount {
+                verifier: "fixture".to_string(),
+                label: "fixture".to_string(),
+                expected_state: "fixture".to_string(),
+                redirect_uri: "http://localhost:1455/auth/callback".to_string(),
+            });
+            self.follow_chat_bottom();
+            serde_json::json!({"ok": true, "fixture": "login-progress"}).to_string()
+        } else if cmd == "login-progress-success-fixture" {
+            let replaced =
+                self.finish_openai_login_progress("✓ OpenAI login complete.".to_string());
+            self.pending_login = None;
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.set_status_notice("Login: openai ready (fixture)");
+            serde_json::json!({"ok": replaced, "fixture": "login-progress-success"}).to_string()
+        } else if cmd == "login-progress-exchange-fixture" {
+            self.update_openai_login_exchange("fixture");
+            self.pending_login = Some(PendingLogin::Exchanging {
+                provider: "openai".to_string(),
+            });
+            serde_json::json!({"ok": true, "fixture": "login-progress-exchange"}).to_string()
         } else if cmd == "expand-badge-fixture" {
             let old_string = (0..24)
                 .map(|idx| format!("old fixture line {idx}\n"))
@@ -396,6 +360,17 @@ impl App {
                 self.debug_force_inline_gallery = false;
                 self.remote_swarm_members.clear();
                 "OK: inline swarm gallery cleared".to_string()
+            } else if raw.starts_with('[') {
+                match serde_json::from_str::<Vec<crate::protocol::SwarmMemberStatus>>(raw) {
+                    Ok(members) => {
+                        let n = members.len();
+                        self.remote_swarm_members = members;
+                        self.debug_force_inline_gallery = true;
+                        self.refresh_pinned_todos_now();
+                        format!("OK: injected {n} explicit swarm members; gallery forced active")
+                    }
+                    Err(error) => format!("Invalid swarm member fixture: {error}"),
+                }
             } else {
                 let n: usize = raw.parse().unwrap_or(3);
                 let statuses = ["running", "thinking", "ready", "completed", "blocked"];
@@ -481,6 +456,8 @@ impl App {
                             auth_method: Some("OAuth".into()),
                             effort: Some("high".into()),
                             elapsed_secs: Some(18),
+                            activity_age_secs: None,
+                            ..Default::default()
                         },
                     })
                     .collect();
@@ -795,7 +772,7 @@ impl App {
             let (role, content) = if let Some((r, c)) = raw.split_once(':') {
                 let role = match r {
                     "user" | "assistant" | "system" | "background_task" | "tool" | "error"
-                    | "meta" => r,
+                    | "todos" | "meta" => r,
                     _ => "assistant",
                 };
                 if role == "assistant" && r != "assistant" {
@@ -807,14 +784,19 @@ impl App {
                 ("assistant", raw)
             };
 
-            self.push_display_message(DisplayMessage {
-                role: role.to_string(),
-                content: content.to_string(),
-                tool_calls: vec![],
-                duration_secs: None,
-                title: None,
-                tool_data: None,
-            });
+            let message = if role == "todos" {
+                DisplayMessage::todos(content)
+            } else {
+                DisplayMessage {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                    tool_calls: vec![],
+                    duration_secs: None,
+                    title: None,
+                    tool_data: None,
+                }
+            };
+            self.push_display_message(message);
             format!("OK: injected {} message ({} chars)", role, content.len())
         } else if cmd == "scroll-test" || cmd.starts_with("scroll-test:") {
             let raw = cmd.strip_prefix("scroll-test:");
@@ -964,6 +946,12 @@ impl App {
             }
         } else if cmd == "version" {
             format!("version: {}", jcode_build_meta::version())
+        } else if cmd == "oauth-notice-preview" {
+            // Synthetic visual validation only. No account, queue, upload,
+            // or persisted one-time receipt is touched by this command.
+            self.oauth_notice_displayed_at = Some(Instant::now());
+            self.request_full_redraw();
+            "OK: provider email telemetry notice preview (8 seconds)".to_string()
         } else if cmd == "help" {
             "Debug commands:\n\
                  - message:<text> - inject and submit a message\n\
@@ -1032,6 +1020,7 @@ impl App {
                  - bundle-save - save test bundle\n\
                  - script:<json> - run test script\n\
                  - version - get version\n\
+                 - oauth-notice-preview - preview provider email notice for 8 seconds, no upload\n\
                  - help - show this help"
                 .to_string()
         } else {

@@ -6,6 +6,16 @@ use std::time::Duration;
 
 const REMOTE_STARTUP_HEADER_DEBOUNCE: Duration = Duration::from_millis(400);
 
+fn startup_usage_slot_pending(
+    is_remote: bool,
+    runtime_pending: bool,
+    usage_received: bool,
+) -> bool {
+    // Cached account rows can arrive before History binds this session to an
+    // account. Keep the sidebar slot until both pieces are authoritative.
+    is_remote && (runtime_pending || !usage_received)
+}
+
 /// How long a routine `LoadingSession` phase may keep showing the known model
 /// hint before the header falls back to the "loading session…" label. History
 /// bootstrap normally lands in ~1s, so the common spawn path never flashes a
@@ -58,6 +68,69 @@ struct WidgetRouteInfo {
     is_remote: bool,
 }
 
+fn remote_oauth_account_label<'a>(
+    server_label: Option<&'a str>,
+    route_api_method: Option<&'a str>,
+) -> Option<&'a str> {
+    server_label
+        .filter(|label| !label.is_empty() && !label.chars().any(char::is_control))
+        .or_else(|| route_api_method.and_then(jcode_provider_core::oauth_account_label))
+}
+
+fn remote_oauth_widget_usage_for_route(
+    provider: crate::tui::info_widget::UsageProvider,
+    route_api_method: Option<&str>,
+    server_label: Option<&str>,
+    quota_rejected: bool,
+    output_tps: Option<f32>,
+    lookup: impl FnOnce(&str) -> Option<crate::usage::AccountUsageSnapshot>,
+) -> crate::tui::info_widget::UsageInfo {
+    let snapshot = remote_oauth_account_label(server_label, route_api_method).and_then(lookup);
+    remote_oauth_widget_usage(provider, snapshot.as_ref(), quota_rejected, output_tps)
+}
+
+fn remote_oauth_widget_usage(
+    provider: crate::tui::info_widget::UsageProvider,
+    snapshot: Option<&crate::usage::AccountUsageSnapshot>,
+    quota_rejected: bool,
+    output_tps: Option<f32>,
+) -> crate::tui::info_widget::UsageInfo {
+    use crate::tui::info_widget::UsageInfo;
+    let Some(snapshot) = snapshot else {
+        return UsageInfo {
+            provider,
+            output_tps,
+            limit_reached: quota_rejected,
+            ..Default::default()
+        };
+    };
+    UsageInfo {
+        provider,
+        account_hint: snapshot
+            .email
+            .as_deref()
+            .map(crate::tui::app::helpers::mask_email),
+        primary_limit_label: snapshot.five_hour_ratio.and(snapshot.primary_label.clone()),
+        five_hour: snapshot.five_hour_ratio.unwrap_or(0.0),
+        // The wire snapshot has one reset timestamp, belonging to the primary
+        // window (or secondary when primary is absent), not both windows.
+        five_hour_resets_at: snapshot.five_hour_ratio.and(snapshot.resets_at.clone()),
+        secondary_limit_label: snapshot
+            .seven_day_ratio
+            .and(snapshot.secondary_label.clone()),
+        seven_day: snapshot.seven_day_ratio.unwrap_or(0.0),
+        seven_day_resets_at: snapshot
+            .seven_day_ratio
+            .filter(|_| snapshot.five_hour_ratio.is_none())
+            .and(snapshot.resets_at.clone()),
+        output_tps,
+        limit_reached: quota_rejected,
+        available: snapshot.error.is_none()
+            && (snapshot.five_hour_ratio.is_some() || snapshot.seven_day_ratio.is_some()),
+        ..Default::default()
+    }
+}
+
 impl App {
     fn sanitize_remote_model_hint(model: Option<String>) -> Option<String> {
         model
@@ -65,7 +138,7 @@ impl App {
             .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("unknown"))
     }
 
-    fn configured_remote_provider_hint(&self) -> Option<String> {
+    pub(super) fn configured_remote_provider_hint(&self) -> Option<String> {
         if crate::tui::is_ssh_remote() {
             return None;
         }
@@ -393,7 +466,58 @@ impl App {
         }
     }
 
+    pub(super) fn openai_widget_account_email(&self) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return None;
+        }
+        if self.is_remote {
+            self.remote_provider_oauth_email
+                .as_ref()
+                .map(|email| email.as_str().to_string())
+        } else {
+            self.provider.active_oauth_account_email()
+        }
+    }
+
+    /// Masked email of the OAuth account this session's requests use. Comes
+    /// from the session's own credential, never the global active login.
+    fn widget_account_hint(&self, provider: WidgetProviderKind) -> Option<String> {
+        if crate::tui::is_ssh_remote() {
+            return None;
+        }
+        let email = if self.is_remote {
+            self.remote_provider_oauth_email
+                .as_ref()
+                .map(|email| email.as_str().to_string())
+        } else if provider == WidgetProviderKind::OpenAI {
+            // Same lookup the local OpenAI usage path already performs.
+            self.openai_widget_account_email()
+        } else {
+            None
+        };
+        email
+            .filter(|email| !email.trim().is_empty())
+            .map(|email| crate::tui::app::helpers::mask_email(&email))
+    }
+
     fn widget_usage_info(
+        &self,
+        route: WidgetRouteInfo,
+        auth_method: crate::tui::info_widget::AuthMethod,
+    ) -> Option<crate::tui::info_widget::UsageInfo> {
+        let mut info = self.widget_usage_info_inner(route, auth_method)?;
+        if matches!(
+            info.provider,
+            crate::tui::info_widget::UsageProvider::OpenAI
+                | crate::tui::info_widget::UsageProvider::Anthropic
+        ) && let Some(hint) = self.widget_account_hint(route.provider)
+        {
+            info.account_hint = Some(hint);
+        }
+        Some(info)
+    }
+
+    fn widget_usage_info_inner(
         &self,
         route: WidgetRouteInfo,
         auth_method: crate::tui::info_widget::AuthMethod,
@@ -437,7 +561,9 @@ impl App {
             cache_read_tokens: self.streaming.streaming_cache_read_tokens,
             cache_write_tokens: self.streaming.streaming_cache_creation_tokens,
             output_tps,
+            limit_reached: false,
             available: true,
+            account_hint: None,
         };
 
         match route.provider {
@@ -457,7 +583,9 @@ impl App {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 output_tps,
+                limit_reached: false,
                 available: display_input_tokens > 0 || display_output_tokens > 0,
+                account_hint: None,
             }),
             WidgetProviderKind::Anthropic => {
                 match auth_method {
@@ -466,6 +594,25 @@ impl App {
                     }
                     crate::tui::info_widget::AuthMethod::AnthropicOAuth => {}
                     _ => return None,
+                }
+
+                if route.is_remote {
+                    // Daemon snapshots are authoritative for the bound account.
+                    // Never call get_sync here: even a cache miss can start a
+                    // local HTTP refresh with this machine's credentials.
+                    return Some(remote_oauth_widget_usage_for_route(
+                        crate::tui::info_widget::UsageProvider::Anthropic,
+                        self.session.route_api_method.as_deref(),
+                        self.remote_provider_oauth_account_label.as_deref(),
+                        false,
+                        output_tps,
+                        |label| {
+                            crate::usage::cached_account_usage_status_snapshot(
+                                crate::usage::MultiAccountProviderKind::Anthropic,
+                                label,
+                            )
+                        },
+                    ));
                 }
 
                 let usage = crate::usage::get_sync();
@@ -485,7 +632,9 @@ impl App {
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
+                    limit_reached: false,
                     available: usage.last_error.is_none(),
+                    account_hint: None,
                 })
             }
             WidgetProviderKind::OpenAI => {
@@ -497,7 +646,31 @@ impl App {
                     _ => return None,
                 }
 
-                let openai_usage = crate::usage::get_openai_usage_sync();
+                if route.is_remote {
+                    // The header reads the daemon's account cache by route label.
+                    // An email lookup here would instead probe this machine's
+                    // credentials and can show a different account's windows.
+                    return Some(remote_oauth_widget_usage_for_route(
+                        crate::tui::info_widget::UsageProvider::OpenAI,
+                        self.session.route_api_method.as_deref(),
+                        self.remote_provider_oauth_account_label.as_deref(),
+                        self.usage_reset.openai_quota_rejected,
+                        output_tps,
+                        |label| {
+                            crate::usage::cached_account_usage_status_snapshot(
+                                crate::usage::MultiAccountProviderKind::OpenAI,
+                                label,
+                            )
+                        },
+                    ));
+                }
+
+                // The selected route is session-bound, unlike the global
+                // active account. Never borrow another login's quota headroom.
+                let openai_usage = self
+                    .openai_widget_account_email()
+                    .map(|email| crate::usage::get_openai_usage_for_email_sync(&email))
+                    .unwrap_or_default();
                 Some(crate::tui::info_widget::UsageInfo {
                     provider: crate::tui::info_widget::UsageProvider::OpenAI,
                     primary_limit_label: openai_usage
@@ -537,7 +710,10 @@ impl App {
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
-                    available: openai_usage.has_limits(),
+                    limit_reached: openai_usage.hard_limit_reached
+                        || self.usage_reset.openai_quota_rejected,
+                    available: openai_usage.has_limits() && openai_usage.last_error.is_none(),
+                    account_hint: None,
                 })
             }
             WidgetProviderKind::Gemini => None,
@@ -566,6 +742,17 @@ impl App {
 }
 
 impl crate::tui::TuiState for App {
+    fn hibernation_frame(&self) -> Option<&ratatui::buffer::Buffer> {
+        self.idle_hibernation.frame.as_ref()
+    }
+
+    fn hibernation_notice(&self) -> Option<&str> {
+        self.idle_hibernation
+            .frame
+            .as_ref()
+            .map(|_| self.idle_hibernation.notice.as_str())
+    }
+
     fn display_messages(&self) -> &[DisplayMessage] {
         &self.display_messages
     }
@@ -636,12 +823,37 @@ impl crate::tui::TuiState for App {
         self.pinned_todos_expanded
     }
 
+    fn justrust_status(&self) -> Option<&crate::tui::justrust_status::StatusRow> {
+        self.justrust_status.row()
+    }
+
     fn background_task_rows(&self) -> &[crate::tui::BackgroundTaskRow] {
         self.background_task_rows_ref()
     }
 
+    fn login_input_hint(&self) -> Option<&'static str> {
+        match self.pending_login.as_ref()? {
+            PendingLogin::Exchanging { .. } => {
+                Some("Login only: exchanging credentials · not sent to AI · please wait")
+            }
+            PendingLogin::OpenAiAccount { .. }
+            | PendingLogin::Gemini { .. }
+            | PendingLogin::Antigravity { .. } => {
+                Some("Login only: paste callback URL · not sent to AI · /cancel")
+            }
+            _ => Some("Login only: authentication input · not sent to AI · /cancel"),
+        }
+    }
+
     fn input(&self) -> &str {
         &self.input
+    }
+
+    fn input_image_attached(&self, number: usize) -> bool {
+        number
+            .checked_sub(1)
+            .and_then(|index| self.pending_images.get(index))
+            .is_some_and(|(media_type, data)| !media_type.is_empty() && !data.is_empty())
     }
 
     fn cursor_pos(&self) -> usize {
@@ -654,6 +866,10 @@ impl crate::tui::TuiState for App {
 
     fn queued_messages(&self) -> &[String] {
         &self.queued_messages
+    }
+
+    fn queued_commands(&self) -> &[String] {
+        &self.queued_commands
     }
 
     fn interleave_message(&self) -> Option<&str> {
@@ -683,21 +899,6 @@ impl crate::tui::TuiState for App {
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
         self.pending_history_anchor
             .map(|anchor| anchor.lines_from_bottom)
-    }
-
-    fn chat_overscroll_active(&self) -> bool {
-        self.chat_overscroll_active()
-    }
-
-    fn chat_overscroll_pinned(&self) -> bool {
-        matches!(
-            self.overscroll_status_mode,
-            crate::config::OverscrollStatusMode::On
-        )
-    }
-
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        self.chat_overscroll_remaining()
     }
 
     fn copy_selection_edge_autoscroll_active(&self) -> bool {
@@ -982,7 +1183,33 @@ impl crate::tui::TuiState for App {
         self.remote_client_count
     }
 
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        self.voice_input_status_line()
+    }
+
+    fn reset_hint_visible(&self, key: &str) -> bool {
+        let mut seen = self.reset_hint_seen.borrow_mut();
+        let now = Instant::now();
+        if seen.as_ref().is_none_or(|(previous, _)| previous != key) {
+            *seen = Some((key.to_owned(), now));
+        }
+        seen.as_ref()
+            .is_some_and(|(_, shown)| now.duration_since(*shown) < Duration::from_secs(15))
+    }
+
     fn status_notice(&self) -> Option<String> {
+        if self.idle_hibernation.frame.is_some() {
+            return Some(self.idle_hibernation.notice.clone());
+        }
+        // This priority notice is owned by the telemetry handshake, not the
+        // expiring general status slot. Other notices cannot clobber it.
+        if crate::telemetry::pending_oauth_account_notice().is_some()
+            || self
+                .oauth_notice_displayed_at
+                .is_some_and(super::oauth_telemetry::readable_notice_active)
+        {
+            return Some(crate::telemetry::OAUTH_ACCOUNT_NOTICE_TEXT.to_string());
+        }
         if !self.is_remote
             && self.provider.uses_jcode_compaction()
             && let Ok(manager) = self.registry.compaction().try_read()
@@ -993,7 +1220,7 @@ impl crate::tui::TuiState for App {
             ));
         }
         self.status_notice.as_ref().and_then(|(text, at)| {
-            if at.elapsed() <= Duration::from_secs(3) {
+            if at.elapsed() <= STATUS_NOTICE_TTL {
                 Some(text.clone())
             } else {
                 None
@@ -1237,6 +1464,10 @@ impl crate::tui::TuiState for App {
                         ContentBlock::ToolReference { tool_name, .. } => {
                             user_chars += tool_name.len();
                         }
+                        ContentBlock::ProviderNative { item, .. } => {
+                            tool_result_count += 1;
+                            tool_result_chars += item.to_string().len();
+                        }
                     }
                 }
             }
@@ -1331,28 +1562,6 @@ impl crate::tui::TuiState for App {
     }
 
     fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData {
-        let session_id = if self.is_remote {
-            self.remote_session_id.as_deref()
-        } else {
-            Some(self.session.id.as_str())
-        };
-
-        let todos_are_swarm_plan = self.swarm_enabled && !self.swarm_plan_items.is_empty();
-        let (todos, todo_goals) =
-            if crate::config::config().display.pin_todos && !todos_are_swarm_plan {
-                // The pinned band is the single source of truth while enabled. Do
-                // not duplicate the same session todos in a margin or overview
-                // info widget.
-                (Vec::new(), Vec::new())
-            } else if todos_are_swarm_plan {
-                (
-                    crate::tui::info_widget::swarm_plan_todos(&self.swarm_plan_items),
-                    Vec::new(),
-                )
-            } else {
-                gather_todos_and_goals_for_session(session_id)
-            };
-
         let context_snapshot = self.context_snapshot();
         let context_info = if let Some(context_info) = context_snapshot.info.clone() {
             (context_info.total_chars > 0).then_some(context_info)
@@ -1478,7 +1687,7 @@ impl crate::tui::TuiState for App {
             };
 
             // Dock data: the agents this session actually manages (spawn
-            // subtree), the shared panel selection/focus, and plan progress.
+            // subtree) and the shared panel selection/focus.
             // This is what the SwarmStatus widget renders. Computed outside
             // the activity gate: managing agents is itself "interesting".
             let managed_members = self.inline_swarm_members();
@@ -1489,22 +1698,6 @@ impl crate::tui::TuiState for App {
                 || client_count.is_some()
                 || !managed_members.is_empty()
             {
-                let plan_progress = if self.swarm_plan_items.is_empty() {
-                    None
-                } else {
-                    let total = self.swarm_plan_items.len() as u32;
-                    let done = self
-                        .swarm_plan_items
-                        .iter()
-                        .filter(|item| matches!(item.status.as_str(), "completed" | "done"))
-                        .count() as u32;
-                    let running = self
-                        .swarm_plan_items
-                        .iter()
-                        .filter(|item| matches!(item.status.as_str(), "running" | "running_stale"))
-                        .count() as u32;
-                    Some((done, running, total))
-                };
                 Some(crate::tui::info_widget::SwarmInfo {
                     session_count,
                     subagent_status,
@@ -1518,7 +1711,6 @@ impl crate::tui::TuiState for App {
                             .min(managed_members.len().saturating_sub(1))
                     },
                     focused: self.swarm_panel_focused,
-                    plan_progress,
                     spinner_frame: (self.animation_elapsed()
                         * jcode_tui_render::swarm_gallery::STRIP_SPINNER_FPS)
                         as usize,
@@ -1531,13 +1723,15 @@ impl crate::tui::TuiState for App {
             None
         };
 
-        // Gather background task info
+        // Gather background task info. Session-scoped rows come from task
+        // events (works when tasks run in the server process). The global
+        // manager only knows tasks spawned in this process.
         let background_info = {
-            // Get running background tasks count
             let bg_manager = crate::background::global();
             let (running_count, running_tasks, progress) = bg_manager.running_snapshot();
+            let rows = self.background_task_rows_ref().to_vec();
 
-            if running_count > 0 {
+            if running_count > 0 || !rows.is_empty() {
                 Some(crate::tui::info_widget::BackgroundInfo {
                     running_count,
                     running_tasks,
@@ -1547,6 +1741,7 @@ impl crate::tui::TuiState for App {
                         .and_then(|progress| progress.detail.clone()),
                     memory_agent_active: false,
                     memory_agent_turns: 0,
+                    rows,
                 })
             } else {
                 None
@@ -1645,21 +1840,58 @@ impl crate::tui::TuiState for App {
         };
 
         crate::tui::info_widget::InfoWidgetData {
-            todos,
-            todo_goals,
-            todos_are_swarm_plan,
+            startup_runtime_pending: self.is_remote && self.remote_startup_phase.is_some(),
+            startup_usage_pending: startup_usage_slot_pending(
+                self.is_remote,
+                self.remote_startup_phase.is_some(),
+                crate::usage::remote_account_usage_received(),
+            ),
             context_info,
             context_info_stale: !context_snapshot.fresh,
             queue_mode: Some(self.queue_mode),
             context_limit: Some(self.context_limit as usize),
             model,
             reasoning_effort,
-            service_tier,
+            service_tier: if !self.is_remote {
+                service_tier
+            } else {
+                service_tier
+                    .or_else(|| {
+                        (self.remote_service_tier_confirmation_pending
+                            || self.remote_reported_service_tier.as_ref().is_some_and(
+                                |(sent, tier)| {
+                                    sent.is_none()
+                                        && super::service_tier_display_label(tier) != "Standard"
+                                },
+                            ))
+                        .then(|| "default".to_string())
+                    })
+                    .map(|requested| {
+                        let label = super::service_tier_display_label(&requested);
+                        match self.remote_reported_service_tier.as_ref() {
+                            Some((sent, reported))
+                                if super::service_tier_display_label(
+                                    sent.as_deref().unwrap_or("default"),
+                                ) == label =>
+                            {
+                                if super::service_tier_display_label(reported) == label {
+                                    requested
+                                } else {
+                                    // Keep the raw report: a generic `default`
+                                    // response tier is not a throughput measurement.
+                                    format!("{reported} ← {label}")
+                                }
+                            }
+                            _ => format!("{label} ?"),
+                        }
+                    })
+            },
             native_compaction_mode,
             native_compaction_threshold_tokens,
             session_count,
             session_name,
             working_dir: self.session.working_dir.clone(),
+            original_working_dir: self.session.original_working_dir.clone(),
             client_count,
             // Memory remains available through commands and tools, but no longer
             // occupies a dedicated info widget.
@@ -1696,6 +1928,14 @@ impl crate::tui::TuiState for App {
                 false
             },
             git_info: gather_git_info(),
+            cloud_info: crate::tui::cloud_status::gather(self.current_session_id()),
+            cloud_connection: self.remote_startup_phase.as_ref().map(|phase| match phase {
+                super::RemoteStartupPhase::Reconnecting { .. } => "Reconnecting".to_string(),
+                _ => "Connecting".to_string(),
+            }),
+            cloud_working: self.is_processing,
+            dual_git_info: crate::tui::cloud_git::gather(),
+            agent_edited: self.agent_edited_paths(),
         }
     }
 
@@ -1749,6 +1989,21 @@ impl crate::tui::TuiState for App {
         self.dual_credential_active(route, provider)
     }
 
+    fn startup_oauth_account_label(&self) -> Option<String> {
+        if !self.is_remote {
+            if crate::tui::is_ssh_remote() {
+                return None;
+            }
+            return self.provider.oauth_account_label();
+        }
+        // SSH must avoid host-local credentials, not daemon-reported identity.
+        remote_oauth_account_label(
+            self.remote_provider_oauth_account_label.as_deref(),
+            self.session.route_api_method.as_deref(),
+        )
+        .map(str::to_owned)
+    }
+
     fn diagram_mode(&self) -> crate::config::DiagramDisplayMode {
         self.diagram_mode
     }
@@ -1766,31 +2021,20 @@ impl crate::tui::TuiState for App {
     }
 
     fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
-        if self.debug_force_inline_gallery {
-            return self.remote_swarm_members.clone();
+        let mut members = self.inline_swarm_members_unticked();
+        // Server snapshots only arrive on state changes, so advance active
+        // workers' stopwatches locally to make them tick every second.
+        if let Some(received_at) = self.remote_swarm_members_received_at {
+            let since = received_at.elapsed().as_secs();
+            for member in &mut members {
+                if jcode_tui_render::swarm_gallery::is_active_status(&member.status)
+                    && let Some(elapsed) = member.runtime.elapsed_secs.as_mut()
+                {
+                    *elapsed = elapsed.saturating_add(since);
+                }
+            }
         }
-        if !self.swarm_enabled {
-            return Vec::new();
-        }
-        // Scope the inline gallery to the subtree this session actually spawned.
-        // Other sessions can share the same swarm (e.g. same repo) without this
-        // session having spawned them; showing those would be noise. The spawn
-        // tree is reconstructed from each member's `report_back_to_session_id`
-        // parent edge.
-        let self_id = if self.is_remote {
-            self.remote_session_id.as_deref()
-        } else {
-            Some(self.session.id.as_str())
-        };
-        match self_id {
-            Some(self_id) => filter_inline_swarm_subtree(&self.remote_swarm_members, self_id),
-            // Session identity is not known yet (e.g. right after connect,
-            // before the History event sets `remote_session_id`). Showing all
-            // swarm members here caused the inline strip to flash on startup
-            // and then disappear once the subtree filter kicked in. Hide the
-            // strip until we know who we are.
-            None => Vec::new(),
-        }
+        members
     }
 
     fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
@@ -1901,6 +2145,9 @@ impl crate::tui::TuiState for App {
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
         &self.side_panel
     }
+    fn side_panel_fullscreen(&self) -> bool {
+        self.side_panel_fullscreen
+    }
     fn pin_images(&self) -> bool {
         self.pin_images && !self.side_panel_user_hidden
     }
@@ -1959,6 +2206,10 @@ impl crate::tui::TuiState for App {
     fn model_status_overlay(&self) -> Option<(usize, &str)> {
         self.model_status_scroll
             .map(|scroll| (scroll, self.model_status_content.as_str()))
+    }
+
+    fn commit_log_overlay(&self) -> Option<&crate::tui::app::CommitLogOverlay> {
+        self.commit_log_overlay.as_ref()
     }
 
     fn session_picker_overlay(
@@ -2174,6 +2425,63 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_swarm_agent_shortcut(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        if code == crossterm::event::KeyCode::Char('p')
+            && modifiers == crossterm::event::KeyModifiers::ALT
+        {
+            self.pop_out_all_swarm_agents();
+            return true;
+        }
+        let Some(index) = swarm_agent_shortcut_index(code, modifiers) else {
+            return false;
+        };
+        if index >= self.inline_swarm_members().len() {
+            return false;
+        }
+        self.swarm_panel_selected = index;
+        self.pop_out_selected_swarm_agent();
+        true
+    }
+
+    /// Open only this session's managed subtree, not repository-wide peers.
+    pub(crate) fn pop_out_all_swarm_agents(&mut self) {
+        let members = self.inline_swarm_members();
+        let order = crate::tui::info_widget::swarm_gallery::members_display_order(&members);
+        if order.is_empty() {
+            self.set_status_notice("No swarm workers to open");
+            return;
+        }
+        let mut opened = 0;
+        let mut failures = Vec::new();
+        for session_id in order {
+            match open_swarm_agent_window(&session_id) {
+                Ok(true) => opened += 1,
+                Ok(false) => failures.push(format!("{session_id}: no terminal emulator found")),
+                Err(error) => failures.push(format!("{session_id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            self.set_status_notice(format!("Opened {opened} swarm workers in new windows"));
+        } else {
+            self.set_status_notice(format!(
+                "Opened {opened} swarm workers, {} failed: {}",
+                failures.len(),
+                failures.join(", ")
+            ));
+        }
+    }
+
+    pub(super) fn swarm_agent_shortcut_digit(&self, session_id: &str) -> Option<u8> {
+        let members = self.inline_swarm_members();
+        let order = crate::tui::info_widget::swarm_gallery::members_display_order(&members);
+        let index = order.iter().position(|id| id == session_id)?;
+        (index < 10).then_some(((index + 1) % 10) as u8)
+    }
+
     /// Open the currently selected swarm agent's session in a new terminal
     /// window (pop-out), reusing the resume-in-new-terminal launcher.
     pub(crate) fn pop_out_selected_swarm_agent(&mut self) {
@@ -2194,16 +2502,41 @@ impl App {
             .and_then(|m| m.friendly_name.clone())
             .unwrap_or_else(|| session_id.chars().take(8).collect());
 
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("jcode"));
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        match jcode_app_core::session_launch::spawn_resume_in_new_terminal(&exe, &session_id, &cwd)
-        {
+        match open_swarm_agent_window(&session_id) {
             Ok(true) => self.set_status_notice(format!("Opened {label} in a new window")),
             Ok(false) => self.set_status_notice(format!(
                 "Could not open a terminal for {label} (no emulator found)"
             )),
             Err(e) => self.set_status_notice(format!("Failed to open {label}: {e}")),
         }
+    }
+}
+
+fn open_swarm_agent_window(session_id: &str) -> anyhow::Result<bool> {
+    let exe = super::launch_client_executable();
+    let cwd = crate::session::Session::load_startup_stub(session_id)
+        .ok()
+        .and_then(|session| session.working_dir)
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let socket = std::env::var("JCODE_SOCKET").ok();
+    super::spawn_in_new_terminal(&exe, session_id, &cwd, socket.as_deref())
+}
+
+/// Decode direct agent badges without capturing plain digits or other chords.
+pub(crate) fn swarm_agent_shortcut_index(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Option<usize> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match code {
+        KeyCode::Char('0') => Some(9),
+        KeyCode::Char(c @ '1'..='9') => Some((c as u8 - b'1') as usize),
+        _ => None,
     }
 }
 
@@ -2313,94 +2646,43 @@ pub(crate) fn filter_inline_swarm_subtree(
         .collect()
 }
 
-#[cfg(test)]
-mod swarm_panel_key_tests {
-    use super::{SwarmPanelAction, swarm_panel_action_for_key};
-    use crossterm::event::{KeyCode, KeyModifiers};
-
-    /// Plain typing (letters, space, enter, arrows without alt) must pass
-    /// through so the user can keep writing into the chat input while the
-    /// panel is focused.
-    #[test]
-    fn plain_typing_is_not_captured() {
-        for code in [
-            KeyCode::Char('j'),
-            KeyCode::Char('k'),
-            KeyCode::Char('o'),
-            KeyCode::Char('g'),
-            KeyCode::Char('G'),
-            KeyCode::Char(' '),
-            KeyCode::Enter,
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Home,
-            KeyCode::End,
-            KeyCode::Backspace,
-        ] {
-            let mods = if code == KeyCode::Char('G') {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            assert_eq!(
-                swarm_panel_action_for_key(code, mods),
-                None,
-                "{code:?} must pass through to the chat input"
-            );
+impl App {
+    fn inline_swarm_members_unticked(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        if self.debug_force_inline_gallery {
+            return self.remote_swarm_members.clone();
         }
-    }
-
-    #[test]
-    fn alt_chords_drive_the_panel() {
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Down, KeyModifiers::ALT),
-            Some(SwarmPanelAction::SelectNext)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Up, KeyModifiers::ALT),
-            Some(SwarmPanelAction::SelectPrev)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Char('j'), KeyModifiers::ALT),
-            Some(SwarmPanelAction::SelectNext)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Char('k'), KeyModifiers::ALT),
-            Some(SwarmPanelAction::SelectPrev)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Char('o'), KeyModifiers::ALT),
-            Some(SwarmPanelAction::PopOut)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Enter, KeyModifiers::ALT),
-            Some(SwarmPanelAction::PopOut)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Char('P'), KeyModifiers::ALT | KeyModifiers::SHIFT),
-            Some(SwarmPanelAction::OpenPrompt)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Char('p'), KeyModifiers::ALT | KeyModifiers::SHIFT),
-            Some(SwarmPanelAction::OpenPrompt)
-        );
-        assert_eq!(
-            swarm_panel_action_for_key(KeyCode::Esc, KeyModifiers::NONE),
-            Some(SwarmPanelAction::Exit)
-        );
-    }
-
-    #[test]
-    fn ctrl_chords_pass_through() {
-        for code in [KeyCode::Char('j'), KeyCode::Char('o'), KeyCode::Down] {
-            assert_eq!(
-                swarm_panel_action_for_key(code, KeyModifiers::CONTROL),
-                None,
-                "{code:?}+ctrl belongs to other handlers"
-            );
+        if !self.swarm_enabled {
+            return Vec::new();
+        }
+        // Scope the inline gallery to the subtree this session actually spawned.
+        // Other sessions can share the same swarm (e.g. same repo) without this
+        // session having spawned them; showing those would be noise. The spawn
+        // tree is reconstructed from each member's `report_back_to_session_id`
+        // parent edge.
+        let self_id = if self.is_remote {
+            self.remote_session_id.as_deref()
+        } else {
+            Some(self.session.id.as_str())
+        };
+        match self_id {
+            Some(self_id) => filter_inline_swarm_subtree(&self.remote_swarm_members, self_id),
+            // Session identity is not known yet (e.g. right after connect,
+            // before the History event sets `remote_session_id`). Showing all
+            // swarm members here caused the inline strip to flash on startup
+            // and then disappear once the subtree filter kicked in. Hide the
+            // strip until we know who we are.
+            None => Vec::new(),
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tui_state_sidebar_usage_tests.rs"]
+mod sidebar_usage_tests;
+
+#[cfg(test)]
+#[path = "swarm_panel_key_tests.rs"]
+mod swarm_panel_key_tests;
 
 #[cfg(test)]
 mod inline_swarm_subtree_tests {

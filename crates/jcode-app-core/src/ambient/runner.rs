@@ -5,6 +5,18 @@
 //! Spawned by the server when ambient mode is enabled. Manages the lifecycle of
 //! ambient cycles: scheduling, spawning agent sessions, handling results, and
 //! providing status for the TUI widget and debug socket.
+//!
+//! reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+//! (2026-11-04 incident: a `Running` status persisted by a process that died
+//! mid-cycle blocked `AmbientManager::should_run()` forever). The liveness
+//! probe reuses this crate's own lock-pid check in `ambient/persistence.rs`
+//! (`AmbientLock::try_acquire` + `is_pid_alive`).
+
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+// reference: no prior art for "recover a persisted Running status", searched
+// crates/jcode-app-core/src/ambient/ and crates/jcode-app-core/src/server/ for
+// an existing stale-status recovery path; the fix reuses this crate's own
+// lock-pid liveness check in ambient/persistence.rs.
 
 use crate::agent::Agent;
 use crate::ambient::{
@@ -115,6 +127,7 @@ impl AmbientRunnerHandle {
                 images: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::User,
+                client_id: None,
             });
             logging::info(&format!(
                 "{} message injected into active ambient cycle: {}",
@@ -134,15 +147,69 @@ impl AmbientRunnerHandle {
         false
     }
 
+    /// Reset a persisted `Running` status left behind by a dead process.
+    ///
+    /// `AmbientStatus::Running` is written to disk before a cycle starts
+    /// (`set_running_detail`) and cleared only when the cycle finishes. If the
+    /// process dies mid-cycle, the status survives the restart, and
+    /// `AmbientManager::should_run()` treats `Running` as "a cycle is already
+    /// in flight" and returns false forever — the runner then logs "not time
+    /// to run" on every wake and never runs a cycle again.
+    ///
+    /// The ambient lock is the authority on whether a cycle is really in
+    /// flight: it records the pid of the process that acquired it, and that
+    /// pid is alive only while the owning process lives. So:
+    ///
+    /// * lock held by a live pid -> a cycle really is running, keep `Running`.
+    /// * lock absent, or held by a dead pid -> the status is a leftover from a
+    ///   process that is gone, so reset it to `Idle` and let the loop proceed.
+    ///
+    /// This is only called when the runner has not started a cycle itself
+    /// (process startup), so it cannot cut short a live cycle of this process.
+    ///
+    // reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+    // reference: no prior art, searched crates/jcode-app-core/src/ambient/ and
+    // crates/jcode-app-core/src/server/ for an existing stale-status recovery
+    // path; this reuses this crate's own lock-pid liveness check in
+    // ambient/persistence.rs (`AmbientLock::try_acquire` + `is_pid_alive`).
+    async fn reset_stale_running_status(&self) {
+        let stale = {
+            let state = self.inner.state.read().await;
+            if !matches!(state.status, AmbientStatus::Running { .. }) {
+                return;
+            }
+            // A live lock holder means the cycle is genuinely in flight.
+            AmbientLock::live_holder_pid().is_none()
+        };
+
+        if !stale {
+            return;
+        }
+
+        let mut state = self.inner.state.write().await;
+        if !matches!(state.status, AmbientStatus::Running { .. }) {
+            return;
+        }
+        state.status = AmbientStatus::Idle;
+        let _ = state.save();
+        logging::info("Ambient runner: cleared a stale Running status left by a previous process");
+    }
+
     /// Manually trigger an ambient cycle (returns immediately, cycle runs async).
     pub async fn trigger(&self) {
-        // Set status to idle so should_run returns true
+        // Set status to idle so should_run returns true.
+        //
+        // `Disabled` is included so a stopped ambient loop can be revived.
+        // `stop()` sets that status, and `ambient_allowed()` returns false
+        // for it, so the (infinite) loop stopped running cycles and only a
+        // process restart could bring ambient back. Measured 2026-11-03.
         let mut state = self.inner.state.write().await;
         if matches!(
             state.status,
-            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
+            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle | AmbientStatus::Disabled
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();
@@ -162,6 +229,20 @@ impl AmbientRunnerHandle {
     pub async fn start(&self, provider: Arc<dyn Provider>) -> bool {
         let already_running = *self.inner.running.read().await;
         if already_running {
+            // The loop task is alive but blocked: `stop()` set the persisted
+            // status to `Disabled`, and `ambient_allowed()` is false for it,
+            // so the loop kept spinning without running a cycle. Returning
+            // false here made a stopped ambient mode unrevivable except by
+            // restarting the process. Revive it instead: reset the status to
+            // Idle and nudge the live loop. Measured 2026-11-03.
+            let mut state = self.inner.state.write().await;
+            if matches!(state.status, AmbientStatus::Disabled) {
+                state.status = AmbientStatus::Idle;
+                let _ = state.save();
+                drop(state);
+                self.inner.wake_notify.notify_one();
+                return true;
+            }
             return false;
         }
         {
@@ -197,9 +278,14 @@ impl AmbientRunnerHandle {
                 let items = mgr.queue().items();
                 let queue_count = items.len();
                 let next_item = items.iter().min_by_key(|item| item.scheduled_for);
+                // Overdue means "due and not delivered". Ambient-target entries
+                // are write-only: the runner only claims direct-delivery
+                // entries, so an overdue ambient entry is a dead letter, not
+                // pending work. Counting it here reported a permanently
+                // growing backlog that nothing could ever clear.
                 let overdue_queue_count = items
                     .iter()
-                    .filter(|item| item.scheduled_for <= now)
+                    .filter(|item| item.scheduled_for <= now && item.target.is_direct_delivery())
                     .count();
                 let reminder_items: Vec<_> = items
                     .iter()
@@ -295,6 +381,9 @@ impl AmbientRunnerHandle {
                                 ScheduleTarget::Session { session_id } => {
                                     ("session", Some(session_id.clone()), None)
                                 }
+                                ScheduleTarget::TodoReview { session_id, .. } => {
+                                    ("todo_review", Some(session_id.clone()), None)
+                                }
                                 ScheduleTarget::Spawn { parent_session_id } => {
                                     ("spawn", None, Some(parent_session_id.clone()))
                                 }
@@ -384,6 +473,22 @@ impl AmbientRunnerHandle {
         Self::wait_for_request_done(&mut client, request_id).await
     }
 
+    async fn notify_live_todo_review(
+        &self,
+        session_id: &str,
+        message: &str,
+        item: &ScheduledItem,
+    ) -> anyhow::Result<()> {
+        let mut client = crate::server::Client::connect().await?;
+        // Connecting yields to todo writers. Revalidate the exact generation
+        // immediately before injection so an already-cleared review stays inert.
+        if !ambient::scheduled_todo_review_is_current(item) {
+            return Ok(());
+        }
+        let request_id = client.notify_session(session_id, message).await?;
+        Self::wait_for_request_done(&mut client, request_id).await
+    }
+
     async fn resume_dead_session_with_reminder(
         &self,
         provider: &Arc<dyn Provider>,
@@ -400,6 +505,10 @@ impl AmbientRunnerHandle {
         let mut agent = Agent::new(cycle_provider, registry);
         agent.set_debug(session.is_debug);
         agent.restore_session(session_id)?;
+
+        if !ambient::scheduled_todo_review_is_current(item) {
+            return Ok(());
+        }
 
         let reminder = ambient::format_scheduled_session_message(item);
         let _ = agent
@@ -432,7 +541,11 @@ impl AmbientRunnerHandle {
                 child.compaction = parent.compaction.clone();
                 child.provider_key = parent.provider_key.clone();
                 child.route_api_method = parent.route_api_method.clone();
-                child.model = parent.model.clone();
+                child.model = parent
+                    .effective_agent_model("ambient", crate::config::Config::load().ambient.model)
+                    .filter(|model| model != "inherit")
+                    .or_else(|| parent.model.clone());
+                child.agent_model_overrides = parent.agent_model_overrides.clone();
                 child.subagent_model = parent.subagent_model.clone();
                 child.improve_mode = parent.improve_mode;
                 child.autoreview_enabled = parent.autoreview_enabled;
@@ -496,11 +609,21 @@ impl AmbientRunnerHandle {
         provider: &Arc<dyn Provider>,
         item: &ScheduledItem,
     ) -> anyhow::Result<()> {
+        if !ambient::scheduled_todo_review_is_current(item) {
+            return Ok(());
+        }
         match &item.target {
             ScheduleTarget::Ambient => Ok(()),
-            ScheduleTarget::Session { session_id } => {
+            ScheduleTarget::Session { session_id }
+            | ScheduleTarget::TodoReview { session_id, .. } => {
                 let reminder = ambient::format_scheduled_session_message(item);
-                match self.notify_live_session(session_id, &reminder).await {
+                let delivery = if matches!(item.target, ScheduleTarget::TodoReview { .. }) {
+                    self.notify_live_todo_review(session_id, &reminder, item)
+                        .await
+                } else {
+                    self.notify_live_session(session_id, &reminder).await
+                };
+                match delivery {
                     Ok(()) => {
                         logging::info(&format!(
                             "Ambient runner: delivered scheduled task {} to live session {}",
@@ -553,6 +676,14 @@ impl AmbientRunnerHandle {
             *running = true;
         }
         logging::info("Ambient runner: starting background loop");
+
+        // A `Running` status on disk can be a leftover from a cycle that was
+        // cut short when the previous process died. `should_run()` treats
+        // `Running` as "a cycle is already in flight", so without this reset
+        // the loop would never run a cycle again. The reset is guarded by the
+        // ambient lock's liveness, so a genuinely running cycle is untouched.
+        // Measured 2026-11-04.
+        self.reset_stale_running_status().await;
 
         // Spawn reply pollers only when ambient mode is enabled at startup; scheduled
         // session-targeted scheduled tasks should still work without the ambient-only reply
@@ -744,9 +875,7 @@ impl AmbientRunnerHandle {
                     if let Ok(mut mgr) = AmbientManager::new() {
                         let _ = mgr.record_cycle_result(result.clone());
                     }
-                    let mut s = self.inner.state.write().await;
-                    s.record_cycle(&result);
-                    let _ = s.save();
+                    self.apply_completed_cycle(&result).await;
 
                     scheduler.on_successful_cycle();
 
@@ -828,6 +957,24 @@ impl AmbientRunnerHandle {
             detail: detail.to_string(),
         };
         let _ = s.save();
+    }
+
+    /// Record a completed cycle into the runner state and persist it.
+    ///
+    /// The runner is the SINGLE writer of the ambient state's cycle
+    /// accounting: this is the only place that increments `total_cycles` and
+    /// writes the resulting `state.json`. The ambient tool
+    /// (`crate::tool::ambient`) and `AmbientManager::record_cycle_result` used
+    /// to persist the same cycle as well, which incremented the counter twice
+    /// per cycle and published a transient overcount on disk
+    /// (measured 2026-11-04).
+    pub(super) async fn apply_completed_cycle(&self, result: &AmbientCycleResult) {
+        let mut state = self.inner.state.write().await;
+        state.record_cycle(result);
+        #[cfg(test)]
+        let _ = state.save_as("runner");
+        #[cfg(not(test))]
+        let _ = state.save();
     }
 
     /// Build the ambient system prompt and initial message for a cycle.

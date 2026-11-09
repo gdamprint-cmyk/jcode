@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 mod display;
-pub use display::DisplayConfig;
+mod update_policy;
+pub use update_policy::{CrossProviderFailoverMode, UpdateChannel};
+mod menubar;
+mod power;
+mod session;
+pub use session::{HibernationMode, SessionConfig};
+pub use {display::DisplayConfig, menubar::MenubarConfig, power::PowerConfig};
 pub mod keybindings;
 mod serde_lenient;
 pub use keybindings::{
@@ -158,30 +164,6 @@ mod diff_display_mode_tests {
     }
 }
 
-/// When to show the overscroll status line (model/provider/context info below
-/// the input).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OverscrollStatusMode {
-    /// Never show the status line.
-    Off,
-    /// Always show the status line below the input (default).
-    #[default]
-    On,
-    /// Elastic reveal: show it briefly when scrolling past the bottom.
-    Overscroll,
-}
-
-impl OverscrollStatusMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::On => "on",
-            Self::Overscroll => "overscroll",
-        }
-    }
-}
-
 /// How to display mermaid diagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -301,82 +283,6 @@ impl ReasoningDisplayMode {
     }
 }
 
-/// Update channel: how aggressively to receive updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum UpdateChannel {
-    /// Only update from tagged GitHub Releases (default).
-    #[default]
-    Stable,
-    /// Update from latest commit on main branch (bleeding edge).
-    Main,
-}
-
-impl UpdateChannel {
-    /// Parse a channel name, returning `None` for unknown values.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "stable" | "release" => Some(Self::Stable),
-            "main" | "nightly" | "edge" => Some(Self::Main),
-            _ => None,
-        }
-    }
-}
-
-/// Config deserialization is deliberately lenient: an unknown or removed
-/// channel name (e.g. a stale `update_channel = "manual"` left in
-/// config.toml) falls back to the default channel instead of failing the
-/// entire config parse. A strict enum here once made the freshly exec'd
-/// server die during the reload handoff, leaving the handoff marker stuck
-/// in `starting` and clients re-requesting the reload forever (issue #349).
-impl<'de> Deserialize<'de> for UpdateChannel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::parse(&value).unwrap_or_default())
-    }
-}
-
-impl std::fmt::Display for UpdateChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Stable => write!(f, "stable"),
-            Self::Main => write!(f, "main"),
-        }
-    }
-}
-
-/// Cross-provider failover behavior when the same input would be resent elsewhere.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CrossProviderFailoverMode {
-    /// Show a 3-second cancelable countdown, then resend on another provider.
-    #[default]
-    Countdown,
-    /// Do not resend the prompt to another provider automatically.
-    #[serde(alias = "off", alias = "false", alias = "disabled", alias = "none")]
-    Manual,
-}
-
-impl CrossProviderFailoverMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Countdown => "countdown",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "manual" | "off" | "false" | "disabled" | "none" => Some(Self::Manual),
-            "countdown" | "auto" | "automatic" => Some(Self::Countdown),
-            _ => None,
-        }
-    }
-}
-
 /// Compaction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -384,14 +290,26 @@ pub struct CompactionConfig {
     /// Compaction mode: reactive (default), proactive, or semantic
     pub mode: CompactionMode,
 
+    /// [reactive] Context fraction that starts background compaction.
+    pub reactive_threshold: f32,
+
+    /// [reactive] Alternative token threshold, whichever is reached first.
+    /// Zero disables the token alternative.
+    pub reactive_threshold_tokens: usize,
+
     /// [proactive] Number of turns to look ahead when projecting token growth
     pub lookahead_turns: usize,
 
     /// [proactive] EWMA alpha for token growth smoothing (0.0-1.0, higher = more recency bias)
     pub ewma_alpha: f32,
 
-    /// [proactive/semantic] Minimum context fill level before any proactive check fires (0.0-1.0)
+    /// [proactive/semantic] Minimum context fill level (0.0-1.0), alternatively
+    /// satisfied by proactive_floor_tokens when that alternative is enabled.
     pub proactive_floor: f32,
+
+    /// [proactive/semantic] Alternative minimum token count. Either this count
+    /// or proactive_floor must be reached. Zero disables the token alternative.
+    pub proactive_floor_tokens: usize,
 
     /// [proactive/semantic] Minimum number of token snapshots needed before proactive check
     pub min_samples: usize,
@@ -426,9 +344,12 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             mode: CompactionMode::Reactive,
+            reactive_threshold: 0.80,
+            reactive_threshold_tokens: 400_000,
             lookahead_turns: 15,
             ewma_alpha: 0.3,
             proactive_floor: 0.40,
+            proactive_floor_tokens: 150_000,
             min_samples: 3,
             stall_window: 5,
             min_turns_between_compactions: 10,
@@ -586,19 +507,19 @@ pub struct AgentsConfig {
     ///
     /// Leave unset (or use `"inherit"` / `"coordinator"`) to have spawned swarm
     /// agents inherit the spawning coordinator's model. Set to a concrete model
-    /// string to change the worker default. An explicit `model` in the swarm
-    /// tool overrides this default for newly spawned workers.
+    /// string to change the worker default.
     pub swarm_model: Option<String>,
-    /// Optional default reasoning effort for spawned swarm/subagent sessions
-    /// (`"low"`, `"medium"`, `"high"`, ...). Applied when a `swarm spawn`
-    /// call does not pass an explicit `effort`. Leave unset to let workers
-    /// inherit the provider-wide reasoning effort.
+    /// Opt in to agent-selected worker models, restricted to the exact allowlist.
+    pub swarm_model_selection: bool,
+    /// Exact model/route strings the agent may request. Empty denies all overrides.
+    pub swarm_model_allowlist: Vec<String>,
+    /// Reasoning effort for spawned swarm workers (`"low"`, `"medium"`,
+    /// `"high"`, ...). The swarm tool does not let agents choose worker
+    /// effort. Unset means `"low"`.
     pub swarm_effort: Option<String>,
-    /// Root reasoning effort in light swarm mode. Unset or invalid means `max`.
+    /// Root reasoning effort in swarm mode. Unset or invalid means `low`.
     /// This does not change worker effort (`swarm_effort`).
     pub swarm_root_effort: Option<String>,
-    /// Root reasoning effort in deep swarm mode. Unset or invalid means `max`.
-    pub swarm_deep_root_effort: Option<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -612,10 +533,38 @@ pub struct AgentsConfig {
     /// as chips on a single row.
     #[serde(default)]
     pub swarm_strip_layout: SwarmStripLayout,
-    /// Jev Decisions provider for recall: auto, openrouter, typesafe, aimlapi,
-    /// or jcode. Auto uses a provider-specific BYOK credential before Jcode.
+    /// Jev Decisions provider for recall: auto, openrouter, typesafe, laya,
+    /// aimlapi, or jcode. Auto uses a provider-specific BYOK credential before Jcode.
     #[serde(default = "default_memory_jev_provider")]
     pub memory_jev_provider: String,
+    /// Retrieval backend for automatic memory recall: `jev` (remote Jev model,
+    /// the historical default) or `hindsight` (a self-hosted Hindsight server:
+    /// semantic + BM25 + graph + temporal arms fused by RRF, then a local
+    /// cross-encoder reranker). `hindsight` needs no model credentials and
+    /// makes no per-turn model call.
+    #[serde(default = "default_memory_provider")]
+    pub memory_provider: String,
+    /// Hindsight base URL when `memory_provider = "hindsight"`.
+    /// Unset = `http://127.0.0.1:8888`. Env: `HINDSIGHT_API_URL`.
+    pub memory_hindsight_url: Option<String>,
+    /// Hindsight bank id when `memory_provider = "hindsight"`.
+    /// Unset = `jcode-legacy`. Env: `HINDSIGHT_BANK`.
+    pub memory_hindsight_bank: Option<String>,
+    /// How many recalled facts to inject into the conversation. 0 disables
+    /// automatic recall entirely.
+    #[serde(default = "default_memory_hindsight_limit")]
+    pub memory_hindsight_limit: usize,
+    /// How many tool calls trigger a memory refresh when the agent is working
+    /// without user messages. 0 disables the tool-call-paced refresh; the
+    /// user-turn refresh is unaffected.
+    #[serde(default = "default_memory_refresh_tool_calls")]
+    pub memory_refresh_tool_calls: usize,
+    /// Optional model override for memory Jev Decisions.
+    pub memory_jev_model: Option<String>,
+    /// Optional model override for browser Jev Decisions.
+    pub browser_jev_model: Option<String>,
+    /// Optional model override for voice Jev Decisions.
+    pub voice_jev_model: Option<String>,
     /// Minimum Jev relevance probability. Invalid values fail closed.
     #[serde(default = "default_memory_jev_threshold")]
     pub memory_jev_threshold: f32,
@@ -651,13 +600,28 @@ pub struct AgentsConfig {
     #[serde(default)]
     pub memory_embedding_dim: Option<usize>,
     /// Maximum number of live swarm worker agents in one swarm. This is the RAM
-    /// safety budget for both recursive ad hoc spawning and deep-mode `run_plan`
-    /// parallelism. Completed/stopped workers do not consume slots. Light mode
-    /// still uses a smaller fixed fan-out. `0` disables this configurable guard,
+    /// safety budget for spawning. Completed/stopped workers do not consume
+    /// slots. `0` disables this configurable guard,
     /// leaving only the absolute `MAX_SWARM_MEMBERS` hard cap.
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+    /// Stalled-worker watchdog window in seconds. A running swarm worker with
+    /// no streamed tokens, tool events, or task heartbeats for this long, and
+    /// no tool currently executing, is flagged as stalled in swarm status and
+    /// its coordinator is notified once. `0` disables the watchdog.
+    /// Env override: `JCODE_SWARM_STALL_AFTER_SECS`.
+    #[serde(default = "default_swarm_stall_after_secs")]
+    pub swarm_stall_after_secs: u64,
+    /// When the watchdog flags a worker as stalled, also queue a short nudge
+    /// message into the worker's own session. Off by default.
+    /// Env override: `JCODE_SWARM_STALL_NUDGE`.
+    #[serde(default)]
+    pub swarm_stall_nudge: bool,
+}
+
+fn default_swarm_stall_after_secs() -> u64 {
+    600
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
@@ -670,6 +634,18 @@ fn default_memory_embedding_backend() -> String {
 
 fn default_memory_jev_provider() -> String {
     "auto".to_string()
+}
+
+fn default_memory_provider() -> String {
+    "jev".to_string()
+}
+
+fn default_memory_hindsight_limit() -> usize {
+    8
+}
+
+fn default_memory_refresh_tool_calls() -> usize {
+    30
 }
 
 fn default_memory_jev_threshold() -> f32 {
@@ -696,13 +672,22 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             swarm_model: None,
+            swarm_model_selection: false,
+            swarm_model_allowlist: Vec::new(),
             swarm_effort: None,
             swarm_root_effort: None,
-            swarm_deep_root_effort: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
             memory_jev_provider: default_memory_jev_provider(),
+            memory_provider: default_memory_provider(),
+            memory_hindsight_url: None,
+            memory_hindsight_bank: None,
+            memory_hindsight_limit: default_memory_hindsight_limit(),
+            memory_refresh_tool_calls: default_memory_refresh_tool_calls(),
+            memory_jev_model: None,
+            browser_jev_model: None,
+            voice_jev_model: None,
             memory_jev_threshold: default_memory_jev_threshold(),
             memory_model: None,
             memory_sidecar_enabled: default_memory_sidecar_enabled(),
@@ -714,25 +699,91 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            swarm_stall_after_secs: default_swarm_stall_after_secs(),
+            swarm_stall_nudge: false,
         }
     }
 }
 
 impl AgentsConfig {
-    /// Resolve a swarm mode's root effort without allowing orchestration
-    /// sentinels to recurse into another mode. Unknown values preserve the
-    /// historical maximum-effort behavior without invalidating other settings.
-    pub fn root_effort_for_swarm(&self, deep: bool) -> &'static str {
-        let configured = if deep {
-            self.swarm_deep_root_effort.as_deref()
-        } else {
-            self.swarm_root_effort.as_deref()
+    // reference: crates/jcode-app-core/src/server/spawn_policy.rs:38 - the existing
+    // `is_inherit_sentinel` helper is the mechanism consolidated here, so the
+    // validator and the spawn resolver cannot disagree about it.
+    /// Whether a requested swarm model is the "inherit the coordinator's model"
+    /// sentinel rather than a concrete route.
+    ///
+    /// The sentinel is semantically identical to omitting `model` entirely: the
+    /// spawn path resolves it to the coordinator's own model, provider key and
+    /// route (`resolve_swarm_spawn_selection`). It is therefore NOT a route
+    /// override and must not be checked against `swarm_model_allowlist`.
+    ///
+    /// This lives here, in the crate both the config layer and the server
+    /// depend on, so the validator and the spawn resolver cannot disagree
+    /// about which strings are sentinels.
+    pub fn is_swarm_inherit_sentinel(model: &str) -> bool {
+        let trimmed = model.trim();
+        trimmed.eq_ignore_ascii_case("inherit") || trimmed.eq_ignore_ascii_case("coordinator")
+    }
+
+    /// Validate an agent-supplied override before resolving any provider route.
+    /// Matching is exact: a bare model never authorizes another provider's route.
+    ///
+    /// The error names the requested model and every allowed route, so a
+    /// coordinator that guessed a route string learns the exact set it may use
+    /// instead of hitting a dead end.
+    pub fn validate_swarm_model_request(&self, model: Option<&str>) -> Result<(), String> {
+        let Some(model) = model else {
+            return Ok(());
         };
-        let value = configured.unwrap_or("max").trim();
+        // The inherit sentinel requests no override at all, so it needs neither
+        // an allowlist entry nor the agent-selection opt-in. It is checked
+        // FIRST: it means "use the user-configured default", exactly like
+        // omitting `model`.
+        if Self::is_swarm_inherit_sentinel(model) {
+            return Ok(());
+        }
+        if !self.swarm_model_selection {
+            return Err(
+                "Agent-selected swarm models are disabled. Omit model to use the user-configured default."
+                    .to_string(),
+            );
+        }
+        if model.trim().is_empty()
+            || !self
+                .swarm_model_allowlist
+                .iter()
+                .any(|allowed| allowed == model)
+        {
+            let allowed = if self.swarm_model_allowlist.is_empty() {
+                "agents.swarm_model_allowlist is empty - no agent-selected model is permitted."
+                    .to_string()
+            } else {
+                format!(
+                    "Allowed swarm models: {}.",
+                    self.swarm_model_allowlist
+                        .iter()
+                        .map(|route| route.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(format!(
+                "Requested swarm model '{model}' is not in agents.swarm_model_allowlist. {allowed} \
+                 Use one of those routes exactly, or omit model to use the user-configured default."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve swarm mode's root effort without allowing the orchestration
+    /// sentinel to recurse into itself. Unknown values use the low-effort
+    /// default without invalidating other settings.
+    pub fn root_effort_for_swarm(&self) -> &'static str {
+        let value = self.swarm_root_effort.as_deref().unwrap_or("low").trim();
         ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
             .into_iter()
             .find(|level| level.eq_ignore_ascii_case(value))
-            .unwrap_or("max")
+            .unwrap_or("low")
     }
 }
 
@@ -947,9 +998,18 @@ pub struct HooksConfig {
     /// Env override: JCODE_HOOK_PRE_TOOL.
     pub pre_tool: Option<HookCommands>,
     /// Runs after each tool call completes.
-    /// Fields: TOOL_NAME, STATUS ("ok"/"error"), DURATION_MS, OUTPUT_BYTES.
+    /// Fields: TOOL_NAME, TOOL_CALL_ID, TOOL_INPUT, TOUCHED_PATHS, STATUS
+    /// ("ok"/"error"), DURATION_MS, OUTPUT_BYTES, ERROR.
     /// Env override: JCODE_HOOK_POST_TOOL.
     pub post_tool: Option<HookCommands>,
+    /// Synchronous hook after each successful tool call. Same fields as
+    /// post_tool, tool input JSON on stdin. Its stdout is appended to the tool
+    /// result the model sees (e.g. linter output for edited files).
+    /// Env override: JCODE_HOOK_POST_TOOL_FEEDBACK.
+    pub post_tool_feedback: Option<HookCommands>,
+    /// Max milliseconds to wait for each post_tool_feedback hook (default:
+    /// 10000). Env override: JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS.
+    pub post_tool_feedback_timeout_ms: u64,
     /// Max milliseconds to wait for the pre_tool gate before failing open
     /// (default: 5000). Env override: JCODE_HOOK_PRE_TOOL_TIMEOUT_MS.
     pub pre_tool_timeout_ms: u64,
@@ -966,6 +1026,8 @@ impl Default for HooksConfig {
             session_end: None,
             pre_tool: None,
             post_tool: None,
+            post_tool_feedback: None,
+            post_tool_feedback_timeout_ms: 10_000,
             pre_tool_timeout_ms: 5000,
         }
     }
@@ -984,16 +1046,16 @@ pub struct AutoReviewConfig {
 /// Integration discovery configuration (legacy `[sponsors]` section name).
 ///
 /// Integration discovery makes third-party developer tools discoverable to
-/// the agent via a `discover_tools` tool backed by a hosted directory. Some
+/// the agent via an `integration_tools` tool backed by a hosted directory. Some
 /// providers may share revenue with Jcode when a referred user becomes a
 /// customer, but partnership status never influences recommendations.
 /// See <https://jcode.sh/discovery-tools>.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SponsorsConfig {
-    /// Enable integration discovery. Enabled by default; set to false to opt
-    /// out. When false, no discovery categories are added to the prompt, the
-    /// `discover_tools` tool is not registered, and jcode never contacts the
+    /// Enable integration discovery. Disabled by default; set to true to opt
+    /// in. When false, no discovery categories are added to the prompt, the
+    /// `integration_tools` tool is not registered, and jcode never contacts the
     /// discovery endpoint.
     pub enabled: bool,
     /// Base URL of the discovery endpoint.
@@ -1003,7 +1065,7 @@ pub struct SponsorsConfig {
 impl Default for SponsorsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             endpoint: "https://api.jcode.sh/v1/discovery".to_string(),
         }
     }
@@ -1017,6 +1079,33 @@ pub struct AutoJudgeConfig {
     pub enabled: bool,
     /// Optional model override for autojudge sessions.
     pub model: Option<String>,
+}
+
+/// Post-turn skill review configuration.
+///
+/// The review is a forked model turn that may patch an existing skill or
+/// create a new one. It is the "skills improve during use" half of the
+/// learning loop, and it is opt-in: a fork that writes executable instruction
+/// has to be something the user turned on deliberately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillReviewConfig {
+    /// Enable the skill review for new/resumed sessions (default: false).
+    pub enabled: bool,
+    /// Turns between reviews (default: 15).
+    pub interval_turns: u32,
+    /// Optional model override for the review fork.
+    pub model: Option<String>,
+}
+
+impl Default for SkillReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_turns: 15,
+            model: None,
+        }
+    }
 }
 
 /// Keybinding configuration
@@ -1042,6 +1131,10 @@ pub struct KeybindingsConfig {
     pub effort_increase: String,
     /// Effort decrease key (default: "cmd+left" on macOS, "alt+left" elsewhere)
     pub effort_decrease: String,
+    /// Speed tier increase key, Standard -> Fast -> Ultrafast (default: "alt+up")
+    pub speed_increase: String,
+    /// Speed tier decrease key, Ultrafast -> Fast -> Standard (default: "alt+down")
+    pub speed_decrease: String,
     /// Centered mode toggle key (default: "alt+c")
     pub centered_toggle: String,
     /// Scroll to previous prompt key (default: "ctrl+[")
@@ -1070,10 +1163,14 @@ pub struct KeybindingsConfig {
     pub copy_selection_toggle: String,
     /// Toggle the diagram pane position (default: "alt+t")
     pub diagram_pane_toggle: String,
+    /// Show/hide the pinned diagram pane (default: "alt+shift+m")
+    pub diagram_pane_visibility_toggle: String,
     /// Toggle typing scroll lock (default: "alt+s")
     pub typing_scroll_lock_toggle: String,
-    /// Cycle inline diff display mode (default: "alt+g")
+    /// Cycle inline diff display mode (default: unbound; use /diff)
     pub diff_mode_cycle: String,
+    /// Show the git commit log of the current project (default: "alt+g")
+    pub commit_log: String,
     /// Toggle the info widget (default: "alt+i")
     pub info_widget_toggle: String,
     /// Show/dismiss the session todo list as an inline card in the chat
@@ -1090,6 +1187,9 @@ pub struct KeybindingsConfig {
     /// Open the `/resume` session picker (default: "cmd+b" on macOS, "alt+r"
     /// elsewhere). Set "" to disable.
     pub open_resume: String,
+    /// Start/stop built-in voice input (default: "ctrl+space"). Speech streams
+    /// to Nari and the transcript is sent as a prompt. Set "" to disable.
+    pub voice_input: String,
     /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
     /// Ctrl+Enter performs the alternate action.
     pub session_picker_enter: SessionPickerResumeAction,
@@ -1114,6 +1214,8 @@ impl Default for KeybindingsConfig {
             fallback_switch: get("fallback_switch", "ctrl+y"),
             effort_increase: get("effort_increase", "alt+right"),
             effort_decrease: get("effort_decrease", "alt+left"),
+            speed_increase: get("speed_increase", "alt+up"),
+            speed_decrease: get("speed_decrease", "alt+down"),
             centered_toggle: get("centered_toggle", "alt+c"),
             scroll_prompt_up: get("scroll_prompt_up", "ctrl+["),
             scroll_prompt_down: get("scroll_prompt_down", "ctrl+]"),
@@ -1128,8 +1230,10 @@ impl Default for KeybindingsConfig {
             side_panel_toggle: get("side_panel_toggle", "alt+m"),
             copy_selection_toggle: get("copy_selection_toggle", "alt+y"),
             diagram_pane_toggle: get("diagram_pane_toggle", "alt+t"),
+            diagram_pane_visibility_toggle: get("diagram_pane_visibility_toggle", "alt+shift+m"),
             typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
-            diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
+            diff_mode_cycle: get("diff_mode_cycle", ""),
+            commit_log: get("commit_log", "alt+g"),
             info_widget_toggle: get("info_widget_toggle", "alt+i"),
             todo_card_toggle: get("todo_card_toggle", "alt+x"),
             swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
@@ -1142,6 +1246,7 @@ impl Default for KeybindingsConfig {
                     "alt+r"
                 },
             ),
+            voice_input: get("voice_input", "ctrl+space"),
             session_picker_enter: SessionPickerResumeAction::CurrentTerminal,
         }
     }
@@ -1180,23 +1285,39 @@ pub struct FeatureConfig {
     pub swarm: bool,
     /// Enable Mermaid rendering and Mermaid-specific model guidance (default: true)
     pub mermaid: bool,
+    /// Render Mermaid diagrams with the Unicode half-block fallback when the
+    /// terminal has no native image protocol (default: false).
+    ///
+    /// Terminals behind a multiplexer that only forwards Kitty graphics (for
+    /// example Windows Terminal hosted by herdr) expose neither Kitty nor
+    /// Sixel to the inner program, so jcode cannot draw a diagram as an image.
+    /// The half-block fallback rasterizes the diagram into Unicode cells
+    /// itself, which every terminal can display. It is lower fidelity than a
+    /// native image protocol, so it stays opt-in.
+    pub mermaid_halfblocks: bool,
     /// Default state of auto-poke (automatic follow-up when the model stops with
     /// incomplete todos). `/poke on` / `/poke off` still override this per session
     /// (default: true)
     pub auto_poke: bool,
+    /// Opt in to one aggregate todo weak-point follow-up per completion cycle.
+    /// Requires auto-poke; independent of the display-only completion report.
+    /// Disabled by default for every user.
+    pub todo_gate_digest: bool,
+    /// Show hypothetical disabled-gate findings in todo completion reports (default: false).
+    /// Display only: does not enable gates or follow-up turns.
+    pub todo_gate_diagnostics: bool,
     /// Inject timestamps into user messages and tool results sent to the model (default: true)
     pub message_timestamps: bool,
     /// Persist auto-recalled memory injections into normal session history instead of sending
     /// them as request-only ephemeral suffix messages (default: false)
     pub persist_memory_injections: bool,
-    /// Surface an in-chat system message whenever a request misses the KV cache
-    /// for a harness-caused (avoidable) reason: the system prompt, tool set, or
-    /// message prefix changed without the conversation legitimately growing.
-    /// These should essentially never happen, so the notice acts as a loud alarm
-    /// that something in the harness silently invalidated the prefix cache
-    /// (default: true).
+    /// Surface an in-chat system message for each meaningful observed KV cache
+    /// miss, including low/zero reads, route changes, expiry, and harness prefix
+    /// changes. Missing telemetry and ordinary first-request cache fills are not
+    /// classified as misses. Harness changes without a documented cause raise a
+    /// warning, while explained misses are informational (default: true).
     pub kv_cache_miss_notices: bool,
-    /// Update channel: "stable" (releases only) or "main" (latest commits)
+    /// Update channel: "stable" (default), "preview" (v1 previews), or "main" (latest commits).
     pub update_channel: UpdateChannel,
 }
 
@@ -1207,7 +1328,10 @@ impl Default for FeatureConfig {
             memory: true,
             swarm: true,
             mermaid: true,
+            mermaid_halfblocks: false,
             auto_poke: true,
+            todo_gate_digest: false,
+            todo_gate_diagnostics: false,
             message_timestamps: true,
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
@@ -1216,75 +1340,8 @@ impl Default for FeatureConfig {
     }
 }
 
-/// Search engine used by the websearch tool.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum WebSearchEngine {
-    /// DuckDuckGo HTML search, no API key required.
-    #[default]
-    Duckduckgo,
-    /// Bing search. Uses the Bing API when configured, otherwise Bing HTML search.
-    Bing,
-    /// SearXNG metasearch instance (JSON API). Requires `searxng_url` (or the
-    /// `JCODE_SEARXNG_URL` env var) to point at a SearXNG instance. Useful on
-    /// hosts where DuckDuckGo/Bing block the request via TLS fingerprinting.
-    Searxng,
-}
-
-impl WebSearchEngine {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Duckduckgo => "duckduckgo",
-            Self::Bing => "bing",
-            Self::Searxng => "searxng",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "duckduckgo" | "ddg" => Some(Self::Duckduckgo),
-            "bing" => Some(Self::Bing),
-            "searxng" | "searx" => Some(Self::Searxng),
-            _ => None,
-        }
-    }
-}
-
-/// Configuration for the websearch tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WebSearchConfig {
-    /// Preferred engine when the tool input does not specify one.
-    pub engine: WebSearchEngine,
-    /// Keyless HTML engines to try after the preferred engine fails.
-    pub fallback_engines: Vec<WebSearchEngine>,
-    /// Optional Bing API key for primary Bing searches. Fallback Bing uses keyless HTML search.
-    pub bing_api_key: Option<String>,
-    /// Environment variable containing the Bing API key.
-    pub bing_api_key_env: String,
-    /// Bing market, e.g. "en-US" or "zh-CN".
-    pub bing_market: String,
-    /// Base URL of a SearXNG instance (e.g. "https://searx.example.org"), used
-    /// by the `searxng` engine. When empty, the `searxng_url_env` variable is
-    /// consulted instead.
-    pub searxng_url: Option<String>,
-    /// Environment variable containing the SearXNG base URL.
-    pub searxng_url_env: String,
-}
-
-impl Default for WebSearchConfig {
-    fn default() -> Self {
-        Self {
-            engine: WebSearchEngine::Duckduckgo,
-            fallback_engines: vec![WebSearchEngine::Bing],
-            bing_api_key: None,
-            bing_api_key_env: "JCODE_BING_API_KEY".to_string(),
-            bing_market: "en-US".to_string(),
-            searxng_url: None,
-            searxng_url_env: "JCODE_SEARXNG_URL".to_string(),
-        }
-    }
-}
+mod web_search;
+pub use web_search::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1301,7 +1358,7 @@ pub struct ProviderConfig {
     pub anthropic_cache_ttl_1h: bool,
     /// OpenAI transport mode (auto|websocket|https)
     pub openai_transport: Option<String>,
-    /// OpenAI service tier override (priority|flex)
+    /// OpenAI service tier override (priority|ultrafast|flex|off). Ultrafast is opt-in.
     pub openai_service_tier: Option<String>,
     /// OpenAI native compaction mode: "auto", "explicit", or "off".
     pub openai_native_compaction_mode: String,
@@ -1344,6 +1401,12 @@ pub struct ProviderConfig {
     /// Maximum exponential-backoff delay between transient-error retries.
     /// Default: 30 seconds. Overridable via `JCODE_RETRY_BACKOFF_CAP_SECS`.
     pub retry_backoff_cap_secs: u64,
+    /// Request-body compression policy: "auto" (compress only when the
+    /// measured uplink makes it faster), "always", or "off". Applies only to
+    /// endpoints verified to accept it: gzip (Anthropic, ChatGPT HTTPS), zstd
+    /// (OpenAI API), and WebSocket permessage-deflate (Responses sockets).
+    /// Overridable via `JCODE_REQUEST_COMPRESSION`.
+    pub request_compression: String,
 }
 
 impl Default for ProviderConfig {
@@ -1352,7 +1415,7 @@ impl Default for ProviderConfig {
             default_model: None,
             default_provider: None,
             openai_reasoning_effort: Some("low".to_string()),
-            anthropic_reasoning_effort: None,
+            anthropic_reasoning_effort: Some("low".to_string()),
             anthropic_cache_ttl_1h: true,
             openai_transport: None,
             openai_service_tier: Some("priority".to_string()),
@@ -1368,6 +1431,7 @@ impl Default for ProviderConfig {
             stream_idle_timeout_secs: 180,
             max_retries: 8,
             retry_backoff_cap_secs: 30,
+            request_compression: "auto".to_string(),
         }
     }
 }
@@ -1582,39 +1646,6 @@ impl Default for GatewayConfig {
     }
 }
 
-/// Power-management configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PowerConfig {
-    /// Prevent automatic system sleep while any jcode session is actively
-    /// streaming/processing. Linux also asks logind to block lid-switch suspend.
-    /// Windows cannot override a user-initiated lid close or power-button action;
-    /// those remain controlled by the active Windows power plan. The display is
-    /// still allowed to sleep. Default: true.
-    ///
-    /// Honored by the shared `jcode serve` daemon. The `JCODE_DISABLE_POWER_INHIBIT`
-    /// environment variable forces this off regardless of the config value.
-    pub prevent_sleep_while_streaming: bool,
-
-    /// Also keep working when the lid closes on macOS and Windows while a
-    /// session is streaming. Linux always blocks lid-close suspend as part of
-    /// `prevent_sleep_while_streaming`. On Windows jcode temporarily sets the
-    /// active power plan's lid close action to "Do nothing". On macOS it runs
-    /// `sudo -n pmset -a disablesleep 1`, which requires a passwordless sudoers
-    /// rule and is skipped otherwise. Original settings are journaled and
-    /// restored when work finishes, including after a crash. Default: true.
-    pub block_lid_close: bool,
-}
-
-impl Default for PowerConfig {
-    fn default() -> Self {
-        Self {
-            prevent_sleep_while_streaming: true,
-            block_lid_close: true,
-        }
-    }
-}
-
 /// A single global launch hotkey: a chord plus the directory it opens jcode in.
 ///
 /// `dir` is usually an absolute path, but a few sentinels keep dynamic targets
@@ -1664,6 +1695,28 @@ pub struct LaunchHotkeysConfig {
 #[cfg(test)]
 mod reasoning_display_defaults_tests {
     use super::*;
+
+    #[test]
+    fn anthropic_effort_defaults_to_low() {
+        let config = ProviderConfig::default();
+        assert_eq!(config.anthropic_reasoning_effort.as_deref(), Some("low"));
+        let parsed: ProviderConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.anthropic_reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn proactive_floor_defaults_and_legacy_config() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.reactive_threshold, 0.80);
+        assert_eq!(config.reactive_threshold_tokens, 400_000);
+        assert_eq!(config.proactive_floor, 0.40);
+        assert_eq!(config.proactive_floor_tokens, 150_000);
+        let parsed: CompactionConfig = serde_json::from_str(r#"{"proactive_floor":0.15}"#).unwrap();
+        assert_eq!(parsed.proactive_floor, 0.15);
+        assert_eq!(parsed.proactive_floor_tokens, 150_000);
+        assert_eq!(parsed.reactive_threshold, 0.80);
+        assert_eq!(parsed.reactive_threshold_tokens, 400_000);
+    }
 
     #[test]
     fn explicit_reasoning_display_is_distinguishable_from_the_legacy_fallback() {

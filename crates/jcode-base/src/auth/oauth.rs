@@ -60,7 +60,7 @@ pub struct OAuthTokens {
 
 fn parse_oauth_scopes(scope: Option<&str>) -> Vec<String> {
     scope
-        .unwrap_or_default()
+        .unwrap_or("")
         .split_whitespace()
         .filter(|scope| !scope.trim().is_empty())
         .map(ToOwned::to_owned)
@@ -458,7 +458,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
 
         eprintln!("\nOpen this URL in your browser:\n");
         eprintln!("{}\n", auth_url);
-        if let Some(qr) = crate::login_qr::indented_section(
+        if let Some(qr) = crate::auth::login_ui::qr_section(
             &manual_auth_url,
             "No browser on this machine? Scan this QR on another device, finish login there, then paste the full callback URL back here:",
             "    ",
@@ -470,7 +470,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
         let browser_opened = if crate::auth::browser_suppressed(no_browser) {
             false
         } else {
-            open::that(&auth_url).is_ok()
+            crate::companion_client::open_url(&auth_url)
         };
         if browser_opened {
             eprintln!(
@@ -524,7 +524,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
 
     eprintln!("\nOpen this URL in your browser:\n");
     eprintln!("{}\n", auth_url);
-    if let Some(qr) = crate::login_qr::indented_section(
+    if let Some(qr) = crate::auth::login_ui::qr_section(
         &auth_url,
         "Scan this QR on another device if this machine has no browser:",
         "    ",
@@ -534,7 +534,7 @@ pub async fn login_claude(no_browser: bool) -> Result<OAuthTokens> {
     }
     eprintln!("Opening browser for Claude login...\n");
     if !crate::auth::browser_suppressed(no_browser) {
-        let _ = open::that(&auth_url);
+        let _ = crate::companion_client::open_url(&auth_url);
     }
     eprintln!("After logging in, copy and paste the callback URL or code here:\n");
     eprint!("> ");
@@ -849,7 +849,7 @@ pub async fn login_openai(no_browser: bool) -> Result<OAuthTokens> {
 
     eprintln!("\nOpen this URL in your browser:\n");
     eprintln!("{}\n", auth_url);
-    if let Some(qr) = crate::login_qr::indented_section(
+    if let Some(qr) = crate::auth::login_ui::qr_section(
         &auth_url,
         "Scan this QR on another device if this machine has no browser:",
         "    ",
@@ -862,7 +862,7 @@ pub async fn login_openai(no_browser: bool) -> Result<OAuthTokens> {
     let browser_opened = if crate::auth::browser_suppressed(no_browser) {
         false
     } else {
-        open::that(&auth_url).is_ok()
+        crate::companion_client::open_url(&auth_url)
     };
 
     if browser_opened {
@@ -941,21 +941,63 @@ pub fn save_claude_tokens_for_account(tokens: &OAuthTokens, label: &str) -> Resu
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ClaudeProfileResponse {
     #[serde(default)]
     account: ClaudeProfileAccount,
+    // Optional metadata must not make an otherwise usable profile fail to parse.
+    #[serde(default)]
+    organization: serde_json::Value,
 }
 
-#[derive(Deserialize, Default)]
+impl ClaudeProfileResponse {
+    fn subscription_type(&self) -> Option<String> {
+        let explicit = self
+            .organization
+            .get("subscription_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if explicit.is_some() {
+            return explicit;
+        }
+        // The live OAuth profile exposes organization_type rather than
+        // subscription_type. Rate-limit tiers refine Max only when the
+        // organization itself confirms that subscription family.
+        match self
+            .organization
+            .get("organization_type")
+            .and_then(serde_json::Value::as_str)?
+        {
+            "claude_max" => Some(
+                match self
+                    .organization
+                    .get("rate_limit_tier")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("default_claude_max_20x") => "max_20x",
+                    Some("default_claude_max_5x") => "max_5x",
+                    _ => "max",
+                }
+                .to_owned(),
+            ),
+            "claude_pro" => Some("pro".to_owned()),
+            "claude_free" => Some("free".to_owned()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ClaudeProfileAccount {
     email: Option<String>,
 }
 
-async fn fetch_claude_profile_email_at_url(
+async fn fetch_claude_profile_at_url(
     access_token: &str,
     profile_url: &str,
-) -> Result<Option<String>> {
+) -> Result<ClaudeProfileResponse> {
     let client = crate::provider::shared_http_client();
     let resp = client
         .get(profile_url)
@@ -975,8 +1017,7 @@ async fn fetch_claude_profile_email_at_url(
         anyhow::bail!("Profile fetch failed ({}): {}", status, body);
     }
 
-    let profile: ClaudeProfileResponse = resp.json().await?;
-    Ok(profile.account.email)
+    Ok(resp.json().await?)
 }
 
 /// Fetch profile metadata for a Claude account and persist any discovered fields.
@@ -984,9 +1025,94 @@ pub async fn update_claude_account_profile(
     label: &str,
     access_token: &str,
 ) -> Result<Option<String>> {
-    let email = fetch_claude_profile_email_at_url(access_token, claude::PROFILE_URL).await?;
-    claude_auth::update_account_profile(label, email.clone())?;
+    let profile = fetch_claude_profile_at_url(access_token, claude::PROFILE_URL).await?;
+    let subscription_type = profile.subscription_type();
+    let email = profile.account.email;
+    claude_auth::update_account_profile_metadata(label, email.clone(), subscription_type)?;
     Ok(email)
+}
+
+const CLAUDE_PROFILE_PREFETCH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+type ClaudeProfilePrefetchAttempts =
+    std::collections::HashMap<(std::path::PathBuf, String), std::time::Instant>;
+
+fn reserve_claude_profile_prefetch(
+    attempts: &mut ClaudeProfilePrefetchAttempts,
+    home: &std::path::Path,
+    label: &str,
+    now: std::time::Instant,
+) -> bool {
+    attempts
+        .retain(|_, attempted| now.duration_since(*attempted) < CLAUDE_PROFILE_PREFETCH_INTERVAL);
+    match attempts.entry((home.to_path_buf(), label.to_owned())) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(now);
+            true
+        }
+    }
+}
+
+/// Opportunistically backfill unknown plans outside the render path. Failed or
+/// incomplete profiles are also throttled, so new-session bursts cannot retry
+/// every account repeatedly. Reuses the normal login profile update path.
+#[cfg(test)]
+pub(crate) fn prefetch_missing_claude_subscription_metadata() {}
+
+#[cfg(not(test))]
+pub(crate) fn prefetch_missing_claude_subscription_metadata() {
+    use futures::StreamExt;
+    static ATTEMPTS: std::sync::OnceLock<std::sync::Mutex<ClaudeProfilePrefetchAttempts>> =
+        std::sync::OnceLock::new();
+    static REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Ok(home) = crate::storage::jcode_dir() else {
+        return;
+    };
+    let home = home.canonicalize().unwrap_or(home);
+    let Ok(accounts) = claude_auth::list_accounts() else {
+        return;
+    };
+    let Ok(mut attempts) = ATTEMPTS.get_or_init(Default::default).lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|account| {
+            account
+                .subscription_type
+                .as_deref()
+                .is_none_or(|plan| plan.trim().is_empty())
+        })
+        .filter(|account| !account.access.is_empty())
+        .filter(|account| {
+            reserve_claude_profile_prefetch(&mut attempts, &home, &account.label, now)
+        })
+        .collect();
+    drop(attempts);
+    if accounts.is_empty() {
+        return;
+    }
+    runtime.spawn(async move {
+        futures::stream::iter(accounts)
+            .for_each_concurrent(2, |account| async move {
+                let Ok(_permit) = REQUESTS.acquire().await else {
+                    return;
+                };
+                // Never log a profile error body: it is untrusted and could
+                // contain sensitive account information or reflected tokens.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(CLAUDE_TOKEN_TIMEOUT_SECS),
+                    update_claude_account_profile(&account.label, &account.access),
+                )
+                .await;
+            })
+            .await;
+    });
 }
 
 /// Load Claude tokens from jcode's credentials file (active account).
@@ -1201,14 +1327,26 @@ pub fn save_openai_tokens_for_account(tokens: &OAuthTokens, label: &str) -> Resu
     Ok(())
 }
 
+/// End-to-end budget for one OpenAI token refresh exchange: connection,
+/// request upload, response headers, and the full response body. The token
+/// endpoint normally answers in well under a second. The shared HTTP client
+/// only bounds connection setup, so without this a server that accepts the
+/// request and then withholds headers or stalls mid-body would block the
+/// refresh (and every caller queued behind the per-account refresh lock)
+/// indefinitely.
+pub const OPENAI_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Refresh OpenAI/Codex OAuth tokens
 pub async fn refresh_openai_tokens(refresh_token: &str) -> Result<OAuthTokens> {
-    match crate::auth::codex::active_account_label() {
-        Some(label) => refresh_openai_tokens_for_account(refresh_token, &label).await,
-        // External token (not stored in jcode auth): nothing on disk to
-        // coordinate against, refresh directly.
-        None => refresh_openai_tokens_inner(refresh_token, None).await,
-    }
+    // External token (not stored in jcode auth) has no label: nothing on disk
+    // to coordinate against, refresh directly.
+    refresh_openai_tokens_at(
+        openai::TOKEN_URL,
+        OPENAI_REFRESH_TIMEOUT,
+        refresh_token,
+        crate::auth::codex::active_account_label(),
+    )
+    .await
 }
 
 /// Stored OpenAI tokens for `label`, expressed as [`OAuthTokens`].
@@ -1235,50 +1373,103 @@ pub async fn refresh_openai_tokens_for_account(
     refresh_token: &str,
     label: &str,
 ) -> Result<OAuthTokens> {
-    let observed_refresh = refresh_token.to_string();
-    let label = label.to_string();
-    // A token the provider already rejected as unrecoverable cannot start
-    // working again. Fail fast so callers fall through to their fallback
-    // instead of paying a doomed round-trip on every catalog sweep and turn.
-    crate::auth::refresh_state::ensure_refresh_allowed(
-        "openai",
+    refresh_openai_tokens_at(
+        openai::TOKEN_URL,
+        OPENAI_REFRESH_TIMEOUT,
         refresh_token,
-        "Run `jcode login --provider openai` to mint a fresh token.",
-    )?;
-    crate::auth::refresh_coordinator::single_flight(
-        format!("openai:{label}"),
-        {
-            let label = label.clone();
-            move || stored_openai_tokens(&label)
-        },
-        {
-            let observed = observed_refresh.clone();
-            move |stored: &OAuthTokens| {
-                stored.refresh_token != observed
-                    && crate::auth::refresh_coordinator::expiry_is_fresh(stored.expires_at)
-            }
-        },
-        move |stored: Option<OAuthTokens>| async move {
-            // Prefer the newest stored refresh token over the caller's
-            // possibly stale observation.
-            let token = stored
-                .map(|tokens| tokens.refresh_token)
-                .filter(|token| !token.is_empty())
-                .unwrap_or(observed_refresh);
-            refresh_openai_tokens_inner(&token, Some(&label)).await
-        },
+        Some(label.to_string()),
     )
     .await
 }
 
-async fn refresh_openai_tokens_inner(
+/// Run a refresh transaction so that dropping the caller cannot interrupt it.
+///
+/// OpenAI rotates refresh tokens. Once the token endpoint has been asked to
+/// rotate, cancelling between "rotated tokens received" and "rotated tokens
+/// persisted" would leave only the now-dead refresh token on disk. The
+/// transaction therefore runs as its own task: the caller may stop waiting,
+/// but the task finishes persistence (and releases the per-account refresh
+/// lock) on its own. It is not an unbounded detached task: its only network
+/// wait is capped by the refresh deadline, and the remaining work is local.
+pub async fn run_refresh_transaction<T, F>(transaction: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .spawn(transaction)
+            .await
+            .map_err(|err| anyhow::anyhow!("OAuth token refresh task failed: {err}"))?,
+        Err(_) => transaction.await,
+    }
+}
+
+async fn refresh_openai_tokens_at(
+    token_url: &str,
+    timeout: Duration,
     refresh_token: &str,
-    label: Option<&str>,
+    label: Option<String>,
 ) -> Result<OAuthTokens> {
-    let result: Result<OAuthTokens> = async {
-        let client = crate::provider::shared_http_client();
-        let resp = client
-            .post(openai::TOKEN_URL)
+    let token_url = token_url.to_string();
+    let observed_refresh = refresh_token.to_string();
+    // The per-account single-flight lock lives inside the transaction task, so
+    // a cancelled caller cannot release it while a rotation is still in
+    // flight and let a second refresh race with the same refresh token.
+    run_refresh_transaction(async move {
+        let Some(label) = label else {
+            return refresh_openai_tokens_inner(&token_url, timeout, &observed_refresh, None).await;
+        };
+        crate::auth::refresh_coordinator::single_flight(
+            format!("openai:{label}"),
+            {
+                let label = label.clone();
+                move || stored_openai_tokens(&label)
+            },
+            {
+                let observed = observed_refresh.clone();
+                move |stored: &OAuthTokens| {
+                    stored.refresh_token != observed
+                        && crate::auth::refresh_coordinator::expiry_is_fresh(stored.expires_at)
+                }
+            },
+            move |stored: Option<OAuthTokens>| async move {
+                // Prefer the newest stored refresh token over the caller's
+                // possibly stale observation.
+                let token = stored
+                    .map(|tokens| tokens.refresh_token)
+                    .filter(|token| !token.is_empty())
+                    .unwrap_or(observed_refresh);
+                // A long-lived daemon may still remember a rejected token after
+                // /cloud imported a rotated credential. Check the effective
+                // disk token, not the stale caller snapshot, after reloading.
+                crate::auth::refresh_state::ensure_refresh_allowed(
+                    "openai",
+                    &token,
+                    "Run `jcode login --provider openai` to mint a fresh token.",
+                )?;
+                refresh_openai_tokens_inner(&token_url, timeout, &token, Some(&label)).await
+            },
+        )
+        .await
+    })
+    .await
+}
+
+/// POST the refresh grant and read the complete response within `timeout`.
+///
+/// Errors never include the request body, tokens, or the success response.
+async fn request_openai_token_refresh(
+    token_url: &str,
+    timeout: Duration,
+    refresh_token: &str,
+) -> Result<OAuthTokens> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let headers_received = AtomicBool::new(false);
+    let exchange = async {
+        let resp = crate::provider::shared_http_client()
+            .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
                 "grant_type=refresh_token&client_id={}&refresh_token={}",
@@ -1286,34 +1477,81 @@ async fn refresh_openai_tokens_inner(
                 urlencoding::encode(refresh_token)
             ))
             .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            anyhow::bail!("OpenAI token refresh failed: {}", text);
+            .await
+            .map_err(|err| anyhow::anyhow!("OpenAI token refresh request failed: {err}"))?;
+        headers_received.store(true, Ordering::SeqCst);
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|err| {
+            anyhow::anyhow!("OpenAI token refresh response body failed (status {status}): {err}")
+        })?;
+        anyhow::Ok((status, body))
+    };
+    let (status, body) = match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result?,
+        Err(_) => {
+            let phase = if headers_received.load(Ordering::SeqCst) {
+                "response body"
+            } else {
+                "response headers"
+            };
+            // The server may already have rotated the refresh token. The
+            // stored token is left untouched: if it was rotated, the next
+            // refresh is rejected and recorded as terminal, instead of being
+            // guessed at or reset here.
+            anyhow::bail!(
+                "OpenAI token refresh timed out after {}s waiting for {phase}; \
+                 the remote rotation outcome is unknown",
+                timeout.as_secs_f32()
+            );
         }
+    };
 
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: String,
-            expires_in: i64,
-            id_token: Option<String>,
-        }
+    if !status.is_success() {
+        anyhow::bail!(
+            "OpenAI token refresh failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
-        let tokens: TokenResponse = resp.json().await?;
-        let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        refresh_token: String,
+        expires_in: i64,
+        id_token: Option<String>,
+    }
 
-        let oauth_tokens = OAuthTokens {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at,
-            id_token: tokens.id_token,
-            scopes: Vec::new(),
-        };
+    // serde_json errors report only a position, never the credential body.
+    let tokens: TokenResponse = serde_json::from_slice(&body)
+        .map_err(|err| anyhow::anyhow!("OpenAI token refresh returned malformed JSON: {err}"))?;
+    let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
+    Ok(OAuthTokens {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at,
+        id_token: tokens.id_token,
+        scopes: Vec::new(),
+    })
+}
+
+async fn refresh_openai_tokens_inner(
+    token_url: &str,
+    timeout: Duration,
+    refresh_token: &str,
+    label: Option<&str>,
+) -> Result<OAuthTokens> {
+    let result: Result<OAuthTokens> = async {
+        let oauth_tokens = request_openai_token_refresh(token_url, timeout, refresh_token).await?;
 
         if let Some(label) = label {
-            save_openai_tokens_for_account(&oauth_tokens, label)?;
+            crate::auth::codex::update_account_tokens(
+                label,
+                &oauth_tokens.access_token,
+                &oauth_tokens.refresh_token,
+                oauth_tokens.id_token.clone(),
+                None,
+                Some(oauth_tokens.expires_at),
+            )?;
         } else {
             crate::logging::info(
                 "Refreshed OpenAI/Codex tokens from an external source without storing them in jcode auth",

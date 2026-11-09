@@ -1,7 +1,10 @@
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
+// reference: https://github.com/jjant/ini-edit - a syntax-preserving editor that
+// takes the new lines' ending from the document instead of the writer's platform.
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_core::eol::{LineEnding, normalize_line_endings, resolve_line_ending};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -157,13 +160,13 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by exact replacement. All edits apply or none do."
+        "Atomically edit a file using a nonempty array of exact replacements."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["file_path"],
+            "required": ["file_path", "edits"],
             "properties": {
                 "intent": super::intent_schema_property(),
                 "file_path": {
@@ -172,7 +175,7 @@ impl Tool for EditTool {
                 },
                 "edits": {
                     "type": "array",
-                    "description": "Replacements applied in order. Each old_string must match exactly once unless replace_all is set.",
+                    "description": "Required replacements in order. Each old_string must match once unless replace_all is set.",
                     "minItems": 1,
                     "items": {
                         "type": "object",
@@ -211,7 +214,14 @@ impl Tool for EditTool {
 
         let _lock = super::file_lock::lock(&path).await;
         let content = tokio::fs::read_to_string(&path).await?;
-        let (new_content, applied) = apply_edits(&content, &edits, &params.file_path)?;
+        // The model emits LF while the file on disk may be CRLF. Matching in one
+        // line-ending space lets a multi-line `old_string` find its target no
+        // matter which ending the file uses; the result is written back in the
+        // file's own ending.
+        let ending = resolve_line_ending(&path, Some(&content));
+        let unified = normalize_line_endings(&content, LineEnding::Lf);
+        let (new_content, applied) = apply_edits(&unified, &edits, &params.file_path)?;
+        let new_content = normalize_line_endings(&new_content, ending);
 
         tokio::fs::write(&path, &new_content).await?;
         super::edit_stats::record(&ctx, &content, &new_content, false).await;
@@ -470,8 +480,78 @@ fn generate_diff_summary(old: &str, new: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "eol_tests.rs"]
+mod eol_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_requires_canonical_nonempty_edits() {
+        let schema = EditTool::new().parameters_schema();
+        assert_eq!(schema["required"], json!(["file_path", "edits"]));
+        let edits = &schema["properties"]["edits"];
+        assert_eq!(edits["type"], "array");
+        assert_eq!(edits["minItems"], 1);
+        assert_eq!(edits["items"]["type"], "object");
+        assert_eq!(
+            edits["items"]["required"],
+            json!(["old_string", "new_string"])
+        );
+        for field in ["old_string", "new_string"] {
+            assert_eq!(edits["items"]["properties"][field]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn schema_normalization_preserves_required_edit_operations() {
+        let schema = EditTool::new().parameters_schema();
+        for spec in jcode_schema_dialect::registry::ALL {
+            let normalized = jcode_schema_dialect::dialect::apply(&schema, spec);
+            assert_eq!(normalized["required"], schema["required"], "{}", spec.id);
+            assert_eq!(
+                normalized["properties"]["edits"]["items"]["required"],
+                json!(["old_string", "new_string"]),
+                "{}",
+                spec.id
+            );
+            assert!(
+                jcode_schema_dialect::must_not_contain_unsupported_constructs(&normalized, spec)
+                    .is_empty(),
+                "{}",
+                spec.id
+            );
+            // Some dialects strip minItems, so executor validation remains essential.
+        }
+        let strict = jcode_provider_core::openai_schema::strict_normalize_schema(&schema);
+        // Strict mode makes optional fields nullable. Canonical edits and their
+        // replacement strings must remain non-nullable now that they are required.
+        assert_eq!(strict["properties"]["edits"]["type"], "array");
+        assert_eq!(strict["properties"]["edits"]["minItems"], 1);
+        for field in ["old_string", "new_string"] {
+            assert_eq!(
+                strict["properties"]["edits"]["items"]["properties"][field]["type"],
+                "string"
+            );
+        }
+    }
+
+    #[test]
+    fn input_rejects_empty_or_incomplete_canonical_edits() {
+        let empty: EditInput = serde_json::from_value(json!({"file_path":"f","edits":[]})).unwrap();
+        assert!(empty.operations().is_err());
+        for edit in [
+            json!({}),
+            json!({"old_string":"a"}),
+            json!({"new_string":"b"}),
+        ] {
+            assert!(
+                serde_json::from_value::<EditInput>(json!({"file_path":"f","edits":[edit]}))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn test_generate_diff_single_line_change() {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 const MEMORY_INCIDENT_WINDOW_MS: u128 = 15 * 60 * 1_000;
@@ -283,7 +283,17 @@ pub(super) async fn maybe_handle_server_state_command(
                     .map(|member| &member.session_id),
             )
         };
-        let member_count = swarm_members.read().await.len();
+        let (member_count, live_swarm_member_count) = {
+            let members = swarm_members.read().await;
+            (
+                members.len(),
+                members
+                    .keys()
+                    .filter(|session_id| live_session_ids.contains(*session_id))
+                    .count(),
+            )
+        };
+        let swarm_count = swarms_by_id.read().await.len();
         let has_update = super::server_has_newer_binary();
         return Ok(Some(
             serde_json::json!({
@@ -296,6 +306,8 @@ pub(super) async fn maybe_handle_server_state_command(
                 "session_count": session_count,
                 "spawned_swarm_agent_count": spawned_swarm_agent_count,
                 "swarm_member_count": member_count,
+                "live_swarm_member_count": live_swarm_member_count,
+                "swarm_count": swarm_count,
                 "has_update": has_update,
                 "debug_control_enabled": super::debug_control_allowed(),
             })
@@ -1159,11 +1171,11 @@ mod tests {
 
     #[tokio::test]
     async fn connected_session_snapshot_releases_connections_before_waiting_for_sessions() {
-        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let sessions = Arc::new(crate::server::session_manager::SessionManager::new());
         let client_connections = Arc::new(RwLock::new(HashMap::new()));
         let swarm_members = Arc::new(RwLock::new(HashMap::new()));
 
-        let sessions_gate = sessions.write().await;
+        let sessions_gate = sessions.write_for_test().await;
         let snapshot = connected_session_snapshot(&sessions, &client_connections, &swarm_members);
         tokio::pin!(snapshot);
         tokio::select! {

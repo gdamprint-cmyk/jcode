@@ -9,6 +9,9 @@
 
 use std::sync::OnceLock;
 
+#[path = "../build_inputs.rs"]
+mod build_inputs;
+
 /// Compile-time human-readable version string, e.g. `v0.14.6-dev (abc1234)`.
 pub const VERSION: &str = env!("JCODE_VERSION");
 /// Short git hash of the build commit, e.g. `abc1234` (or `unknown`).
@@ -35,15 +38,7 @@ static RUNTIME_GIT_DATE: OnceLock<Option<String>> = OnceLock::new();
 static RUNTIME_GIT_TAG: OnceLock<Option<String>> = OnceLock::new();
 
 fn parse_release_semver(value: &str) -> Option<String> {
-    let value = value.trim().trim_start_matches('v');
-    let mut parts = value.split('.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    let patch = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(format!("{major}.{minor}.{patch}"))
+    build_inputs::release_semver(value)
 }
 
 /// Optional release semver supplied by the fast-release wrapper at process start.
@@ -126,6 +121,18 @@ pub fn is_release_build() -> bool {
 #[cfg(test)]
 mod tests {
     use super::parse_release_semver;
+
+    #[test]
+    fn release_build_display_preserves_comparison_identity() {
+        if option_env!("JCODE_RELEASE_BUILD").is_some() {
+            assert!(super::VERSION.starts_with(&format!("v{} (", super::SEMVER)));
+            assert_eq!(super::UPDATE_SEMVER, super::SEMVER);
+        }
+        assert_eq!(
+            parse_release_semver("v1.0.0-preview.42").as_deref(),
+            Some("1.0.0-preview.42")
+        );
+    }
 
     #[test]
     fn runtime_release_semver_accepts_only_three_numeric_components() {

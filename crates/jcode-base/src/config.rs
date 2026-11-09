@@ -5,14 +5,14 @@
 
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
-    CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
-    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands, HooksConfig,
-    KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
-    MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
-    NamedProviderType, NativeScrollbarConfig, NotificationsConfig, OverscrollStatusMode,
-    PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig, SessionPickerResumeAction,
-    SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig, UpdateChannel,
-    WebSearchConfig, WebSearchEngine,
+    CompactionMode, CrossProviderFailoverMode, CustomWebSearchConfig, CustomWebSearchMethod,
+    DiagramDisplayMode, DiagramPanePosition, DiffDisplayMode, DisplayConfig, FeatureConfig,
+    GatewayConfig, HookCommands, HooksConfig, KeybindingsConfig, LatexRenderingMode,
+    LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, MenubarConfig, NamedProviderAuth,
+    NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    SessionConfig, SessionPickerResumeAction, SkillReviewConfig, SponsorsConfig, SwarmSpawnMode,
+    SwarmStripLayout, TerminalConfig, UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -27,8 +27,106 @@ const CONFIG_CACHE_CHECK_INTERVAL: Duration = if cfg!(test) {
     Duration::from_millis(500)
 };
 
+#[cfg(test)]
+#[test]
+fn kagi_websearch_documented_config_parses() {
+    let docs = include_str!("../../../docs/kagi-web-search.md");
+    let example = docs
+        .split("```toml\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let config: Config = toml::from_str(example).unwrap();
+    assert_eq!(config.websearch.engine, WebSearchEngine::Kagi);
+    assert!(!config.websearch.native_enabled());
+    assert!(config.websearch.fallback_engines.is_empty());
+    assert_eq!(config.websearch.kagi_api_key_env, "KAGI_API_KEY");
+    let encoded = toml::to_string(&config.websearch).unwrap();
+    let decoded: WebSearchConfig = toml::from_str(&encoded).unwrap();
+    assert_eq!(decoded.engine, WebSearchEngine::Kagi);
+    assert_eq!(decoded.kagi_api_key_env, "KAGI_API_KEY");
+}
+
+#[cfg(test)]
+#[test]
+fn custom_websearch_config_toml_roundtrip() {
+    let input = r#"
+engine = "custom"
+prefer_native = false
+fallback_engines = []
+[custom]
+endpoint = "https://search.example.test/api"
+method = "POST"
+query_param = "search"
+count_param = "limit"
+params = { format = "json" }
+body = { options = { safe = true } }
+headers = { Accept = "application/json" }
+header_env = { Authorization = "SEARCH_AUTH" }
+results_pointer = "/data/hits"
+title_pointer = "/name"
+url_pointer = "/link"
+snippet_pointer = "/summary"
+"#;
+    let config: WebSearchConfig = toml::from_str(input).unwrap();
+    assert_eq!(config.engine, WebSearchEngine::Custom);
+    assert!(!config.native_enabled());
+    assert_eq!(
+        WebSearchEngine::parse("custom"),
+        Some(WebSearchEngine::Custom)
+    );
+    assert!(WebSearchEngine::Custom.is_local());
+    assert_eq!(WebSearchEngine::Custom.as_str(), "custom");
+    let encoded = toml::to_string(&config).unwrap();
+    let decoded: WebSearchConfig = toml::from_str(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_value(config).unwrap(),
+        serde_json::to_value(decoded).unwrap()
+    );
+    let no_count: CustomWebSearchConfig =
+        toml::from_str("endpoint = 'https://example.test'").unwrap();
+    assert!(no_count.count_param.is_none());
+    assert_eq!(no_count.method, CustomWebSearchMethod::Get);
+    assert!(WebSearchConfig::default().custom.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn agents_jev_models_parse_and_default_unset() {
+    let config: AgentsConfig = toml::from_str(
+        r#"
+memory_jev_model = "typesafe/jev-1.14"
+browser_jev_model = "typesafe/jev-1.14"
+voice_jev_model = "typesafe/jev-1.14"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.memory_jev_model.as_deref(),
+        Some("typesafe/jev-1.14")
+    );
+    assert_eq!(
+        config.browser_jev_model.as_deref(),
+        Some("typesafe/jev-1.14")
+    );
+    assert_eq!(config.voice_jev_model.as_deref(), Some("typesafe/jev-1.14"));
+    let defaults = AgentsConfig::default();
+    assert!(defaults.memory_jev_model.is_none());
+    assert!(defaults.browser_jev_model.is_none());
+    assert!(defaults.voice_jev_model.is_none());
+}
+
 const CONFIG_ENV_KEYS: &[&str] = &[
+    "JCODE_HIBERNATION_IDLE_SECS",
+    "JCODE_HIBERNATION_MODE",
+    "JCODE_REQUEST_COMPRESSION",
     "HOME",
+    "JCODE_COMMIT_LOG_KEY",
+    "JCODE_RESUME_PROJECT_SCOPE",
+    "JCODE_SWARM_STALL_AFTER_SECS",
+    "JCODE_SWARM_STALL_NUDGE",
     "JCODE_ACP_PROFILE",
     "JCODE_ACP_TOOL_PROFILE",
     "JCODE_ACTIVE_SESSIONS_MANAGER",
@@ -67,6 +165,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DEBUG_SOCKET",
     "JCODE_DEFAULT_REASONING_DISPLAY",
     "JCODE_DICTATION_COMMAND",
+    "JCODE_DICTATION_RECORDER",
     "JCODE_DICTATION_KEY",
     "JCODE_DICTATION_MODE",
     "JCODE_DICTATION_TIMEOUT_SECS",
@@ -74,6 +173,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DIFF_MODE",
     "JCODE_DIFF_MODE_CYCLE_KEY",
     "JCODE_DIAGRAM_PANE_TOGGLE_KEY",
+    "JCODE_DIAGRAM_PANE_VISIBILITY_TOGGLE_KEY",
     "JCODE_DISABLE_BASE_TOOLS",
     "JCODE_DISABLED_ANIMATIONS",
     "JCODE_DISABLED_TOOLS",
@@ -84,6 +184,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DISPLAY_CENTERED",
     "JCODE_EFFORT_DECREASE_KEY",
     "JCODE_EFFORT_INCREASE_KEY",
+    "JCODE_SPEED_DECREASE_KEY",
+    "JCODE_SPEED_INCREASE_KEY",
     "JCODE_EMAIL_REPLY_ENABLED",
     "JCODE_EMAIL_TO",
     "JCODE_FOCUS_HOOK",
@@ -96,6 +198,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_HOOK_PRE_TOOL_TRANSFORM_TIMEOUT_MS",
     "JCODE_HOOK_PRE_TOOL_TIMEOUT_MS",
     "JCODE_HOOK_POST_TOOL",
+    "JCODE_HOOK_POST_TOOL_FEEDBACK",
+    "JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS",
     "JCODE_HOOK_SESSION_END",
     "JCODE_HOOK_SESSION_START",
     "JCODE_HOOK_TURN_END",
@@ -120,8 +224,22 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MEMORY_EMBEDDING_DIM",
     "JCODE_MEMORY_EMBEDDING_MODEL",
     "JCODE_MEMORY_ENABLED",
+    "JCODE_HINDSIGHT_MEMORY_ENABLED",
+    "JCODE_MEMORY_PROVIDER",
+    "JCODE_MEMORY_HINDSIGHT_LIMIT",
+    "JCODE_MEMORY_REFRESH_TOOL_CALLS",
     "JCODE_MEMORY_JEV_PROVIDER",
+    "JCODE_BROWSER_HANDOFF",
+    "JCODE_BROWSER_JEV_PROVIDER",
+    "JCODE_VOICE_JEV_PROVIDER",
+    "JCODE_LAYA_BASE_URL",
+    "LAYA_BASE_URL",
+    "LAYA_API_KEY",
+    "JCODE_MEMORY_JEV_MODEL",
+    "JCODE_BROWSER_JEV_MODEL",
+    "JCODE_VOICE_JEV_MODEL",
     "JCODE_ENABLE_MERMAID",
+    "JCODE_MERMAID_HALFBLOCKS",
     "JCODE_MEMORY_MODEL",
     "JCODE_MEMORY_SIDECAR_ENABLED",
     "JCODE_PERSIST_MEMORY_INJECTIONS",
@@ -173,11 +291,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MAX_RETRIES",
     "JCODE_MCP_TOOLS",
     "JCODE_MCP_TOOLS_TOKEN_THRESHOLD",
+    "JCODE_CODEMODE",
     "JCODE_RETRY_BACKOFF_CAP_SECS",
     "JCODE_SWARM_ENABLED",
     "JCODE_SWARM_EFFORT",
     "JCODE_SWARM_ROOT_EFFORT",
-    "JCODE_SWARM_DEEP_ROOT_EFFORT",
     "JCODE_SWARM_MODEL",
     "JCODE_SWARM_MAX_CONCURRENT_AGENTS",
     "JCODE_SWARM_SPAWN_MODE",
@@ -191,8 +309,13 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES",
     "JCODE_TYPING_SCROLL_LOCK_TOGGLE_KEY",
     "JCODE_UPDATE_CHANNEL",
+    "JCODE_VOICE_INPUT_KEY",
     "JCODE_WEBSEARCH_ENGINE",
     "JCODE_WEBSEARCH_FALLBACK_ENGINES",
+    "JCODE_WEBSEARCH_NATIVE_ALLOWED_DOMAINS",
+    "JCODE_WEBSEARCH_NATIVE_BLOCKED_DOMAINS",
+    "JCODE_WEBSEARCH_NATIVE_MAX_USES",
+    "JCODE_WEBSEARCH_PREFER_NATIVE",
     "JCODE_WORKSPACE_DOWN_KEY",
     "JCODE_WORKSPACE_LEFT_KEY",
     "JCODE_WORKSPACE_RIGHT_KEY",
@@ -474,10 +597,47 @@ pub fn on_config_reloaded(listener: fn()) {
         .push(listener);
 }
 
+/// Scoped local resource bridge policy. Zero disables access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudConfig {
+    pub local_access_seconds: u32,
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            local_access_seconds: 86_400,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_config_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_access_defaults_and_overrides() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.cloud.local_access_seconds, 86400);
+        for seconds in [0, 900, 172800] {
+            let config: Config =
+                toml::from_str(&format!("[cloud]\nlocal_access_seconds = {seconds}")).unwrap();
+            assert_eq!(config.cloud.local_access_seconds, seconds);
+        }
+        assert!(toml::from_str::<Config>("[cloud]\nlocal_access_seconds = -1").is_err());
+    }
+}
+
 /// Main configuration struct
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
+    /// Local resource access after cloud handoff.
+    pub cloud: CloudConfig,
+    /// Idle session memory hibernation policy.
+    pub session: SessionConfig,
+
     /// Daemon behavior for autonomous wake requests.
     pub server: ServerConfig,
 
@@ -544,11 +704,17 @@ pub struct Config {
     /// Power-management configuration (prevent sleep while streaming)
     pub power: PowerConfig,
 
+    /// macOS menu bar session indicator
+    pub menubar: MenubarConfig,
+
     /// Auto-review configuration
     pub autoreview: AutoReviewConfig,
 
     /// Auto-judge configuration
     pub autojudge: AutoJudgeConfig,
+
+    /// Post-turn skill review configuration
+    pub skill_review: SkillReviewConfig,
 
     /// Partner discovery configuration. Skipped when it matches the shipped
     /// default so saving config never bakes today's default into the file (see
@@ -617,13 +783,16 @@ impl Default for AcpConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpToolsMode {
-    /// Expose individual tools until their serialized definitions exceed the
-    /// configured threshold, then use the fixed search/call surface.
+    /// Never change the cached tool list for MCP changes. Providers with
+    /// native deferred loading (Claude, OpenAI gpt-5.4+) get MCP tools as
+    /// deferred definitions; others get the fixed `mcp` search/call
+    /// surface, with new tools described in the transcript.
     #[default]
     Auto,
     /// Always expose every MCP server tool as a top-level tool definition.
+    /// Adding a server mid-session then invalidates the prompt cache.
     Eager,
-    /// Expose only the fixed `mcp_search` and `mcp_call` tools.
+    /// Same as `Auto` (kept for existing configs).
     Deferred,
 }
 
@@ -650,6 +819,10 @@ impl McpToolsMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolConfig {
+    /// Opt into Jev browser handoff. Direct browser actions remain available.
+    pub browser_handoff: bool,
+    /// Foreground time before automatic tool handoff, in milliseconds. Zero disables it.
+    pub auto_background_timeout_ms: u64,
     /// Tool profile: "full" (default), "acp", "minimal"/"lite", or "none".
     pub profile: String,
     /// Explicit allow-list. When set, only these tools are exposed.
@@ -661,24 +834,33 @@ pub struct ToolConfig {
     pub disable_base_tools: bool,
     /// MCP tool exposure mode: auto (default), eager, or deferred.
     pub mcp_tools: McpToolsMode,
-    /// In auto mode, defer MCP tools when their definitions exceed this token estimate.
+    /// Ignored. `auto` used to switch MCP exposure at this token estimate,
+    /// which changed the cached tool list mid-session. Kept so existing
+    /// configs and the env override still parse.
     #[serde(
         alias = "mcp_tools_threshold",
         alias = "mcp_tools_auto_threshold",
         alias = "mcp_tools_auto_threshold_tokens"
     )]
     pub mcp_tools_token_threshold: usize,
+    /// Codemode: expose a `codemode` tool that runs model-written
+    /// JavaScript in an embedded QuickJS sandbox able to call every other
+    /// tool (including MCP tools). Enabled by default.
+    pub codemode: bool,
 }
 
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
+            browser_handoff: false,
+            auto_background_timeout_ms: 3_000,
             profile: String::new(),
             enabled: Vec::new(),
             disabled: Vec::new(),
             disable_base_tools: false,
             mcp_tools: McpToolsMode::Auto,
             mcp_tools_token_threshold: 8_000,
+            codemode: true,
         }
     }
 }
@@ -743,7 +925,6 @@ impl ToolConfig {
                     "read",
                     "write",
                     "edit",
-                    "replace",
                     "apply_patch",
                     "agentgrep",
                     "ls",
@@ -761,7 +942,6 @@ impl ToolConfig {
                     "read",
                     "write",
                     "edit",
-                    "replace",
                     "apply_patch",
                     "agentgrep",
                     "ls",
@@ -812,9 +992,25 @@ pub struct DictationConfig {
     pub key: String,
     /// Maximum time to wait for the command to finish (0 = no timeout).
     pub timeout_secs: u64,
-    /// Extra names or terms sent as recognition context to built-in voice
-    /// transcription, added to Jcode's own product names.
+    /// Personal names or terms sent as recognition context to built-in voice
+    /// transcription. Appended to the built-in vocabulary every user gets
+    /// (Jcode names plus common coding agent terms), for this user only.
     pub vocabulary: Vec<String>,
+    /// Built-in voice input: optional shell command that records the
+    /// microphone and prints raw mono 16 kHz s16le PCM to stdout. Empty means
+    /// auto-detect (pw-record, parecord, arecord, rec, ffmpeg).
+    pub recorder: String,
+    /// Keyboards `jcode companion` watches for Copilot-key push-to-talk
+    /// (Linux evdev nodes, preferably stable `/dev/input/by-id/...` paths).
+    /// Empty disables the companion's global voice listener.
+    pub global_devices: Vec<std::path::PathBuf>,
+    /// Language of the built-in voice input, as an ISO 639-1 code sent to the
+    /// transcription provider (`ru`, `en`, `de`, ...). Empty means "en".
+    ///
+    /// Measured 2026-11-04: with a hardcoded `language: "en"` the provider
+    /// TRANSLATED Russian speech into English instead of transcribing it. The
+    /// same recording came back English under "en" and Russian under "ru".
+    pub language: String,
 }
 
 impl Default for DictationConfig {
@@ -825,6 +1021,9 @@ impl Default for DictationConfig {
             key: "off".to_string(),
             timeout_secs: 90,
             vocabulary: Vec::new(),
+            recorder: String::new(),
+            global_devices: Vec::new(),
+            language: String::new(),
         }
     }
 }
@@ -846,18 +1045,8 @@ mod color_tests;
 /// Whether integration discovery settings carry no information beyond the shipped
 /// default, so `[sponsors]` can be left out of written config files.
 ///
-/// Discovery originally shipped opt-in with `enabled = false`, and because
-/// config saves serialize the whole struct, any save during that window froze
-/// the old default into the user's file and permanently disabled discovery even
-/// after the default flipped. Omitting default sections prevents a repeat.
+/// Explicit opt-ins must be serialized so unrelated preference saves cannot
+/// silently disable discovery on the next load.
 fn sponsors_is_default(sponsors: &SponsorsConfig) -> bool {
-    sponsors.enabled && is_default_discovery_endpoint(&sponsors.endpoint)
-}
-
-/// Endpoints used by shipped defaults. These may also be explicit user choices.
-fn is_default_discovery_endpoint(endpoint: &str) -> bool {
-    matches!(
-        endpoint.trim_end_matches('/'),
-        "https://api.jcode.sh/v1/discovery" | "https://api.solosystems.dev/v1/discovery"
-    )
+    !sponsors.enabled && sponsors.endpoint == SponsorsConfig::default().endpoint
 }

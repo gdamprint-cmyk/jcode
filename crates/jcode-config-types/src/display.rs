@@ -2,7 +2,7 @@
 
 use crate::{
     DiagramDisplayMode, DiffDisplayMode, LatexRenderingMode, MarkdownSpacingMode,
-    NativeScrollbarConfig, OverscrollStatusMode, ReasoningDisplayMode, default_true,
+    NativeScrollbarConfig, ReasoningDisplayMode, default_true,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,9 @@ pub struct DisplayConfig {
     pub centered: bool,
     /// Show thinking/reasoning content by default (default: true)
     pub show_thinking: bool,
+    /// Remove blank rows before thinking activity (default: false).
+    /// Applies to retained, embedded assistant, and live-streaming reasoning.
+    pub compact_thinking: bool,
     /// How to display reasoning/thinking content (off/full/current).
     /// When unset, falls back to `show_thinking` (true => full, false => off).
     #[serde(
@@ -45,6 +48,8 @@ pub struct DisplayConfig {
     /// Markdown block spacing style (compact/document, default: compact)
     #[serde(deserialize_with = "crate::serde_lenient::lenient_enum")]
     pub markdown_spacing: MarkdownSpacingMode,
+    /// Append link destinations after Markdown link labels (default: false).
+    pub show_link_urls: bool,
     /// LaTeX rendering style (none/unicode/image, default: image)
     #[serde(deserialize_with = "crate::serde_lenient::lenient_enum")]
     pub latex_rendering: LatexRenderingMode,
@@ -117,13 +122,17 @@ pub struct DisplayConfig {
     /// sessions (issue #674).
     #[serde(default = "default_true")]
     pub external_sessions: bool,
+    /// Open `/resume` filtered to sessions from the current project (same dir,
+    /// subdirectories, sibling git worktrees) when it has any (default: false).
+    /// Resume is intentionally global by default; `s` cycles filters either way.
+    #[serde(default)]
+    pub resume_project_scope: bool,
+    /// Highlight and prioritize sessions whose last client transport closed
+    /// within this many seconds in Resume (default: 30). Zero disables it.
+    /// This uses socket-disconnect events, never transcript/message activity.
+    pub resume_recent_close_seconds: u64,
     /// Usage percentage wording: "left" (default) or "used".
     pub usage_display: String,
-    /// When to show the overscroll status line below the input
-    /// (off/on/overscroll, default: on). "overscroll" is the elastic
-    /// reveal when scrolling past the bottom, "on" keeps it always visible.
-    #[serde(default, deserialize_with = "crate::serde_lenient::lenient_enum")]
-    pub overscroll_status: OverscrollStatusMode,
 }
 impl Default for DisplayConfig {
     fn default() -> Self {
@@ -139,9 +148,11 @@ impl Default for DisplayConfig {
             emoji: true,
             centered: false,
             show_thinking: true,
+            compact_thinking: false,
             reasoning_display: Some(ReasoningDisplayMode::Full),
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
+            show_link_urls: false,
             latex_rendering: LatexRenderingMode::default(),
             idle_animation: false,
             prompt_entry_animation: true,
@@ -161,8 +172,9 @@ impl Default for DisplayConfig {
             colors: std::collections::BTreeMap::new(),
             active_sessions_manager: false,
             external_sessions: true,
+            resume_project_scope: false,
+            resume_recent_close_seconds: 30,
             usage_display: "left".to_string(),
-            overscroll_status: OverscrollStatusMode::default(),
         }
     }
 }
@@ -219,6 +231,36 @@ mod tests {
     use crate::ReasoningDisplayMode;
 
     #[test]
+    fn link_urls_are_opt_in_and_roundtrip() {
+        assert!(!DisplayConfig::default().show_link_urls);
+        let missing: DisplayConfig = serde_json::from_str("{}").unwrap();
+        assert!(!missing.show_link_urls);
+        for value in [true, false] {
+            let config: DisplayConfig = serde_json::from_value(serde_json::json!({
+                "show_link_urls": value
+            }))
+            .unwrap();
+            assert_eq!(config.show_link_urls, value);
+            let roundtrip: DisplayConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.show_link_urls, value);
+        }
+    }
+
+    #[test]
+    fn recent_close_window_defaults_to_thirty_and_is_configurable() {
+        let missing: DisplayConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.resume_recent_close_seconds, 30);
+        for seconds in [0, 5, 120] {
+            let config: DisplayConfig = serde_json::from_value(serde_json::json!({
+                "resume_recent_close_seconds": seconds
+            }))
+            .unwrap();
+            assert_eq!(config.resume_recent_close_seconds, seconds);
+        }
+    }
+
+    #[test]
     fn thinking_is_shown_in_full_by_default() {
         let default = DisplayConfig::default();
         assert!(default.show_thinking);
@@ -227,6 +269,18 @@ mod tests {
         let missing: DisplayConfig = serde_json::from_str("{}").expect("display config");
         assert!(missing.show_thinking);
         assert_eq!(missing.reasoning_display(), ReasoningDisplayMode::Full);
+    }
+
+    #[test]
+    fn compact_thinking_is_opt_in() {
+        assert!(!DisplayConfig::default().compact_thinking);
+        let missing: DisplayConfig = serde_json::from_str("{}").unwrap();
+        assert!(!missing.compact_thinking);
+        let enabled: DisplayConfig = serde_json::from_str(r#"{"compact_thinking":true}"#).unwrap();
+        assert!(enabled.compact_thinking);
+        let roundtrip: DisplayConfig =
+            serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
+        assert!(roundtrip.compact_thinking);
     }
 
     #[test]

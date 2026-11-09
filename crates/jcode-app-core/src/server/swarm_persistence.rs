@@ -96,48 +96,45 @@ pub(super) struct LoadedSwarmRuntimeState {
     pub swarms_by_id: HashMap<String, HashSet<String>>,
 }
 
+/// Recovery note on an idle headless worker that a server restart stopped.
+/// No headless process survives a restart (issue #1651).
+pub(super) const IDLE_WORKER_NOT_RESTORED_NOTE: &str =
+    "idle worker not restored after server restart";
+/// Suffix appended only after the owner's model-facing interrupt was accepted.
+/// Persisting it suppresses reconnect/restart duplicates. Delivery precedes
+/// acknowledgement, so a crash in between may repeat a notice rather than lose it.
+pub(super) const OWNER_NOTIFIED_NOTE: &str = "owner notified";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSwarmState {
-    swarm_id: String,
+pub struct PersistedSwarmState {
+    pub swarm_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan: Option<PersistedVersionedPlan>,
+    pub plan: Option<PersistedVersionedPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    coordinator_session_id: Option<String>,
+    pub coordinator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    members: Vec<PersistedSwarmMember>,
-    updated_at_unix_ms: u64,
+    pub members: Vec<PersistedSwarmMember>,
+    pub updated_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedVersionedPlan {
-    items: Vec<crate::plan::PlanItem>,
-    version: u64,
-    participants: Vec<String>,
+pub struct PersistedVersionedPlan {
+    pub items: Vec<crate::plan::PlanItem>,
+    pub version: u64,
+    pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    task_progress: HashMap<String, SwarmTaskProgress>,
-    #[serde(default = "default_plan_mode", skip_serializing_if = "is_light_mode")]
-    mode: String,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    node_meta: HashMap<String, crate::plan::NodeMeta>,
-}
-
-fn default_plan_mode() -> String {
-    "light".to_string()
-}
-
-fn is_light_mode(mode: &str) -> bool {
-    mode == "light"
+    pub task_progress: HashMap<String, SwarmTaskProgress>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSwarmMember {
+pub struct PersistedSwarmMember {
     #[serde(flatten)]
-    record: SwarmMemberRecord,
+    pub record: SwarmMemberRecord,
     /// Wall-clock time when the member entered its current terminal status.
     /// Legacy snapshots omit this; their snapshot timestamp becomes the
     /// conservative migration fallback so reports are not discarded eagerly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_since_unix_ms: Option<u64>,
+    pub terminal_since_unix_ms: Option<u64>,
 }
 
 fn now_unix_ms() -> u64 {
@@ -219,7 +216,7 @@ fn migrate_legacy_state() {
     }
 }
 
-fn state_path(swarm_id: &str) -> PathBuf {
+pub(super) fn state_path(swarm_id: &str) -> PathBuf {
     let sanitized: String = swarm_id
         .chars()
         .map(|ch| {
@@ -284,7 +281,10 @@ fn remove_snapshot_files(swarm_id: &str) -> bool {
     removed
 }
 
-fn from_persisted_plan(mut plan: PersistedVersionedPlan, updated_at_unix_ms: u64) -> VersionedPlan {
+pub(super) fn from_persisted_plan(
+    mut plan: PersistedVersionedPlan,
+    updated_at_unix_ms: u64,
+) -> VersionedPlan {
     for item in &mut plan.items {
         if item.status == "running" {
             item.status = "running_stale".to_string();
@@ -300,8 +300,6 @@ fn from_persisted_plan(mut plan: PersistedVersionedPlan, updated_at_unix_ms: u64
         version: plan.version,
         participants: plan.participants.into_iter().collect(),
         task_progress: plan.task_progress,
-        mode: plan.mode,
-        node_meta: plan.node_meta,
     };
     plan.prune_side_maps();
     plan
@@ -315,8 +313,6 @@ fn to_persisted_plan(plan: &VersionedPlan) -> PersistedVersionedPlan {
         version: plan.version,
         participants,
         task_progress: plan.task_progress.clone(),
-        mode: plan.mode.clone(),
-        node_meta: plan.node_meta.clone(),
     }
 }
 
@@ -329,6 +325,48 @@ fn to_persisted_member(member: &SwarmMember, snapshot_unix_ms: u64) -> Persisted
         record: member.durable_record(),
         terminal_since_unix_ms,
     }
+}
+
+pub(super) fn transfer_snapshot(runtime: &super::state::SwarmRuntime) -> PersistedSwarmState {
+    let updated_at_unix_ms = now_unix_ms();
+    PersistedSwarmState {
+        swarm_id: runtime.swarm_id.clone(),
+        plan: runtime.plan.as_ref().map(to_persisted_plan),
+        coordinator_session_id: runtime.coordinator_session_id.clone(),
+        members: runtime
+            .members
+            .iter()
+            .map(|member| to_persisted_member(member, updated_at_unix_ms))
+            .collect(),
+        updated_at_unix_ms,
+    }
+}
+
+pub(super) fn write_transfer_snapshot(snapshot: &PersistedSwarmState) -> anyhow::Result<()> {
+    let file_lock = swarm_file_lock(&snapshot.swarm_id);
+    let _guard = file_lock.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(existing) = read_transfer_snapshot(&snapshot.swarm_id)? {
+        anyhow::ensure!(
+            existing.swarm_id == snapshot.swarm_id,
+            "swarm persistence path collision"
+        );
+    }
+    storage::write_json_fast(&state_path(&snapshot.swarm_id), snapshot)
+}
+
+pub(super) fn read_transfer_snapshot(
+    swarm_id: &str,
+) -> anyhow::Result<Option<PersistedSwarmState>> {
+    let path = state_path(swarm_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let snapshot: PersistedSwarmState = storage::read_json(&path)?;
+    anyhow::ensure!(
+        snapshot.swarm_id == swarm_id,
+        "swarm persistence path collision for {swarm_id}"
+    );
+    Ok(Some(snapshot))
 }
 
 fn append_recovery_detail(detail: Option<String>, note: &str) -> Option<String> {
@@ -361,7 +399,7 @@ fn recover_member_status(
             append_recovery_detail(
                 detail,
                 if is_headless {
-                    "idle worker not restored after server restart"
+                    IDLE_WORKER_NOT_RESTORED_NOTE
                 } else {
                     "client not attached after server restart"
                 },
@@ -395,7 +433,7 @@ fn recovered_member_event_tx() -> mpsc::UnboundedSender<ServerEvent> {
     tx
 }
 
-fn from_persisted_member(
+pub(super) fn from_persisted_member(
     member: PersistedSwarmMember,
     snapshot_updated_at_unix_ms: u64,
     loaded_at_unix_ms: u64,
@@ -437,7 +475,26 @@ fn from_persisted_member(
             .checked_sub(terminal_age)
             .unwrap_or_else(Instant::now);
     }
+    hydrate_member_todos(&mut recovered);
     Some(recovered)
+}
+
+/// Todo snapshots live only in memory on the swarm member, so a reload would
+/// otherwise blank every worker's todo list until its next `todo` call. The
+/// session's todo file is the source of truth, so rebuild the snapshot from it.
+fn hydrate_member_todos(member: &mut SwarmMember) {
+    let Ok(todos) = crate::todo::load_todos(&member.session_id) else {
+        return;
+    };
+    if todos.is_empty() {
+        return;
+    }
+    let completed = todos.iter().filter(|t| t.status == "completed").count() as u32;
+    member.todo_progress = Some((completed, todos.len() as u32));
+    member.todo_items = super::background_tasks::compact_todo_items(&todos);
+    let (statuses, blocked_reason) = super::background_tasks::todo_runtime_projection(&todos);
+    member.runtime.todo_statuses = statuses;
+    member.runtime.todo_blocked_reason = blocked_reason;
 }
 
 pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
@@ -455,7 +512,7 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
     let mut plans = HashMap::new();
     let mut coordinators = HashMap::new();
     let mut members = HashMap::new();
-    let mut swarms_by_id = HashMap::new();
+    let mut swarms_by_id: HashMap<String, HashSet<String>> = HashMap::new();
     let loaded_at_unix_ms = now_unix_ms();
     let terminal_retention = super::swarm::swarm_terminal_member_retention();
     let plan_retention = dormant_plan_retention();
@@ -463,6 +520,14 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
     let mut pruned_dormant_plans = 0usize;
     let mut pruned_members_by_swarm: HashMap<String, HashSet<String>> = HashMap::new();
     let mut pruned_plan_swarms: HashSet<String> = HashSet::new();
+    // Issue #1650: a session may appear in several snapshots when an older
+    // build moved it between swarms without rewriting the previous snapshot
+    // (a resumed session kept its temporary `session:<temp>` swarm id). Only
+    // the newest record is the member's real swarm. Track which snapshot
+    // provided each member so stale duplicates do not attribute it to
+    // swarms it no longer belongs to.
+    let mut member_source: HashMap<String, (u64, String)> = HashMap::new();
+    let mut superseded_member_swarms: HashSet<String> = HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -509,6 +574,26 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
                 continue;
             };
             let member_session_id = member.record.session_id.clone();
+            if let Some((existing_updated_at, existing_swarm_id)) =
+                member_source.get(&member_session_id).cloned()
+            {
+                if existing_updated_at >= state.updated_at_unix_ms {
+                    superseded_member_swarms.insert(member_swarm_id.clone());
+                    continue;
+                }
+                if let Some(session_ids) = swarms_by_id.get_mut(&existing_swarm_id) {
+                    session_ids.remove(&member_session_id);
+                    if session_ids.is_empty() {
+                        swarms_by_id.remove(&existing_swarm_id);
+                    }
+                }
+                members.remove(&member_session_id);
+                superseded_member_swarms.insert(existing_swarm_id);
+            }
+            member_source.insert(
+                member_session_id.clone(),
+                (state.updated_at_unix_ms, member_swarm_id.clone()),
+            );
             let Some(member) = from_persisted_member(
                 member,
                 state.updated_at_unix_ms,
@@ -524,7 +609,7 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
             };
             swarms_by_id
                 .entry(member_swarm_id.clone())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(member_session_id.clone());
             members.insert(member_session_id, member);
         }
@@ -546,6 +631,7 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
     let rewritten_swarms: HashSet<String> = pruned_members_by_swarm
         .keys()
         .chain(pruned_plan_swarms.iter())
+        .chain(superseded_member_swarms.iter())
         .cloned()
         .collect();
     for swarm_id in &rewritten_swarms {

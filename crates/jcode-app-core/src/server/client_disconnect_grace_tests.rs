@@ -7,6 +7,7 @@ use crate::session::{Session, SessionStatus};
 use crate::tool::Registry;
 use async_trait::async_trait;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 struct NoRequests;
@@ -100,7 +101,9 @@ impl Fixture {
                 runtime: Default::default(),
             },
         )])));
-        let sessions = Arc::new(RwLock::new(HashMap::from([(id.clone(), agent.clone())])));
+        let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+            HashMap::from([(id.clone(), agent.clone())]),
+        ));
         let connections = Arc::new(RwLock::new(HashMap::from([(
             "original".into(),
             connection("original", &id),
@@ -241,6 +244,25 @@ async fn unsaved_idle_session_expires_without_persisting_or_leaking() {
     assert!(!fixture.members.read().await.contains_key(&fixture.id));
     assert!(fixture.connections.read().await.is_empty());
     assert!(!crate::session::session_exists(&fixture.id));
+}
+
+#[tokio::test]
+async fn unsaved_idle_session_without_swarm_member_still_expires() {
+    // A client that disconnects before subscribe registers a swarm member
+    // (window closed mid-subscribe) must not be mistaken for a replaced
+    // attachment. Previously this leaked the Agent for the server lifetime.
+    let _lock = crate::storage::lock_test_env();
+    let _home = Home::new();
+    let fixture = Fixture::new(false).await;
+    fixture.members.write().await.clear();
+    timeout(
+        Duration::from_secs(1),
+        fixture.cleanup(false, Duration::from_millis(60)),
+    )
+    .await
+    .unwrap();
+    assert!(!fixture.sessions.read().await.contains_key(&fixture.id));
+    assert!(fixture.connections.read().await.is_empty());
 }
 
 #[tokio::test]

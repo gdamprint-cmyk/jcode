@@ -39,9 +39,11 @@ pub mod overnight;
 pub mod perf;
 pub mod replay;
 pub mod restart_snapshot;
+pub mod running_tool_registry;
 pub mod server;
 pub mod server_spawn;
 pub mod session_effort;
+pub mod session_env;
 pub mod session_launch;
 pub mod session_rebuild;
 pub mod setup_hints;
@@ -50,6 +52,7 @@ pub mod startup_profile;
 pub mod tool;
 pub mod turn_cancel_registry;
 pub mod update;
+pub mod wait_registry;
 
 use std::sync::Mutex;
 

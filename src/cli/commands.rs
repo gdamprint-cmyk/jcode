@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -1083,8 +1082,10 @@ fn run_cloud_sessions_dashboard(request: CloudSessionsDashboardRequest) -> Resul
         items.len(),
         output_path.display()
     );
-    if request.open {
-        let _ = open::that(&output_path);
+    if request.open
+        && let Err(error) = open::that(&output_path)
+    {
+        eprintln!("Dashboard saved, but could not open it: {error}");
     }
     Ok(())
 }
@@ -1431,11 +1432,18 @@ pub async fn run_transcript_command(
         trimmed.to_string()
     };
 
+    // Focused-window lookup needs the user's compositor, so it happens here in
+    // the client rather than in the (possibly remote) server.
+    let session = session.or_else(|| {
+        jcode_voice::dictation::focused_jcode_session()
+            .ok()
+            .flatten()
+    });
     let mut client = crate::server::Client::connect_debug().await?;
     let request_id = client.send_transcript(&text, mode, session).await?;
 
     loop {
-        match client.read_event().await? {
+        match unwrap_turn_event(client.read_event().await?) {
             crate::protocol::ServerEvent::Ack { id } if id == request_id => {}
             crate::protocol::ServerEvent::Done { id } if id == request_id => return Ok(()),
             crate::protocol::ServerEvent::Error { id, message, .. } if id == request_id => {
@@ -1446,11 +1454,34 @@ pub async fn run_transcript_command(
     }
 }
 
+pub async fn run_companion_command(status: bool, no_voice: bool) -> Result<()> {
+    use crate::companion_client::{CompanionRequest, request_async};
+    if status {
+        match request_async(CompanionRequest::Status, std::time::Duration::from_secs(2)).await {
+            Ok(response) => {
+                println!(
+                    "{} at {} (capabilities: {})",
+                    response.message,
+                    crate::companion_client::socket_path().display(),
+                    response.capabilities.join(", ")
+                );
+                return Ok(());
+            }
+            Err(error) => anyhow::bail!("{error}"),
+        }
+    }
+    jcode_companion::run(jcode_companion::CompanionOptions {
+        voice: !no_voice,
+        ..Default::default()
+    })
+    .await
+}
+
 pub async fn run_dictate_command(type_output: bool) -> Result<()> {
-    let run = crate::dictation::run_configured().await?;
+    let run = jcode_voice::dictation::run_configured().await?;
 
     if type_output {
-        crate::dictation::type_text(&run.text)
+        jcode_voice::dictation::type_text(&run.text)
     } else {
         run_transcript_command(Some(run.text), run.mode, None).await
     }
@@ -1883,7 +1914,7 @@ pub fn run_pair_command(list: bool, revoke: Option<String>) -> Result<()> {
 
     eprintln!();
     eprintln!("  \x1b[1mScan with the jcode iOS app:\x1b[0m\n");
-    match crate::login_qr::render_unicode_qr(&pair_uri) {
+    match jcode_terminal_prompt::qr::render_unicode_qr(&pair_uri) {
         Ok(qr) => {
             for line in qr.lines() {
                 eprintln!("  {line}");
@@ -1999,6 +2030,9 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                 "  compatibility: {}",
                 if status.compatible {
                     "ok"
+                } else if !status.responding {
+                    // Nothing answered, so there is no extension to compare.
+                    "unknown (bridge not responding)"
                 } else {
                     "extension/bridge mismatch"
                 }
@@ -2007,7 +2041,22 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                 println!("  missing actions: {}", status.missing_actions.join(", "));
             }
 
-            if status.ready {
+            if status.ready && !browser::status_answered_by(&status, target.kind) {
+                let answering = status
+                    .connected_browser
+                    .as_deref()
+                    .unwrap_or("another browser");
+                println!(
+                    "\n{name} is not connected: the bridge that answered belongs to {answering}. Browser actions with browser={} will fail until {name} runs the Browser Agent Bridge extension. Run `jcode browser setup {}` to set it up.",
+                    target.kind.id(),
+                    target.kind.id()
+                );
+                if browser::is_browser_running(target.kind)
+                    && let Some(diagnosis) = browser::diagnose_silent_chromium_bridge(target.kind)
+                {
+                    println!("{diagnosis}");
+                }
+            } else if status.ready {
                 println!("\nBuilt-in browser tool is ready.");
             } else if status.responding && !status.compatible {
                 println!(
@@ -2024,6 +2073,9 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                     name,
                     target.kind.extensions_page()
                 );
+                if let Some(diagnosis) = browser::diagnose_silent_chromium_bridge(target.kind) {
+                    println!("{diagnosis}");
+                }
             } else {
                 println!("\nRun `jcode browser setup` to install or repair it.");
             }
@@ -2070,7 +2122,36 @@ struct NdjsonRunState {
     connection_type: Option<String>,
     connection_phase: Option<String>,
     status_detail: Option<String>,
+    requested_service_tier: Option<String>,
+    served_service_tier: Option<String>,
     usage: crate::agent::TokenUsage,
+}
+
+impl NdjsonRunState {
+    /// Compare wire metadata only. A match is not independent confirmation of
+    /// backend routing or billing, especially on subscription-backed endpoints.
+    fn service_tier_report_status(&self) -> &'static str {
+        let Some(reported) = self.served_service_tier.as_deref() else {
+            return "not_reported";
+        };
+        if reported == "auto" {
+            return "unresolved";
+        }
+        fn canonical(tier: &str) -> &str {
+            match tier {
+                "off" | "standard" | "default" | "auto" => "default",
+                "fast" | "priority" => "priority",
+                _ => tier,
+            }
+        }
+        if canonical(self.requested_service_tier.as_deref().unwrap_or("default"))
+            == canonical(reported)
+        {
+            "reported_match"
+        } else {
+            "reported_mismatch"
+        }
+    }
 }
 
 pub fn run_auth_status_command(emit_json: bool) -> Result<()> {
@@ -2156,6 +2237,38 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct ServerReloadReport {
+    socket: String,
+    had_listener: bool,
+    forced: bool,
+    reloaded: bool,
+    already_current: bool,
+    handoff_ready: bool,
+    detail: String,
+}
+
+fn validate_server_reload_report(report: &ServerReloadReport) -> Result<()> {
+    // A reload that asked the old server to hand over, and then never saw the
+    // new one take the socket, did not succeed. It is the one outcome a caller
+    // cannot infer from the exit status alone: until now every path here
+    // returned Ok(()), and the distinction lived only inside the JSON body.
+    //
+    // Scope is deliberately narrow, because the comment below documents that
+    // an installer may call `jcode server reload` unconditionally. The two
+    // states that are arguably a success keep exit 0: there was nothing
+    // running (`had_listener == false`), or the binary was already current
+    // (`already_current`). Only the not-ready handoff, where the daemon is
+    // genuinely not serving yet, reports failure.
+    if report.had_listener && !report.already_current && !report.handoff_ready {
+        anyhow::bail!(
+            "jcode server reload was requested but the new server never became ready: {}",
+            report.detail
+        );
+    }
+    Ok(())
+}
+
 /// Gracefully reload the running background server onto the newest binary.
 ///
 /// This is the preferred upgrade path (issue #291): instead of killing the
@@ -2172,29 +2285,31 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
 /// - If no server is running, this is a successful no-op so installers can call
 ///   it unconditionally.
 pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    run_server_reload_command_to(force, emit_json, &mut stdout).await
+}
+
+async fn run_server_reload_command_to(
+    force: bool,
+    emit_json: bool,
+    stdout: &mut impl Write,
+) -> Result<()> {
     use crate::protocol::ServerEvent;
     use std::time::Duration;
 
     let socket = crate::server::socket_path();
 
-    #[derive(Serialize)]
-    struct ServerReloadReport {
-        socket: String,
-        had_listener: bool,
-        forced: bool,
-        reloaded: bool,
-        already_current: bool,
-        handoff_ready: bool,
-        detail: String,
-    }
-
-    let emit = |report: ServerReloadReport| -> Result<()> {
+    let mut emit = |report: ServerReloadReport| -> Result<()> {
+        let outcome = validate_server_reload_report(&report);
         if emit_json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            serde_json::to_writer_pretty(&mut *stdout, &report)?;
+            stdout.write_all(b"\n")?;
         } else if !report.detail.is_empty() {
-            println!("{}", report.detail);
+            writeln!(stdout, "{}", report.detail)?;
         }
-        Ok(())
+        // Keep printing the report above the status check so --json output is
+        // byte-identical for callers that parse it.
+        outcome
     };
 
     // No server? Nothing to reload. This is a success so an installer can call
@@ -2263,7 +2378,7 @@ pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<(
     // exec's a new process, which drops this connection after it sends Done;
     // we treat a disconnect after observing Reloading as the expected handoff.
     loop {
-        match client.read_event().await {
+        match client.read_event().await.map(unwrap_turn_event) {
             Ok(ServerEvent::Ack { id }) if id == request_id => {}
             Ok(ServerEvent::Reloading { .. }) => {
                 reloading = true;
@@ -2494,11 +2609,19 @@ pub async fn run_single_message_command(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
-    let provider = if emit_json || emit_ndjson {
-        super::provider_init::init_provider_quiet(choice, model).await?
-    } else {
-        super::provider_init::init_provider_for_validation(choice, model).await?
-    };
+    let provider =
+        super::provider_init::init_provider_for_run(choice, model, emit_json || emit_ndjson)
+            .await?;
+    // Older model caches contain names but no account-scoped speed capabilities.
+    // Hydrate those before the first headless request so an unsupported saved
+    // tier cannot slip through the backward-compatible unknown-catalog path.
+    if provider.model_capabilities_need_refresh()
+        && let Err(error) = provider.prefetch_models().await
+    {
+        crate::logging::warn(&format!(
+            "Could not refresh model capabilities before headless run: {error}"
+        ));
+    }
     let registry = crate::tool::Registry::new(provider.clone()).await;
     // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
     // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
@@ -2528,6 +2651,29 @@ pub async fn run_single_message_command(
     run_single_message_with_agent(&mut agent, provider, message, emit_json, emit_ndjson).await
 }
 
+/// Provider id for `jcode run --json`/`--ndjson` output.
+///
+/// Every direct OpenAI-compatible profile (Ollama, LM Studio, DeepSeek, custom
+/// endpoints, ...) runs on the OpenRouter transport, whose `name()` is the
+/// fixed slot id `openrouter`. Reporting that attributed purely local runs to
+/// a paid third-party aggregator (#804). The session already records the
+/// resolved route identity, so prefer it for that slot and leave every other
+/// provider's established value unchanged.
+fn run_report_provider_name(
+    provider: &dyn crate::provider::Provider,
+    session_provider_key: Option<&str>,
+) -> String {
+    let name = provider.name();
+    if name.eq_ignore_ascii_case("openrouter")
+        && let Some(key) = session_provider_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    {
+        return key.to_string();
+    }
+    name.to_string()
+}
+
 async fn run_single_message_with_agent(
     agent: &mut crate::agent::Agent,
     provider: std::sync::Arc<dyn crate::provider::Provider>,
@@ -2535,12 +2681,20 @@ async fn run_single_message_with_agent(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
+    // A detached dependency can outlive a model turn without holding an
+    // in-process activity guard. Keep this CLI continuation alive across the
+    // wait too, rather than letting an idle-only runtime replacement lose it.
+    // run_once's nested read reservations are deliberately safe.
     let result: Result<()> = async {
+        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
         if emit_json {
             let text = run_single_message_command_capture_with_auto_poke(agent, message).await?;
             let report = RunCommandReport {
                 session_id: agent.session_id().to_string(),
-                provider: provider.name().to_string(),
+                provider: run_report_provider_name(
+                    provider.as_ref(),
+                    agent.session_provider_key().as_deref(),
+                ),
                 model: provider.model(),
                 text,
                 usage: agent.last_usage().clone(),
@@ -2562,6 +2716,11 @@ async fn run_single_message_with_agent(
     // one-shot exit from looking like a stale-PID crash on the next startup
     // (issue #988).
     agent.mark_closed();
+    // The skill review runs detached so it does not hold the answer hostage.
+    // But this process is about to exit, and a detached task dies with the
+    // runtime. Wait for it here, AFTER the answer was printed, so the review
+    // is not silently dropped in the one-shot mode.
+    agent.wait_for_skill_review().await;
     result
 }
 
@@ -2605,17 +2764,25 @@ fn run_command_mcp_cold_wait() -> std::time::Duration {
 /// would otherwise miss the single-turn snapshot.
 fn cold_cache_mcp_servers() -> Vec<String> {
     let config = crate::mcp::McpConfig::load();
-    if config.servers.is_empty() {
-        return Vec::new();
-    }
     let cache = crate::mcp::McpSchemaCache::load();
+    uncached_enabled_mcp_servers(&config, &cache)
+}
+
+fn uncached_enabled_mcp_servers(
+    config: &crate::mcp::McpConfig,
+    cache: &crate::mcp::McpSchemaCache,
+) -> Vec<String> {
     config
         .servers
         .iter()
-        .filter(|(name, cfg)| cache.tools_for(name, cfg).is_none())
+        .filter(|(name, cfg)| cfg.is_enabled() && cache.tools_for(name, cfg).is_none())
         .map(|(name, _)| name.clone())
         .collect()
 }
+
+#[cfg(test)]
+#[path = "mcp_startup_tests.rs"]
+mod mcp_startup_tests;
 
 /// Bridge the cold-cache gap for `jcode run`: if any configured MCP server has
 /// no cached schema, briefly poll the registry until its `mcp__*` tools appear
@@ -2638,11 +2805,9 @@ async fn wait_for_cold_cache_mcp_tools(registry: &crate::tool::Registry) {
     ));
     let deadline = std::time::Instant::now() + budget;
     loop {
-        let names = registry.tool_names().await;
-        let covered = cold_servers.iter().all(|server| {
-            let prefix = format!("mcp__{}__", server);
-            names.iter().any(|name| name.starts_with(&prefix))
-        });
+        let covered = cold_servers
+            .iter()
+            .all(|server| registry.has_mcp_tools_for_server(server));
         if covered {
             crate::logging::info(
                 "jcode run: cold-cache MCP server(s) registered tools; proceeding",
@@ -2673,149 +2838,14 @@ fn run_command_auto_poke_limit_reached(turns_completed: usize, max_turns: Option
         .unwrap_or(false)
 }
 
-#[derive(Debug)]
-enum RunAutoPokeFollowUp {
-    Incomplete {
-        count: usize,
-        message: String,
-    },
-    ConfidenceSummary {
-        total_todos: usize,
-        message: String,
-        confidence_spike_challenge: bool,
-    },
-    /// Deferred quality-check reminder for the points this turn flagged and
-    /// never resolved. Delivered once, ahead of the confidence summary.
-    GateDigest {
-        message: String,
-    },
-}
-
-fn run_todos(session_id: &str) -> Vec<crate::todo::TodoItem> {
-    crate::todo::load_todos(session_id).unwrap_or_default()
-}
-
-/// Build the deferred quality-check reminder for a headless run, consuming the
-/// turn's observation log.
-///
-/// The log is cleared whether or not a reminder results, so one turn's points
-/// cannot be raised again against the next turn's work. Returns `None` only when
-/// the turn recorded nothing.
-fn take_run_gate_digest(session_id: &str, already_delivered: bool) -> Option<String> {
-    if already_delivered {
-        return None;
-    }
-    let observations = crate::todo::load_gate_observations(session_id).unwrap_or_default();
-    if observations.is_empty() {
-        return None;
-    }
-    let plan = crate::todo::load_plan(session_id).unwrap_or_default();
-    let goals = crate::todo::load_goals(session_id).unwrap_or_default();
-    let digest = crate::todo::build_gate_digest(&observations, &plan, &goals);
-    let _ = crate::todo::clear_gate_observations(session_id);
-    digest
-}
-
-/// Consume the observation log only once the turn has actually ended.
-///
-/// `take_run_gate_digest` clears the log, so calling it while todos are still
-/// open would destroy the reminder: auto-poke iterates many times with open work
-/// on a long run, and the incomplete-todo follow-up takes precedence, so the
-/// digest string would be dropped on the floor with the log already emptied.
-fn take_run_gate_digest_if_turn_ended(
-    session_id: &str,
-    already_delivered: bool,
-    todos: &[crate::todo::TodoItem],
-) -> Option<String> {
-    let work_remains = todos.iter().any(|todo| {
-        !crate::todo::todo_status_is_completed(&todo.status)
-            && !crate::todo::todo_status_is_cancelled(&todo.status)
-    });
-    if work_remains {
-        return None;
-    }
-    take_run_gate_digest(session_id, already_delivered)
-}
-
-fn build_run_auto_poke_follow_up_from_todos(
-    todos: &[crate::todo::TodoItem],
-    confidence_spike_challenged: bool,
-    gate_digest: Option<String>,
-) -> Option<RunAutoPokeFollowUp> {
-    let incomplete: Vec<_> = todos
-        .iter()
-        .filter(|todo| {
-            !crate::todo::todo_status_is_completed(&todo.status)
-                && !crate::todo::todo_status_is_cancelled(&todo.status)
-        })
-        .cloned()
-        .collect();
-    if !incomplete.is_empty() {
-        return Some(RunAutoPokeFollowUp::Incomplete {
-            count: incomplete.len(),
-            message: build_run_poke_message(&incomplete),
-        });
-    }
-    // Verify the weak points before judging completion confidence: the digest
-    // may prompt work that changes those very assessments.
-    if let Some(message) = gate_digest {
-        return Some(RunAutoPokeFollowUp::GateDigest { message });
-    }
-    if !todos.is_empty()
-        && let Some((message, confidence_spike_challenge)) =
-            build_run_todo_validation_message(todos, !confidence_spike_challenged)
-    {
-        return Some(RunAutoPokeFollowUp::ConfidenceSummary {
-            total_todos: todos.len(),
-            message,
-            confidence_spike_challenge,
-        });
-    }
-    None
-}
-
-fn build_run_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    crate::todo::build_auto_poke_message(incomplete.len())
-}
-
-fn build_run_todo_validation_message(
-    todos: &[crate::todo::TodoItem],
-    allow_confidence_spike_challenge: bool,
-) -> Option<(String, bool)> {
-    let completed: Vec<&crate::todo::TodoItem> = todos
-        .iter()
-        .filter(|todo| crate::todo::todo_status_is_completed(&todo.status))
-        .collect();
-    if completed.is_empty() {
-        return None;
-    }
-
-    let completion_confidence_needs_validation = completed
-        .iter()
-        .any(|todo| !crate::todo::completion_confidence_passes(todo.completion_confidence));
-    let confidence_spike_detected =
-        allow_confidence_spike_challenge && !crate::todo::spike_completed_todos(todos).is_empty();
-
-    if !completion_confidence_needs_validation && !confidence_spike_detected {
-        // Nothing actionable: completing the loop with a generic summary just
-        // spends tokens on "all good" theater, so send nothing and end the run.
-        return None;
-    }
-
-    if completion_confidence_needs_validation {
-        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
-        Some((
-            crate::todo::build_todo_completion_continuation_message(todos),
-            false,
-        ))
-    } else {
-        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::ConfidenceSpike);
-        Some((
-            crate::todo::build_todo_confidence_spike_continuation_message(todos),
-            true,
-        ))
-    }
-}
+mod todo_followup;
+use todo_followup::{
+    RunAutoPokeFollowUp, build_run_auto_poke_follow_up_from_todos, prepare_run_todo_follow_up,
+    run_actionable_poke_message, run_blocked_notice, run_completely_blocked_notice,
+    run_external_blocker_notice, run_todos, take_run_gate_digest_if_turn_ended,
+};
+#[cfg(test)]
+use todo_followup::{run_actionable_todos, take_run_gate_digest};
 
 async fn run_single_message_command_plain_with_auto_poke(
     agent: &mut crate::agent::Agent,
@@ -2826,6 +2856,7 @@ async fn run_single_message_command_plain_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         agent.run_once(&next_message).await?;
         turns_completed += 1;
@@ -2833,10 +2864,42 @@ async fn run_single_message_command_plain_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            agent.session_id(),
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            eprintln!("{}", run_blocked_notice(&todos).unwrap_or_else(||
+                "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
+            ));
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            eprintln!(
+                "We stopped poking after {} attempts without todo progress; unfinished todos remain.",
+                crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS
+            );
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -2877,6 +2940,8 @@ async fn run_single_message_command_plain_with_auto_poke(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         eprintln!(
@@ -2908,6 +2973,7 @@ async fn run_single_message_command_capture_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         outputs.push(agent.run_once_capture(&next_message).await?);
         turns_completed += 1;
@@ -2915,10 +2981,42 @@ async fn run_single_message_command_capture_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            agent.session_id(),
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            eprintln!("{}", run_blocked_notice(&todos).unwrap_or_else(||
+                "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
+            ));
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            eprintln!(
+                "We stopped poking after {} attempts without todo progress; unfinished todos remain.",
+                crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS
+            );
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -2956,6 +3054,8 @@ async fn run_single_message_command_capture_with_auto_poke(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         outputs.push(format!(
@@ -2990,6 +3090,8 @@ async fn run_single_message_command_ndjson(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let session_id = agent.session_id().to_string();
+    let provider_name =
+        run_report_provider_name(provider.as_ref(), agent.session_provider_key().as_deref());
     let mut stdout = std::io::stdout().lock();
     let mut state = NdjsonRunState {
         session_id: Some(session_id.clone()),
@@ -3000,7 +3102,7 @@ async fn run_single_message_command_ndjson(
         &serde_json::json!({
             "type": "start",
             "session_id": session_id,
-            "provider": provider.name(),
+            "provider": provider_name,
             "model": provider.model(),
         }),
     )?;
@@ -3011,6 +3113,7 @@ async fn run_single_message_command_ndjson(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         let turn_result = {
             let mut run_future = std::pin::pin!(agent.run_once_streaming_mpsc(
@@ -3051,10 +3154,66 @@ async fn run_single_message_command_ndjson(
             break;
         }
         let todos = run_todos(&session_id);
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            &session_id,
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            write_json_line(
+                &mut stdout,
+                &serde_json::json!({
+                    "type": "auto_poke_dependency_resolved",
+                    "session_id": session_id,
+                    "message": next_message,
+                }),
+            )?;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            write_json_line(
+                &mut stdout,
+                &serde_json::json!({
+                    "type": "auto_poke_stopped",
+                    "session_id": session_id,
+                    "reason": if run_completely_blocked_notice(&todos).is_some() { "completely_blocked" } else if run_external_blocker_notice(&todos).is_some() { "external_blocker" } else { "turn_limit" },
+                    "message": run_blocked_notice(&todos),
+                    "completely_blocked": todos.iter().any(crate::todo::todo_completely_blocked),
+                    "waiting_on_background": todos.iter().any(|todo| !todo.waiting_on.is_empty()),
+                    "waiting_on_external": todos.iter().any(crate::todo::todo_has_external_blocker),
+                    "max_turns": max_turns,
+                }),
+            )?;
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({
+                    "type": "auto_poke_stopped",
+                    "reason": "unchanged_todos",
+                    "max_attempts": crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS,
+                    "incomplete_todos": todos.iter().filter(|todo| crate::todo::is_incomplete_todo(todo)).count(),
+                })
+            )?;
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -3108,6 +3267,8 @@ async fn run_single_message_command_ndjson(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         write_json_line(
@@ -3144,7 +3305,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "done",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "text": state.text,
                     "usage": state.usage,
@@ -3152,6 +3313,12 @@ async fn run_single_message_command_ndjson(
                     "connection_type": state.connection_type,
                     "connection_phase": state.connection_phase,
                     "status_detail": state.status_detail,
+                    "requested_service_tier": state.requested_service_tier,
+                    "reported_service_tier": state.served_service_tier,
+                    "service_tier_report_status": state.service_tier_report_status(),
+                    // Retained for compatibility; this is provider-reported
+                    // metadata, not independently verified serving evidence.
+                    "served_service_tier": state.served_service_tier,
                 }),
             )?;
             Ok(())
@@ -3162,7 +3329,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "error",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "message": format!("{err:#}"),
                 }),
@@ -3172,6 +3339,17 @@ async fn run_single_message_command_ndjson(
     }
 }
 
+/// Legacy CLI adapters consume the payload even when an identity-aware peer
+/// sends an explicit envelope. Unwrap iteratively to tolerate nested envelopes.
+pub(super) fn unwrap_turn_event(
+    mut event: crate::protocol::ServerEvent,
+) -> crate::protocol::ServerEvent {
+    while let crate::protocol::ServerEvent::TurnEvent { event: inner, .. } = event {
+        event = *inner;
+    }
+    event
+}
+
 fn emit_ndjson_event(
     stdout: &mut impl Write,
     state: &mut NdjsonRunState,
@@ -3179,7 +3357,7 @@ fn emit_ndjson_event(
 ) -> Result<()> {
     use crate::protocol::ServerEvent;
 
-    match event {
+    match unwrap_turn_event(event) {
         ServerEvent::TextDelta { text } => {
             state.text.push_str(&text);
             write_json_line(
@@ -3192,6 +3370,15 @@ fn emit_ndjson_event(
             write_json_line(
                 stdout,
                 &serde_json::json!({ "type": "text_replace", "text": text }),
+            )
+        }
+        ServerEvent::TextSuffixReplace { old_text, new_text } => {
+            crate::message::replace_text_suffix(&mut state.text, &old_text, &new_text);
+            write_json_line(
+                stdout,
+                &serde_json::json!({
+                    "type": "text_suffix_replace", "old_text": old_text, "new_text": new_text,
+                }),
             )
         }
         ServerEvent::ToolStart { id, name } => write_json_line(
@@ -3226,6 +3413,7 @@ fn emit_ndjson_event(
             output,
             cache_read_input,
             cache_creation_input,
+            ..
         } => {
             state.usage = crate::agent::TokenUsage {
                 input_tokens: input,
@@ -3241,6 +3429,19 @@ fn emit_ndjson_event(
                     "output": output,
                     "cache_read_input": cache_read_input,
                     "cache_creation_input": cache_creation_input,
+                }),
+            )
+        }
+        ServerEvent::ServiceTierReported { requested, tier } => {
+            state.requested_service_tier = requested.clone();
+            state.served_service_tier = Some(tier.clone());
+            write_json_line(
+                stdout,
+                &serde_json::json!({
+                    "type": "service_tier",
+                    "requested": requested,
+                    "tier": tier,
+                    "report_status": state.service_tier_report_status(),
                 }),
             )
         }
@@ -3330,6 +3531,7 @@ fn emit_ndjson_event(
             display_role,
             point,
             tools_skipped,
+            client_ids,
         } => write_json_line(
             stdout,
             &serde_json::json!({
@@ -3338,6 +3540,7 @@ fn emit_ndjson_event(
                 "display_role": display_role,
                 "point": point,
                 "tools_skipped": tools_skipped,
+                "client_ids": client_ids,
             }),
         ),
         ServerEvent::BatchProgress { progress } => write_json_line(
@@ -3436,87 +3639,66 @@ pub async fn run_model_command(
     Ok(())
 }
 
-fn cli_api_method_display(raw: &str) -> String {
-    crate::provider::ModelRouteApiMethod::parse(raw).display_label()
+#[cfg(test)]
+mod turn_envelope_tests {
+    use super::*;
+    use crate::protocol::{ServerEvent, TurnIdentity};
+
+    fn envelope(event: ServerEvent) -> ServerEvent {
+        ServerEvent::TurnEvent {
+            identity: TurnIdentity {
+                runtime_generation: "runtime-test".into(),
+                turn_id: 7,
+            },
+            event: Box::new(event),
+        }
+    }
+
+    #[test]
+    fn ndjson_preserves_wrapped_text_tool_and_error_payloads() {
+        for event in [
+            ServerEvent::TextDelta {
+                text: "hello".into(),
+            },
+            ServerEvent::ToolStart {
+                id: "tool-1".into(),
+                name: "read".into(),
+            },
+            ServerEvent::Interrupted,
+            ServerEvent::Error {
+                id: 9,
+                message: "failure".into(),
+                retry_after_secs: None,
+            },
+        ] {
+            let mut plain = Vec::new();
+            let mut wrapped = Vec::new();
+            let mut plain_state = NdjsonRunState::default();
+            let mut wrapped_state = NdjsonRunState::default();
+            emit_ndjson_event(&mut plain, &mut plain_state, event.clone()).unwrap();
+            emit_ndjson_event(&mut wrapped, &mut wrapped_state, envelope(envelope(event))).unwrap();
+            assert!(!plain.is_empty());
+            assert_eq!(wrapped, plain);
+            assert_eq!(wrapped_state.text, plain_state.text);
+        }
+    }
+
+    #[test]
+    fn unwrap_preserves_terminal_request_id_and_legacy_events() {
+        assert!(matches!(
+            unwrap_turn_event(envelope(envelope(ServerEvent::Done { id: 42 }))),
+            ServerEvent::Done { id: 42 }
+        ));
+        assert!(matches!(
+            unwrap_turn_event(ServerEvent::Done { id: 43 }),
+            ServerEvent::Done { id: 43 }
+        ));
+    }
 }
 
-fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
-    if crate::provider::ModelRouteApiMethod::parse(api_method).is_openrouter()
-        && provider != "auto"
-        && !provider.contains("OpenRouter")
-    {
-        format!("OpenRouter/{}", provider)
-    } else {
-        provider.to_string()
-    }
-}
+mod model_routes;
+use model_routes::*;
 
-fn collect_cli_model_names(
-    routes: &[crate::provider::ModelRoute],
-    display_models: Vec<String>,
-) -> Vec<String> {
-    let mut deduped = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    fn push_model(deduped: &mut Vec<String>, seen: &mut BTreeSet<String>, model: &str) {
-        let trimmed = model.trim();
-        if !crate::provider::is_listable_model_name(trimmed) {
-            return;
-        }
-        if seen.insert(trimmed.to_string()) {
-            deduped.push(trimmed.to_string());
-        }
-    }
-
-    for route in routes.iter().filter(|route| route.available) {
-        push_model(&mut deduped, &mut seen, &route.model);
-    }
-
-    if deduped.is_empty() {
-        for route in routes {
-            push_model(&mut deduped, &mut seen, &route.model);
-        }
-    }
-
-    for model in display_models {
-        push_model(&mut deduped, &mut seen, &model);
-    }
-
-    deduped
-}
-
-#[allow(deprecated)]
-fn filter_cli_model_routes_for_choice(
-    choice: &super::provider_init::ProviderChoice,
-    routes: &[crate::provider::ModelRoute],
-) -> Vec<crate::provider::ModelRoute> {
-    use super::provider_init::ProviderChoice;
-
-    let keep = |route: &&crate::provider::ModelRoute| match choice {
-        ProviderChoice::Claude => route.api_method_kind().is_anthropic_credential_route(),
-        ProviderChoice::Openai => {
-            let method = route.api_method_kind();
-            matches!(method, crate::provider::ModelRouteApiMethod::OpenAIOAuth)
-                || matches!(method, crate::provider::ModelRouteApiMethod::Other(ref value) if value == "chatgpt-web")
-        }
-        ProviderChoice::OpenaiApi => matches!(
-            route.api_method_kind(),
-            crate::provider::ModelRouteApiMethod::OpenAIApiKey
-        ),
-        ProviderChoice::Openrouter | ProviderChoice::Azure => {
-            route.api_method_kind().is_openrouter()
-        }
-        ProviderChoice::Copilot => route.api_method_kind().is_copilot(),
-        _ => true,
-    };
-
-    let filtered: Vec<_> = routes.iter().filter(keep).cloned().collect();
-    if filtered.is_empty() {
-        routes.to_vec()
-    } else {
-        filtered
-    }
-}
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod tests;

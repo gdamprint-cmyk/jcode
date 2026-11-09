@@ -4,6 +4,9 @@ use super::{
     shared_server_binary_path, stable_binary_path,
 };
 use anyhow::Result;
+// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the Unix wrapper that
+// exports JCODE_BUILD_GIT_HASH/JCODE_BUILD_GIT_DATE; this file mirrors it for the
+// native Windows Cargo path.
 use chrono::{DateTime, Utc};
 use jcode_storage as storage;
 use std::path::{Path, PathBuf};
@@ -211,6 +214,7 @@ fn selfdev_build_command_for_target_on_platform(
             program: "bash".to_string(),
             args: vec!["-lc".to_string(), command],
             display: display_build_command("scripts/dev_cargo.sh", &specs),
+            env: Vec::new(),
         };
     }
 
@@ -220,6 +224,7 @@ fn selfdev_build_command_for_target_on_platform(
             program: "cargo".to_string(),
             args: cargo_build_args(&specs),
             display: command,
+            env: git_build_env(repo_dir),
         };
     }
 
@@ -227,7 +232,42 @@ fn selfdev_build_command_for_target_on_platform(
         program: "bash".to_string(),
         args: vec!["-lc".to_string(), command.clone()],
         display: command,
+        env: Vec::new(),
     }
+}
+
+/// Environment for a native Cargo build that carries the current git identity.
+///
+/// `scripts/dev_cargo.sh` exports these on Unix, but the Windows build path
+/// invokes Cargo directly (no wrapper), so `jcode-build-meta`'s build script
+/// never sees a fresh `JCODE_BUILD_GIT_HASH` and keeps embedding the hash from
+/// the previous commit. `build.rs` declares
+/// `cargo:rerun-if-env-changed=JCODE_BUILD_GIT_HASH`, so exporting the current
+/// value here makes the metadata refresh exactly when HEAD moves.
+fn git_build_env(repo_dir: &Path) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Ok(hash) = super::current_git_hash(repo_dir)
+        && !hash.is_empty()
+    {
+        env.push(("JCODE_BUILD_GIT_HASH".to_string(), hash));
+    }
+    if let Ok(date) = git_output(repo_dir, &["log", "-1", "--format=%ci"])
+        && !date.is_empty()
+    {
+        env.push(("JCODE_BUILD_GIT_DATE".to_string(), date));
+    }
+    env
+}
+
+fn git_output(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("git {} failed", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn cargo_build_args(specs: &[(&str, &str)]) -> Vec<String> {
@@ -308,6 +348,7 @@ pub fn run_selfdev_build(repo_dir: &Path) -> Result<SelfDevBuildCommand> {
     let build = selfdev_build_command(repo_dir);
     let status = Command::new(&build.program)
         .args(&build.args)
+        .envs(build.env.iter().cloned())
         .current_dir(repo_dir)
         .status()?;
 
@@ -475,7 +516,8 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
             return Some(shared_server);
         }
     } else if let Some(shared_server) = shared_server
-        && shared_server_channel_is_current_enough()
+        && (shared_server_channel_is_current_enough()
+            || shared_server_channel_newer_than_stable())
     {
         return Some(shared_server);
     }
@@ -485,6 +527,42 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
+}
+
+// reference: in-repo prior art - `repair_stale_shared_server_channel` in crates/jcode-build-support/src/lib.rs
+// (same "compare the approved shared-server channel against stable by mtime" decision, applied on the daemon side).
+//
+// True when the approved `shared-server` channel is strictly newer than the
+// `stable` channel on disk.
+//
+// The marker gate ([`shared_server_channel_is_current_enough`]) compares the
+// shared-server version marker against the `stable`/`current` markers. That
+// comparison is wrong whenever a LOCAL build advanced `current` after the
+// shared-server channel was promoted: the markers legitimately disagree, the
+// gate rejects the approved channel, and the selection falls back to `stable` -
+// which on this host is a much older release (v0.84.0). The client then spawns
+// that ancient daemon, sees a server older than its own client, and asks for
+// a reload; the reload execs into `shared-server`, the client reconnects, the
+// next client start spawns the old `stable` daemon again - a reload loop that
+// interrupts every session.
+//
+// mtime is the same directional signal the rest of the reload machinery uses
+// (see `server_has_newer_binary`), so an approved channel that is strictly
+// newer than `stable` must be preferred over the older `stable` fallback. A
+// deliberately pinned OLD self-dev channel stays pinned: it is not newer.
+fn shared_server_channel_newer_than_stable() -> bool {
+    let (Ok(shared), Ok(stable)) = (shared_server_binary_path(), stable_binary_path()) else {
+        return false;
+    };
+    let shared = resolve_binary_payload(&shared);
+    let stable = resolve_binary_payload(&stable);
+    match (binary_mtime(&shared), binary_mtime(&stable)) {
+        (Some(shared), Some(stable)) => shared > stable,
+        // An unreadable stable mtime means we cannot prove the fallback is
+        // older, so keep the approved channel (it was explicitly promoted).
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn shared_server_channel_is_current_enough() -> bool {
@@ -638,6 +716,36 @@ mod tests {
         temp
     }
 
+    /// A real git repository with one commit, so `git rev-parse --short HEAD`
+    /// resolves to a known hash.
+    /// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the same git
+    /// metadata the Unix wrapper exports, mirrored for the native Windows path.
+    fn git_repo_fixture() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().expect("temp repo");
+        let path = temp.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(
+            path.join("Cargo.toml"),
+            "[package]\nname = \"jcode\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo.toml");
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-m", "init"]);
+        temp
+    }
+
     #[test]
     fn find_repo_in_ancestors_finds_workspace_from_crate_dir() {
         let repo = repo_fixture(false);
@@ -701,6 +809,45 @@ mod tests {
         assert!(
             !command.args.iter().any(|arg| arg.contains("dev_cargo.sh")),
             "Windows must not pass a native script path through bash"
+        );
+    }
+
+    #[test]
+    /// The Windows build path invokes Cargo directly (no `scripts/dev_cargo.sh`
+    /// wrapper), so the current git hash must travel in the command's own
+    /// environment. Without it `jcode-build-meta` keeps embedding the previous
+    /// commit's hash and the publish guard refuses the binary.
+    /// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the contract
+    /// the native Windows Cargo path has to satisfy on its own.
+    fn windows_selfdev_build_carries_the_current_git_hash() {
+        let repo = git_repo_fixture();
+        let expected = crate::current_git_hash(repo.path()).expect("git hash");
+
+        let command = selfdev_build_command_for_target_on_platform(
+            repo.path(),
+            SelfDevBuildTarget::Tui,
+            true,
+        );
+
+        let serialized = serde_json::to_value(&command).expect("serialize command");
+        let hash = serialized
+            .get("env")
+            .and_then(|value| value.as_array())
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    let pair = entry.as_array()?;
+                    if pair.first()?.as_str()? == "JCODE_BUILD_GIT_HASH" {
+                        pair.get(1)?.as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        assert_eq!(
+            hash.as_deref(),
+            Some(expected.as_str()),
+            "windows selfdev build must carry JCODE_BUILD_GIT_HASH={expected}"
         );
     }
 

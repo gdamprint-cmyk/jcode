@@ -10,6 +10,10 @@ const COMPACTED_HISTORY_LOAD_SCROLL_THRESHOLD: usize = 2;
 const COMPACTED_HISTORY_MARKER_PREFIX: &str = "Earlier conversation compacted - ";
 const OVERNIGHT_CARD_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+#[path = "state_ui_reminder_tests.rs"]
+mod reminder_tests;
+
 fn display_message_from_stored_message(
     message: &crate::session::StoredMessage,
 ) -> Option<DisplayMessage> {
@@ -19,6 +23,11 @@ fn display_message_from_stored_message(
     }
     if is_background_task_lifecycle_message(&text) {
         return None;
+    }
+    if !matches!(message.role, Role::Assistant)
+        && let Some(swarm) = super::remote_notifications::swarm_delivery_display_message(&text)
+    {
+        return Some(swarm);
     }
     match message.display_role {
         Some(crate::session::StoredDisplayRole::System) => Some(DisplayMessage::system(text)),
@@ -54,6 +63,15 @@ fn is_background_task_lifecycle_message(content: &str) -> bool {
         || content.starts_with("**Background task stalled**")
 }
 
+/// A tool row for a provider-executed tool (hosted web search), which streams
+/// mid-response as part of the current attempt rather than after it.
+pub(super) fn is_attempt_provider_native_row(message: &DisplayMessage) -> bool {
+    message.role == "tool"
+        && message.tool_data.as_ref().is_some_and(|tool| {
+            crate::message::provider_native::is_provider_native_tool_id(&tool.id)
+        })
+}
+
 fn stored_message_visible_text(message: &crate::session::StoredMessage) -> String {
     let mut parts = Vec::new();
     for block in &message.content {
@@ -77,30 +95,46 @@ fn stored_message_visible_text(message: &crate::session::StoredMessage) -> Strin
             ContentBlock::Image { media_type, .. } => {
                 parts.push(format!("[image:{}]", media_type));
             }
-            ContentBlock::OpenAICompaction { .. } | ContentBlock::ToolReference { .. } => {}
+            ContentBlock::OpenAICompaction { .. }
+            | ContentBlock::ToolReference { .. }
+            | ContentBlock::ProviderNative { .. } => {}
         }
     }
     parts.join("\n\n")
 }
 
 impl App {
+    /// Keep explicit provider overload notices in chat, while transport details
+    /// remain transient. Check the current turn to deduplicate replayed notices
+    /// even after another detail has replaced the status label.
+    pub(super) fn apply_status_detail(&mut self, detail: String) {
+        const OVERLOAD_PREFIX: &str = "OpenAI reported server overload";
+        if detail.starts_with(OVERLOAD_PREFIX)
+            && !self
+                .display_messages
+                .iter()
+                .rev()
+                .take_while(|message| message.role != "user")
+                .any(|message| {
+                    message.role == "system" && message.content.starts_with(OVERLOAD_PREFIX)
+                })
+        {
+            self.push_display_message(DisplayMessage::system(detail.clone()));
+        }
+        self.status_detail = Some(detail);
+    }
+
     pub fn push_display_message(&mut self, mut message: DisplayMessage) {
         if is_background_task_lifecycle_message(&message.content) {
             return;
         }
-        compact_display_message_tool_data(&mut message);
-        // A trailing Ctrl+L spacer only exists to keep the screen clear while
-        // idle. The moment real content arrives, drop it so the transcript
-        // stays contiguous instead of keeping a screenful of blank rows
-        // embedded in the scrollback.
-        if message.role != "spacer"
-            && self
-                .display_messages
-                .last()
-                .is_some_and(|last| last.role == "spacer")
-        {
-            self.display_messages.pop();
+        if message.role == "tool" && message.duration_secs.is_none() {
+            message.duration_secs = DisplayMessage::tool_duration_from_output(&message.content);
         }
+        compact_display_message_tool_data(&mut message);
+        // Keep Ctrl+L's spacer as a clear boundary when new content arrives.
+        // The renderer packs only the content after it while following the tail,
+        // so sending a prompt does not restore the pre-clear conversation.
         if self.try_coalesce_repeated_display_message(&message) {
             return;
         }
@@ -109,7 +143,9 @@ impl App {
         // RetryRollback can remove exactly the current attempt's committed
         // output. Any non-assistant message (user/tool/system) is a fence: it
         // proves earlier assistant messages belong to completed work.
-        if message.role == "assistant" {
+        // Provider-native tool rows (hosted web search) are emitted mid-stream
+        // by the same attempt, so they count as attempt output, not a fence.
+        if message.role == "assistant" || is_attempt_provider_native_row(&message) {
             self.attempt_committed_assistant_messages += 1;
         } else {
             self.attempt_committed_assistant_messages = 0;
@@ -128,6 +164,11 @@ impl App {
 
     pub(super) fn replace_display_messages(&mut self, mut messages: Vec<DisplayMessage>) {
         messages.retain(|message| !is_background_task_lifecycle_message(&message.content));
+        for message in &mut messages {
+            if message.role == "tool" && message.duration_secs.is_none() {
+                message.duration_secs = DisplayMessage::tool_duration_from_output(&message.content);
+            }
+        }
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
         self.attempt_committed_assistant_messages = 0;
@@ -166,6 +207,18 @@ impl App {
         }
     }
 
+    pub(super) fn set_latest_tool_duration(&mut self, tool_call_id: &str, seconds: f32) {
+        if let Some(message) = self.display_messages.iter_mut().rev().find(|message| {
+            message
+                .tool_data
+                .as_ref()
+                .is_some_and(|tool| tool.id == tool_call_id)
+        }) {
+            message.duration_secs = Some(seconds);
+            self.bump_display_messages_version();
+        }
+    }
+
     pub(super) fn replace_latest_tool_display_message(
         &mut self,
         tool_call_id: &str,
@@ -195,10 +248,91 @@ impl App {
         &self.background_task_rows
     }
 
+    /// User-only blockers and live waits suppress all automatic continuations.
+    /// Disk state survives a TUI reload and overrides stale retained UI rows.
+    pub(super) fn todo_is_paused_for_auto_followup(&self, todo: &crate::todo::TodoItem) -> bool {
+        crate::todo::todo_completely_blocked(todo)
+            || crate::todo::todo_has_external_blocker(todo)
+            || crate::todo::todo_waits_on_running_task(todo, |task_id| {
+                self.running_todo_await_dependency(task_id)
+                    || self.running_todo_background_dependency(task_id).is_some()
+            })
+    }
+
+    pub(super) fn running_todo_await_dependency(&self, task_id: &str) -> bool {
+        let session_id = self
+            .remote_session_id
+            .as_deref()
+            .unwrap_or(&self.session.id);
+        crate::todo::await_dependency::running(&crate::storage::runtime_dir(), task_id, session_id)
+    }
+
+    pub(super) fn running_todo_background_dependency(
+        &self,
+        task_id: &str,
+    ) -> Option<crate::background::TaskStatusFile> {
+        let session_id = self
+            .remote_session_id
+            .as_deref()
+            .unwrap_or(&self.session.id);
+        if std::path::Path::new(task_id)
+            .file_name()
+            .and_then(|s| s.to_str())
+            != Some(task_id)
+        {
+            return None;
+        }
+        if self.background_task_rows.iter().any(|row| {
+            row.task_id == task_id && row.status != crate::tui::BackgroundTaskRowStatus::Running
+        }) {
+            return None;
+        }
+        let bytes = match std::fs::read(crate::background::global().status_path_for(task_id)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot read background dependency status: {error}"
+                ));
+                return None;
+            }
+        };
+        let status: crate::background::TaskStatusFile = match serde_json::from_slice(&bytes) {
+            Ok(status) => status,
+            Err(error) => {
+                crate::logging::warn(&format!("Invalid background dependency status: {error}"));
+                return None;
+            }
+        };
+        // UI rows are history, not proof that an owner survived a crash.
+        let owner = if status.detached {
+            status.pid
+        } else {
+            status.owner_pid.or(status.pid)
+        };
+        if owner.is_none_or(|pid| {
+            pid == 0 || pid > i32::MAX as u32 || !crate::platform::is_process_running(pid)
+        }) {
+            return None;
+        }
+        (status.task_id == task_id
+            && status.session_id == session_id
+            && status.status == crate::bus::BackgroundTaskStatus::Running)
+            .then_some(status)
+    }
+
+    pub(super) fn all_open_todos_are_paused(&self) -> bool {
+        let open = super::commands::incomplete_poke_todos(self);
+        !open.is_empty()
+            && open
+                .iter()
+                .all(|todo| self.todo_is_paused_for_auto_followup(todo))
+    }
+
     fn retain_latest_background_tasks(&mut self) {
-        const MAX_PINNED_BACKGROUND_TASKS: usize = 2;
-        if self.background_task_rows.len() > MAX_PINNED_BACKGROUND_TASKS {
-            let stale = self.background_task_rows.len() - MAX_PINNED_BACKGROUND_TASKS;
+        const MAX_TRACKED_BACKGROUND_TASKS: usize = 8;
+        if self.background_task_rows.len() > MAX_TRACKED_BACKGROUND_TASKS {
+            let stale = self.background_task_rows.len() - MAX_TRACKED_BACKGROUND_TASKS;
             self.background_task_rows.drain(..stale);
         }
     }
@@ -300,7 +434,7 @@ impl App {
     }
 
     /// Successful tasks are useful as short-lived confirmation, but should not
-    /// permanently consume the pinned todo band's limited space. Failures stay
+    /// permanently consume the background widget's limited space. Failures stay
     /// until acted on, and running tasks always stay visible.
     pub(super) fn prune_irrelevant_background_tasks(&mut self) -> bool {
         const COMPLETED_TASK_VISIBILITY: std::time::Duration = std::time::Duration::from_secs(12);
@@ -819,11 +953,23 @@ impl App {
             .first()
             .and_then(parse_compacted_history_marker)
             .unwrap_or_default();
-        // The marker text does not encode how many prompts are hidden, so derive
-        // it from the session render info when a compacted window is in effect.
-        // This keeps prompt numbering absolute (the first visible prompt keeps
-        // its real turn number).
-        if lazy.remaining_messages > 0 || lazy.total_messages > 0 {
+        let marker_hidden_prompts = self
+            .display_messages
+            .first()
+            .filter(|message| parse_compacted_history_marker(message).is_some())
+            .and_then(|message| {
+                message
+                    .content
+                    .rsplit_once(" Hidden user prompts: ")
+                    .and_then(|(_, count)| count.strip_suffix('.'))
+                    .and_then(|count| count.parse::<usize>().ok())
+            });
+        // New servers include the authoritative offset. A remote startup stub
+        // has no transcript, and a retained local snapshot may be stale.
+        // Derive it locally only for legacy markers without that metadata.
+        if let Some(hidden) = marker_hidden_prompts {
+            lazy.hidden_user_prompts = hidden;
+        } else if lazy.remaining_messages > 0 || lazy.total_messages > 0 {
             let visible = if lazy.remaining_messages == 0 {
                 usize::MAX
             } else {
@@ -925,6 +1071,6 @@ fn parse_leading_usize(text: &str) -> Option<(usize, &str)> {
         .take_while(|(_, ch)| ch.is_ascii_digit())
         .map(|(idx, ch)| idx + ch.len_utf8())
         .last()?;
-    let value = text[..end].parse().ok()?;
+    let Ok(value) = text[..end].parse() else { return None; };
     Some((value, &text[end..]))
 }

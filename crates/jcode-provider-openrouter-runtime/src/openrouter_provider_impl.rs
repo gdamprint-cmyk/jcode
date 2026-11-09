@@ -1,3 +1,4 @@
+use super::opencode_go_responses::model_uses_responses_api;
 use super::openrouter_sse_stream::run_stream_with_retries;
 use super::*;
 use jcode_base::provider::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
@@ -41,7 +42,17 @@ impl Provider for OpenRouterProvider {
         system: &str,
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
+        if self.profile_id.as_deref() == Some("muse-subscription") {
+            jcode_base::auth::muse::ensure_enabled()?;
+            let client = jcode_base::auth::muse::http_client()?;
+            jcode_base::auth::muse::refresh_if_needed(&client).await?;
+        }
+        if self.builtin_azure {
+            return self.complete_azure_responses(messages, tools, system).await;
+        }
         let model = self.model.read().await.clone();
+        let responses_api =
+            model_uses_responses_api(&self.api_base, self.profile_id.as_deref(), &model);
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
         // Moonshot's dedicated Kimi coding endpoint enables thinking server-side
@@ -158,6 +169,10 @@ impl Provider for OpenRouterProvider {
         if let Some(enable) = thinking_enabled
             && !sent_reasoning_config
             && !strict_openai_schema
+            // MiniMax rejects `thinking: {"type":"disabled"}` on M3.1-Flash and
+            // `{"type":"enabled"}` on M3, and thinking is on by default, so the
+            // field is never sent for that profile.
+            && !Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
         {
             request["thinking"] = serde_json::json!({
                 "type": if enable { "enabled" } else { "disabled" }
@@ -205,6 +220,29 @@ impl Provider for OpenRouterProvider {
             request["provider"] = obj;
         }
 
+        // MiniMax splits thinking into a separate `reasoning_content` field
+        // only when `reasoning_split` is true. Without it, MiniMax-M3 and the
+        // M2.x family return their thinking INSIDE `content` wrapped in
+        // `<think>` tags, and jcode's stream parser reads only
+        // `reasoning_content` - so the reasoning text was rendered as ordinary
+        // assistant text. MiniMax-M3.1-Flash goes further and REQUIRES
+        // `reasoning_split: true` (`reasoning_split: false` is answered with
+        // HTTP 400 "requires reasoning_split=true").
+        //
+        // Measured live on 2026-11-03 against api.minimax.io:
+        //   M3.1-Flash split=omitted -> reasoning_content=286, no think tags
+        //   M3         split=omitted -> reasoning_content=None, 1 think tag
+        //   M3         split=true    -> reasoning_content=233, no think tags
+        //   M2.7       split=true    -> reasoning_content=189, no think tags
+        //   M3.1-Flash split=false   -> HTTP 400 (2013)
+        //
+        // The field is set BEFORE the extra_body merge below, so a user who
+        // needs a different value can still override it from named-profile
+        // config.
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            request["reasoning_split"] = serde_json::json!(true);
+        }
+
         // Merge user-configured extra request-body fields last so they can
         // satisfy non-standard backend requirements (e.g. NVIDIA NIM
         // DeepSeek-V4 `chat_template_kwargs`) and intentionally override any
@@ -214,6 +252,29 @@ impl Provider for OpenRouterProvider {
         {
             for (key, value) in extra {
                 request_obj.insert(key.clone(), value.clone());
+            }
+        }
+
+        // OpenCode Go exposes a small model-specific subset through the
+        // Responses API. Build that protocol after the generic chat request so
+        // provider-only fields cannot leak into `/responses`; configured extra
+        // body fields remain an intentional escape hatch and are merged last.
+        if responses_api {
+            request = super::opencode_go_responses::build_request(
+                &effective_messages,
+                tools,
+                system,
+                &model,
+                reasoning_effort.as_deref(),
+                self.max_tokens,
+                jcode_provider_openrouter::request::sanitize_tool_parameters_schema,
+            );
+            if let Some(extra) = self.extra_body.as_ref()
+                && let Some(request_obj) = request.as_object_mut()
+            {
+                for (key, value) in extra {
+                    request_obj.insert(key.clone(), value.clone());
+                }
             }
         }
 
@@ -239,7 +300,11 @@ impl Provider for OpenRouterProvider {
                 "openai-compatible"
             },
             &model,
-            "chat_completions",
+            if responses_api {
+                "responses"
+            } else {
+                "chat_completions"
+            },
             &request,
             &message_items,
             system_value.as_ref(),
@@ -262,7 +327,7 @@ impl Provider for OpenRouterProvider {
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
         let client = self.client.clone();
         let api_base = self.api_base.clone();
-        let auth = self.auth.clone();
+        let auth = (self.auth)()?;
         let send_openrouter_headers = self.send_openrouter_headers;
         let conversation_id = self.conversation_id.clone();
         let request_for_retries = request;
@@ -286,9 +351,11 @@ impl Provider for OpenRouterProvider {
                 send_openrouter_headers,
                 conversation_id,
                 request_for_retries,
+                false,
                 tx,
                 provider_pin,
                 model_for_stream,
+                responses_api,
             )
             .await;
         });
@@ -335,6 +402,14 @@ impl Provider for OpenRouterProvider {
         }
         if Self::profile_rejects_image_input(self.profile_id.as_deref()) {
             return false;
+        }
+
+        // The catalog already states which modalities each model accepts, so
+        // honour that before falling back to a per-provider guess. Without this
+        // a vision-capable model on the native OpenRouter route is clamped to
+        // text even though the provider advertised image input for it.
+        if self.catalog_declares_image_input(&model_id) {
+            return true;
         }
 
         // Direct OpenAI-compatible local providers such as Ollama and LM Studio
@@ -407,7 +482,9 @@ impl Provider for OpenRouterProvider {
             self.clear_pin_if_model_changed(&model_id, true);
         }
 
-        if Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
+        if (self.builtin_azure
+            || Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
+            || Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()))
             || self
                 .model_reasoning_config()
                 .and_then(|config| config.1.as_ref())
@@ -455,6 +532,7 @@ impl Provider for OpenRouterProvider {
         let mut accepted = self.available_efforts().contains(&requested.as_str());
         if !self.supports_deepseek_reasoning_effort()
             && !self.supports_openai_reasoning_effort()
+            && !Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref())
             && requested == "max"
         {
             accepted = true;
@@ -475,7 +553,25 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if self.supports_deepseek_reasoning_effort() {
+        if Self::profile_supports_minimax_reasoning_effort(self.profile_id.as_deref()) {
+            // The MiniMax profile owns its ladder. A model that ignores
+            // `reasoning_effort` gets no effort rungs, rather than falling
+            // through to the generic OpenAI ladder the MiniMax change exists
+            // to remove. The swarm sentinel stays: it is a Jcode UI mode, not
+            // a wire-level effort, so `/effort swarm` keeps working there.
+            //
+            // This branch comes BEFORE the DeepSeek one: a profile-level
+            // `supports_reasoning_effort = true` override makes the DeepSeek
+            // check true, and that ladder contains `none`, which the MiniMax
+            // API answers with HTTP 400.
+            if self.minimax_reasoning_disabled_by_profile() {
+                Vec::new()
+            } else if self.model_supports_minimax_reasoning_effort() {
+                jcode_provider_core::MINIMAX_SELECTABLE_EFFORTS.to_vec()
+            } else {
+                vec!["swarm"]
+            }
+        } else if self.supports_deepseek_reasoning_effort() {
             jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
         } else if self.supports_openai_reasoning_effort() {
             jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
@@ -635,7 +731,8 @@ impl Provider for OpenRouterProvider {
             return Ok(());
         }
 
-        let _ = self.fetch_models().await?;
+        let models = self.fetch_models().await?;
+        self.promote_placeholder_default_model(&models);
         if self.supports_provider_features {
             // Also prefetch endpoints for the current model so preferred_provider() works immediately.
             let model = self.model();
@@ -651,6 +748,7 @@ impl Provider for OpenRouterProvider {
         let before_routes = self.model_routes();
 
         let refreshed_models = self.refresh_models().await?;
+        self.promote_placeholder_default_model(&refreshed_models);
 
         if self.supports_provider_features {
             let mut targets = Vec::new();
@@ -710,10 +808,21 @@ impl Provider for OpenRouterProvider {
         // the (large) provider default and over-budgeting the request. See #403.
         let raw_model = self.model();
         let model_id = self.strip_session_profile_prefix(&raw_model).to_string();
+        // A pinned variant suffix is routing syntax, not part of the catalog id.
+        // OpenRouter's `/models` lists `stealth/space-bunny-alpha` while the pinned
+        // runtime model is `stealth/space-bunny-alpha@Stealth`, so comparing only the
+        // pinned form matched nothing and fell through to the 200K default even
+        // though the catalog entry carries context_length 1000000. Try the base id too.
+        let base_model_id = model_id
+            .split_once('@')
+            .map(|(b, _)| b)
+            .filter(|b| !b.is_empty());
         // Try cached model data from OpenRouter API
         let cache = self.models_cache.try_read();
         if let Ok(cache) = cache
-            && let Some(model) = cache.models.iter().find(|m| m.id == model_id)
+            && let Some(model) = std::iter::once(model_id.as_str())
+                .chain(base_model_id)
+                .find_map(|id| cache.models.iter().find(|m| m.id == id))
             && let Some(ctx) = model.context_length
         {
             return ctx as usize;
@@ -723,7 +832,9 @@ impl Provider for OpenRouterProvider {
         // in-memory cache. Use that live catalog context length before falling
         // back to static defaults.
         if let Some(cache_entry) = self.load_usable_model_disk_cache_entry()
-            && let Some(model) = cache_entry.models.iter().find(|m| m.id == model_id)
+            && let Some(model) = std::iter::once(model_id.as_str())
+                .chain(base_model_id)
+                .find_map(|id| cache_entry.models.iter().find(|m| m.id == id))
             && let Some(ctx) = model.context_length
         {
             return ctx as usize;
@@ -779,6 +890,7 @@ impl Provider for OpenRouterProvider {
             supports_provider_features: self.supports_provider_features,
             supports_model_catalog: self.supports_model_catalog,
             profile_id: self.profile_id.clone(),
+            builtin_azure: self.builtin_azure,
             reasoning_effort_support: self.reasoning_effort_support,
             disable_reasoning_heuristics: self.disable_reasoning_heuristics,
             static_reasoning_config: self.static_reasoning_config.clone(),
@@ -812,6 +924,94 @@ impl Provider for OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    async fn complete_azure_responses(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+    ) -> Result<EventStream> {
+        use jcode_provider_openai::request::{
+            build_responses_input, build_tools, downgrade_web_search_calls, insert_additional_tools,
+        };
+
+        let model = self.model.read().await.clone();
+        let mut input = build_responses_input(messages);
+        insert_additional_tools(&mut input, messages, tools);
+        downgrade_web_search_calls(&mut input);
+        let api_tools = build_tools(tools);
+        let mut request = serde_json::json!({
+            "model": model,
+            "instructions": system,
+            "input": input,
+            "tools": api_tools,
+            "stream": true,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+        });
+        if !api_tools.is_empty() {
+            request["tool_choice"] = serde_json::json!("auto");
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            request["max_output_tokens"] = serde_json::json!(max_tokens);
+        }
+        if let Some(effort) = self.reasoning_effort() {
+            let effort =
+                jcode_base::prompt::swarm_root_reasoning_effort(&effort).unwrap_or(effort.as_str());
+            request["reasoning"] = serde_json::json!({"effort": effort});
+        }
+        if let Some(extra) = self.extra_body.as_ref()
+            && let Some(request_obj) = request.as_object_mut()
+        {
+            for (key, value) in extra {
+                request_obj.insert(key.clone(), value.clone());
+            }
+        }
+
+        jcode_provider_core::fingerprint::log_provider_canonical_input(
+            "azure-openai",
+            &model,
+            "openai_responses_full",
+            &request,
+            &input,
+            request.get("instructions"),
+            request.get("tools"),
+            Some(api_tools.len()),
+            &[],
+        );
+        let auth = (self.auth)()?;
+        let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let client = self.client.clone();
+        let api_base = self.api_base.clone();
+        let conversation_id = self.conversation_id.clone();
+        let provider_pin = Arc::clone(&self.provider_pin);
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(StreamEvent::ConnectionType {
+                    connection: "https/sse".to_string(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            run_stream_with_retries(
+                client,
+                api_base,
+                auth,
+                false,
+                conversation_id,
+                request,
+                true,
+                tx,
+                provider_pin,
+                model,
+                false,
+            )
+            .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
     /// The disk-cache namespace this provider's *foreground* catalog reads and
     /// writes should use.
     ///
@@ -825,7 +1025,7 @@ impl OpenRouterProvider {
     /// Standard/direct OpenRouter and built-in profiles keep the existing
     /// env-var-driven `cache_path()` semantics.
     pub(crate) fn foreground_cache_namespace(&self) -> Option<String> {
-        self.is_user_named_profile()
+        (self.is_user_named_profile() || self.profile_id.as_deref() == Some("grok-build"))
             .then(|| self.profile_id.clone())
             .flatten()
     }
@@ -859,6 +1059,9 @@ impl OpenRouterProvider {
         let Some(id) = self.profile_id.as_deref() else {
             return false;
         };
+        if self.builtin_azure {
+            return false;
+        }
         match jcode_base::provider_catalog::openai_compatible_profile_by_id(id) {
             // A `[providers.<name>]` block that shadows a built-in profile name
             // but points somewhere else is still a user-declared endpoint, so
@@ -887,4 +1090,48 @@ impl OpenRouterProvider {
         // `/models` catalog refreshes (issue #579).
         self.supports_provider_features || self.profile_id.is_none() || self.is_user_named_profile()
     }
+
+    /// Whether the model catalog declares `image` as an accepted input modality
+    /// for this model.
+    ///
+    /// Memory decides whenever it holds an opinion about the model, so a freshly
+    /// fetched catalog is never overruled by a stale copy on disk. Only when
+    /// memory is silent does the persisted catalog answer, and that fallback is
+    /// what makes the first request after startup behave: the in-memory cache is
+    /// initialised empty while the catalog is normally already on disk from the
+    /// previous run, so memory alone would keep clamping images until the first
+    /// refresh completed.
+    ///
+    /// `supports_image_input` is a sync trait method, so the in-memory read uses
+    /// `try_read` rather than awaiting the tokio lock; a busy lock defers to the
+    /// disk copy instead of blocking.
+    pub(crate) fn catalog_declares_image_input(&self, model_id: &str) -> bool {
+        if !self.supports_model_catalog {
+            return false;
+        }
+        if let Ok(cache) = self.models_cache.try_read()
+            && let Some(model) = cache
+                .models
+                .iter()
+                .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
+        {
+            return declares_image_input(model);
+        }
+        self.load_usable_model_disk_cache_entry()
+            .is_some_and(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
+                    .is_some_and(declares_image_input)
+            })
+    }
+}
+
+/// Whether one catalog entry declares `image` as an accepted input modality.
+fn declares_image_input(model: &jcode_provider_openrouter::ModelInfo) -> bool {
+    model
+        .input
+        .iter()
+        .any(|modality| modality.eq_ignore_ascii_case("image"))
 }

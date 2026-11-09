@@ -1,7 +1,296 @@
 use super::*;
 use chrono::{Duration as ChronoDuration, Utc};
+use ratatui::layout::Position;
 use std::io::Write;
 use std::time::{Duration as StdDuration, SystemTime};
+
+#[test]
+fn resume_canvas_reserves_compact_right_card_with_spatial_focus_and_mouse_regions() {
+    for width in [20, 80, 120] {
+        let session = make_session("right-sidebar", "sidebar", false, SessionStatus::Closed);
+        let mut picker = SessionPicker::new(vec![session]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|frame| picker.render(frame)).unwrap();
+        let preview = picker.last_preview_area.unwrap();
+        let sidebar = picker.last_list_area.unwrap();
+        assert_eq!(preview, Rect::new(0, 0, width, 30));
+        assert!(sidebar.x > preview.x);
+        assert!(sidebar.right() < preview.right());
+        assert_eq!(
+            sidebar.right(),
+            preview.right() - 2,
+            "one blank column must separate the card and native scrollbar"
+        );
+        assert!(sidebar.height < preview.height);
+        assert!(sidebar.bottom() < preview.bottom());
+        assert!(picker.mouse_over_preview(sidebar.x + 1, sidebar.bottom() + 1));
+        assert!(picker.mouse_over_preview(preview.x + 1, preview.y + 1));
+        assert!(!picker.mouse_over_preview(sidebar.x + 1, sidebar.y + 1));
+        for key in [KeyCode::Left, KeyCode::Char('h')] {
+            assert!(picker.handle_focus_navigation_key(key, KeyModifiers::empty()));
+            assert_eq!(picker.focus, PaneFocus::Preview);
+        }
+        for key in [KeyCode::Right, KeyCode::Char('l')] {
+            assert!(picker.handle_focus_navigation_key(key, KeyModifiers::empty()));
+            assert_eq!(picker.focus, PaneFocus::Sessions);
+        }
+    }
+}
+
+#[test]
+fn resume_card_does_not_rewrap_or_scroll_the_underlying_session() {
+    let _lock = crate::tui::ui::render_state_test_lock();
+    for width in [40, 80, 120] {
+        let mut session = make_session("overlay-parity", "fox", false, SessionStatus::Closed);
+        session.messages_preview.push(PreviewMessage {
+            role: "assistant".into(),
+            content: (0..70)
+                .map(|n| format!("row {n}: {}", "Unicode 界 text ".repeat(12)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+            timestamp: None,
+        });
+        let mut actual = SessionPicker::new(vec![session.clone()]);
+        let mut baseline = SessionPicker::new(vec![session]);
+        let area = Rect::new(0, 0, width, 45);
+        // Unbordered conversation canvas, without painting the control card.
+        baseline.reserved_panel_area = Some(Rect::default());
+        let mut expected =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 45)).unwrap();
+        let mut rendered =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 45)).unwrap();
+        expected
+            .draw(|frame| baseline.render_preview(frame, area))
+            .unwrap();
+        rendered.draw(|frame| actual.render(frame)).unwrap();
+        let card = actual.reserved_panel_area.unwrap();
+        assert_eq!(actual.scroll_offset, baseline.scroll_offset);
+        assert_eq!(
+            actual.preview_cache.as_ref().unwrap().wrapped_lines,
+            baseline.preview_cache.as_ref().unwrap().wrapped_lines
+        );
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if !card.contains(Position::new(x, y)) {
+                    assert_eq!(
+                        rendered.backend().buffer()[(x, y)],
+                        expected.backend().buffer()[(x, y)],
+                        "session pixel outside overlay changed at ({x},{y}), width={width}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resume_card_stays_anchored_when_preview_bands_change() {
+    let _lock = crate::tui::ui::render_state_test_lock();
+    let session = make_session("pinned-placement", "fox", false, SessionStatus::Closed);
+    let id = session.id.clone();
+    let mut other = session.clone();
+    other.id = "other-placement".into();
+    other.short_name = "other".into();
+    other.server_name = Some("cloud".into());
+    other.model = Some("different-model".into());
+    let mut picker = SessionPicker::new(vec![session, other]);
+    let selected = picker.find_item_index_for_session_id(&id).unwrap();
+    picker.list_state.select(Some(selected));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+    terminal.draw(|frame| picker.render(frame)).unwrap();
+    let initial_card = picker.reserved_panel_area.unwrap();
+    let initial_list = picker.last_list_area.unwrap();
+    let payload = serde_json::json!({"todos": (0..20).map(|n| serde_json::json!({
+        "id": format!("item-{n}"), "content": format!("Pinned work item {n}"),
+        "status": "pending", "priority": "high", "phase": 1, "lane": format!("lane-{n}")
+    })).collect::<Vec<_>>()})
+    .to_string();
+    picker.preview_extras.insert(
+        id,
+        PreviewExtras {
+            todos_payload: Some(payload.clone()),
+            ..Default::default()
+        },
+    );
+    terminal.draw(|frame| picker.render(frame)).unwrap();
+    let (lines, _) = super::super::ui::viewport::pinned_todo_band_lines_for_payload(
+        Some(&payload),
+        false,
+        crate::config::config().display.diff_mode,
+        119,
+        47,
+    );
+    assert!(
+        !lines.is_empty(),
+        "fixture must exercise the pinned todo band"
+    );
+    let card = picker.reserved_panel_area.unwrap();
+    assert_eq!(card, initial_card, "loaded todos must not move the card");
+    assert_eq!(card.right(), 118);
+    for _ in 0..3 {
+        picker.next();
+        terminal.draw(|frame| picker.render(frame)).unwrap();
+        assert_eq!(picker.reserved_panel_area, Some(initial_card));
+        assert_eq!(picker.last_list_area, Some(initial_list));
+        picker.previous();
+        terminal.draw(|frame| picker.render(frame)).unwrap();
+        assert_eq!(picker.reserved_panel_area, Some(initial_card));
+        assert_eq!(picker.last_list_area, Some(initial_list));
+    }
+}
+
+#[test]
+fn resume_canvas_uses_right_columns_below_search_card() {
+    let mut session = make_session("canvas-flow", "canvas", false, SessionStatus::Closed);
+    session.messages_preview = vec![PreviewMessage {
+        role: "assistant".into(),
+        content: (0..80)
+            .map(|_| "W".repeat(115))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: None,
+        timestamp: None,
+    }];
+    let mut picker = SessionPicker::new(vec![session]);
+    picker.auto_scroll_preview = false;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| picker.render(frame)).unwrap();
+    let panel = picker.reserved_panel_area.unwrap();
+    let buffer = terminal.backend().buffer();
+    assert!(
+        (panel.bottom()..38).any(|y| (panel.x..115).any(|x| buffer[(x, y)].symbol() == "W")),
+        "Transcript must reclaim the right-side columns below the bounded card"
+    );
+    let search: String = (panel.x..panel.right())
+        .map(|x| buffer[(x, panel.y)].symbol())
+        .collect();
+    assert!(search.contains("Search sessions"));
+}
+
+#[test]
+fn preview_cache_preserves_live_tool_metadata_and_invalidates_on_changes() {
+    let mut session = make_session(
+        "render-parity",
+        "render-parity",
+        false,
+        SessionStatus::Closed,
+    );
+    session.messages_preview.push(PreviewMessage {
+        role: "tool".into(),
+        content: "Build succeeded".into(),
+        tool_calls: Vec::new(),
+        duration_secs: Some(2.3),
+        title: Some("Saved tool title".into()),
+        tool_data: Some(crate::message::ToolCall {
+            id: "timed-preview".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "echo hello"}),
+            intent: Some("Check saved timing".into()),
+            thought_signature: None,
+        }),
+        timestamp: None,
+    });
+    let picker = SessionPicker::new(vec![session.clone()]);
+    let mode = crate::config::DiffDisplayMode::Off;
+    let hash = picker.preview_content_hash(&session, mode);
+    for width in [8, 30, 80] {
+        let inner = Rect::new(0, 0, width, 20);
+        let key = PreviewCacheKey {
+            content_hash: hash,
+            inner_width: width,
+            inner_height: 20,
+            diff_mode: mode,
+            search_query: String::new(),
+        };
+        let cache = picker.build_preview_cache(&session, inner, inner, key, Alignment::Left, mode);
+        let messages: Vec<_> = session
+            .messages_preview
+            .iter()
+            .map(|msg| DisplayMessage {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                tool_calls: msg.tool_calls.clone(),
+                duration_secs: msg.duration_secs,
+                title: msg.title.clone(),
+                tool_data: msg.tool_data.clone(),
+            })
+            .collect();
+        let text_width = width - u16::from(cache.show_scrollbar);
+        let text_width = text_width.saturating_sub(super::super::ui::left_aligned_content_inset(
+            text_width, false,
+        ));
+        let live =
+            super::super::ui::prepare::prepare_history_preview(&messages, 0, text_width, mode);
+        let header = super::super::ui::header::build_preview_header(&session, text_width);
+        let offset = header.len()
+            + super::super::ui::prepare::initial_header_pad_top(inner.height, header.len());
+        assert_eq!(
+            cache.wrapped_lines[offset..],
+            live.wrapped_lines,
+            "width={width}"
+        );
+    }
+    session.messages_preview.last_mut().unwrap().duration_secs = Some(4.5);
+    let changed_timing = picker.preview_content_hash(&session, mode);
+    assert_ne!(hash, changed_timing);
+    session.messages_preview.last_mut().unwrap().title = Some("Updated title".into());
+    assert_ne!(changed_timing, picker.preview_content_hash(&session, mode));
+}
+
+#[test]
+fn completed_empty_preview_is_not_loaded_again() {
+    let mut session = make_session("empty_preview", "empty", false, SessionStatus::Closed);
+    session.messages_preview.clear();
+    let mut picker = SessionPicker::new(vec![session]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    picker.pending_preview_load = Some(PendingSessionPreviewLoad {
+        session_id: "empty_preview".into(),
+        receiver: rx,
+    });
+    tx.send(Some(LoadedSessionPreview {
+        messages: vec![],
+        extras: PreviewExtras::default(),
+    }))
+    .unwrap();
+    assert!(picker.poll_preview_load());
+    picker.ensure_selected_preview_loading();
+    assert!(picker.pending_preview_load.is_none());
+}
+
+#[test]
+fn failed_preview_is_not_retried_or_rendered_as_loading() {
+    let mut session = make_session("failed_preview", "failed", false, SessionStatus::Closed);
+    session.messages_preview.clear();
+    let mut picker = SessionPicker::new(vec![session]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    picker.pending_preview_load = Some(PendingSessionPreviewLoad {
+        session_id: "failed_preview".into(),
+        receiver: rx,
+    });
+    tx.send(None).unwrap();
+    assert!(picker.poll_preview_load());
+    picker.ensure_selected_preview_loading();
+    assert!(picker.pending_preview_load.is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    terminal.draw(|frame| picker.render(frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Preview unavailable"));
+    assert!(!text.contains("Loading preview"));
+}
 
 fn write_session_file_with_mtime(
     path: impl AsRef<std::path::Path>,
@@ -42,6 +331,8 @@ fn make_session_with_flags(
             content: "hello".to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         },
         PreviewMessage {
@@ -49,6 +340,8 @@ fn make_session_with_flags(
             content: "world".to_string(),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         },
     ];
@@ -97,6 +390,436 @@ fn make_session_with_flags(
         },
         external_path: None,
     }
+}
+
+#[test]
+fn cloud_filter_supports_flat_sessions_and_debug_visibility() {
+    let local = make_session("local", "local", false, SessionStatus::Closed);
+    let mut cloud = make_session("cloud", "cloud", false, SessionStatus::Closed);
+    cloud.server_icon = Some("☁".into());
+    let mut debug_cloud = cloud.clone();
+    debug_cloud.id = "debug_cloud".into();
+    debug_cloud.is_debug = true;
+    let mut picker = SessionPicker::new(vec![local, cloud, debug_cloud]);
+    picker.filter_mode = SessionFilterMode::Cloud;
+    picker.rebuild_items();
+    assert_eq!(picker.visible_sessions.len(), 1);
+    assert_eq!(picker.selected_session().unwrap().id, "cloud");
+    assert_eq!(picker.hidden_test_count, 1);
+    picker.toggle_test_sessions();
+    assert_eq!(picker.visible_sessions.len(), 2);
+    assert_eq!(picker.hidden_test_count, 0);
+    picker.cycle_filter_mode_backwards();
+    assert_eq!(picker.filter_mode, SessionFilterMode::Saved);
+    picker.cycle_filter_mode();
+    assert_eq!(picker.filter_mode, SessionFilterMode::Cloud);
+}
+
+#[test]
+fn cloud_history_mixes_with_local_and_preserves_real_servers_and_saved_boost() {
+    let now = Utc::now();
+    let mut local = make_session("local", "local", false, SessionStatus::Closed);
+    local.last_message_time = now;
+    let mut cloud = make_session("cloud", "cloud", false, SessionStatus::Closed);
+    cloud.server_name = Some("cloud: host".into());
+    cloud.server_icon = Some("☁".into());
+    cloud.last_message_time = now - ChronoDuration::minutes(2);
+    let mut old_local = local.clone();
+    old_local.id = "old_local".into();
+    old_local.last_message_time = now - ChronoDuration::minutes(3);
+    let mut saved_cloud = cloud.clone();
+    saved_cloud.id = "saved_cloud".into();
+    saved_cloud.saved = true;
+    let cloud_group = ServerGroup {
+        name: "cloud: host".into(),
+        icon: "☁".into(),
+        version: String::new(),
+        git_hash: String::new(),
+        is_running: false,
+        sessions: vec![cloud, saved_cloud],
+    };
+    let mut picker = SessionPicker::new_grouped(vec![cloud_group], vec![old_local, local]);
+    let ids = |picker: &SessionPicker| {
+        picker
+            .visible_session_iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&picker), ["saved_cloud", "local", "cloud", "old_local"]);
+    assert!(matches!(
+        picker.items[0],
+        PickerItem::SavedHeader { session_count: 1 }
+    ));
+    assert!(!picker.items.iter().any(|item| matches!(
+        item,
+        PickerItem::ServerHeader { .. } | PickerItem::OrphanHeader { .. }
+    )));
+
+    let real = make_session("real", "real", false, SessionStatus::Closed);
+    picker.all_server_groups.push(ServerGroup {
+        name: "real server".into(),
+        icon: "🛰".into(),
+        version: "1".into(),
+        git_hash: String::new(),
+        is_running: true,
+        sessions: vec![real],
+    });
+    picker.rebuild_items();
+    assert_eq!(
+        ids(&picker),
+        ["saved_cloud", "real", "local", "cloud", "old_local"]
+    );
+    assert!(picker.items.iter().any(|item| matches!(item, PickerItem::ServerHeader { name, session_count: 1, .. } if name == "real server")));
+    picker.filter_mode = SessionFilterMode::Cloud;
+    picker.rebuild_items();
+    assert_eq!(ids(&picker), ["cloud", "saved_cloud"]);
+    assert!(
+        picker
+            .items
+            .iter()
+            .all(|item| matches!(item, PickerItem::Session))
+    );
+    picker.search_query = "local".into();
+    picker.rebuild_items();
+    assert!(picker.visible_sessions.is_empty());
+}
+
+#[test]
+fn cloud_session_picker_renders_host_and_preserves_resume_target() {
+    let mut session = make_session(
+        "session_cloud_1770000000000",
+        "cloud",
+        false,
+        SessionStatus::Closed,
+    );
+    session.server_name = Some("cloud: dev-cloud".into());
+    session.server_icon = Some("☁".into());
+    let target = session.resume_target.clone();
+    let mut picker = SessionPicker::new_grouped(
+        vec![ServerGroup {
+            name: "cloud: dev-cloud".into(),
+            icon: "☁".into(),
+            version: String::new(),
+            git_hash: String::new(),
+            is_running: false,
+            sessions: vec![session],
+        }],
+        vec![],
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| picker.render(frame)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.to_lowercase().contains("cloud: dev-cloud"));
+    assert_eq!(picker.selection_or_current_targets(), vec![target]);
+}
+
+#[test]
+fn standalone_resume_renders_before_list_load_finishes() {
+    let mut picker = SessionPicker::loading();
+    let (_sender, receiver) = std::sync::mpsc::channel::<SessionListUpdate>();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("loading frame");
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(picker.loading_message.is_some());
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Loading sessions"));
+}
+
+#[test]
+fn shortcut_search_accepts_typing_before_sessions_arrive() {
+    let mut picker = SessionPicker::loading();
+    picker.activate_search();
+    picker
+        .handle_overlay_key(KeyCode::Char('b'), KeyModifiers::empty())
+        .expect("search input");
+    assert!(picker.search_active);
+    assert_eq!(picker.search_query, "b");
+    picker.reseed_grouped(Vec::new(), Vec::new());
+    assert!(picker.search_active);
+    assert_eq!(picker.search_query, "b");
+}
+
+#[test]
+fn loading_picker_accepts_and_renders_search_before_sessions_arrive() {
+    let mut picker = SessionPicker::loading();
+    let (_sender, receiver) = std::sync::mpsc::channel::<SessionListUpdate>();
+    for code in
+        std::iter::once(KeyCode::Char('/')).chain("query-before-data".chars().map(KeyCode::Char))
+    {
+        assert!(matches!(
+            picker
+                .handle_overlay_key(code, KeyModifiers::empty())
+                .expect("loading search input"),
+            OverlayAction::Continue
+        ));
+    }
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(picker.loading_message.is_some());
+    assert!(picker.search_active);
+    assert_eq!(picker.search_query, "query-before-data");
+
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("loading search frame");
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Loading sessions"));
+    assert!(text.contains("query-before-data"));
+}
+
+#[test]
+fn loading_picker_search_is_editable_and_escape_clears_without_closing() {
+    let mut picker = SessionPicker::loading();
+    for code in [
+        KeyCode::Char('/'),
+        KeyCode::Char('q'),
+        KeyCode::Char('x'),
+        KeyCode::Backspace,
+        KeyCode::Char('z'),
+    ] {
+        assert!(matches!(
+            picker
+                .handle_overlay_key(code, KeyModifiers::empty())
+                .expect("edit loading search"),
+            OverlayAction::Continue
+        ));
+    }
+    assert_eq!(picker.search_query, "qz");
+    assert!(picker.search_active);
+    assert!(picker.loading_message.is_some());
+    assert!(matches!(
+        picker
+            .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
+            .expect("leave search"),
+        OverlayAction::Continue
+    ));
+    assert!(!picker.search_active);
+    assert!(picker.search_query.is_empty());
+    assert!(picker.loading_message.is_some());
+    assert!(matches!(
+        picker
+            .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
+            .expect("close after leaving search"),
+        OverlayAction::Close
+    ));
+}
+
+#[test]
+fn loading_picker_without_search_keeps_escape_and_ctrl_c_cancellation() {
+    for (code, modifiers) in [
+        (KeyCode::Esc, KeyModifiers::empty()),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut picker = SessionPicker::loading();
+        assert!(!picker.search_active);
+        assert!(matches!(
+            picker
+                .handle_overlay_key(code, modifiers)
+                .expect("cancel loading picker"),
+            OverlayAction::Close
+        ));
+    }
+}
+
+#[test]
+fn loading_picker_search_survives_cached_and_fresh_updates_and_filters_both() {
+    let mut picker = SessionPicker::loading();
+    for code in std::iter::once(KeyCode::Char('/')).chain("needle".chars().map(KeyCode::Char)) {
+        assert!(matches!(
+            picker
+                .handle_overlay_key(code, KeyModifiers::empty())
+                .expect("search before list arrives"),
+            OverlayAction::Continue
+        ));
+    }
+    let matching = make_session("matching", "needle", false, SessionStatus::Closed);
+    let other = make_session("other", "unrelated", false, SessionStatus::Closed);
+    assert!(
+        !picker
+            .apply_session_list_update(SessionListUpdate::Cached((
+                Vec::new(),
+                vec![other.clone(), matching.clone()],
+            )))
+            .expect("cached list")
+    );
+    assert_eq!(picker.search_query, "needle");
+    assert!(picker.search_active);
+    assert_eq!(picker.visible_sessions.len(), 1);
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("matching")
+    );
+
+    assert!(
+        picker
+            .apply_session_list_update(SessionListUpdate::Fresh(Ok((
+                Vec::new(),
+                vec![matching, other],
+            ))))
+            .expect("fresh list")
+    );
+    assert_eq!(picker.search_query, "needle");
+    assert!(picker.search_active);
+    assert_eq!(picker.visible_sessions.len(), 1);
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("matching")
+    );
+}
+
+#[test]
+fn loading_picker_enter_preserves_search_without_queuing_resume() {
+    let mut picker = SessionPicker::loading();
+    for code in [KeyCode::Char('/'), KeyCode::Char('q'), KeyCode::Enter] {
+        assert!(matches!(
+            picker
+                .handle_overlay_key(code, KeyModifiers::empty())
+                .unwrap(),
+            OverlayAction::Continue
+        ));
+    }
+    assert_eq!(picker.search_query, "q");
+    assert!(picker.search_active);
+    picker
+        .apply_session_list_update(SessionListUpdate::Cached((
+            Vec::new(),
+            vec![make_session("matching", "q", false, SessionStatus::Closed)],
+        )))
+        .unwrap();
+    assert_eq!(picker.search_query, "q");
+    assert!(picker.search_active);
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("matching")
+    );
+}
+
+#[test]
+fn loading_picker_filter_choice_survives_refresh() {
+    let mut picker = SessionPicker::loading();
+    picker
+        .handle_overlay_key(KeyCode::Char('s'), KeyModifiers::empty())
+        .unwrap();
+    let chosen = picker.filter_mode;
+    assert!(picker.filter_mode_user_chosen);
+    assert_eq!(chosen, SessionFilterMode::CurrentDir);
+    picker
+        .apply_session_list_update(SessionListUpdate::Cached((
+            Vec::new(),
+            vec![make_session("first", "first", false, SessionStatus::Closed)],
+        )))
+        .unwrap();
+    assert_eq!(picker.filter_mode, chosen);
+    assert!(picker.filter_mode_user_chosen);
+    picker
+        .apply_session_list_update(SessionListUpdate::Fresh(Ok((Vec::new(), Vec::new()))))
+        .unwrap();
+    assert_eq!(picker.filter_mode, chosen);
+    assert!(picker.filter_mode_user_chosen);
+}
+
+#[test]
+fn standalone_resume_refresh_preserves_cached_selection_and_search() {
+    let mut picker = SessionPicker::loading();
+    let first = make_session("first", "first", false, SessionStatus::Closed);
+    let second = make_session("second", "second", false, SessionStatus::Closed);
+    assert!(
+        !picker
+            .apply_session_list_update(SessionListUpdate::Cached((
+                Vec::new(),
+                vec![first.clone(), second.clone()],
+            )))
+            .expect("cached list")
+    );
+    assert!(picker.loading_message.is_none());
+    let index = picker
+        .find_item_index_for_session_id("second")
+        .expect("second item");
+    picker.list_state.select(Some(index));
+    picker.search_query = "test".to_string();
+    picker.search_active = true;
+    picker.filter_mode_user_chosen = true;
+    assert!(
+        picker
+            .apply_session_list_update(SessionListUpdate::Fresh(Ok((
+                Vec::new(),
+                vec![second, first],
+            ))))
+            .expect("fresh list")
+    );
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("second")
+    );
+    assert_eq!(picker.search_query, "test");
+    assert!(picker.search_active);
+    assert!(picker.filter_mode_user_chosen);
+}
+
+#[test]
+fn standalone_resume_load_error_preserves_existing_list() {
+    let mut picker = SessionPicker::loading();
+    picker
+        .apply_session_list_update(SessionListUpdate::Cached((
+            Vec::new(),
+            vec![make_session(
+                "cached",
+                "cached",
+                false,
+                SessionStatus::Closed,
+            )],
+        )))
+        .expect("cached list");
+    let err = picker
+        .apply_session_list_update(SessionListUpdate::Fresh(Err(anyhow::anyhow!(
+            "scan failed"
+        ))))
+        .expect_err("report loader failure");
+    assert_eq!(err.to_string(), "scan failed");
+    assert_eq!(
+        picker.selected_session().map(|s| s.id.as_str()),
+        Some("cached")
+    );
+}
+
+#[test]
+fn standalone_resume_empty_refresh_finishes_loading() {
+    let mut picker = SessionPicker::loading();
+    assert!(
+        picker
+            .apply_session_list_update(SessionListUpdate::Fresh(Ok((Vec::new(), Vec::new(),))))
+            .expect("empty list")
+    );
+    assert!(picker.loading_message.is_none());
+    assert!(picker.selected_session().is_none());
 }
 
 #[test]
@@ -247,7 +970,7 @@ fn test_session_item_uses_single_primary_title_line() {
     let text_rows: Vec<String> = rows.iter().map(line_text).collect();
 
     // The title must appear on exactly one row (the primary line); other rows
-    // (stats, prompt preview, created/dir) must not repeat it.
+    // (compact activity/prompt context) must not repeat it.
     assert_eq!(
         text_rows
             .iter()
@@ -267,7 +990,11 @@ fn test_session_item_uses_single_primary_title_line() {
         text_rows.iter().all(|row| !row.contains("rhino")),
         "memorable short name should remain searchable but not take display space: {text_rows:?}"
     );
-    assert!(text_rows[1].contains("~1.2M tok"));
+    assert_eq!(
+        text_rows.len(),
+        2,
+        "normal entries should use only two rows"
+    );
 }
 
 #[test]
@@ -631,6 +1358,94 @@ fn test_filter_matches_recent_message_content() {
 }
 
 #[test]
+fn resume_search_recovers_matches_as_typo_query_grows() {
+    let mut session = make_session("typo_target", "target", false, SessionStatus::Closed);
+    session.search_index = "config deploy".into();
+    let mut picker = SessionPicker::new(vec![session]);
+    for query in ["c", "co", "coo", "coon", "coonf", "coonfig"] {
+        picker.search_query = query.into();
+        picker.rebuild_items();
+    }
+    wait_for_picker_search(&mut picker);
+    assert_eq!(picker.visible_sessions.len(), 1);
+    picker.search_query = "deply conifg".into();
+    picker.rebuild_items();
+    wait_for_picker_search(&mut picker);
+    assert_eq!(picker.visible_sessions.len(), 1);
+}
+
+fn wait_for_picker_search(picker: &mut SessionPicker) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while picker.transcript_search.pending() {
+        assert!(std::time::Instant::now() < deadline, "search timed out");
+        picker.poll_transcript_search();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn resume_search_ranks_literal_matches_before_newer_typo_matches() {
+    let mut exact = make_session("literal", "literal", false, SessionStatus::Closed);
+    exact.search_index = "config deploy".into();
+    let mut typo = make_session("typo", "typo", false, SessionStatus::Closed);
+    typo.search_index = "conifg deploy".into();
+    typo.last_message_time = exact.last_message_time + chrono::Duration::seconds(10);
+    let mut picker = SessionPicker::new(vec![typo, exact]);
+    picker.search_query = "config".into();
+    picker.rebuild_items();
+    wait_for_picker_search(&mut picker);
+    assert_eq!(picker.visible_sessions.len(), 2);
+    assert_eq!(
+        picker
+            .session_by_ref(picker.visible_sessions[0])
+            .unwrap()
+            .id,
+        "literal"
+    );
+}
+
+#[test]
+fn resume_search_battery_prompt_outranks_incidental_tool_mentions() {
+    let mut whale = make_session("whale", "power-triage", false, SessionStatus::Closed);
+    whale.first_user_prompt = Some("Can you help me optimize my BATTERY life?".into());
+    whale.search_index = "power-triage can you help me optimize my battery life?".into();
+    let mut sessions = vec![whale.clone()];
+    for i in 0..97 {
+        let mut incidental = make_session(
+            &format!("unrelated-{i}"),
+            "Health check",
+            false,
+            SessionStatus::Closed,
+        );
+        incidental.first_user_prompt = Some("check my niri".into());
+        incidental.search_index =
+            "health check check my niri tool output battery-notify.desktop".into();
+        incidental.last_message_time = whale.last_message_time + chrono::Duration::seconds(i + 1);
+        sessions.push(incidental);
+    }
+    let mut picker = SessionPicker::new(sessions);
+    picker.search_query = "battery".into();
+    picker.rebuild_items();
+    assert_eq!(picker.visible_sessions.len(), 98);
+    assert_eq!(
+        picker
+            .session_by_ref(picker.visible_sessions[0])
+            .unwrap()
+            .id,
+        "whale"
+    );
+    picker.search_query.clear();
+    picker.rebuild_items();
+    assert_eq!(
+        picker
+            .session_by_ref(picker.visible_sessions[0])
+            .unwrap()
+            .id,
+        "unrelated-96"
+    );
+}
+
+#[test]
 fn test_loading_preview_refreshes_search_index_for_picker_filtering() {
     let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("temp dir");
@@ -692,6 +1507,8 @@ fn benchmark_resume_search_reports_incremental_timings() {
                 content: format!("benchmark transcript content alpha beta zebra-token-{idx:03}"),
                 tool_calls: Vec::new(),
                 tool_data: None,
+                duration_secs: None,
+                title: None,
                 timestamp: None,
             }];
             session.search_index = build_search_index(
@@ -792,6 +1609,10 @@ fn test_filter_mode_cycles_through_requested_session_sources() {
     assert_eq!(picker.items.len(), picker.visible_sessions.len());
 
     picker.cycle_filter_mode();
+    assert_eq!(picker.filter_mode, SessionFilterMode::Cloud);
+    assert!(picker.visible_sessions.is_empty());
+
+    picker.cycle_filter_mode();
     assert_eq!(picker.filter_mode, SessionFilterMode::Active);
     // No live processes own these synthetic sessions, so the Active view is
     // empty in tests.
@@ -866,116 +1687,7 @@ fn test_filter_mode_keyboard_shortcuts_cycle_both_directions() {
     assert_eq!(picker.filter_mode, SessionFilterMode::All);
 }
 
-fn live_presence(session_id: &str, streaming: bool) -> crate::session::SessionPresence {
-    crate::session::SessionPresence {
-        session_id: session_id.to_string(),
-        pid: std::process::id(),
-        streaming,
-        streaming_since: streaming
-            .then(|| std::time::SystemTime::now() - std::time::Duration::from_secs(90)),
-        internal: false,
-    }
-}
-
-#[test]
-fn test_active_filter_shows_only_live_sessions_ready_before_working() {
-    let live_working = make_session("session_working", "alpha", false, SessionStatus::Active);
-    let live_ready = make_session("session_ready", "beta", false, SessionStatus::Active);
-    let dead = make_session("session_dead", "dead", false, SessionStatus::Closed);
-
-    let mut picker = SessionPicker::new(vec![live_working, live_ready, dead]);
-    picker.activate_active_filter();
-    picker.set_live_presence_for_test(vec![
-        live_presence("session_working", true),
-        live_presence("session_ready", false),
-    ]);
-
-    let visible: Vec<&str> = picker
-        .visible_session_iter()
-        .map(|session| session.id.as_str())
-        .collect();
-    // Only live sessions appear; the ready one is triaged above the working one.
-    assert_eq!(visible, vec!["session_ready", "session_working"]);
-
-    let ready = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_ready")
-        .expect("ready visible");
-    let working = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_working")
-        .expect("working visible");
-    assert!(!picker.session_is_streaming(ready));
-    assert!(picker.session_is_streaming(working));
-    assert!(picker.session_streaming_duration(working).is_some());
-}
-
-#[test]
-fn test_active_rows_render_working_and_ready_badges() {
-    let live_working = make_session("session_working", "alpha", false, SessionStatus::Active);
-    let live_ready = make_session("session_ready", "beta", false, SessionStatus::Closed);
-    let mut picker = SessionPicker::new(vec![live_working, live_ready]);
-    picker.activate_active_filter();
-    picker.set_live_presence_for_test(vec![
-        live_presence("session_working", true),
-        live_presence("session_ready", false),
-    ]);
-
-    let working = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_working")
-        .cloned()
-        .expect("working visible");
-    let ready = picker
-        .visible_session_iter()
-        .find(|session| session.id == "session_ready")
-        .cloned()
-        .expect("ready visible");
-
-    let working_lines = picker.render_session_item_lines(&working, false);
-    let working_text = working_lines
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        working_text.contains("working 1m"),
-        "expected working badge with duration, got: {working_text}"
-    );
-
-    let first_frame = picker
-        .render_session_item_lines_at_frame(&working, false, 0)
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let second_frame = picker
-        .render_session_item_lines_at_frame(&working, false, 1)
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(first_frame.contains('⠋'));
-    assert!(second_frame.contains('⠙'));
-    assert_ne!(first_frame, second_frame, "running glyph should animate");
-    assert!(picker.has_visible_running_sessions());
-
-    let ready_lines = picker.render_session_item_lines(&ready, false);
-    let ready_text = ready_lines
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        ready_text.contains("ready"),
-        "expected ready badge, got: {ready_text}"
-    );
-    // Live presence overrides the stale persisted "closed" status.
-    assert!(
-        !ready_text.contains("closed"),
-        "live session must not render as closed: {ready_text}"
-    );
-}
+include!("session_picker_tests/live_presence.rs");
 
 fn make_claude_session(session_id: &str) -> SessionInfo {
     let mut session = make_session(
@@ -1067,30 +1779,6 @@ fn live_claude_row_is_labeled_and_closed_claude_cannot_take_over() {
 }
 
 #[test]
-fn test_current_session_row_is_labeled() {
-    let session = make_session("session_self", "self", false, SessionStatus::Active);
-    let mut picker = SessionPicker::new(vec![session.clone()]);
-    picker.set_current_session_id(Some("session_self".to_string()));
-
-    let lines = picker.render_session_item_lines(&session, false);
-    let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-    assert!(
-        text.contains("current"),
-        "expected current label, got: {text}"
-    );
-}
-
-#[test]
-fn test_maybe_refresh_live_presence_throttles_and_detects_changes() {
-    let session = make_session("session_live", "live", false, SessionStatus::Active);
-    let mut picker = SessionPicker::new(vec![session]);
-    picker.activate_active_filter();
-    // Freshly injected snapshot: refresh is throttled, nothing changes.
-    picker.set_live_presence_for_test(vec![live_presence("session_live", true)]);
-    assert!(!picker.maybe_refresh_live_presence());
-}
-
-#[test]
 fn test_space_selects_multiple_sessions_and_enter_returns_them() {
     let mut newer = make_session("session_newer", "newer", false, SessionStatus::Closed);
     let mut older = make_session("session_older", "older", false, SessionStatus::Closed);
@@ -1150,6 +1838,65 @@ fn test_space_selects_multiple_sessions_and_enter_returns_them() {
         }
         other => panic!("expected alternate selected sessions, got {other:?}"),
     }
+}
+
+#[test]
+fn saved_placement_expiry_keeps_bookmarks_in_saved_filter() {
+    let mut saved = make_session(
+        "expired_saved_placement",
+        "saved",
+        false,
+        SessionStatus::Closed,
+    );
+    saved.saved = true;
+    saved.last_message_time = Utc::now() - ChronoDuration::days(8);
+    let normal = make_session(
+        "recent_normal_placement",
+        "normal",
+        false,
+        SessionStatus::Closed,
+    );
+    let mut picker = SessionPicker::new(vec![saved, normal]);
+    assert!(
+        !picker
+            .items
+            .iter()
+            .any(|item| matches!(item, PickerItem::SavedHeader { .. }))
+    );
+    let ids: Vec<_> = picker
+        .visible_session_iter()
+        .map(|s| s.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["recent_normal_placement", "expired_saved_placement"]
+    );
+    picker.filter_mode = SessionFilterMode::Saved;
+    picker.rebuild_items();
+    assert_eq!(picker.visible_sessions.len(), 1);
+    assert_eq!(
+        picker.selected_session().unwrap().id,
+        "expired_saved_placement"
+    );
+    assert!(picker.selected_session().unwrap().saved);
+}
+
+#[test]
+fn saved_placement_recent_bookmark_still_gets_header() {
+    let mut saved = make_session(
+        "recent_saved_placement",
+        "saved",
+        false,
+        SessionStatus::Closed,
+    );
+    saved.saved = true;
+    let picker = SessionPicker::new(vec![saved]);
+    assert!(
+        picker
+            .items
+            .iter()
+            .any(|item| matches!(item, PickerItem::SavedHeader { session_count: 1 }))
+    );
 }
 
 #[test]
@@ -1223,217 +1970,6 @@ fn test_keyboard_scroll_uses_sessions_focus_for_paging() {
 }
 
 #[test]
-fn onboarding_external_filter_picks_latest_visible_transcript() {
-    let now = Utc::now();
-
-    let mut older = make_session("codex_older", "older", false, SessionStatus::Closed);
-    older.source = SessionSource::Codex;
-    older.model = Some("gpt-5-codex".to_string());
-    older.last_active_at = Some(now - ChronoDuration::minutes(30));
-    older.resume_target = ResumeTarget::CodexSession {
-        session_id: "codex_older".to_string(),
-        session_path: "/tmp/codex_older.jsonl".to_string(),
-    };
-
-    let mut newer = make_session("codex_newer", "newer", false, SessionStatus::Closed);
-    newer.source = SessionSource::Codex;
-    newer.model = Some("gpt-5-codex".to_string());
-    newer.last_active_at = Some(now - ChronoDuration::minutes(2));
-    newer.resume_target = ResumeTarget::CodexSession {
-        session_id: "codex_newer".to_string(),
-        session_path: "/tmp/codex_newer.jsonl".to_string(),
-    };
-
-    // A non-Codex session that must be filtered out.
-    let jcode = make_session("jcode_one", "jcode", false, SessionStatus::Closed);
-
-    let mut picker = SessionPicker::new(vec![older, jcode, newer]);
-    picker.activate_external_cli_filter(SessionFilterMode::Codex);
-
-    assert_eq!(picker.visible_session_count(), 2);
-
-    let latest = picker
-        .latest_visible_resume_target()
-        .expect("latest visible target");
-    assert_eq!(
-        latest,
-        ResumeTarget::CodexSession {
-            session_id: "codex_newer".to_string(),
-            session_path: "/tmp/codex_newer.jsonl".to_string(),
-        }
-    );
-}
-
-#[test]
-fn onboarding_external_filter_with_no_matches_has_no_target() {
-    let jcode = make_session("jcode_only", "jcode", false, SessionStatus::Closed);
-    let mut picker = SessionPicker::new(vec![jcode]);
-    picker.activate_external_cli_filter(SessionFilterMode::ClaudeCode);
-
-    assert_eq!(picker.visible_session_count(), 0);
-    assert!(picker.latest_visible_resume_target().is_none());
-}
-
-#[test]
-fn onboarding_banner_defaults_to_suggested_review() {
-    let mut picker = SessionPicker::new(Vec::new());
-    picker.activate_onboarding_banner(vec![Line::from("welcome")]);
-
-    assert!(picker.onboarding_banner_active());
-    assert!(picker.onboarding_review_recent_project_highlighted());
-    assert!(!picker.onboarding_start_new_highlighted());
-}
-
-#[test]
-fn onboarding_banner_is_action_only() {
-    let mut picker = SessionPicker::new(Vec::new());
-    picker.activate_onboarding_banner(vec![Line::from("welcome")]);
-
-    assert_eq!(picker.visible_session_count(), 0);
-    assert!(picker.onboarding_review_recent_project_highlighted());
-}
-
-#[test]
-fn onboarding_banner_offers_review_then_new_session() {
-    let mut picker = SessionPicker::new(Vec::new());
-    picker.activate_onboarding_banner(vec![Line::from("welcome")]);
-
-    // The suggested review is the default top action.
-    let action = picker
-        .handle_overlay_key(KeyCode::Enter, KeyModifiers::empty())
-        .expect("overlay key");
-    assert!(matches!(
-        action,
-        OverlayAction::Selected(PickerResult::ReviewRecentProject)
-    ));
-
-    // Any non-submit key rotates between the two choices.
-    picker
-        .handle_overlay_key(KeyCode::Char('x'), KeyModifiers::empty())
-        .expect("ordinary key");
-    assert!(picker.onboarding_start_new_highlighted());
-    picker
-        .handle_overlay_key(KeyCode::Char('x'), KeyModifiers::empty())
-        .expect("ordinary key");
-    assert!(picker.onboarding_review_recent_project_highlighted());
-
-    // Keys that normally close the full picker rotate on this action-only page.
-    picker
-        .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
-        .expect("escape key");
-    assert!(picker.onboarding_start_new_highlighted());
-    picker
-        .handle_overlay_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
-        .expect("control-c");
-    assert!(picker.onboarding_review_recent_project_highlighted());
-
-    // Arrow keys use the same rotation behavior.
-    picker
-        .handle_overlay_key(KeyCode::Down, KeyModifiers::empty())
-        .expect("down arrow");
-    assert!(picker.onboarding_start_new_highlighted());
-    let action = picker
-        .handle_overlay_key(KeyCode::Enter, KeyModifiers::empty())
-        .expect("overlay key");
-    assert!(matches!(
-        action,
-        OverlayAction::Selected(PickerResult::StartNewSession)
-    ));
-
-    // There is no session list below the two actions.
-    picker.next();
-    assert!(picker.onboarding_start_new_highlighted());
-    picker
-        .handle_overlay_key(KeyCode::Up, KeyModifiers::empty())
-        .expect("up arrow");
-    assert!(picker.onboarding_review_recent_project_highlighted());
-}
-
-#[test]
-fn onboarding_banner_renders_prompt_and_both_action_rows() {
-    let mut picker = SessionPicker::new(Vec::new());
-    picker.activate_onboarding_banner(vec![
-        Line::from("Welcome to jcode"),
-        Line::from("Choose how to begin."),
-    ]);
-
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
-    terminal
-        .draw(|frame| picker.render(frame))
-        .expect("render onboarding picker");
-
-    let buffer = terminal.backend().buffer().clone();
-    let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-    let lines = (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-
-    assert!(
-        text.contains("Welcome to jcode"),
-        "onboarding prompt should render in the banner: {text:?}"
-    );
-    assert!(
-        text.contains("Start in the current directory"),
-        "start-new row should render in the banner: {text:?}"
-    );
-    assert!(
-        text.contains("Find bugs in my most active repo"),
-        "suggested-review row should render in the banner: {text:?}"
-    );
-    assert!(
-        !text.contains("Sessions"),
-        "resume chrome must be absent: {text:?}"
-    );
-    assert!(
-        !text.contains('╭') && !text.contains('╰') && !text.contains('│'),
-        "onboarding choice should not render an outer boundary: {lines:#?}"
-    );
-
-    let welcome_y = lines
-        .iter()
-        .position(|line| line.contains("Welcome to jcode"))
-        .expect("welcome row");
-    let review_y = lines
-        .iter()
-        .position(|line| line.contains("Find bugs in my most active repo"))
-        .expect("review row");
-    let start_y = lines
-        .iter()
-        .position(|line| line.contains("Start in the current directory"))
-        .expect("start-new row");
-    let review_x = lines[review_y]
-        .find("Find bugs in my most active repo")
-        .expect("review column");
-    let start_x = lines[start_y]
-        .find("Start in the current directory")
-        .expect("start-new column");
-
-    assert!(
-        welcome_y < review_y,
-        "welcome copy should introduce the centered suggested prompt: {lines:#?}"
-    );
-    assert!(
-        review_y.abs_diff(buffer.area.height as usize / 2) <= 1,
-        "suggested prompt should be vertically centered: {lines:#?}"
-    );
-    assert!(
-        review_x < 50,
-        "suggested prompt should span the visual center: {lines:#?}"
-    );
-    let width = buffer.area.width as usize;
-    let start_end = lines[start_y].trim_end().chars().count();
-    assert!(
-        start_y >= buffer.area.height as usize - 3 && start_x > width / 2 && start_end + 4 >= width,
-        "blank-session action should stay secondary in the bottom-right: {lines:#?}"
-    );
-}
-
-#[test]
 fn test_keyboard_scroll_uses_preview_focus_for_paging() {
     let s1 = make_session("session_1", "one", false, SessionStatus::Closed);
     let s2 = make_session("session_2", "two", false, SessionStatus::Closed);
@@ -1463,6 +1999,8 @@ fn make_session_with_many_turns(id: &str, turns: usize) -> SessionInfo {
             content: format!("user prompt number {i}"),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
         preview.push(PreviewMessage {
@@ -1470,6 +2008,8 @@ fn make_session_with_many_turns(id: &str, turns: usize) -> SessionInfo {
             content: format!("assistant reply number {i}"),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
     }
@@ -1514,6 +2054,8 @@ fn bench_preview_messages(turns: usize, assistant_paragraphs: usize) -> Vec<Prev
             ),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
 
@@ -1535,6 +2077,8 @@ fn bench_preview_messages(turns: usize, assistant_paragraphs: usize) -> Vec<Prev
             content: body,
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
     }
@@ -1821,6 +2365,64 @@ fn contains_scrollbar_glyph(text: &str) -> bool {
 }
 
 #[test]
+fn test_preview_transcript_omits_picker_metadata() {
+    let mut session = make_session("metadata", "metadata-monkey", false, SessionStatus::Active);
+    session.title = "metadata-video-title".to_string();
+    session.working_dir = Some("/metadata-only-directory".to_string());
+    let mut picker = SessionPicker::new(vec![session]);
+    picker.auto_scroll_preview = false;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render_preview(frame, frame.area()))
+        .unwrap();
+    let cache = picker.preview_cache.as_ref().expect("rendered transcript");
+    let text = cache
+        .wrapped_lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("1› hello"), "{text}");
+    assert!(
+        text.contains("client: Metadata-monkey"),
+        "the real startup header belongs to the scrolling transcript"
+    );
+    for metadata in [
+        "metadata-video-title",
+        "/metadata-only-directory",
+        "▶ Active",
+        "────",
+    ] {
+        assert!(
+            !text.contains(metadata),
+            "unexpected picker metadata: {text}"
+        );
+    }
+}
+
+#[test]
+fn preview_transcript_hash_ignores_picker_metadata() {
+    let session = make_session("metadata", "metadata-monkey", false, SessionStatus::Active);
+    let picker = SessionPicker::new(vec![session.clone()]);
+    let mode = crate::config::DiffDisplayMode::Off;
+    let original = picker.preview_content_hash(&session, mode);
+    let mut changed = session;
+    changed.title = "renamed".into();
+    changed.status = SessionStatus::Closed;
+    changed.saved = true;
+    changed.working_dir = Some("/another-directory".into());
+    assert_eq!(original, picker.preview_content_hash(&changed, mode));
+    changed.messages_preview[1].content.push_str(" updated");
+    assert_ne!(original, picker.preview_content_hash(&changed, mode));
+}
+
+#[test]
 fn test_preview_is_left_aligned_independently_of_chat_markdown_context() {
     for width in [60, 100] {
         let mut reference = None;
@@ -1845,11 +2447,18 @@ fn test_preview_is_left_aligned_independently_of_chat_markdown_context() {
                     let rows: Vec<String> = (1..39)
                         .map(|y| (1..width - 1).map(|x| buffer[(x, y)].symbol()).collect())
                         .collect();
-                    for text in ["Test session", "1› hello", "world"] {
+                    for text in ["1› hello", "world"] {
                         let row = rows.iter().find(|row| row.contains(text)).expect(text);
-                        assert!(row.starts_with(text), "preview must be flush left: {row:?}");
+                        assert!(
+                            row.starts_with(&format!(" {text}")),
+                            "preview must use the live one-cell gutter: {row:?}"
+                        );
                     }
-                    for text in ["list item", "code sample", "tool:"] {
+                    assert!(
+                        rows.iter().all(|row| !row.contains("tool:")),
+                        "preview must not show a tool-name summary line: {rows:?}"
+                    );
+                    for text in ["list item", "code sample"] {
                         let row = rows.iter().find(|row| row.contains(text)).expect(text);
                         assert!(
                             row.chars().take_while(|c| *c == ' ').count() <= 2,
@@ -1869,9 +2478,23 @@ fn test_preview_is_left_aligned_independently_of_chat_markdown_context() {
 
 #[test]
 fn test_preview_structured_messages_stay_left_aligned() {
+    // The todo tool card is only shown inline when todos are not pinned.
+    let _env_lock = crate::storage::lock_test_env();
+    crate::env::set_var("JCODE_PIN_TODOS", "0");
+    crate::config::invalidate_config_cache();
+    struct RestorePin;
+    impl Drop for RestorePin {
+        fn drop(&mut self) {
+            crate::env::remove_var("JCODE_PIN_TODOS");
+            crate::config::invalidate_config_cache();
+        }
+    }
+    let _restore = RestorePin;
     let todos = serde_json::json!([{
+        // Finished lists intentionally collapse to status dots. Keep an active
+        // item so this test exercises alignment of the structured card body.
         "id": "alignment", "content": "Verify structured preview alignment",
-        "status": "completed", "priority": "high", "confidence": "verified"
+        "status": "in_progress", "priority": "high", "confidence": "verified"
     }]);
     let mut session = make_session(
         "structured_alignment",
@@ -1887,7 +2510,7 @@ fn test_preview_structured_messages_stay_left_aligned() {
         ("background_task", "**Background task** `alignment-task` · `selfdev test` (`selfdev-test`) · ✓ completed · 18.5s · exit 0\n\n```text\nAll alignment checks passed\n```".to_string(), None),
     ] {
         session.messages_preview.push(PreviewMessage {
-            role: role.to_string(), content, tool_calls: Vec::new(), timestamp: None,
+            role: role.to_string(), content, tool_calls: Vec::new(), duration_secs: None, title: None, timestamp: None,
             tool_data: tool.map(|name| crate::message::ToolCall {
                 id: format!("alignment-{name}"), name: name.to_string(),
                 input: serde_json::json!({"command": "echo alignment"}),
@@ -1910,12 +2533,19 @@ fn test_preview_structured_messages_stay_left_aligned() {
                 "preview must restore chat context"
             );
             let cache = picker.preview_cache.as_ref().unwrap();
+            assert!(
+                cache
+                    .wrapped_lines
+                    .iter()
+                    .all(|line| !line_text(line).contains("tool:")),
+                "preview must not show a tool-name summary line"
+            );
             for needle in [
-                "tool:",
                 "Verify structured preview alignment",
                 "Reviewing the weak points",
                 "Check structured preview alignment",
-                "All alignment checks passed",
+                // Successful background notices render as one compact line.
+                "Background task alignment-task",
             ] {
                 let line = cache
                     .wrapped_lines
@@ -1988,12 +2618,12 @@ fn test_preview_sticky_prompt_header_appears_after_scrolling() {
         .expect("render picker");
     let buffer = terminal.backend().buffer().clone();
 
-    // The preview pane occupies the right 60% of the width; its inner content
-    // starts just inside the rounded border. Read the first inner content row and
-    // confirm it carries the "N›" sticky-header marker.
-    let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
-    let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+    // Startup chrome scrolls away. The sticky previous prompt is the first row.
+    let preview = picker.last_preview_area.expect("preview pane");
+    let preview_inner_x = preview.x;
+    let header_y = preview.y;
+    let header_row: String = (preview_inner_x..preview.right().saturating_sub(1))
+        .map(|x| buffer[(x, header_y)].symbol())
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2003,6 +2633,7 @@ fn test_preview_sticky_prompt_header_appears_after_scrolling() {
     // The header marker is a prompt number followed by the chevron.
     assert!(
         header_row
+            .trim_start()
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_digit()),
@@ -2029,7 +2660,7 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
     // Simulate an in-flight background load for the selected session: empty
     // preview + a pending load whose id matches. Keep the sender alive so the
     // receiver reports `Empty` (still loading) rather than `Disconnected`.
-    let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<PreviewMessage>>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<LoadedSessionPreview>>();
     picker.pending_preview_load = Some(PendingSessionPreviewLoad {
         session_id: "async_sticky".to_string(),
         receiver: rx,
@@ -2054,6 +2685,14 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
         "auto-scroll should stay armed while the preview is still loading"
     );
 
+    // The initial session-list refresh can arrive while the transcript is
+    // loading. It must preserve the pending bottom scroll for this selection.
+    picker.reseed_grouped(Vec::new(), vec![session]);
+    assert!(
+        picker.auto_scroll_preview,
+        "refresh must preserve the pending jump to the transcript bottom"
+    );
+
     // The background load completes: deliver the real transcript exactly the way
     // `poll_preview_load` would (drop the channel + populate the preview).
     drop(tx);
@@ -2069,9 +2708,27 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
         picker.scroll_offset
     );
 
-    let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
-    let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+    assert!(picker.preview_max_scroll > 0);
+    assert_eq!(
+        picker.scroll_offset, picker.preview_max_scroll,
+        "loaded transcript must open at the exact bottom"
+    );
+    assert!(!picker.auto_scroll_preview);
+
+    // Subsequent refreshes must not pull a user who scrolled back to the bottom.
+    assert!(picker.scroll_preview_up(3));
+    let user_offset = picker.scroll_offset;
+    let loaded_session = picker.selected_session().unwrap().clone();
+    picker.reseed_grouped(Vec::new(), vec![loaded_session]);
+    let _ = render(&mut picker);
+    assert_eq!(picker.scroll_offset, user_offset);
+    assert!(!picker.auto_scroll_preview);
+
+    let preview = picker.last_preview_area.expect("preview pane");
+    let preview_inner_x = preview.x;
+    let header_y = preview.y;
+    let header_row: String = (preview_inner_x..preview.right().saturating_sub(1))
+        .map(|x| buffer[(x, header_y)].symbol())
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2280,6 +2937,52 @@ fn test_reseed_grouped_keeps_selection_when_list_changes() {
         Some(target),
         "selection should follow the session id across a reordered refresh"
     );
+}
+
+#[test]
+fn test_search_mode_held_ctrl_j_k_navigate_session_list() {
+    use crossterm::event::{KeyEvent, KeyEventKind};
+
+    let sessions = (0..5)
+        .map(|i| {
+            make_session(
+                &format!("session_{i}"),
+                "match",
+                false,
+                SessionStatus::Closed,
+            )
+        })
+        .collect();
+    let mut picker = SessionPicker::new(sessions);
+    picker
+        .handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()))
+        .unwrap();
+    let first = picker.selected_session().unwrap().id.clone();
+    for code in [KeyCode::Char('j'), KeyCode::Char('k')] {
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Repeat,
+        ] {
+            let before = picker.selected_session().unwrap().id.clone();
+            picker
+                .handle_key_event(KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, kind))
+                .unwrap();
+            assert_ne!(picker.selected_session().unwrap().id, before);
+            assert!(picker.search_active);
+            assert!(picker.search_query.is_empty());
+        }
+        let before_release = picker.selected_session().unwrap().id.clone();
+        picker
+            .handle_key_event(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            ))
+            .unwrap();
+        assert_eq!(picker.selected_session().unwrap().id, before_release);
+    }
+    assert_eq!(picker.selected_session().unwrap().id, first);
 }
 
 #[test]
@@ -2601,3 +3304,9 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         "no search means no highlight color in preview"
     );
 }
+
+#[path = "session_picker_scope_tests.rs"]
+mod project_scope;
+
+#[path = "session_picker_tests/onboarding.rs"]
+mod onboarding;

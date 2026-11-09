@@ -63,7 +63,8 @@ pub fn build_transcript_for_extraction(messages: &[crate::message::Message]) -> 
                 | crate::message::ContentBlock::ReasoningTrace { .. }
                 | crate::message::ContentBlock::AnthropicThinking { .. }
                 | crate::message::ContentBlock::OpenAIReasoning { .. }
-                | crate::message::ContentBlock::ToolReference { .. } => {}
+                | crate::message::ContentBlock::ToolReference { .. }
+                | crate::message::ContentBlock::ProviderNative { .. } => {}
                 crate::message::ContentBlock::Image { .. } => {
                     transcript.push_str("[Image]\n");
                 }
@@ -130,11 +131,28 @@ impl MemoryAgentHandle {
         messages: Arc<[crate::message::Message]>,
         working_dir: Option<String>,
     ) {
+        self.update_context_sync_with_dir_forced(session_id, messages, working_dir, false);
+    }
+
+    /// Send a context update that bypasses the same-query suppression.
+    ///
+    /// MEASURED 2026-11-04: during long autonomous work the focused query
+    /// often does not change (the tool output is stripped from it), so the
+    /// 30 s repeat suppression blocked every scheduled refresh and the agent
+    /// ran for hours with the memory it started with.
+    pub fn update_context_sync_with_dir_forced(
+        &self,
+        session_id: &str,
+        messages: Arc<[crate::message::Message]>,
+        working_dir: Option<String>,
+        force: bool,
+    ) {
         let msg = AgentMessage::Context {
             session_id: session_id.to_string(),
             messages,
             working_dir,
             timestamp: Instant::now(),
+            force,
         };
         let _ = self.tx.try_send(msg);
     }
@@ -152,6 +170,8 @@ enum AgentMessage {
         messages: Arc<[crate::message::Message]>,
         working_dir: Option<String>,
         timestamp: Instant,
+        /// Bypass the same-query repeat suppression.
+        force: bool,
     },
     Reset,
 }
@@ -196,6 +216,7 @@ impl MemoryAgent {
                     messages,
                     working_dir,
                     timestamp,
+                    force,
                 } => {
                     // A bounded queue must not recall for a context that aged out
                     // while another session's remote provider was unavailable.
@@ -215,7 +236,7 @@ impl MemoryAgent {
                     if let Ok(mut stats) = MEMORY_AGENT_STATS.lock() {
                         stats.turns_processed += 1;
                     }
-                    if let Err(error) = self.process_context(&session_id, &messages).await {
+                    if let Err(error) = self.process_context(&session_id, &messages, force).await {
                         memory::clear_pending_memory(&session_id);
                         self.sessions.entry(session_id).or_default().failed_at =
                             Some(Instant::now());
@@ -233,6 +254,7 @@ impl MemoryAgent {
         &mut self,
         session_id: &str,
         messages: &[crate::message::Message],
+        force: bool,
     ) -> Result<()> {
         let query = memory::format_focused_query_for_relevance(messages);
         if query.trim().is_empty() {
@@ -256,17 +278,73 @@ impl MemoryAgent {
         {
             return Ok(());
         }
-        if ss.last_query.as_deref() == Some(query.as_str())
+        if !force
+            && ss.last_query.as_deref() == Some(query.as_str())
             && ss
                 .last_check
                 .is_some_and(|at| at.elapsed() < REPEAT_SUPPRESSION)
         {
             return Ok(());
         }
-        ss.last_query = Some(query);
+        ss.last_query = Some(query.clone());
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
         memory::clear_pending_memory(session_id);
+        // The Hindsight backend replaces the remote Jev model for RECALL.
+        // It is selected here rather than inside MemoryManager because the
+        // two backends produce different things: Jev selects entries from the
+        // LOCAL memory graph, Hindsight returns its own documents, which are
+        // not in that graph. Both end up in the same pending-memory store, so
+        // the injection, dedup and TTL machinery below is unchanged.
+        if crate::memory_hindsight::provider_enabled() {
+            let recall = match crate::memory_hindsight::recall_configured() {
+                Ok(config) => crate::memory_hindsight::recall(&config, query.as_str()),
+                Err(error) => {
+                    crate::memory_log::log_pending_discarded(
+                        session_id,
+                        &format!("hindsight recall config invalid: {error}"),
+                    );
+                    return Ok(());
+                }
+            };
+            match recall {
+                Ok(recall) => {
+                    if let Some(prompt) = crate::memory_hindsight::format_recall_block(&recall) {
+                        let count = recall.facts.len();
+                        let ids: Vec<String> = recall
+                            .facts
+                            .iter()
+                            .map(|fact| fact.id.clone())
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        // EXTERNAL publication: these memories live in the
+                        // Hindsight bank, not in the local graph, so the
+                        // project-scoped path would reject the selection.
+                        memory::set_pending_memory_external(
+                            session_id,
+                            prompt,
+                            count,
+                            ids,
+                            None,
+                            self.sessions
+                                .get(session_id)
+                                .and_then(|state| state.working_dir.as_deref()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::memory_log::log_pending_discarded(
+                        session_id,
+                        &format!("hindsight recall failed: {error}"),
+                    );
+                }
+            }
+            self.sessions
+                .entry(session_id.to_string())
+                .or_default()
+                .failed_at = None;
+            return Ok(());
+        }
         if !memory::memory_runtime_active() {
             return Ok(());
         }
@@ -350,6 +428,28 @@ pub fn update_context_sync_with_dir(
         tokio::spawn(async move {
             if let Ok(handle) = init().await {
                 handle.update_context_sync_with_dir(&sid, messages, working_dir);
+            }
+        });
+    }
+}
+
+/// Force a context update, bypassing the same-query repeat suppression.
+///
+/// Used by the scheduled memory refresh: during long autonomous work the
+/// focused query usually does not change, so the normal suppression window
+/// would silently block every refresh.
+pub fn update_context_sync_with_dir_forced(
+    session_id: &str,
+    messages: Arc<[crate::message::Message]>,
+    working_dir: Option<String>,
+) {
+    if let Some(handle) = get() {
+        handle.update_context_sync_with_dir_forced(session_id, messages, working_dir, true);
+    } else {
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            if let Ok(handle) = init().await {
+                handle.update_context_sync_with_dir_forced(&sid, messages, working_dir, true);
             }
         });
     }

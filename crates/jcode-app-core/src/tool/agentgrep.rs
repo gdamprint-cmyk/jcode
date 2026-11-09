@@ -4,6 +4,7 @@ use crate::session::Session;
 use crate::storage;
 use crate::{logging, util};
 use ::agentgrep::cli::{FindArgs, FullRegionMode, GrepArgs, OutlineArgs, SmartArgs};
+use ::agentgrep::control::{SearchControl, SearchLimits, with_search_control};
 use ::agentgrep::find::{FindResult, run_find};
 use ::agentgrep::outline::run_outline;
 use ::agentgrep::search::{GrepResult, run_grep};
@@ -18,9 +19,50 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 const AGENTGREP_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
+
+struct CancelSearchOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelSearchOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Dropping a JoinHandle detaches it. Foreground ownership must instead abort
+/// the async owner, whose cancellation guard signals the blocking worker.
+struct SearchTaskOwner(Option<tokio::task::JoinHandle<Result<ToolOutput>>>);
+
+impl Drop for SearchTaskOwner {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+fn spawn_cancellable_search(
+    work: impl FnOnce() -> Result<ToolOutput> + Send + 'static,
+) -> tokio::task::JoinHandle<Result<ToolOutput>> {
+    let token = Arc::new(AtomicBool::new(false));
+    let control = SearchControl::new(token.clone(), SearchLimits::default());
+    // Create outside the future so abort before its first poll also cancels.
+    let guard = CancelSearchOnDrop(token);
+    tokio::spawn(async move {
+        let _guard = guard;
+        tokio::task::spawn_blocking(move || {
+            with_search_control(control, work).map_err(anyhow::Error::msg)?
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("agentgrep blocking task failed to join: {err}"))?
+    })
+}
 
 mod args;
 mod context;
@@ -259,8 +301,7 @@ impl Tool for AgentGrepTool {
         // the first cold-cache search feel like it "takes forever" with no
         // spinner and an unresponsive interrupt. This mirrors how the sibling
         // grep/glob/ls tools offload their work.
-        let work_handle =
-            tokio::task::spawn_blocking(move || run_agentgrep_blocking(&params, &ctx));
+        let work_handle = spawn_cancellable_search(move || run_agentgrep_blocking(&params, &ctx));
         await_or_background_search(
             work_handle,
             AGENTGREP_FOREGROUND_BUDGET,
@@ -272,12 +313,17 @@ impl Tool for AgentGrepTool {
 }
 
 async fn await_or_background_search(
-    mut work_handle: tokio::task::JoinHandle<Result<ToolOutput>>,
+    work_handle: tokio::task::JoinHandle<Result<ToolOutput>>,
     foreground_budget: Duration,
     display_name: String,
     session_id: String,
 ) -> Result<ToolOutput> {
-    match tokio::time::timeout(foreground_budget, &mut work_handle).await {
+    let mut owner = SearchTaskOwner(Some(work_handle));
+    let work_handle = owner
+        .0
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("agentgrep task owner is missing"))?;
+    match tokio::time::timeout(foreground_budget, work_handle).await {
         Ok(joined) => {
             joined.map_err(|err| anyhow::anyhow!("agentgrep task failed to join: {err}"))?
         }
@@ -288,27 +334,34 @@ async fn await_or_background_search(
                     Some(display_name.clone()),
                     &session_id,
                     true,
-                    false,
-                    work_handle,
+                    true,
+                    // Transfer, do not cancel: the background manager becomes
+                    // the sole owner, including while adoption is awaiting.
+                    owner
+                        .0
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("agentgrep task owner is missing"))?,
                 )
                 .await;
             Ok(ToolOutput::new(format!(
-                    "Search is still running after 5s and is continuing in background.\n\n\
+                "Search is still running after 5s and is continuing in background.\n\n\
                      Task ID: {}\n\
                      Name: {}\n\n\
-                     Use `bg` with action=\"wait\" and task_id=\"{}\" to wait for completion, or action=\"output\" to inspect its output.",
-                    info.task_id, display_name, info.task_id,
-                ))
-                .with_title(display_name.clone())
-                .with_metadata(json!({
-                    "background": true,
-                    "task_id": info.task_id,
-                    "display_name": display_name,
-                    "output_file": info.output_file.to_string_lossy(),
-                    "status_file": info.status_file.to_string_lossy(),
-                    "timeout_promoted": true,
-                    "foreground_timeout_ms": foreground_budget.as_millis(),
-                })))
+                     {}",
+                info.task_id,
+                display_name,
+                super::BACKGROUND_WAIT_GUIDANCE,
+            ))
+            .with_title(display_name.clone())
+            .with_metadata(json!({
+                "background": true,
+                "task_id": info.task_id,
+                "display_name": display_name,
+                "output_file": info.output_file.to_string_lossy(),
+                "status_file": info.status_file.to_string_lossy(),
+                "timeout_promoted": true,
+                "foreground_timeout_ms": foreground_budget.as_millis(),
+            })))
         }
     }
 }
@@ -408,8 +461,10 @@ fn execute_linked_agentgrep(
         "find" => {
             let args = build_find_args(params, ctx)?;
             let root = resolve_search_root(ctx, args.path.as_deref())?;
-            let result =
-                filter_find_result_to_exact_file(run_find(&root, &args), exact_file.as_deref());
+            let result = filter_find_result_to_exact_file(
+                run_find(&root, &args).map_err(anyhow::Error::msg)?,
+                exact_file.as_deref(),
+            );
             Ok(ToolOutput::new(render_find_output(&result, &args)).with_title("agentgrep find"))
         }
         "outline" => {
@@ -450,6 +505,33 @@ fn exact_search_file_path(ctx: &ToolContext, path: Option<&str>) -> Option<Strin
         .map(|name| name.to_string_lossy().into_owned())
 }
 
+/// Match a search-result path against the exact file the caller asked for.
+///
+/// The result paths are RELATIVE to the search root (the agentgrep crate's
+/// `display_path`, e.g. `.\util.rs`), while the caller's request is reduced
+/// to the bare FILE NAME. Comparing the two strings directly never matches
+/// for a nested file, so a file-scoped search silently dropped every file and
+/// reported zero matches.
+///
+/// The comparison is on the NORMALISED RELATIVE path, not on the file name:
+/// the root handed to ripgrep is the parent directory of the requested file
+/// and the glob is the bare name, and that glob is recursive - a directory
+/// holding `a.rs` and `sub/a.rs` matches both. Matching on the name alone
+/// would let the unrelated `sub/a.rs` through; matching the relative path
+/// keeps exactly the requested file.
+fn path_matches_exact_file(result_path: &str, exact_file: &str) -> bool {
+    fn normalize(path: &str) -> String {
+        let trimmed = path.trim();
+        let without_prefix = trimmed
+            .strip_prefix("./")
+            .or_else(|| trimmed.strip_prefix(".\\"))
+            .unwrap_or(trimmed);
+        without_prefix.replace('/', "\\")
+    }
+
+    normalize(result_path) == normalize(exact_file)
+}
+
 fn filter_grep_result_to_exact_file(
     mut result: GrepResult,
     exact_file: Option<&str>,
@@ -458,7 +540,9 @@ fn filter_grep_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.total_files = result.files.len();
     result.total_matches = result.files.iter().map(|file| file.matches.len()).sum();
     result
@@ -472,7 +556,9 @@ fn filter_find_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result
 }
 
@@ -484,7 +570,9 @@ fn filter_smart_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.summary.total_files = result.files.len();
     result.summary.total_regions = result.files.iter().map(|file| file.regions.len()).sum();
     result.summary.best_file = result.files.first().map(|file| file.path.clone());
@@ -515,3 +603,7 @@ fn is_match_all_glob(glob: &str) -> bool {
 #[cfg(test)]
 #[path = "agentgrep_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agentgrep_scope_tests.rs"]
+mod scope_tests;

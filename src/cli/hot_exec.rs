@@ -10,6 +10,7 @@ pub fn has_requested_action(run_result: &RunResult) -> bool {
         || run_result.rebuild_session.is_some()
         || run_result.update_session.is_some()
         || run_result.restart_session.is_some()
+        || run_result.hibernate_session.is_some()
 }
 
 pub fn execute_requested_action(run_result: &RunResult) -> Result<()> {
@@ -29,6 +30,13 @@ pub fn execute_requested_action(run_result: &RunResult) -> Result<()> {
         hot_restart(restart_session_id)?;
     }
 
+    if let Some(ref session_id) = run_result.hibernate_session {
+        let mut cmd = super::hibernate_wait::waiter_command(session_id)?;
+        crate::logging::info("Hibernating: exec into idle waiter");
+        let err = crate::platform::replace_process_reparented(&mut cmd);
+        return Err(anyhow::anyhow!("Failed to exec hibernation waiter: {err}"));
+    }
+
     Ok(())
 }
 
@@ -46,7 +54,7 @@ pub fn hot_restart(session_id: &str) -> Result<()> {
         cmd.arg("self-dev");
     }
     cmd.arg("--resume").arg(session_id).current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
 
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
@@ -66,7 +74,7 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
                 .arg("--no-update")
                 .env_remove("JCODE_MIGRATE_BINARY")
                 .current_dir(cwd);
-            let err = crate::platform::replace_process(&mut cmd);
+            let err = crate::platform::replace_process_reparented(&mut cmd);
             return Err(anyhow::anyhow!("Failed to exec {:?}: {}", binary_path, err));
         } else {
             crate::logging::warn(&format!(
@@ -118,7 +126,7 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
             // will repopulate the transcript after reconnect.
             .env("JCODE_RELOAD_FAST_START", "1")
             .current_dir(&cwd);
-        let err = crate::platform::replace_process(&mut cmd);
+        let err = crate::platform::replace_process_reparented(&mut cmd);
 
         if err.kind() == std::io::ErrorKind::NotFound && attempt < 2 {
             crate::logging::warn(&format!(
@@ -139,26 +147,26 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
 pub fn hot_update(session_id: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
-    update::print_centered("Checking for updates...");
+    super::output::print_centered("Checking for updates...");
 
     match update::check_for_update_blocking() {
         Ok(Some(release)) => {
             let current = jcode_build_meta::version();
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "Update available: {} -> {}",
                 current, release.tag_name
             ));
-            update::print_centered(&format!("Downloading {}...", release.tag_name));
+            super::output::print_centered(&format!("Downloading {}...", release.tag_name));
 
             match update::download_and_install_blocking_with_progress(&release, |progress| {
-                update::print_centered(&format!(
+                super::output::print_centered(&format!(
                     "{} {}",
                     release.tag_name,
                     update::format_download_progress_bar(progress)
                 ));
             }) {
                 Ok(path) => {
-                    update::print_centered(&format!("✓ Installed {}", release.tag_name));
+                    super::output::print_centered(&format!("✓ Installed {}", release.tag_name));
                     reload_server_after_update("installed update");
 
                     let is_selfdev = crate::cli::selfdev::client_selfdev_requested();
@@ -166,7 +174,10 @@ pub fn hot_update(session_id: &str) -> Result<()> {
                         .map(|(p, _)| p)
                         .unwrap_or(path);
 
-                    update::print_centered(&format!("Restarting with session {}...", session_id));
+                    super::output::print_centered(&format!(
+                        "Restarting with session {}...",
+                        session_id
+                    ));
 
                     crate::env::set_var("JCODE_RESUMING", "1");
 
@@ -178,11 +189,11 @@ pub fn hot_update(session_id: &str) -> Result<()> {
                         .arg(session_id)
                         .arg("--no-update")
                         .current_dir(&cwd);
-                    let err = crate::platform::replace_process(&mut cmd);
+                    let err = crate::platform::replace_process_reparented(&mut cmd);
                     return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
                 }
                 Err(e) => {
-                    update::print_centered(&format!(
+                    super::output::print_centered(&format!(
                         "✗ Download failed: {}",
                         update::summarize_update_error(&format!("{:#}", e))
                     ));
@@ -193,13 +204,13 @@ pub fn hot_update(session_id: &str) -> Result<()> {
             if repair_stale_shared_server_after_update_check() {
                 reload_server_after_update("repaired stale server target");
             }
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "Already up to date ({})",
                 jcode_build_meta::version()
             ));
         }
         Err(e) => {
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "✗ Update check failed: {}",
                 update::summarize_update_error(&format!("{:#}", e))
             ));
@@ -217,7 +228,7 @@ pub fn hot_update(session_id: &str) -> Result<()> {
         .arg(session_id)
         .arg("--no-update")
         .current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
 
@@ -246,7 +257,10 @@ fn claim_update_fetch_slot() -> bool {
         return false;
     }
     // Touch before fetching so a spawn burst collapses to ~one fetch.
-    std::fs::write(&marker, b"").is_ok()
+    // A non-empty payload is required: an empty write never reaches the
+    // filesystem, so the marker mtime would not move and every spawn
+    // would run `git fetch` again.
+    crate::storage::touch_stamp(&marker).is_ok()
 }
 
 /// `None` means this local checkout has no tracking branch, not a failed check.
@@ -388,7 +402,7 @@ pub fn run_auto_update() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let err =
-        crate::platform::replace_process(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
+        crate::platform::replace_process_reparented(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
 
     Err(anyhow::anyhow!(
         "Failed to exec new binary {:?}: {}",
@@ -399,32 +413,42 @@ pub fn run_auto_update() -> Result<()> {
 
 /// Explicit updates follow the configured channel for release and dev builds alike.
 /// Source rebuilds belong to self-dev and /rebuild, not the stable update path.
-pub fn run_update() -> Result<()> {
-    update::print_centered("Checking GitHub for latest release...");
-    match update::check_for_update_blocking() {
+pub fn run_update(channel: Option<&str>) -> Result<()> {
+    let explicit_channel = channel
+        .map(|value| {
+            crate::config::UpdateChannel::parse(value)
+                .ok_or_else(|| anyhow::anyhow!("Unknown update channel: {value}"))
+        })
+        .transpose()?;
+    if let Some(channel) = explicit_channel {
+        crate::config::Config::set_update_channel(channel)?;
+        super::output::print_centered(&format!("Update channel: {channel}"));
+    }
+    super::output::print_centered("Checking GitHub for latest release...");
+    match update::check_for_update_with_channel_blocking(explicit_channel) {
         Ok(Some(release)) => {
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "Downloading {} \u{2192} {}...",
                 jcode_build_meta::version(),
                 release.tag_name
             ));
             let _path =
                 update::download_and_install_blocking_with_progress(&release, |progress| {
-                    update::print_centered(&format!(
+                    super::output::print_centered(&format!(
                         "{} {}",
                         release.tag_name,
                         update::format_download_progress_bar(progress)
                     ));
                 })?;
-            update::print_centered(&format!("✅ Updated to {}", release.tag_name));
+            super::output::print_centered(&format!("✅ Updated to {}", release.tag_name));
             reload_server_after_update("installed update");
-            update::print_centered("Restart jcode to use the new version.");
+            super::output::print_centered("Restart jcode to use the new version.");
         }
         Ok(None) => {
             if repair_stale_shared_server_after_update_check() {
                 reload_server_after_update("repaired stale server target");
             }
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "Already up to date ({})",
                 jcode_build_meta::version()
             ));
@@ -449,7 +473,7 @@ fn repair_stale_shared_server_after_update_check() -> bool {
                 "update: repaired stale shared-server channel {:?} -> {}",
                 previous, repaired_to
             ));
-            update::print_centered(&format!(
+            super::output::print_centered(&format!(
                 "Repaired stale server reload target: {}",
                 repaired_to
             ));

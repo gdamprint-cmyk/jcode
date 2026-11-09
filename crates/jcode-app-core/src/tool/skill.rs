@@ -1,5 +1,6 @@
 //! Skill tool - load, list, reload, and read skills
 
+use super::skill_write;
 use super::{Tool, ToolContext, ToolOutput};
 use crate::skill::SkillRegistry;
 use anyhow::Result;
@@ -30,7 +31,8 @@ impl SkillTool {
 
 #[derive(Deserialize)]
 struct SkillInput {
-    /// Action to perform: load (default), list, reload, reload_all, read.
+    /// Action to perform: load (default), list, reload, reload_all, read,
+    /// create, patch, write_file.
     /// `list` shows both loaded skills and the jcode-endorsed catalog.
     #[serde(default = "default_action")]
     action: String,
@@ -38,10 +40,23 @@ struct SkillInput {
     #[serde(alias = "skill")]
     #[serde(default)]
     name: Option<String>,
+    /// Full SKILL.md body for `create` and `write_file`.
     /// Optional Claude-compatible Skill wrapper argument. The skill loader only
     /// needs to load the prompt, so args are currently accepted and ignored.
     #[serde(default)]
     args: Option<String>,
+    /// SKILL.md body for `create`, and the file body for `write_file`.
+    #[serde(default)]
+    content: Option<String>,
+    /// Support-file path relative to the skill directory, for `write_file`.
+    #[serde(default)]
+    file_path: Option<String>,
+    /// Exact text to replace, for `patch`.
+    #[serde(default)]
+    old_string: Option<String>,
+    /// Replacement text, for `patch`.
+    #[serde(default)]
+    new_string: Option<String>,
 }
 
 fn default_action() -> String {
@@ -65,12 +80,31 @@ impl Tool for SkillTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["load", "list", "reload", "reload_all", "read"],
-                    "description": "Action."
+                    "enum": [
+                        "load", "list", "reload", "reload_all", "read",
+                        "create", "patch", "write_file"
+                    ],
+                    "description": "Action. 'create' writes a new skill, 'patch' changes an existing one, 'write_file' adds a support file under it."
                 },
                 "name": {
                     "type": "string",
                     "description": "Skill name."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "SKILL.md body for 'create' (YAML frontmatter with name and description, then markdown), or the body of a support file for 'write_file'."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Path of the support file relative to the skill directory, for 'write_file' (e.g. 'references/detail.md')."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact existing text to replace, for 'patch'. Must match exactly once."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text, for 'patch'."
                 }
             }
         })
@@ -94,8 +128,24 @@ impl Tool for SkillTool {
                 self.read_skill(params.name, ctx.working_dir.as_deref())
                     .await
             }
+            "create" => {
+                self.write_skill(params, skill_write::SkillAction::Create, ctx.working_dir.as_deref())
+                    .await
+            }
+            "patch" => {
+                self.write_skill(params, skill_write::SkillAction::Patch, ctx.working_dir.as_deref())
+                    .await
+            }
+            "write_file" => {
+                self.write_skill(
+                    params,
+                    skill_write::SkillAction::WriteFile,
+                    ctx.working_dir.as_deref(),
+                )
+                .await
+            }
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', or 'read'.",
+                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', 'create', 'patch', or 'write_file'.",
                 params.action
             ))),
         }
@@ -143,6 +193,17 @@ impl SkillTool {
                 anyhow::anyhow!("Skill '{}' not found", name)
             }
         })?;
+
+        // A skill marked `disable-model-invocation` is user-invoked only. The
+        // user reaches it through its slash command, which does not go through
+        // this tool; a model-initiated load would be exactly what the flag
+        // forbids.
+        if skill.disable_model_invocation {
+            anyhow::bail!(
+                "Skill '{}' is user-invoked only (`disable-model-invocation: true`). Do not load it on your own initiative; the user activates it with `/{name}`.",
+                name
+            );
+        }
 
         let base_dir = skill
             .path
@@ -306,6 +367,56 @@ impl SkillTool {
             ))
             .with_title("Skills: Not found"))
         }
+    }
+
+    /// Write a skill, then make the change visible immediately.
+    ///
+    /// The registry is reloaded after the write so the new or patched skill is
+    /// loadable in this same session. Without the reload the agent would have
+    /// to author a skill and then discover it does not exist.
+    async fn write_skill(
+        &self,
+        params: SkillInput,
+        action: skill_write::SkillAction,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<ToolOutput> {
+        let name = params
+            .name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("'name' is required for this action"))?;
+        let request = skill_write::SkillWrite {
+            name,
+            content: params.content,
+            file_path: params.file_path,
+            old_string: params.old_string,
+            new_string: params.new_string,
+        };
+
+        let root = skill_write::skills_root(working_dir);
+        let outcome = match action {
+            skill_write::SkillAction::Create => skill_write::create_skill(&root, &request)?,
+            skill_write::SkillAction::Patch => skill_write::patch_skill(&root, &request)?,
+            skill_write::SkillAction::WriteFile => skill_write::write_skill_file(&root, &request)?,
+        };
+
+        // A new SKILL.md is only visible to the registry after a reload.
+        {
+            let mut registry = self.registry.write().await;
+            if let Err(error) = registry.reload_global() {
+                crate::logging::warn(&format!(
+                    "[tool:skill_manage] reload after write failed error={}",
+                    error
+                ));
+            }
+        }
+
+        Ok(ToolOutput::new(format!(
+            "{}\n\nPath: {}\n\nThe skill is live: load it with skill_manage action=load name={}.",
+            outcome.summary,
+            outcome.path.display(),
+            request.name.trim().trim_start_matches('/')
+        ))
+        .with_title(format!("Skills: {}", outcome.summary)))
     }
 }
 

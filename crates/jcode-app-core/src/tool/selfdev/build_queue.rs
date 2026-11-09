@@ -92,6 +92,7 @@ export -f cargo
     ) -> Result<TaskResult> {
         let mut cmd = tokio::process::Command::new(&command.program);
         cmd.args(&command.args)
+            .envs(command.env.iter().cloned())
             .current_dir(&repo_dir)
             .env(
                 "JCODE_DEV_CARGO_SCRIPT",
@@ -543,7 +544,7 @@ export -f cargo
                 "Completion delivery is disabled for this watcher."
             };
             let output = format!(
-                "Matching self-dev build already queued/running, so this request was attached instead of spawning a duplicate build.\n\n- Your request ID: `{}`\n- Watcher task ID: `{}`\n- Existing request: `{}`\n- Requested by: {}\n- Reason: {}\n- Target version: `{}`\n- Source fingerprint: `{}`\n\n{}",
+                "Matching self-dev build already queued/running, so this request was attached instead of spawning a duplicate build.\n\n- Your request ID: `{}`\n- Watcher task ID: `{}`\n- Existing request: `{}`\n- Requested by: {}\n- Reason: {}\n- Target version: `{}`\n- Source fingerprint: `{}`\n\n{}\n\n{}",
                 request_id,
                 info.task_id,
                 existing.request_id,
@@ -551,7 +552,8 @@ export -f cargo
                 existing.reason,
                 requested_source.version_label,
                 requested_source.fingerprint,
-                delivery
+                delivery,
+                crate::tool::BACKGROUND_WAIT_GUIDANCE
             );
 
             return Ok(ToolOutput::new(output).with_metadata(json!({
@@ -658,6 +660,8 @@ export -f cargo
             info.status_file.display(),
             delivery
         );
+        output.push_str("\n\n");
+        output.push_str(crate::tool::BACKGROUND_WAIT_GUIDANCE);
 
         if let Some(ref blocker) = blocker {
             output.push_str(&format!(
@@ -667,11 +671,7 @@ export -f cargo
             ));
         }
 
-        output.push_str(&format!(
-            "\n\nUse `bg action=\"wait\" task_id=\"{}\"` to wait for completion/checkpoints, `bg action=\"status\" task_id=\"{}\"` to check progress immediately, or `selfdev status` to inspect the build queue.\nAfter it finishes, use `selfdev reload` when you want to restart onto the new binary.",
-            info.task_id,
-            info.task_id
-        ));
+        output.push_str("\n\nAfter it finishes, use `selfdev reload` when you want to restart onto the new binary.");
 
         Ok(ToolOutput::new(output).with_metadata(json!({
             "background": true,
@@ -748,10 +748,9 @@ export -f cargo
 
         if !finished {
             return Ok(ToolOutput::new(format!(
-                "{}\n\nThe build is still running after waiting {}s, so the automatic reload was not started yet. Use `bg action=\"wait\" task_id=\"{}\"` to keep waiting, then `selfdev reload` once it finishes.",
+                "{}\n\nThe build is still running after waiting {}s, so the automatic reload was not started yet. After it finishes, use `selfdev reload`.",
                 build_output.output,
-                wait.as_secs(),
-                task_id
+                wait.as_secs()
             ))
             .with_metadata(json!({
                 "phase": "build",
@@ -879,6 +878,7 @@ export -f cargo
                 SelfDevTool::optimized_test_shell_command(&command),
             ],
             display: command.clone(),
+            env: Vec::new(),
         };
         let dedupe_key = format!(
             "test:{}:{}:{}",
@@ -975,10 +975,8 @@ export -f cargo
                 blocker.reason
             ));
         }
-        output.push_str(&format!(
-            "\n\nUse `bg action=\"wait\" task_id=\"{}\"` to wait for completion/checkpoints, or `selfdev status` to inspect the queue.",
-            info.task_id
-        ));
+        output.push_str("\n\n");
+        output.push_str(crate::tool::BACKGROUND_WAIT_GUIDANCE);
 
         Ok(ToolOutput::new(output).with_metadata(json!({
             "background": true,

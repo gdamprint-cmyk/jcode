@@ -80,6 +80,75 @@ fn detect_multiplexer_from_env() -> Multiplexer {
     )
 }
 
+/// Adjust a detected protocol for multiplexer limitations.
+///
+/// Zellij supports classic Kitty placements, not Unicode placeholders. Our
+/// custom renderer handles that distinction, so Kitty need not be downgraded
+/// unless explicitly disabled for an older Zellij build or configuration.
+pub(super) fn adjust_protocol_for_multiplexer(
+    protocol: ProtocolType,
+    multiplexer: Multiplexer,
+    zellij_kitty_enabled: bool,
+) -> ProtocolType {
+    if protocol == ProtocolType::Kitty
+        && multiplexer == Multiplexer::Zellij
+        && !zellij_kitty_enabled
+    {
+        ProtocolType::Halfblocks
+    } else {
+        protocol
+    }
+}
+
+fn zellij_kitty_images_enabled() -> bool {
+    std::env::var("JCODE_ZELLIJ_KITTY_IMAGES")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(true)
+}
+
+pub(super) fn use_classic_kitty() -> bool {
+    #[cfg(test)]
+    {
+        TEST_CLASSIC_KITTY.with(|value| value.get())
+    }
+    #[cfg(not(test))]
+    {
+        detect_multiplexer_from_env() == Multiplexer::Zellij
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TEST_CLASSIC_KITTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+pub(super) fn with_classic_kitty_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CLASSIC_KITTY.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_CLASSIC_KITTY.with(|value| value.replace(true)));
+    f()
+}
+
+fn apply_multiplexer_protocol_limits(picker: &mut Picker, multiplexer: Multiplexer) {
+    let current = picker.protocol_type();
+    let adjusted =
+        adjust_protocol_for_multiplexer(current, multiplexer, zellij_kitty_images_enabled());
+    if adjusted != current {
+        crate::log_info(&format!(
+            "Image protocol {:?} disabled inside {}; using {:?}. Unset JCODE_ZELLIJ_KITTY_IMAGES to use classic Kitty placements",
+            current,
+            multiplexer.label(),
+            adjusted
+        ));
+        picker.set_protocol_type(adjusted);
+    }
+}
+
 fn tmux_reports_native_sixel(sixel_support: &str, client_termfeatures: &str) -> bool {
     sixel_support.trim() == "1"
         && client_termfeatures
@@ -107,8 +176,8 @@ fn tmux_has_native_sixel() -> bool {
     let output = String::from_utf8_lossy(&output.stdout);
     let mut lines = output.lines();
     tmux_reports_native_sixel(
-        lines.next().unwrap_or_default(),
-        lines.next().unwrap_or_default(),
+        lines.next().unwrap_or(""),
+        lines.next().unwrap_or(""),
     )
 }
 
@@ -146,18 +215,21 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
 /// * `probe_override` is the parsed value of `JCODE_MERMAID_PICKER_PROBE`
 ///   (`Some(true)`/`Some(false)` when set explicitly, `None` otherwise) and
 ///   always wins so users can force either behavior.
-/// * When the override is absent, startup stays on the environment-based fast
-///   path. The upstream stdio probe can block for two seconds when a terminal
-///   does not answer, which made an optional image capability dominate the TUI
-///   critical path. Users behind multiplexers that hide the outer terminal can
-///   still opt into the authoritative probe with
-///   `JCODE_MERMAID_PICKER_PROBE=1`.
+/// * Without an override, Orca is probed automatically outside multiplexers:
+///   it answers capability queries, including when inline images are disabled,
+///   so the probe respects that setting. Other terminals keep the fast path because
+///   the upstream stdio probe can block for two seconds if they do not answer.
+///   Multiplexer users can opt into the probe with `JCODE_MERMAID_PICKER_PROBE=1`.
 pub(super) fn decide_picker_init_mode(
     probe_override: Option<bool>,
     _env_protocol: Option<ProtocolType>,
-    _multiplexer: Multiplexer,
+    multiplexer: Multiplexer,
+    term_program: Option<&str>,
 ) -> PickerInitMode {
-    if probe_override == Some(true) {
+    if probe_override.unwrap_or(
+        multiplexer == Multiplexer::None
+            && term_program.is_some_and(|program| program.eq_ignore_ascii_case("Orca")),
+    ) {
         PickerInitMode::Probe
     } else {
         PickerInitMode::Fast
@@ -216,6 +288,16 @@ pub(super) fn infer_protocol_from_env(
             return Some(ProtocolType::Iterm2);
         }
         return None;
+    }
+
+    // foot has built-in sixel support (since 1.2.0, no libsixel) and sets
+    // TERM=foot with no TERM_PROGRAM, so TERM is the signal. foot only
+    // advertises DA1 attribute 4 when sixel is enabled at runtime
+    // ([tweak].sixel=no) and compile time, so a disabled-sixel foot is still
+    // mis-detected here; JCODE_MERMAID_PICKER_PROBE=1 probes the real DA1 and
+    // overrides the protocol with the truthful answer.
+    if term.starts_with("foot") || term_program.contains("foot") {
+        return Some(ProtocolType::Sixel);
     }
 
     if term.contains("sixel") {
@@ -357,10 +439,10 @@ pub(crate) fn prewarm_svg_font_db_async() {
 }
 
 /// Initialize the global picker.
-/// By default jcode uses environment-based detection and never blocks startup
-/// on terminal capability responses. Set JCODE_MERMAID_PICKER_PROBE=1 to run an
-/// authoritative stdio probe when a multiplexer masks the outer terminal, or
-/// =0 to explicitly retain the fast path. Cache eviction runs once before image
+/// By default jcode probes Orca automatically outside multiplexers and uses
+/// environment-based detection elsewhere to avoid waiting on capability responses.
+/// Set JCODE_MERMAID_PICKER_PROBE=1 to force the authoritative stdio probe, or
+/// =0 to retain the fast path even in Orca. Cache eviction runs once before image
 /// rendering can begin so it cannot delete a file between materialization and
 /// in-memory cache registration.
 pub fn init_picker() {
@@ -376,7 +458,12 @@ pub fn init_picker() {
             .ok()
             .as_deref()
             .and_then(parse_env_bool);
-        let mode = decide_picker_init_mode(probe_override, env_protocol, multiplexer);
+        let mode = decide_picker_init_mode(
+            probe_override,
+            env_protocol,
+            multiplexer,
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        );
         crate::log_info(&format!(
             "Mermaid picker init: mode={:?} multiplexer={} env_protocol={:?} probe_override={:?}",
             mode,
@@ -384,10 +471,12 @@ pub fn init_picker() {
             env_protocol,
             probe_override
         ));
-        match mode {
-            PickerInitMode::Fast => Some(fast_picker()),
-            PickerInitMode::Probe => Some(probe_picker()),
-        }
+        let mut picker = match mode {
+            PickerInitMode::Fast => fast_picker(),
+            PickerInitMode::Probe => probe_picker(),
+        };
+        apply_multiplexer_protocol_limits(&mut picker, multiplexer);
+        Some(picker)
     });
     // Note: the SVG font-DB prewarm is intentionally NOT triggered here.
     // init_picker() runs on every TUI startup, and the font load is only
@@ -432,6 +521,29 @@ thread_local! {
     /// of relying on process-wide ordering.
     static IMAGE_PROTOCOL_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+    /// Scoped test override for *native* image-protocol availability. A picker
+    /// that fell back to the Unicode half-block renderer is still "available"
+    /// (it can draw), but it is not a native protocol, so the two signals are
+    /// pinned separately.
+    static NATIVE_IMAGE_PROTOCOL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with native image-protocol availability forced on/off on the current
+/// thread (or `None` to restore the real detection). Independent of
+/// [`with_image_protocol_override`], which pins whether any renderer exists.
+pub fn with_native_image_protocol_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
+    NATIVE_IMAGE_PROTOCOL_OVERRIDE.with(|cell| {
+        let prev = cell.replace(enabled);
+        struct Reset<'a>(&'a std::cell::Cell<Option<bool>>, Option<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _reset = Reset(cell, prev);
+        f()
+    })
 }
 
 /// Run `f` with image-protocol availability forced on/off on the current
@@ -473,6 +585,9 @@ fn protocol_supports_native_images(
 /// useful raster fallback, but Mermaid source is more useful than a degraded
 /// diagram on terminals without Kitty, iTerm2, or Sixel support.
 pub fn native_image_protocol_available() -> bool {
+    if let Some(enabled) = NATIVE_IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
     if let Some(enabled) = IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
         return enabled;
     }
@@ -508,6 +623,51 @@ pub fn is_video_export_mode() -> bool {
 pub fn get_cached_png(hash: u64) -> Option<(PathBuf, u32, u32)> {
     let diagram = get_cached_diagram(hash, None)?;
     Some((diagram.path, diagram.width, diagram.height))
+}
+
+/// Register a local markdown image, rasterizing SVGs for terminal protocols.
+/// SVG cache keys include the source bytes so edited graphs never reuse old pixels.
+pub fn register_markdown_image(path: &Path) -> Option<u64> {
+    if !path.extension()?.eq_ignore_ascii_case("svg") {
+        let (width, height) = image::image_dimensions(path).map_or_else(|error| { crate::log_info(&format!("Markdown image dimensions unavailable: {error}")); None }, Some)?;
+        return Some(register_external_image(path, width, height));
+    }
+
+    let bytes = fs::read(path).map_or_else(|error| { crate::log_info(&format!("Markdown image read failed: {error}")); None }, Some)?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let content_hash = hasher.finish();
+    let output = RENDER_CACHE
+        .lock()
+        .map_or_else(|error| { crate::log_info(&format!("Markdown image cache lock failed: {error}")); None }, Some)?
+        .cache_dir
+        .join(format!("{content_hash:016x}_external_svg.png"));
+    if !output.exists() {
+        // Do not resolve external resources in document-supplied SVGs.
+        let options = usvg::Options {
+            fontdb: SVG_FONT_DB.clone(),
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_string: Box::new(|_, _| None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tree = usvg::Tree::from_data(&bytes, &options).map_or_else(|error| { crate::log_info(&format!("Markdown SVG parse failed: {error}")); None }, Some)?;
+        let size = tree.size().to_int_size();
+        // Bound allocations for malformed or unexpectedly large documents.
+        if u64::from(size.width()) * u64::from(size.height()) > 32_000_000 {
+            return None;
+        }
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::default(),
+            &mut pixmap.as_mut(),
+        );
+        pixmap.save_png(&output).map_or_else(|error| { crate::log_info(&format!("Markdown SVG cache write failed: {error}")); None }, Some)?;
+    }
+    let (width, height) = image::image_dimensions(&output).map_or_else(|error| { crate::log_info(&format!("Markdown SVG dimensions unavailable: {error}")); None }, Some)?;
+    Some(register_external_image(&output, width, height))
 }
 
 /// Register an external image file (e.g. from file_read) in the render cache
@@ -773,6 +933,15 @@ mod tests {
             infer_protocol_from_env(Some("xterm-sixel"), None, None, None),
             Some(ProtocolType::Sixel)
         );
+        assert_eq!(
+            infer_protocol_from_env(Some("foot"), Some("foot"), None, None),
+            Some(ProtocolType::Sixel)
+        );
+        // foot sets TERM=foot but no TERM_PROGRAM.
+        assert_eq!(
+            infer_protocol_from_env(Some("foot"), None, None, None),
+            Some(ProtocolType::Sixel)
+        );
     }
 
     #[test]
@@ -785,10 +954,6 @@ mod tests {
                 Some("stale-kitty-window")
             ),
             Some(ProtocolType::Iterm2)
-        );
-        assert_eq!(
-            infer_protocol_from_env(Some("foot"), Some("foot"), None, None),
-            None
         );
         assert_eq!(
             infer_protocol_from_env(Some("xterm-256color"), Some("konsole"), None, None),
@@ -878,36 +1043,125 @@ mod tests {
     }
 
     #[test]
+    fn zellij_preserves_classic_kitty_unless_explicitly_disabled() {
+        assert_eq!(
+            adjust_protocol_for_multiplexer(ProtocolType::Kitty, Multiplexer::Zellij, false),
+            ProtocolType::Halfblocks
+        );
+        assert_eq!(
+            adjust_protocol_for_multiplexer(ProtocolType::Kitty, Multiplexer::Zellij, true),
+            ProtocolType::Kitty
+        );
+        // Zellij's Sixel passthrough and other multiplexers are untouched.
+        assert_eq!(
+            adjust_protocol_for_multiplexer(ProtocolType::Sixel, Multiplexer::Zellij, false),
+            ProtocolType::Sixel
+        );
+        for mux in [Multiplexer::None, Multiplexer::Tmux, Multiplexer::Herdr] {
+            assert_eq!(
+                adjust_protocol_for_multiplexer(ProtocolType::Kitty, mux, false),
+                ProtocolType::Kitty
+            );
+        }
+    }
+
+    #[test]
     fn decide_mode_respects_explicit_override() {
         // Force-on always probes, even when env already detected a protocol.
         assert_eq!(
-            decide_picker_init_mode(Some(true), Some(ProtocolType::Kitty), Multiplexer::None),
+            decide_picker_init_mode(
+                Some(true),
+                Some(ProtocolType::Kitty),
+                Multiplexer::None,
+                None
+            ),
             PickerInitMode::Probe
         );
         // Force-off never probes, even on an env miss inside a multiplexer.
         assert_eq!(
-            decide_picker_init_mode(Some(false), None, Multiplexer::Herdr),
+            decide_picker_init_mode(Some(false), None, Multiplexer::Herdr, None),
             PickerInitMode::Fast
         );
+        for term_program in [None, Some("Orca"), Some("kitty"), Some("xterm")] {
+            assert_eq!(
+                decide_picker_init_mode(Some(true), None, Multiplexer::None, term_program),
+                PickerInitMode::Probe,
+                "force-on for {term_program:?}"
+            );
+            assert_eq!(
+                decide_picker_init_mode(Some(false), None, Multiplexer::None, term_program),
+                PickerInitMode::Fast,
+                "force-off for {term_program:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_mode_probes_orca_case_insensitively() {
+        for term_program in ["Orca", "orca", "ORCA", "oRcA"] {
+            assert_eq!(
+                decide_picker_init_mode(None, None, Multiplexer::None, Some(term_program)),
+                PickerInitMode::Probe,
+                "{term_program}"
+            );
+        }
     }
 
     #[test]
     fn decide_mode_defaults_to_fast_path() {
         // Env already identified a graphics terminal: stay fast.
         assert_eq!(
-            decide_picker_init_mode(None, Some(ProtocolType::Kitty), Multiplexer::None),
+            decide_picker_init_mode(None, Some(ProtocolType::Kitty), Multiplexer::None, None),
             PickerInitMode::Fast
         );
         // An env miss must not turn an optional capability query into a
         // two-second startup stall. Multiplexer users can opt in explicitly.
         assert_eq!(
-            decide_picker_init_mode(None, None, Multiplexer::Herdr),
+            decide_picker_init_mode(None, None, Multiplexer::Herdr, None),
             PickerInitMode::Fast
         );
         assert_eq!(
-            decide_picker_init_mode(None, None, Multiplexer::None),
+            decide_picker_init_mode(None, None, Multiplexer::None, None),
             PickerInitMode::Fast
         );
+        for term_program in [
+            None,
+            Some(""),
+            Some("kitty"),
+            Some("ghostty"),
+            Some("WezTerm"),
+            Some("iTerm.app"),
+            Some("foot"),
+            Some("xterm"),
+            Some("Orca Nightly"),
+            Some("not-orca"),
+            Some(" Orca "),
+        ] {
+            assert_eq!(
+                decide_picker_init_mode(None, None, Multiplexer::None, term_program),
+                PickerInitMode::Fast,
+                "{term_program:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_mode_keeps_orca_multiplexers_fast_unless_forced() {
+        for multiplexer in [
+            Multiplexer::Tmux,
+            Multiplexer::Screen,
+            Multiplexer::Herdr,
+            Multiplexer::Zellij,
+        ] {
+            assert_eq!(
+                decide_picker_init_mode(None, None, multiplexer, Some("Orca")),
+                PickerInitMode::Fast
+            );
+            assert_eq!(
+                decide_picker_init_mode(Some(true), None, multiplexer, Some("Orca")),
+                PickerInitMode::Probe
+            );
+        }
     }
 
     #[test]

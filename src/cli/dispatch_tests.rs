@@ -106,6 +106,44 @@ impl Drop for ReloadTestEnv {
     }
 }
 
+/// The shared daemon must keep its plain `serve` argv; an owned server must
+/// ask for the temporary lifecycle and name its owner, or the ephemeral server
+/// a headless `run` starts would outlive the run (#1748).
+#[test]
+fn owned_server_argv_requests_the_temporary_lifecycle() {
+    assert_eq!(
+        serve_subcommand_args(ServerLifetime::Shared, 4321),
+        vec!["serve".to_string()]
+    );
+    assert_eq!(
+        serve_subcommand_args(ServerLifetime::OwnedByThisProcess, 4321),
+        vec![
+            "serve".to_string(),
+            "--temporary-server".to_string(),
+            "--owner-pid".to_string(),
+            "4321".to_string(),
+        ]
+    );
+
+    // The argv must parse back into the flags `serve` actually reads.
+    let argv = std::iter::once("jcode".to_string())
+        .chain(serve_subcommand_args(
+            ServerLifetime::OwnedByThisProcess,
+            4321,
+        ))
+        .collect::<Vec<_>>();
+    let parsed = <crate::cli::args::Args as clap::Parser>::try_parse_from(argv)
+        .expect("parse owned serve argv");
+    assert!(matches!(
+        parsed.command,
+        Some(Command::Serve {
+            temporary_server: true,
+            owner_pid: Some(4321),
+            ..
+        })
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn spawn_lock_serializes_shared_server_bootstrap() {
@@ -313,4 +351,85 @@ async fn server_is_running_at_treats_live_listener_as_running_without_pong() {
         server_is_running_at(&socket_path).await,
         "a live listener should prevent duplicate server spawns even if ping is slow or absent"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_lock_creates_missing_runtime_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("missing/nested/jcode.sock.spawning");
+    assert!(!path.parent().unwrap().exists());
+
+    let guard = try_acquire_spawn_lock(&path)
+        .expect("create runtime directory and acquire lock")
+        .expect("first lock should succeed");
+    assert!(path.is_file());
+    assert!(try_acquire_spawn_lock(&path).unwrap().is_none());
+
+    drop(guard);
+    assert!(!path.exists());
+    assert!(path.parent().unwrap().is_dir());
+}
+
+#[test]
+fn provider_profile_transport_follows_profile_type() {
+    // Issue #1560: --provider-profile forced OpenAI-compatible for every profile.
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[providers.fcc-anthropic]
+type = "anthropic-compatible"
+base_url = "http://127.0.0.1:8082/v1"
+auth = "none"
+
+[providers.local-openai]
+type = "openai-compatible"
+base_url = "http://127.0.0.1:8000/v1"
+auth = "none"
+"#,
+    )
+    .expect("valid config");
+
+    assert!(matches!(
+        provider_choice_for_named_profile_in("fcc-anthropic", &config),
+        ProviderChoice::Auto
+    ));
+    assert!(matches!(
+        provider_choice_for_named_profile_in("local-openai", &config),
+        ProviderChoice::OpenaiCompatible
+    ));
+    assert!(matches!(
+        provider_choice_for_named_profile_in("missing", &config),
+        ProviderChoice::OpenaiCompatible
+    ));
+}
+
+/// The regression this guards: a session opened OUTSIDE the checkout used to
+/// run as a normal session, because the decision was `is_jcode_repo(cwd)`
+/// only. A checkout discoverable from anywhere must still yield self-dev.
+#[test]
+fn selfdev_is_enabled_when_a_checkout_is_available_outside_the_cwd() {
+    // Session opened in an unrelated project directory, checkout found
+    // elsewhere on the host.
+    assert!(should_enable_selfdev(false, true, false, false));
+
+    // Session opened inside the checkout: still self-dev.
+    assert!(should_enable_selfdev(true, true, false, false));
+
+    // Session opened inside the checkout but the host has no other checkout
+    // discovery path: still self-dev (the original behaviour).
+    assert!(should_enable_selfdev(true, false, false, false));
+}
+
+#[test]
+fn selfdev_is_not_enabled_without_a_checkout_or_when_explicitly_disabled() {
+    // No checkout anywhere: normal session.
+    assert!(!should_enable_selfdev(false, false, false, false));
+
+    // Explicit opt-out wins even with a checkout available.
+    assert!(!should_enable_selfdev(true, true, false, true));
+    assert!(!should_enable_selfdev(false, true, false, true));
+
+    // Already self-dev: do not re-announce or re-set.
+    assert!(!should_enable_selfdev(true, true, true, false));
+    assert!(!should_enable_selfdev(false, true, true, false));
 }

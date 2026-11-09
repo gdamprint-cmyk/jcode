@@ -169,6 +169,29 @@ pub fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     build_responses_input_with_logger(messages, |_, _| {})
 }
 
+/// Replace stored hosted-search `web_search_call` items with their labelled
+/// text summary. Used when the request does not declare the hosted
+/// `web_search` tool (native search off, Codex model, custom gateway, Copilot,
+/// compaction), so the request never carries hosted-tool history it does not
+/// declare.
+pub fn downgrade_web_search_calls(input: &mut [Value]) {
+    use jcode_message_types::provider_native::{
+        PROVIDER_NATIVE_OPENAI, provider_native_text_fallback,
+    };
+    for item in input.iter_mut() {
+        if item.get("type").and_then(Value::as_str) != Some("web_search_call") {
+            continue;
+        }
+        let text = provider_native_text_fallback(PROVIDER_NATIVE_OPENAI, item, None)
+            .unwrap_or_else(|| "[web_search] (earlier provider-side search)".to_string());
+        *item = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }]
+        });
+    }
+}
+
 pub fn build_responses_input_with_logger(
     messages: &[ChatMessage],
     mut logger: impl FnMut(OpenAiRequestLogLevel, &str),
@@ -294,6 +317,24 @@ pub fn build_responses_input_with_logger(
             Role::Assistant => {
                 for block in &msg.content {
                     match block {
+                        ContentBlock::ProviderNative { provider, item } => {
+                            use jcode_message_types::provider_native;
+                            let is_web_search_call = provider
+                                == provider_native::PROVIDER_NATIVE_OPENAI
+                                && item.get("type").and_then(Value::as_str)
+                                    == Some("web_search_call");
+                            if is_web_search_call {
+                                items.push(item.clone());
+                            } else if let Some(text) =
+                                provider_native::provider_native_text_fallback(provider, item, None)
+                            {
+                                items.push(serde_json::json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{ "type": "output_text", "text": text }]
+                                }));
+                            }
+                        }
                         ContentBlock::Text { text, .. } => {
                             items.push(serde_json::json!({
                                 "type": "message",
@@ -530,6 +571,7 @@ pub fn build_responses_input_with_logger(
 
     let mut ordered: Vec<Value> = Vec::with_capacity(normalized.len());
     let mut used_outputs: HashSet<String> = HashSet::new();
+    let mut relocated_outputs: HashSet<String> = HashSet::new();
     let mut injected_ordered = 0usize;
     let mut dropped_duplicate_outputs = 0usize;
     let mut rewritten_orphans = 0usize;
@@ -547,7 +589,9 @@ pub fn build_responses_input_with_logger(
             if let Some(call_id) = call_id {
                 if let Some(output_item) = output_map.get(&call_id) {
                     ordered.push(output_item.clone());
-                    used_outputs.insert(call_id);
+                    if used_outputs.insert(call_id.clone()) {
+                        relocated_outputs.insert(call_id);
+                    }
                 } else {
                     injected_ordered += 1;
                     ordered.push(serde_json::json!({
@@ -565,7 +609,11 @@ pub fn build_responses_input_with_logger(
             if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str())
                 && used_outputs.contains(call_id)
             {
-                dropped_duplicate_outputs += 1;
+                // The first original was already emitted next to its call.
+                // Only additional originals are actual duplicate outputs.
+                if !relocated_outputs.remove(call_id) {
+                    dropped_duplicate_outputs += 1;
+                }
                 continue;
             }
             if let Some(message_item) = orphan_tool_output_to_user_message(&item, &missing_output) {
@@ -628,6 +676,83 @@ mod tests {
     use super::*;
     use jcode_message_types::ToolDefinition;
     use serde_json::json;
+
+    fn tool_call(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read".into(),
+                input: json!({}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn relocated_outputs_are_not_logged_as_duplicates() {
+        for messages in [
+            vec![tool_call("a"), ChatMessage::tool_result("a", "real", false)],
+            vec![tool_call("a")],
+            vec![ChatMessage::tool_result("a", "real", false), tool_call("a")],
+            vec![
+                tool_call("a"),
+                tool_call("b"),
+                ChatMessage::tool_result("b", "second", false),
+                ChatMessage::tool_result("a", "first", false),
+            ],
+        ] {
+            let mut logs = Vec::new();
+            let items = build_responses_input_with_logger(&messages, |_, message| {
+                logs.push(message.to_string());
+            });
+            assert!(
+                !logs.iter().any(|log| log.contains("duplicate tool output")),
+                "{logs:?}"
+            );
+            let calls = messages
+                .iter()
+                .filter(|msg| msg.role == Role::Assistant)
+                .count();
+            assert_eq!(items.len(), calls * 2);
+            for pair in items.chunks_exact(2) {
+                assert_eq!(pair[0]["type"], "function_call");
+                assert_eq!(pair[1]["type"], "function_call_output");
+                assert_eq!(pair[0]["call_id"], pair[1]["call_id"]);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_duplicate_outputs_still_log_and_preserve_selected_output() {
+        // Distinct persisted IDs can collide after OpenAI ID sanitization.
+        let messages = vec![
+            tool_call("a.b"),
+            ChatMessage::tool_result("a.b", "first", false),
+            tool_call("a_b"),
+            ChatMessage::tool_result("a_b", "second", false),
+        ];
+        let mut logs = Vec::new();
+        let items = build_responses_input_with_logger(&messages, |_, message| {
+            logs.push(message.to_string());
+        });
+        assert!(
+            logs.iter()
+                .any(|log| log == "[openai] Dropped 1 duplicate tool output(s) during re-ordering"),
+            "{logs:?}"
+        );
+        assert_eq!(
+            items,
+            vec![
+                json!({"type":"function_call", "name":"read", "arguments":"{}", "call_id":"a_b"}),
+                json!({"type":"function_call_output", "call_id":"a_b", "output":"first"}),
+                json!({"type":"function_call", "name":"read", "arguments":"{}", "call_id":"a_b"}),
+                json!({"type":"function_call_output", "call_id":"a_b", "output":"first"}),
+            ]
+        );
+    }
 
     #[test]
     fn build_tools_flattens_allof_schema_for_openai() {
@@ -721,6 +846,40 @@ mod tests {
             items[0]["summary"],
             json!([{ "type": "summary_text", "text": "Checked constraints." }])
         );
+    }
+
+    #[test]
+    fn build_responses_input_replays_web_search_calls_and_downgrades_foreign_items() {
+        let web_search_call = json!({
+            "type": "web_search_call", "id": "ws_1", "status": "completed",
+            "action": {"type": "search", "query": "jcode"}
+        });
+        let messages = vec![ChatMessage {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ProviderNative {
+                    provider: "openai".to_string(),
+                    item: web_search_call.clone(),
+                },
+                ContentBlock::ProviderNative {
+                    provider: "anthropic".to_string(),
+                    item: json!({"type": "web_search_tool_result", "tool_use_id": "s", "content": [
+                        {"type": "web_search_result", "url": "https://a.example", "title": "A", "encrypted_content": "ENC"}
+                    ]}),
+                },
+            ],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+
+        let items = build_responses_input(&messages);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], web_search_call);
+        assert_eq!(items[1]["type"], json!("message"));
+        let text = items[1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("https://a.example"), "{text}");
+        assert!(!text.contains("ENC"));
     }
 
     /// Integration-level regression test for issue #687: the payload actually

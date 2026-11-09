@@ -99,7 +99,9 @@ fn session_picker_enter_queues_current_terminal_resume_and_closes_overlay() {
 
     assert!(app.session_picker_overlay.is_none());
     assert_eq!(
-        app.workspace_client.take_pending_resume_session().as_deref(),
+        app.workspace_client
+            .take_pending_resume_session()
+            .as_deref(),
         Some("session_here_123")
     );
 }
@@ -117,6 +119,53 @@ fn slash_resume_opens_session_picker_overlay_locally() {
     assert_eq!(app.session_picker_mode, SessionPickerMode::Resume);
     assert!(app.pending_session_picker_load.is_some());
     assert!(app.input.is_empty());
+}
+
+#[test]
+fn session_picker_cached_update_keeps_fresh_refresh_pending() {
+    use crate::tui::session_picker::{SessionListUpdate, SessionPicker};
+    let mut app = create_test_app();
+    app.session_picker_mode = SessionPickerMode::Resume;
+    app.session_picker_overlay = Some(RefCell::new(SessionPicker::loading()));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.pending_session_picker_load = Some(PendingSessionPickerLoad { receiver });
+
+    sender
+        .send(SessionListUpdate::Cached((vec![], vec![])))
+        .unwrap();
+    assert!(app.poll_session_picker_load());
+    assert!(app.session_picker_overlay.is_some());
+    assert!(app.pending_session_picker_load.is_some());
+    assert!(!app.poll_session_picker_load());
+
+    sender
+        .send(SessionListUpdate::Fresh(Ok((vec![], vec![]))))
+        .unwrap();
+    assert!(app.poll_session_picker_load());
+    assert!(app.session_picker_overlay.is_some());
+    assert!(app.pending_session_picker_load.is_none());
+}
+
+#[test]
+fn session_picker_closed_overlay_is_not_reopened_by_cached_or_fresh_results() {
+    use crate::tui::session_picker::SessionListUpdate;
+    let mut app = create_test_app();
+    app.session_picker_mode = SessionPickerMode::Resume;
+    app.session_picker_overlay = None;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.pending_session_picker_load = Some(PendingSessionPickerLoad { receiver });
+
+    sender
+        .send(SessionListUpdate::Cached((vec![], vec![])))
+        .unwrap();
+    assert!(!app.poll_session_picker_load());
+    assert!(app.session_picker_overlay.is_none());
+    sender
+        .send(SessionListUpdate::Fresh(Ok((vec![], vec![]))))
+        .unwrap();
+    assert!(!app.poll_session_picker_load());
+    assert!(app.session_picker_overlay.is_none());
+    assert!(app.pending_session_picker_load.is_none());
 }
 
 #[test]
@@ -326,10 +375,7 @@ fn slash_provider_test_coverage_with_args_shows_provider_detail() {
             .starts_with("# Provider test coverage")
     );
     assert!(app.model_status_content.contains("Provider: fpt"));
-    assert!(
-        app.model_status_content
-            .contains("Model: FPT.AI-KIE-v1.7")
-    );
+    assert!(app.model_status_content.contains("Model: FPT.AI-KIE-v1.7"));
 }
 
 #[test]
@@ -371,6 +417,8 @@ fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
             content: format!("prompt line {i}"),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
         messages.push(PreviewMessage {
@@ -378,6 +426,8 @@ fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
             content: format!("assistant reply {i}"),
             tool_calls: Vec::new(),
             tool_data: None,
+            duration_secs: None,
+            title: None,
             timestamp: None,
         });
     }
@@ -440,12 +490,12 @@ fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
         "long preview should auto-scroll to the bottom on first render"
     );
 
-    // A wheel up over the preview pane (right ~60% of width) routes through the
+    // A wheel up over the preview pane (left ~60% of width) routes through the
     // shared mouse-scroll momentum (enqueue + drain) instead of an instant jump,
     // and actually moves the preview offset.
     let scroll_only = app.handle_mouse_event(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::ScrollUp,
-        column: 90,
+        column: 20,
         row: 10,
         modifiers: crossterm::event::KeyModifiers::empty(),
     });
@@ -582,23 +632,7 @@ fn test_help_topic_shows_commit_push_command_details() {
     assert!(msg.content.contains("push"));
 }
 
-#[test]
-fn test_fast_release_command_starts_synthetic_user_turn() {
-    let mut app = create_test_app();
-    app.input = "/fast-release".to_string();
-    app.submit_input();
-
-    assert!(app.is_processing);
-    assert!(app.pending_turn);
-    let notice = app
-        .display_messages()
-        .last()
-        .expect("missing launch notice");
-    assert_eq!(notice.role, "system");
-    assert!(notice
-        .content
-        .contains("Starting logical commits + push + fast local release"));
-}
+include!("release_commands.rs");
 
 #[test]
 fn test_triage_command_starts_synthetic_user_turn() {
@@ -621,153 +655,6 @@ fn test_triage_command_includes_focus_in_prompt() {
     let prompt = crate::tui::app::commands::build_triage_prompt(" only crash reports");
     assert!(prompt.contains("Triage the open GitHub issues"));
     assert!(prompt.contains("Additional focus from the user: only crash reports"));
-}
-
-#[test]
-fn test_cut_release_alias_starts_fast_release_turn() {
-    let mut app = create_test_app();
-    app.input = "/cut-release".to_string();
-    app.submit_input();
-
-    assert!(app.is_processing);
-    assert!(app.pending_turn);
-    let notice = app
-        .display_messages()
-        .last()
-        .expect("missing launch notice");
-    assert!(notice.content.contains("fast local release"));
-}
-
-#[test]
-fn test_fast_release_prompt_uses_selfdev_cache() {
-    let fast_prompt = super::commands::build_fast_release_prompt();
-    assert!(fast_prompt.contains("quick-release.sh --prepare-fast"));
-    assert!(fast_prompt.contains("quick-release.sh --fast-local"));
-    assert!(fast_prompt.contains("warm target/selfdev cache"));
-    assert!(fast_prompt.contains("Do not run the separate local macOS cross-build"));
-    let prepare = fast_prompt.find("--prepare-fast").unwrap();
-    let bump = fast_prompt.find("Bump the version").unwrap();
-    assert!(prepare < bump);
-}
-
-#[test]
-fn test_fast_macos_release_command_uses_prepared_cross_build() {
-    let mut app = create_test_app();
-    app.input = "/fast-macos-release".to_string();
-    app.submit_input();
-
-    assert!(app.is_processing);
-    assert!(app.pending_turn);
-    let notice = app
-        .display_messages()
-        .last()
-        .expect("missing launch notice");
-    assert!(notice.content.contains("fast macOS release"));
-
-    let prompt = super::commands::build_fast_macos_release_prompt();
-    assert!(prompt.contains("quick-release.sh --prepare-fast-macos"));
-    assert!(prompt.contains("quick-release.sh --fast-macos-local"));
-    assert!(prompt.contains("macOS arm64"));
-    let prepare = prompt.find("--prepare-fast-macos").unwrap();
-    let bump = prompt.find("Bump the version").unwrap();
-    assert!(prepare < bump);
-}
-
-#[test]
-fn test_help_topic_shows_fast_macos_release_details() {
-    let mut app = create_test_app();
-    app.input = "/help fast-macos-release".to_string();
-    app.submit_input();
-
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing help response");
-    assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("/fast-macos-release"));
-    assert!(msg.content.contains("--prepare-fast-macos"));
-    assert!(msg.content.contains("--fast-macos-local"));
-    assert!(msg.content.contains("osxcross"));
-}
-
-#[test]
-fn test_remote_release_command_uses_tag_only_ci_path() {
-    let mut app = create_test_app();
-    app.input = "/remote-release".to_string();
-    app.submit_input();
-
-    assert!(app.is_processing);
-    assert!(app.pending_turn);
-    let notice = app
-        .display_messages()
-        .last()
-        .expect("missing launch notice");
-    assert_eq!(notice.role, "system");
-    assert!(notice
-        .content
-        .contains("Starting logical commits + push + remote release"));
-
-    let prompt = super::commands::build_remote_release_prompt();
-    assert!(prompt.contains("quick-release.sh --remote"));
-    assert!(prompt.contains("without any local build"));
-    assert!(prompt.contains("publication gated"));
-    assert!(prompt.contains("Only use the following Jcode-specific procedure"));
-    assert!(prompt.contains("repository's own established release conventions"));
-    assert!(prompt.contains("Do not assume the project uses Cargo"));
-    assert!(prompt.contains("tag-triggered or workflow-dispatch CI release"));
-}
-
-#[test]
-fn test_commit_push_release_alias_starts_synthetic_user_turn() {
-    let mut app = create_test_app();
-    app.input = "/commit-push-release".to_string();
-    app.submit_input();
-
-    assert!(app.is_processing);
-    assert!(app.pending_turn);
-    let notice = app
-        .display_messages()
-        .last()
-        .expect("missing launch notice");
-    assert_eq!(notice.role, "system");
-    assert!(notice
-        .content
-        .contains("Starting logical commits + push + fast local release"));
-}
-
-#[test]
-fn test_help_topic_shows_cut_release_command_details() {
-    let mut app = create_test_app();
-    app.input = "/help cut-release".to_string();
-    app.submit_input();
-
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing help response");
-    assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("/fast-release"));
-    assert!(msg.content.contains("--prepare-fast"));
-    assert!(msg.content.contains("--fast-local"));
-    assert!(msg.content.contains("target/selfdev"));
-    assert!(msg.content.contains("compatibility alias"));
-}
-
-#[test]
-fn test_help_topic_shows_remote_release_command_details() {
-    let mut app = create_test_app();
-    app.input = "/help remote-release".to_string();
-    app.submit_input();
-
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing help response");
-    assert_eq!(msg.role, "system");
-    assert!(msg.content.contains("/remote-release"));
-    assert!(msg.content.contains("--remote"));
-    assert!(msg.content.contains("without running any local build"));
-    assert!(msg.content.contains("remains a draft"));
 }
 
 #[test]
@@ -918,6 +805,44 @@ fn test_maybe_show_catchup_after_history_adds_brief_page_and_marks_seen() {
             persisted.updated_at,
             &persisted.status
         ));
+    });
+}
+
+#[test]
+fn test_catchup_brief_reveals_side_panel_the_user_hid() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.side_panel = test_side_panel_snapshot("plan", "Plan");
+        // The user dismissed the panel before opening Catch Up.
+        app.dismiss_side_panel();
+        assert!(app.side_panel.focused_page_id.is_none());
+
+        let mut target = Session::create(None, Some("hidden catchup".to_string()));
+        target.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "Check the release notes.".to_string(),
+                cache_control: None,
+            }],
+        );
+        target.mark_closed();
+        target.save().expect("save catchup session");
+        let target_id = target.id.clone();
+
+        app.begin_in_flight_catchup_resume(PendingCatchupResume {
+            target_session_id: target_id.clone(),
+            source_session_id: Some(app.session.id.clone()),
+            queue_position: None,
+            show_brief: true,
+        });
+        app.maybe_show_catchup_after_history(&target_id);
+
+        assert_eq!(
+            app.side_panel.focused_page_id.as_deref(),
+            Some("catchup"),
+            "an explicit Catch Up must show its brief"
+        );
+        assert!(!app.side_panel_user_hidden);
     });
 }
 
@@ -1199,10 +1124,7 @@ fn test_fork_command_with_prompt_forks_session() {
     app.input = "/fork try the other approach".to_string();
     app.submit_input();
 
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing fork message");
+    let msg = app.display_messages().last().expect("missing fork message");
     assert_eq!(msg.role, "system");
     assert!(msg.content.contains("created for the next prompt"));
     let session_id = msg
@@ -1235,10 +1157,7 @@ fn test_fork_command_without_prompt_forks_idle_session() {
     app.input = "/fork".to_string();
     app.submit_input();
 
-    let msg = app
-        .display_messages()
-        .last()
-        .expect("missing fork message");
+    let msg = app.display_messages().last().expect("missing fork message");
     assert_eq!(msg.role, "system");
     assert!(msg.content.contains("✂ Fork →"));
     let session_id = msg
@@ -1517,7 +1436,9 @@ fn test_observe_updates_latest_tool_context_only() {
         id: "tool_1".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs", "start_line": 1, "end_line": 10}),
-        intent: None, thought_signature: None, };
+        intent: None,
+        thought_signature: None,
+    };
     app.observe_tool_call(&tool_call);
 
     let page = app.side_panel.focused_page().expect("missing observe page");
@@ -1556,7 +1477,9 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_read".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
-        intent: None, thought_signature: None, };
+        intent: None,
+        thought_signature: None,
+    };
     app.observe_tool_result(&read_tool, "fn main() {}", false, Some("read"));
     let before = app
         .side_panel
@@ -1569,7 +1492,9 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_side_panel".to_string(),
         name: "side_panel".to_string(),
         input: serde_json::json!({"action": "write", "page_id": "plan"}),
-        intent: None, thought_signature: None, };
+        intent: None,
+        thought_signature: None,
+    };
     app.observe_tool_call(&noise_tool);
     app.observe_tool_result(&noise_tool, "ok", false, Some("side_panel"));
 
@@ -1621,6 +1546,42 @@ fn test_goals_show_command_focuses_goal_page() {
 }
 
 #[test]
+fn test_initiatives_commands_reopen_a_closed_side_panel() {
+    with_temp_jcode_home(|| {
+        let project = tempfile::tempdir().expect("project dir");
+        let goal = crate::goal::create_goal(
+            crate::goal::GoalCreateInput {
+                title: "Ship mobile MVP".to_string(),
+                scope: crate::goal::GoalScope::Project,
+                ..crate::goal::GoalCreateInput::default()
+            },
+            Some(project.path()),
+        )
+        .expect("create goal");
+
+        let mut app = create_test_app();
+        app.session.working_dir = Some(project.path().display().to_string());
+        app.side_panel = test_side_panel_snapshot("plan", "Plan");
+        for command in [
+            "/initiatives".to_string(),
+            "/initiatives resume".to_string(),
+            format!("/initiatives show {}", goal.id),
+        ] {
+            // The user closed the panel, then asks for initiatives.
+            app.dismiss_side_panel();
+            assert!(!app.diff_pane_visible());
+            app.input = command.clone();
+            app.submit_input();
+            assert!(
+                app.diff_pane_visible() && app.side_panel.focused_page().is_some(),
+                "{command} must show the side panel the user closed"
+            );
+            assert!(!app.side_panel_user_hidden, "{command}");
+        }
+    });
+}
+
+#[test]
 fn test_compact_mode_command_updates_local_session_mode() {
     let mut app = create_test_app();
 
@@ -1668,7 +1629,7 @@ fn test_fast_on_while_processing_mentions_next_request_locally() {
     assert_eq!(last.role, "system");
     assert_eq!(
         last.content,
-        "✓ Fast mode on (Fast)\nApplies to the next request/turn. The current in-flight request keeps its existing tier."
+        "✓ Fast mode configured on (Fast)\nRequested for the next provider request, including later in this turn. The current in-flight request is unchanged. Provider acceptance is not yet confirmed."
     );
     assert_eq!(
         app.status_notice(),

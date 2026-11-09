@@ -1,4 +1,3 @@
-use crate::agent::Agent;
 use crate::server::reload_recovery::ReloadRecoveryRole;
 use crate::server::{SwarmEvent, SwarmEventType, SwarmMember};
 use crate::tool::selfdev::ReloadContext;
@@ -7,9 +6,9 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{RwLock, broadcast, watch};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 
 const RELOAD_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -55,7 +54,7 @@ async fn receive_reload_signal(
 }
 
 pub(super) async fn await_reload_signal(
-    sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
+    sessions: crate::server::SessionAgents,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
@@ -110,6 +109,38 @@ pub(super) async fn await_reload_signal(
         {
             crate::logging::info(
                 "Server: JCODE_TEST_SESSION set, skipping process exec for reload test",
+            );
+            continue;
+        }
+
+        // Resolve the exec target BEFORE the graceful shutdown.
+        //
+        // The shutdown below closes every session; if there is then no valid
+        // exec target, the daemon would have killed its clients and stayed
+        // dead - the worst outcome. Resolving first lets a no-op reload abort
+        // while the daemon and its sessions are still alive.
+        //
+        // A missing target means either the candidate IS the running binary
+        // (a self-exec, refused by the guard) or the candidate is older than
+        // the running binary (downgrade refused). Both are no-ops, not kills.
+        let prefers_selfdev = signal.prefer_selfdev_binary;
+        let exec_target =
+            super::reload_exec_target(prefers_selfdev).filter(|(binary, _)| binary.exists());
+        if exec_target.is_none() {
+            crate::logging::warn(&format!(
+                "Server: reload request={} has no valid exec target (candidate is the running binary or an older candidate); keeping the daemon alive",
+                signal.request_id,
+            ));
+            crate::server::write_reload_state(
+                &signal.request_id,
+                &signal.hash,
+                crate::server::ReloadPhase::Failed,
+                Some("no reloadable binary found (self-exec or downgrade refused)".to_string()),
+            );
+            super::reload_trace::record_value(
+                &signal.request_id,
+                "exec_target_unavailable",
+                serde_json::json!({}),
             );
             continue;
         }
@@ -172,9 +203,7 @@ pub(super) async fn await_reload_signal(
             serde_json::json!({ "count": aborted }),
         );
 
-        let prefers_selfdev = signal.prefer_selfdev_binary;
-
-        if let Some((binary, label)) = super::reload_exec_target(prefers_selfdev) {
+        if let Some((binary, label)) = exec_target {
             if binary.exists() {
                 let socket = super::socket_path();
                 crate::logging::info(&format!(
@@ -227,6 +256,9 @@ pub(super) async fn await_reload_signal(
                     crate::server::ReloadPhase::Failed,
                     Some(format!("missing binary: {}", binary.display())),
                 );
+                // The binary vanished between resolution and exec: no exec
+                // happened, so the daemon must stay alive.
+                continue;
             }
         } else {
             crate::server::write_reload_state(
@@ -235,7 +267,12 @@ pub(super) async fn await_reload_signal(
                 crate::server::ReloadPhase::Failed,
                 Some("no reloadable binary found".to_string()),
             );
+            // No exec happened: killing the daemon here would strand every
+            // connected client with no replacement. Keep serving.
+            continue;
         }
+        // Only reached when an exec was actually attempted and failed
+        // (`replace_process` never returns on success).
         std::process::exit(42);
     }
 }

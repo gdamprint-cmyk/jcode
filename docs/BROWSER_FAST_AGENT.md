@@ -8,9 +8,14 @@ values. A bounded controller uses Jev's typed Decisions API with
 The main LLM supplies generated code or text only when asked, then hands the
 next stretch back to Jev. Jev never generates executable browser arguments.
 
-This is the default browser-task path in both the tool description and action
-schema. Direct actions remain available for setup, tab discovery/creation, and
-tasks handoff cannot complete. The implementation lives in the shared
+Handoff is disabled by default. Opt in with `browser_handoff = true` under
+`[tools]` in `~/.jcode/config.toml`, or `JCODE_BROWSER_HANDOFF=1`.
+`JCODE_BROWSER_HANDOFF=0` disables it, and the legacy
+`JCODE_BROWSER_HANDOFF_DISABLED=1` kill switch overrides any opt-in.
+When disabled, handoff and its arguments are omitted from the tool schema and
+handoff calls are rejected before browser setup. Direct actions remain available.
+When enabled, the tool instructions prefer handoff for browser tasks.
+The implementation lives in the shared
 runtime, so Desktop and the TUI use the same controller.
 
 ## Setup
@@ -52,10 +57,16 @@ or switch your main coding model.
 
 - `tab_id` and a nonempty `goal` are required. Frame 0 is the default.
   `window_id`, when supplied, is checked against the selected tab.
-- `max_steps` defaults to 12 and must be 1 through 30. The controller has a
-  180-second wall-clock budget. `timeout_ms` controls individual operations,
+- `max_steps` defaults to 40 and must be 1 through 100. The controller has a
+  600-second wall-clock budget. `timeout_ms` controls individual operations,
   defaults to 20,000, and is clamped to 1 through 60,000 milliseconds and the
-  remaining total budget.
+  remaining total budget. Read-only observation reconnect retries have an
+  additional eight-second cap (or the smaller `timeout_ms`). Post-action
+  navigation settling also retains its internal eight-second cap. A larger
+  `timeout_ms` does not extend these caps. If reconnecting fails, handback
+  preserves the last connection error. Blank or restricted pages may have no
+  content script: navigate to a supported page before handing off. Only a
+  dispatched action failure carries the in-flight action warning.
 - `confidence_threshold` defaults to 0.8. The transport validates the typed
   choice, offered IDs, probability distribution, and confidence. It uses the
   lower of the selected probability and reported confidence.

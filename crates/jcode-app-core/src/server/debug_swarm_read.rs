@@ -3,15 +3,14 @@ use super::{
     FileTouchService, ServerIdentity, SharedContext, SwarmMember, SwarmState, VersionedPlan,
     git_common_dir_for, swarm_id_for_dir,
 };
-use crate::agent::Agent;
 use crate::plan::{next_runnable_item_ids, summarize_plan_graph};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 #[expect(
@@ -81,6 +80,26 @@ pub(super) async fn maybe_handle_swarm_read_command(
         let members = swarm_members.read().await;
         let mut out: Vec<serde_json::Value> = Vec::new();
         for (swarm_id, session_ids) in swarms.iter() {
+            // Issue #1650: the swarm index can lag the member records. A member
+            // belongs to exactly the swarm its own record names, so never report
+            // a session under a swarm it has moved away from.
+            let mut owned_session_ids: Vec<&String> = session_ids
+                .iter()
+                .filter(|session_id| {
+                    members
+                        .get(*session_id)
+                        .is_some_and(|member| member.swarm_id.as_deref() == Some(swarm_id))
+                })
+                .collect();
+            owned_session_ids.sort();
+            let stale_session_ids: Vec<&String> = {
+                let mut stale: Vec<&String> = session_ids
+                    .iter()
+                    .filter(|session_id| !owned_session_ids.contains(session_id))
+                    .collect();
+                stale.sort();
+                stale
+            };
             let coordinator = coordinators.get(swarm_id);
             let coordinator_name =
                 coordinator.and_then(|cid| members.get(cid).and_then(|m| m.friendly_name.clone()));
@@ -88,9 +107,9 @@ pub(super) async fn maybe_handle_swarm_read_command(
             let mut headless_count = 0usize;
             let mut attached_member_count = 0usize;
             let mut live_attachment_count = 0usize;
-            let member_details: Vec<serde_json::Value> = session_ids
+            let member_details: Vec<serde_json::Value> = owned_session_ids
                 .iter()
-                .filter_map(|session_id| members.get(session_id))
+                .filter_map(|session_id| members.get(*session_id))
                 .map(|member| {
                     *status_counts.entry(member.status.clone()).or_default() += 1;
                     if member.is_headless {
@@ -113,8 +132,9 @@ pub(super) async fn maybe_handle_swarm_read_command(
                 .collect();
             out.push(serde_json::json!({
                 "swarm_id": swarm_id,
-                "member_count": session_ids.len(),
-                "members": session_ids.iter().collect::<Vec<_>>(),
+                "member_count": owned_session_ids.len(),
+                "members": owned_session_ids,
+                "stale_index_members": stale_session_ids,
                 "coordinator": coordinator,
                 "coordinator_name": coordinator_name,
                 "headless_count": headless_count,
@@ -276,8 +296,6 @@ pub(super) async fn maybe_handle_swarm_read_command(
                 "participants": &vp.participants,
                 "items": &vp.items,
                 "task_progress": &vp.task_progress,
-                "mode": &vp.mode,
-                "node_meta": &vp.node_meta,
                 "ready_ids": summary.ready_ids,
                 "blocked_ids": summary.blocked_ids,
                 "active_ids": summary.active_ids,
@@ -308,8 +326,6 @@ pub(super) async fn maybe_handle_swarm_read_command(
                 "participants": &vp.participants,
                 "items": &vp.items,
                 "task_progress": &vp.task_progress,
-                "mode": &vp.mode,
-                "node_meta": &vp.node_meta,
                 "ready_ids": summary.ready_ids,
                 "blocked_ids": summary.blocked_ids,
                 "active_ids": summary.active_ids,
@@ -629,15 +645,18 @@ pub(super) async fn maybe_handle_swarm_read_command(
             let member_details: Vec<_> = session_ids
                 .iter()
                 .filter_map(|sid| {
-                    members.get(sid).map(|m| {
-                        serde_json::json!({
-                            "session_id": m.session_id,
-                            "friendly_name": m.friendly_name,
-                            "status": m.status,
-                            "detail": m.detail,
-                            "working_dir": m.working_dir,
+                    members
+                        .get(sid)
+                        .filter(|m| m.swarm_id.as_deref() == Some(swarm_id))
+                        .map(|m| {
+                            serde_json::json!({
+                                "session_id": m.session_id,
+                                "friendly_name": m.friendly_name,
+                                "status": m.status,
+                                "detail": m.detail,
+                                "working_dir": m.working_dir,
+                            })
                         })
-                    })
                 })
                 .collect();
 

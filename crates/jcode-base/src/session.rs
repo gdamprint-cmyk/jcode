@@ -7,46 +7,32 @@ pub use crate::storage::{
 };
 use crate::storage::{active_pids_dir, register_active_pid, unregister_active_pid};
 
-/// RAII guard that marks a session as actively streaming for its lifetime.
-///
-/// Wraps the on-disk streaming marker from `jcode-storage` (cleared on every
-/// exit path so presence UIs never show a phantom streaming session) and
-/// additionally holds a macOS power assertion so the system does not
-/// idle-sleep in the middle of a streaming model response.
-pub struct StreamingGuard {
-    _marker: crate::storage::StreamingGuard,
-    #[allow(dead_code)]
-    sleep_assertion: crate::platform::PowerAssertion,
-}
-
-impl StreamingGuard {
-    pub fn new(session_id: impl Into<String>) -> Self {
-        Self {
-            _marker: crate::storage::StreamingGuard::new(session_id),
-            sleep_assertion: crate::platform::PowerAssertion::prevent_user_idle_system_sleep(
-                "Jcode streaming model response",
-            ),
-        }
-    }
-}
+mod streaming;
+mod window_closures;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+pub use streaming::StreamingGuard;
+pub use window_closures::{clear_window_closed, recent_window_closures, record_window_closed};
+
+mod agent_models;
 mod crash;
+pub use agent_models::AgentModelOverrides;
 mod journal;
 mod load_telemetry;
 mod maintenance;
 mod memory_profile;
 mod model;
+mod parallel_messages;
 mod persistence;
+pub mod prewarm;
 mod render;
 mod storage_paths;
 pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
-pub use jcode_session_types::prompt_title;
 pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
@@ -66,13 +52,24 @@ pub use render::{
     summarize_tool_calls,
 };
 pub use storage_paths::session_journal_path_from_snapshot;
+pub(crate) mod resume_cache;
 #[cfg(test)]
 pub(crate) use storage_paths::session_path_in_dir;
 use storage_paths::{estimate_json_bytes, persist_vector_mode_label};
 pub use storage_paths::{session_exists, session_journal_path, session_path};
+pub use {jcode_session_types::prompt_title, persistence::drain_saves_for_shutdown};
 
 fn stored_messages_to_messages(messages: &[StoredMessage]) -> Vec<Message> {
     messages.iter().map(StoredMessage::to_message).collect()
+}
+
+fn message_has_tool_image(content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+        && content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
 fn is_internal_system_reminder_message(message: &StoredMessage) -> bool {
@@ -111,6 +108,7 @@ pub struct Session {
     pub custom_title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(deserialize_with = "parallel_messages::deserialize")]
     pub messages: Vec<StoredMessage>,
     /// Full assembled system prompt replacement, including an intentionally empty prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,9 +137,15 @@ pub struct Session {
     /// Provider reasoning/thinking effort for this session (e.g., OpenAI low|medium|high|xhigh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-session context ceiling. Missing values follow the global cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_cap: Option<usize>,
     /// Optional fixed model to use for subagents launched from this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_model: Option<String>,
+    /// Session worker routing. Missing keys follow saved global defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_model_overrides: AgentModelOverrides,
     /// Last requested `/improve` mode for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub improve_mode: Option<SessionImproveMode>,
@@ -160,6 +164,9 @@ pub struct Session {
     /// Working directory (for self-dev detection)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// First session directory, retained when the session moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_working_dir: Option<String>,
     /// Memorable short name (e.g., "fox", "oak")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short_name: Option<String>,
@@ -190,6 +197,10 @@ pub struct Session {
     /// Non-conversation UI/state events persisted for higher-fidelity replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_events: Vec<StoredReplayEvent>,
+    /// Migration epoch of the machine move that delivered this copy
+    /// (`jcode cloud move` / `return`). Zero for sessions that never moved.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub migration_epoch: u64,
     #[serde(skip)]
     persist_state: SessionPersistState,
     #[serde(skip)]
@@ -232,7 +243,11 @@ struct SessionStartupStub {
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
+    context_cap: Option<usize>,
+    #[serde(default)]
     subagent_model: Option<String>,
+    #[serde(default)]
+    agent_model_overrides: AgentModelOverrides,
     #[serde(default)]
     improve_mode: Option<SessionImproveMode>,
     #[serde(default)]
@@ -245,6 +260,8 @@ struct SessionStartupStub {
     testing_build: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    #[serde(default)]
+    original_working_dir: Option<String>,
     #[serde(default)]
     short_name: Option<String>,
     #[serde(default)]
@@ -259,6 +276,8 @@ struct SessionStartupStub {
     saved: bool,
     #[serde(default)]
     save_label: Option<String>,
+    #[serde(default)]
+    migration_epoch: u64,
 }
 
 const MAX_SESSION_JOURNAL_BYTES: u64 = 512 * 1024;
@@ -283,6 +302,10 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn default_is_test_session() -> bool {
     env_flag_enabled("JCODE_TEST_SESSION")
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
@@ -340,13 +363,16 @@ impl Session {
         session.model = stub.model;
         session.route_api_method = stub.route_api_method;
         session.reasoning_effort = stub.reasoning_effort;
+        session.context_cap = stub.context_cap;
         session.subagent_model = stub.subagent_model;
+        session.agent_model_overrides = stub.agent_model_overrides;
         session.improve_mode = stub.improve_mode;
         session.autoreview_enabled = stub.autoreview_enabled;
         session.autojudge_enabled = stub.autojudge_enabled;
         session.is_canary = stub.is_canary;
         session.testing_build = stub.testing_build;
         session.working_dir = stub.working_dir;
+        session.original_working_dir = stub.original_working_dir;
         session.short_name = stub.short_name;
         session.status = stub.status;
         session.last_pid = stub.last_pid;
@@ -354,12 +380,14 @@ impl Session {
         session.is_debug = stub.is_debug;
         session.saved = stub.saved;
         session.save_label = stub.save_label;
+        session.migration_epoch = stub.migration_epoch;
         session.messages.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
         session.replay_events.clear();
         session.rebuild_memory_profile_cache();
         session.reset_persist_state(true);
+        session.persist_state.transcript_stripped = true;
         session
     }
 
@@ -376,13 +404,16 @@ impl Session {
         session.model = snapshot.model;
         session.route_api_method = snapshot.route_api_method;
         session.reasoning_effort = snapshot.reasoning_effort;
+        session.context_cap = snapshot.context_cap;
         session.subagent_model = snapshot.subagent_model;
+        session.agent_model_overrides = snapshot.agent_model_overrides;
         session.improve_mode = snapshot.improve_mode;
         session.autoreview_enabled = snapshot.autoreview_enabled;
         session.autojudge_enabled = snapshot.autojudge_enabled;
         session.is_canary = snapshot.is_canary;
         session.testing_build = snapshot.testing_build;
         session.working_dir = snapshot.working_dir;
+        session.original_working_dir = snapshot.original_working_dir;
         session.short_name = snapshot.short_name;
         session.status = snapshot.status;
         session.last_pid = snapshot.last_pid;
@@ -510,18 +541,24 @@ impl Session {
             system_prompt: self.system_prompt.clone(),
             updated_at: self.updated_at,
             compaction: self.compaction.clone(),
+            compaction_unchanged: false,
             provider_session_id: self.provider_session_id.clone(),
             model_usage_turn_id: self.model_usage_turn_id.clone(),
             provider_key: self.provider_key.clone(),
+            route_api_method: self.route_api_method.clone(),
+            route_api_method_present: true,
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            context_cap: self.context_cap,
             subagent_model: self.subagent_model.clone(),
+            agent_model_overrides: self.agent_model_overrides.clone(),
             improve_mode: self.improve_mode,
             autoreview_enabled: self.autoreview_enabled,
             autojudge_enabled: self.autojudge_enabled,
             is_canary: self.is_canary,
             testing_build: self.testing_build.clone(),
             working_dir: self.working_dir.clone(),
+            original_working_dir: self.original_working_dir.clone(),
             short_name: self.short_name.clone(),
             status: self.status.clone(),
             last_pid: self.last_pid,
@@ -544,6 +581,7 @@ impl Session {
             memory_injections_mode: PersistVectorMode::Clean,
             replay_events_mode: PersistVectorMode::Clean,
             last_meta: Some(self.journal_meta()),
+            transcript_stripped: self.persist_state.transcript_stripped,
         };
     }
 
@@ -690,10 +728,6 @@ impl Session {
         }
     }
 
-    fn mark_env_snapshots_full_dirty(&mut self) {
-        self.persist_state.env_snapshots_mode = PersistVectorMode::Full;
-    }
-
     fn mark_memory_injections_append_dirty(&mut self) {
         if self.persist_state.memory_injections_mode != PersistVectorMode::Full {
             self.persist_state.memory_injections_mode = PersistVectorMode::Append;
@@ -712,19 +746,27 @@ impl Session {
         self.custom_title = meta.custom_title;
         self.system_prompt = meta.system_prompt;
         self.updated_at = meta.updated_at;
-        self.compaction = meta.compaction;
+        if !meta.compaction_unchanged {
+            self.compaction = meta.compaction;
+        }
         self.provider_session_id = meta.provider_session_id;
         self.model_usage_turn_id = meta.model_usage_turn_id;
         self.provider_key = meta.provider_key;
+        if meta.route_api_method_present {
+            self.route_api_method = meta.route_api_method;
+        }
         self.model = meta.model;
         self.reasoning_effort = meta.reasoning_effort;
+        self.context_cap = meta.context_cap;
         self.subagent_model = meta.subagent_model;
+        self.agent_model_overrides = meta.agent_model_overrides;
         self.improve_mode = meta.improve_mode;
         self.autoreview_enabled = meta.autoreview_enabled;
         self.autojudge_enabled = meta.autojudge_enabled;
         self.is_canary = meta.is_canary;
         self.testing_build = meta.testing_build;
         self.working_dir = meta.working_dir;
+        self.original_working_dir = meta.original_working_dir;
         self.short_name = meta.short_name;
         self.status = meta.status;
         self.last_pid = meta.last_pid;
@@ -760,13 +802,16 @@ impl Session {
             model: None,
             route_api_method: None,
             reasoning_effort: None,
+            context_cap: None,
             subagent_model: None,
+            agent_model_overrides: AgentModelOverrides::new(),
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
             is_canary: false,
             testing_build: None,
             working_dir: current_working_dir_string(),
+            original_working_dir: None,
             short_name,
             status: SessionStatus::Active,
             last_pid: Some(std::process::id()),
@@ -777,6 +822,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            migration_epoch: 0,
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -816,13 +862,16 @@ impl Session {
             model: None,
             route_api_method: None,
             reasoning_effort: None,
+            context_cap: None,
             subagent_model: None,
+            agent_model_overrides: AgentModelOverrides::new(),
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
             is_canary: false,
             testing_build: None,
             working_dir: current_working_dir_string(),
+            original_working_dir: None,
             short_name: Some(short_name),
             status: SessionStatus::Active,
             last_pid: Some(std::process::id()),
@@ -833,6 +882,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            migration_epoch: 0,
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -918,13 +968,19 @@ impl Session {
         self.memory_profile_cache.env_snapshots_count += 1;
         self.memory_profile_cache.env_snapshots_json_bytes += estimate_json_bytes(&snapshot);
         self.env_snapshots.push(snapshot);
+        // Trimming here would force a full snapshot rewrite (seconds on large
+        // transcripts) on every resume. Append instead and trim only when a
+        // checkpoint rewrites the snapshot anyway (see `trim_env_snapshots`).
+        self.mark_env_snapshots_append_dirty();
+    }
+
+    /// Drop all but the newest `MAX_ENV_SNAPSHOTS`. Only call right before a
+    /// full snapshot write, because it shrinks an append-tracked vector.
+    pub(crate) fn trim_env_snapshots(&mut self) {
         if self.env_snapshots.len() > MAX_ENV_SNAPSHOTS {
             let excess = self.env_snapshots.len() - MAX_ENV_SNAPSHOTS;
             self.env_snapshots.drain(0..excess);
             self.mark_memory_profile_dirty();
-            self.mark_env_snapshots_full_dirty();
-        } else {
-            self.mark_env_snapshots_append_dirty();
         }
     }
 
@@ -1075,12 +1131,34 @@ request in this new forked session, using the inherited conversation only as con
         self.status = SessionStatus::Error { message };
     }
 
+    /// Why this in-memory copy may not run turns or persist on this machine
+    /// because the session migrated (see `jcode_storage::session_lease`).
+    pub fn migration_lease_block(&self) -> Option<crate::storage::SessionLeaseBlock> {
+        crate::storage::session_lease_block(&self.id, self.migration_epoch)
+    }
+
     /// Mark session as active (e.g., when resuming)
     pub fn mark_active(&mut self) {
+        self.mark_active_unregistered();
+        self.register_presence_markers();
+    }
+
+    /// Mark active in memory only, without writing presence markers.
+    ///
+    /// Reload reconnects build a provisional session that is replaced by the
+    /// resumed one almost immediately. Writing and then deleting its
+    /// `active_pids`/`internal_pids` markers costs filesystem work on every
+    /// reconnect of a storm, so callers defer that to
+    /// [`Self::register_presence_markers`] once the session is committed.
+    pub fn mark_active_unregistered(&mut self) {
         self.status = SessionStatus::Active;
-        let pid = std::process::id();
-        self.last_pid = Some(pid);
+        self.last_pid = Some(std::process::id());
         self.last_active_at = Some(Utc::now());
+    }
+
+    /// Write this session's on-disk presence markers for its owning PID.
+    pub fn register_presence_markers(&self) {
+        let pid = self.last_pid.unwrap_or_else(std::process::id);
         register_active_pid(&self.id, pid);
         self.sync_internal_presence_flag();
     }
@@ -1179,6 +1257,9 @@ request in this new forked session, using the inherited conversation only as con
                         *content = crate::message::redact_secrets(content);
                     }
                     ContentBlock::ToolUse { input, .. } => redact_json_value(input),
+                    // Export copy only: the stored item stays verbatim for
+                    // replay, but queries can carry pasted credentials.
+                    ContentBlock::ProviderNative { item, .. } => redact_json_value(item),
                     ContentBlock::Image { .. } => {}
                     ContentBlock::OpenAICompaction { .. } | ContentBlock::ToolReference { .. } => {}
                 }
@@ -1305,8 +1386,28 @@ request in this new forked session, using the inherited conversation only as con
             .message_stats
             .merge_from(&summarize_blocks(&message.content));
         self.adopt_prompt_title(&message);
+        let adds_tool_image = message_has_tool_image(&message.content);
         self.messages.push(message);
         self.mark_messages_append_dirty();
+        if adds_tool_image {
+            self.decay_old_tool_images();
+        }
+    }
+
+    /// Replace inline screenshots from older tool results with short text
+    /// markers once they exceed the tool image budget, so computer-use and
+    /// browser sessions do not grow the transcript without bound (#1680). The
+    /// newest screenshots keep their data and are still sent to the provider.
+    /// Returns the number of images replaced.
+    pub fn decay_old_tool_images(&mut self) -> usize {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let stripped = jcode_compaction_core::decay_old_tool_images_in_contents(&mut contents);
+        if stripped > 0 {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+        }
+        stripped
     }
 
     /// Name an untitled session after its first real user prompt so lists show
@@ -1611,6 +1712,7 @@ request in this new forked session, using the inherited conversation only as con
         self.rebuild_memory_profile_cache();
         self.reset_provider_messages_cache();
         self.reset_persist_state(true);
+        self.persist_state.transcript_stripped = true;
     }
 
     /// Remove all ToolUse content blocks from a specific message.
@@ -1680,7 +1782,7 @@ struct RemoteStartupSessionSnapshot {
     system_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "parallel_messages::deserialize")]
     messages: Vec<StoredMessage>,
     #[serde(default)]
     compaction: Option<StoredCompactionState>,
@@ -1695,7 +1797,11 @@ struct RemoteStartupSessionSnapshot {
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
+    context_cap: Option<usize>,
+    #[serde(default)]
     subagent_model: Option<String>,
+    #[serde(default)]
+    agent_model_overrides: AgentModelOverrides,
     #[serde(default)]
     improve_mode: Option<SessionImproveMode>,
     #[serde(default)]
@@ -1708,6 +1814,8 @@ struct RemoteStartupSessionSnapshot {
     testing_build: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    #[serde(default)]
+    original_working_dir: Option<String>,
     #[serde(default)]
     short_name: Option<String>,
     #[serde(default)]

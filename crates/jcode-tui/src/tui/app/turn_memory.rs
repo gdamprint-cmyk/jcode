@@ -15,29 +15,24 @@ impl App {
         }
 
         let skills = self.current_skills_snapshot();
-        let skill_prompt = self
-            .active_skill
-            .as_ref()
-            .and_then(|name| skills.get(name).map(|s| s.get_prompt().to_string()));
+        // Announced once in the transcript on activation; never in the
+        // system prompt, so skill changes cannot invalidate the cache.
+        let skill_prompt: Option<String> = None;
         let available_skills: Vec<crate::prompt::SkillInfo> = skills
             .list()
             .iter()
             .map(|s| crate::prompt::SkillInfo {
                 name: s.name.clone(),
                 description: s.description.clone(),
+                user_invoked_only: s.disable_model_invocation,
             })
             .collect();
-        let (mut split, context_info) = crate::prompt::build_system_prompt_split(
+        let (split, context_info) = crate::prompt::build_system_prompt_split(
             skill_prompt.as_deref(),
             &available_skills,
             self.session.is_canary,
             memory_prompt,
             None,
-        );
-        self.append_current_turn_system_reminder(&mut split);
-        crate::prompt::append_swarm_effort_directive(
-            &mut split,
-            self.provider.reasoning_effort().as_deref(),
         );
         self.context_info = context_info;
         split
@@ -107,22 +102,39 @@ impl App {
             return None;
         }
 
-        // Take pending memory if available (computed in background during last turn)
+        // Take pending memory if available (computed in background during last turn).
+        // Taken on EVERY send, not only at a fresh user turn: the recall is
+        // prepared in the background, so a payload raised during autonomous
+        // tool work would otherwise sit in the queue until the user spoke
+        // again. The injected-set/TTL bookkeeping suppresses repeats.
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(messages);
-        let pending = if fresh_user_turn {
-            crate::memory::take_pending_memory_for_project(
-                &self.session.id,
-                self.session.working_dir.as_deref(),
-            )
-        } else {
-            None
-        };
+        let pending = crate::memory::take_pending_memory_for_project(
+            &self.session.id,
+            self.session.working_dir.as_deref(),
+        );
+
+        // Scheduled refresh on a tool-call cadence.
+        let refresh_every = crate::config::config().agents.memory_refresh_tool_calls;
+        let tool_calls_due = refresh_every > 0
+            && crate::memory::tool_calls_since_refresh(&self.session.id) >= refresh_every;
 
         // Send context to memory agent for the NEXT turn (doesn't block current send)
         // Relevance results are consumed only at the start of a fresh user turn.
         // Tool continuations do not provide another injection opportunity, so
         // avoid re-running the local embedding model after every tool result.
-        if fresh_user_turn {
+        if tool_calls_due {
+            // Forced: the focused query rarely changes during autonomous
+            // work, so the normal repeat suppression would swallow the
+            // scheduled refresh.
+            let shared_messages: std::sync::Arc<[crate::message::Message]> =
+                messages.to_vec().into();
+            crate::memory_agent::update_context_sync_with_dir_forced(
+                &self.session.id,
+                shared_messages,
+                self.session.working_dir.clone(),
+            );
+            crate::memory::reset_tool_calls_since_refresh(&self.session.id);
+        } else if fresh_user_turn {
             let shared_messages: std::sync::Arc<[crate::message::Message]> =
                 messages.to_vec().into();
             crate::memory_agent::update_context_sync_with_dir(
@@ -182,7 +194,8 @@ impl App {
                     | ContentBlock::ReasoningTrace { .. }
                     | ContentBlock::AnthropicThinking { .. }
                     | ContentBlock::OpenAIReasoning { .. }
-                    | ContentBlock::ToolReference { .. } => {}
+                    | ContentBlock::ToolReference { .. }
+                    | ContentBlock::ProviderNative { .. } => {}
                     ContentBlock::Image { .. } => {
                         transcript.push_str("[Image]\n");
                     }
@@ -219,7 +232,8 @@ impl App {
             .filter(|e| e.active)
             .map(|e| e.content)
             .collect();
-        let sidecar = crate::sidecar::Sidecar::new();
+        // Honor this session's `/agents memory` choice, like server-side extraction.
+        let sidecar = crate::sidecar::Sidecar::for_session(&self.session);
         match sidecar
             .extract_memories_with_existing(&transcript, &existing)
             .await

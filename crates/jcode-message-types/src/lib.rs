@@ -1,3 +1,5 @@
+pub mod provider_native;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
@@ -216,6 +218,17 @@ pub enum ContentBlock {
     ToolReference {
         tool_use_id: String,
         tool_name: String,
+    },
+    /// Provider-native (server-side) tool item, stored verbatim.
+    ///
+    /// Examples: Anthropic `server_tool_use` / `web_search_tool_result`
+    /// blocks, OpenAI Responses `web_search_call` items. These can carry
+    /// encrypted payloads that the provider requires back unmodified on later
+    /// turns, so jcode never rewrites `item`. Only the provider named by
+    /// `provider` replays it; others ignore it. See [`provider_native`].
+    ProviderNative {
+        provider: String,
+        item: serde_json::Value,
     },
 }
 
@@ -546,8 +559,8 @@ fn dynamic_system_context_message(system_dynamic: &str) -> Option<Message> {
     )))
 }
 
-/// Insert dynamic system context after the latest fresh user prompt without
-/// disturbing the stable cached history prefix.
+/// Insert dynamic system context after the latest user turn or compaction boundary
+/// without disturbing the stable cached history prefix or moving on tool rounds.
 pub fn messages_with_dynamic_system_context(
     messages: &[Message],
     system_dynamic: &str,
@@ -559,9 +572,15 @@ pub fn messages_with_dynamic_system_context(
     let mut out = messages.to_vec();
     let insert_at = out
         .iter()
-        .rposition(is_fresh_user_text_message)
+        .rposition(|message| {
+            is_fresh_user_text_message(message)
+                || message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::OpenAICompaction { .. }))
+        })
         .map(|idx| idx + 1)
-        .unwrap_or(out.len());
+        .unwrap_or(0);
     out.insert(insert_at, dynamic_message);
     out
 }
@@ -626,14 +645,17 @@ impl ToolCall {
 
     pub fn parse_streamed_input_to_object(input: &str) -> serde_json::Value {
         let trimmed = input.trim();
+        // No argument text at all is how providers stream a no-argument call.
         if trimmed.is_empty() {
             return serde_json::Value::Object(serde_json::Map::new());
         }
 
-        match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(value) => Self::normalize_input_to_object(value),
-            Err(_) => serde_json::Value::Null,
-        }
+        // Keep explicit non-object arguments (`null`, numbers, arrays,
+        // strings) and unparseable JSON as-is. Coercing them to `{}` ran the
+        // tool with missing arguments and hid the malformed call from
+        // `validation_error`, so the model never got a schema correction and
+        // could repeat the same bad call indefinitely.
+        serde_json::from_str::<serde_json::Value>(trimmed).unwrap_or(serde_json::Value::Null)
     }
 
     pub fn validation_error(&self) -> Option<String> {
@@ -729,6 +751,9 @@ impl std::fmt::Display for ConnectionPhase {
 pub enum StreamEvent {
     /// Text content delta
     TextDelta(String),
+    /// Correct a completed message using late provider metadata. Only replace
+    /// an exact trailing match, preserving earlier messages in the response.
+    TextSuffixReplace { old_text: String, new_text: String },
     /// An assistant text message ended within a provider response.
     TextDone,
     /// Tool use started
@@ -800,6 +825,11 @@ pub enum StreamEvent {
     ConnectionPhase { phase: ConnectionPhase },
     /// Provider-supplied human-readable transport detail for the status line
     StatusDetail { detail: String },
+    /// Effective tier reported by the provider, never inferred from configuration.
+    ServiceTier {
+        tier: String,
+        requested: Option<String>,
+    },
     /// Error occurred
     Error {
         message: String,
@@ -823,11 +853,48 @@ pub enum StreamEvent {
         tool_name: String,
         input: serde_json::Value,
     },
+    /// A complete provider-native (server-side) tool item, e.g. an Anthropic
+    /// `server_tool_use` or `web_search_tool_result` block. The provider has
+    /// already run the tool; consumers store it verbatim as
+    /// [`ContentBlock::ProviderNative`] for replay and render it for display.
+    ProviderNative {
+        provider: String,
+        item: serde_json::Value,
+    },
+}
+
+/// Apply a provider's late text correction only to an exact trailing match.
+/// Returns the replaced byte offset, or None for stale/mismatched snapshots.
+pub fn replace_text_suffix(text: &mut String, old_text: &str, new_text: &str) -> Option<usize> {
+    if old_text.is_empty() || !text.ends_with(old_text) {
+        return None;
+    }
+    let start = text.len() - old_text.len();
+    text.truncate(start);
+    text.push_str(new_text);
+    Some(start)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_correction_preserves_unicode_prefix_and_rejects_stale_snapshots() {
+        let mut text = "先前 🦀. raw citation".to_string();
+        assert_eq!(
+            replace_text_suffix(&mut text, "raw citation", "[Source](https://a.example)"),
+            Some("先前 🦀. ".len())
+        );
+        assert_eq!(text, "先前 🦀. [Source](https://a.example)");
+        let before = text.clone();
+        assert_eq!(
+            replace_text_suffix(&mut text, "raw citation", "wrong"),
+            None
+        );
+        assert_eq!(replace_text_suffix(&mut text, "", "wrong"), None);
+        assert_eq!(text, before);
+    }
 
     fn text_of(message: &Message) -> &str {
         match message.content.first() {
@@ -888,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_context_appends_when_no_fresh_user_prompt_exists() {
+    fn dynamic_context_prepends_when_no_turn_boundary_exists() {
         let messages = vec![
             Message::assistant_text("assistant"),
             Message::user("<system-reminder>\ninternal\n</system-reminder>"),
@@ -897,13 +964,49 @@ mod tests {
         let out = messages_with_dynamic_system_context(&messages, "Time: 10:00:00 UTC");
 
         assert_eq!(out.len(), 3);
-        assert_role_text(&out[0], Role::Assistant, "assistant");
+        assert!(text_of(&out[0]).contains("Time: 10:00:00 UTC"));
+        assert_role_text(&out[1], Role::Assistant, "assistant");
         assert_role_text(
-            &out[1],
+            &out[2],
             Role::User,
             "<system-reminder>\ninternal\n</system-reminder>",
         );
-        assert!(text_of(&out[2]).contains("Time: 10:00:00 UTC"));
+    }
+
+    #[test]
+    fn dynamic_context_stays_anchored_across_tool_rounds() {
+        for boundary in [
+            Message::user("prompt"),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::OpenAICompaction {
+                    encrypted_content: "compact".into(),
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+        ] {
+            let mut messages = vec![Message::user("older prompt"), boundary];
+            let before = messages_with_dynamic_system_context(&messages, "wake");
+            messages.push(Message::assistant_text("tool round"));
+            let mut result = Message::tool_result("call", "output", false);
+            result.content.push(ContentBlock::Text {
+                text: "tool-associated text is not a prompt".into(),
+                cache_control: None,
+            });
+            messages.push(result);
+            messages.push(Message::user("<system-reminder>internal</system-reminder>"));
+            let after = messages_with_dynamic_system_context(&messages, "wake");
+            assert_eq!(
+                cache_relevant_messages(&before),
+                cache_relevant_messages(&after[..before.len()])
+            );
+            assert!(text_of(&after[2]).contains("wake"));
+
+            messages.push(Message::user("fresh prompt"));
+            let fresh = messages_with_dynamic_system_context(&messages, "new turn");
+            assert!(text_of(fresh.last().unwrap()).contains("new turn"));
+        }
     }
 
     #[test]

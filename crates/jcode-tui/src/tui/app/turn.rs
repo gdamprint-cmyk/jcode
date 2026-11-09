@@ -1,3 +1,5 @@
+#[path = "turn_system_reminder.rs"]
+mod system_reminder;
 use super::*;
 use crate::message::ToolDefinition;
 
@@ -58,26 +60,6 @@ impl PendingStreamingTools {
 }
 
 impl App {
-    pub(super) fn append_current_turn_system_reminder(
-        &self,
-        split: &mut crate::prompt::SplitSystemPrompt,
-    ) {
-        let Some(reminder) = self
-            .current_turn_system_reminder
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        else {
-            return;
-        };
-
-        if !split.dynamic_part.is_empty() {
-            split.dynamic_part.push_str("\n\n");
-        }
-        split.dynamic_part.push_str("# System Reminder\n\n");
-        split.dynamic_part.push_str(reminder);
-    }
-
     /// Run turn with interactive input handling (redraws UI, accepts input during streaming)
     pub(super) async fn run_turn_interactive(
         &mut self,
@@ -92,6 +74,7 @@ impl App {
         let mut status_spinner_renderer = super::run_shell::StatusSpinnerRenderer::default();
 
         'turn_loop: loop {
+            self.streaming.response_output.reset();
             // Mark the turn as in-flight work: from here until the turn ends,
             // missing progress beats mean a real hang, not an idle client.
             let _turn_work = crate::logging::watchdog::begin_work("turn.request");
@@ -134,9 +117,10 @@ impl App {
             let tools = self.registry.definitions(None).await;
             // Non-blocking memory: uses pending result from last turn, spawns check for next turn
             let memory_pending = self.build_memory_prompt_nonblocking(&provider_messages);
-            // Use split prompt for better caching - static content cached, dynamic not
-            let split_prompt =
-                self.build_system_prompt_split(memory_pending.as_ref().map(|p| p.prompt.as_str()));
+            // Use split prompt for better caching - static content cached, dynamic not.
+            // Memory rides as an ephemeral tail message, never in the system
+            // prompt, so recalled memories cannot invalidate the cached history.
+            let split_prompt = self.build_system_prompt_split(None);
             self.context_info.tool_defs_count = tools.len();
             self.context_info.tool_defs_chars = ToolDefinition::aggregate_prompt_chars(&tools);
             if let Some(pending) = &memory_pending {
@@ -159,6 +143,14 @@ impl App {
             // Clone data needed for the API call to avoid borrow issues
             // The future would hold references across the select! which conflicts with handle_key
             let provider = self.provider.clone();
+            let mut provider_messages = provider_messages;
+            let cache_signature_len = provider_messages.len();
+            if let Some(pending) = &memory_pending {
+                provider_messages.push(Message::user(&format!(
+                    "<system-reminder>\n{}\n</system-reminder>",
+                    pending.prompt
+                )));
+            }
             let request_messages = if crate::config::config().features.message_timestamps {
                 Message::with_timestamps(&provider_messages)
             } else {
@@ -167,7 +159,12 @@ impl App {
             let session_id_clone = self.provider_session_id.clone();
             let static_part = split_prompt.static_part.clone();
             let dynamic_part = split_prompt.dynamic_part.clone();
-            self.begin_kv_cache_request(&request_messages, &tools, &static_part, &dynamic_part);
+            self.begin_kv_cache_request(
+                &request_messages[..cache_signature_len],
+                &tools,
+                &static_part,
+                &dynamic_part,
+            );
 
             // Make API call non-blocking - poll it in select! so we can handle input while waiting
             let mut api_future = std::pin::pin!(provider.complete_split(
@@ -185,8 +182,10 @@ impl App {
                     event = event_stream.next() => {
                         match event {
                             Some(Ok(Event::Key(key))) => {
+                                let key = jcode_tui_core::korean_input::normalize_key_event(key);
                                 self.update_copy_badge_key_event(key);
-                                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                self.observe_voice_key_release(&key);
+                                if !self.handle_voice_key_event(&key) && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                     let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                     let _ = self.handle_key_press_event(key);
                                     if self.cancel_requested {
@@ -316,6 +315,9 @@ impl App {
             let mut first_event = true;
             let mut saw_message_end = false;
             let mut call_output_tokens_seen: u64 = 0;
+            // Latest provider-reported usage for this API call, for usage_report.
+            let mut call_usage = jcode_provider_core::SimpleCompletionUsage::default();
+            let model_at_request_start = self.provider.model();
             let mut interleaved = false; // Track if we interleaved a message mid-stream
             // Track tool results from provider (already executed by Claude Code CLI)
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
@@ -326,6 +328,10 @@ impl App {
             let mut reasoning_content = String::new();
             let mut reasoning_signature = String::new();
             let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
+            // Provider-executed tool items (e.g. native web search), stored
+            // verbatim at their position in the response for exact replay.
+            let mut provider_native_items =
+                crate::message::provider_native::ProviderNativeItems::default();
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
             // Stream with input handling
@@ -371,8 +377,10 @@ impl App {
                     event = event_stream.next() => {
                         match event {
                             Some(Ok(Event::Key(key))) => {
+                                let key = jcode_tui_core::korean_input::normalize_key_event(key);
                                 self.update_copy_badge_key_event(key);
-                                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                self.observe_voice_key_release(&key);
+                                if !self.handle_voice_key_event(&key) && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                     let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                     let _ = self.handle_key_press_event(key);
                                     // Check for cancel request
@@ -573,6 +581,10 @@ impl App {
                                 }
                                 match event {
                                     StreamEvent::TextDelta(text) => {
+                                        self.streaming.response_output.text(&text);
+                                        if !text.is_empty() {
+                                            self.usage_reset.openai_quota_rejected = false;
+                                        }
                                         self.status = ProcessingStatus::Streaming;
                                         text_content.push_str(&text);
                                         self.resume_streaming_tps();
@@ -600,7 +612,26 @@ impl App {
                                             }
                                         }
                                     }
+                                    StreamEvent::TextSuffixReplace { old_text, new_text } => {
+                                        if provider_native_items.replace_text_suffix(
+                                            &mut text_content, &old_text, &new_text,
+                                        ) {
+                                            let ops = self.stream_buffer.flush();
+                                            self.apply_stream_ops(ops);
+                                            let mut corrected = self.streaming.streaming_text.clone();
+                                            if crate::message::replace_text_suffix(
+                                                &mut corrected, &old_text, &new_text,
+                                            ).is_some() {
+                                                self.replace_streaming_text(corrected);
+                                            }
+                                            if eager_stream_redraw {
+                                                status_spinner_renderer.draw_full(self, terminal)?;
+                                            }
+                                        }
+                                    }
                                     StreamEvent::ToolUseStart { id, name } => {
+                                        self.streaming.response_output.tool();
+                                        self.usage_reset.openai_quota_rejected = false;
                                         // Tool input JSON is still provider-generated output and is
                                         // included in provider output-token usage. Keep the TPS timer
                                         // running until the tool call has finished streaming; actual
@@ -723,6 +754,12 @@ impl App {
                                         cache_read_input_tokens,
                                         cache_creation_input_tokens,
                                     } => {
+                                        call_usage.observe(
+                                            input_tokens,
+                                            output_tokens,
+                                            cache_read_input_tokens,
+                                            cache_creation_input_tokens,
+                                        );
                                         let mut usage_changed = self
                                             .apply_stream_usage_input_report(
                                                 input_tokens,
@@ -777,13 +814,18 @@ impl App {
                                         }
                                     }
                                     StreamEvent::StatusDetail { detail } => {
-                                        self.status_detail = Some(detail);
+                                        self.apply_status_detail(detail);
                                         if eager_stream_redraw {
                                             status_spinner_renderer.draw_full(self, terminal)?;
                                         }
                                     }
+                                    StreamEvent::ServiceTier { tier, requested } => {
+                                        self.remote_reported_service_tier = Some((requested, tier.clone()));
+                                        self.status_detail = Some(format!("Provider tier: {tier}"));
+                                    }
                                     StreamEvent::TextDone => {}
-                    StreamEvent::MessageEnd { .. } => {
+                    StreamEvent::MessageEnd { stop_reason } => {
+                                        self.streaming.response_output.finish(stop_reason.as_deref());
                                         self.pause_streaming_tps(true);
                                         self.stream_message_ended = true;
                                         saw_message_end = true;
@@ -812,6 +854,7 @@ impl App {
                                         reasoning_content.clear();
                                         reasoning_signature.clear();
                                         openai_reasoning_items.clear();
+                                        provider_native_items.clear();
                                         openai_native_compaction = None;
                                         saw_message_end = false;
                                         self.rollback_streaming_attempt();
@@ -991,6 +1034,7 @@ impl App {
                                         if let Some(dm) = self.display_messages.iter_mut().rev().find(|dm| {
                                             dm.tool_data.as_ref().map(|td| &td.id) == Some(&tool_use_id)
                                         }) {
+                                            dm.duration_secs = DisplayMessage::tool_duration_from_output(&content);
                                             dm.content = content.clone();
                                             self.bump_display_messages_version();
                                         }
@@ -1002,6 +1046,38 @@ impl App {
                                         self.status = ProcessingStatus::Streaming;
 
                                         sdk_tool_results.insert(tool_use_id, (content, is_error));
+                                    }
+                                    StreamEvent::ProviderNative { provider: native_provider, item } => {
+                                        if let Some(display) =
+                                            crate::message::provider_native::provider_native_display(
+                                                &native_provider,
+                                                &item,
+                                            )
+                                            && let Some(output) = display.output
+                                        {
+                                            self.pause_streaming_tps(false);
+                                            self.commit_pending_streaming_assistant_message();
+                                            let input = display
+                                                .input
+                                                .unwrap_or_else(|| provider_native_items.call_input(&display.id));
+                                            let tool_call = ToolCall {
+                                                intent: ToolCall::intent_from_input(&input),
+                                                id: display.id,
+                                                name: display.name,
+                                                input,
+                                                thought_signature: None,
+                                            };
+                                            self.push_display_message(DisplayMessage {
+                                                role: "tool".to_string(),
+                                                content: output,
+                                                tool_calls: vec![],
+                                                duration_secs: None,
+                                                title: None,
+                                                tool_data: Some(tool_call),
+                                            });
+                                            self.status = ProcessingStatus::Streaming;
+                                        }
+                                        provider_native_items.push(text_content.len(), native_provider, item);
                                     }
                                     StreamEvent::GeneratedImage {
                                         id,
@@ -1156,6 +1232,16 @@ impl App {
                 }
             }
 
+            // Record before the interleave early-continue: an interrupted call
+            // still consumed whatever the provider reported.
+            crate::telemetry::record_simple_completion_usage(
+                Some(&self.session.id),
+                &provider_name,
+                &model_at_request_start,
+                crate::telemetry::UsageSource::Agent,
+                call_usage,
+            );
+
             // If we interleaved a message, skip post-processing and go straight to new API call
             if interleaved {
                 continue;
@@ -1163,7 +1249,9 @@ impl App {
 
             // Add assistant message to history
             let mut content_blocks = Vec::new();
-            if !text_content.is_empty() {
+            if !provider_native_items.is_empty() {
+                content_blocks.extend(provider_native_items.interleave(&text_content));
+            } else if !text_content.is_empty() {
                 content_blocks.push(ContentBlock::Text {
                     text: text_content.clone(),
                     cache_control: None,
@@ -1282,6 +1370,11 @@ impl App {
 
             // Execute tools with input handling (non-blocking)
             // SDK may have executed some tools, but custom tools need local execution
+            // Track the tool calls so the memory pipeline can refresh on a
+            // tool-call cadence. MEASURED 2026-11-04: the agent works for hours
+            // with no user message, and a recall gated on a user turn never
+            // arrives during that work.
+            crate::memory::note_tool_calls(&self.session.id, tool_calls.len());
             for tc in tool_calls {
                 self.status = ProcessingStatus::RunningTool(tc.name.clone());
                 self.observe_tool_call(&tc);
@@ -1322,6 +1415,9 @@ impl App {
                         sdk_content.clone()
                     };
                     let _ = self.replace_latest_tool_display_message(&tc.id, None, display_output);
+                    if let Some(seconds) = DisplayMessage::tool_duration_from_output(&sdk_content) {
+                        self.set_latest_tool_duration(&tc.id, seconds);
+                    }
 
                     self.observe_tool_result(&tc, &sdk_content, sdk_is_error, None);
                     self.note_tool_completed(&tc, sdk_is_error);
@@ -1392,8 +1488,10 @@ impl App {
                         event = event_stream.next() => {
                             match event {
                                 Some(Ok(Event::Key(key))) => {
+                                    let key = jcode_tui_core::korean_input::normalize_key_event(key);
                                     self.update_copy_badge_key_event(key);
-                                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                    self.observe_voice_key_release(&key);
+                                    if !self.handle_voice_key_event(&key) && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                         let scroll_only = super::input::is_scroll_only_key(self, key.code, key.modifiers);
                                         let _ = self.handle_key_press_event(key);
                                         if self.cancel_requested {
@@ -1562,6 +1660,7 @@ impl App {
                     output.clone(),
                 );
 
+                self.set_latest_tool_duration(&tc.id, tool_duration_ms as f32 / 1000.0);
                 self.add_provider_message(Message::tool_result_with_duration(
                     &tc.id,
                     &output,
@@ -1604,68 +1703,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod keyed_tool_tests {
-    use super::*;
-
-    fn tool(id: &str) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            name: "read".into(),
-            input: serde_json::Value::Null,
-            intent: None,
-            thought_signature: None,
-        }
-    }
-
-    #[test]
-    fn keyed_tool_inputs_interleave_and_finish_out_of_order() {
-        let mut pending = PendingStreamingTools::default();
-        pending.start(tool("a"));
-        pending.input(Some("a"), r#"{"file_path":"a","intent":"Read "#);
-        pending.start(tool("b"));
-        pending.input(Some("b"), r#"{"file_path":"b","intent":"Read B"}"#);
-        pending.input(Some("a"), r#"A"}"#);
-        pending.signature("a", "signature-a");
-        let b = pending.finish(Some("b")).unwrap();
-        assert_eq!(b.input["file_path"], "b");
-        assert_eq!(b.intent.as_deref(), Some("Read B"));
-        assert_eq!(b.thought_signature, None);
-        let a = pending.finish(Some("a")).unwrap();
-        assert_eq!(a.input["file_path"], "a");
-        assert_eq!(a.intent.as_deref(), Some("Read A"));
-        assert_eq!(a.thought_signature.as_deref(), Some("signature-a"));
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn keyed_tool_inputs_preserve_unkeyed_fallback_and_ignore_unknown_ids() {
-        let mut pending = PendingStreamingTools::default();
-        pending.start(tool("legacy"));
-        pending.input(None, r#"{"file_path":"legacy"}"#);
-        pending.input(Some("unknown"), "corruption");
-        assert!(pending.finish(Some("unknown")).is_none());
-        assert_eq!(pending.finish(None).unwrap().input["file_path"], "legacy");
-        assert!(pending.finish(None).is_none());
-    }
-
-    #[test]
-    fn keyed_tool_inputs_rollback_and_interruption_cover_all_pending_calls() {
-        let mut pending = PendingStreamingTools::default();
-        pending.start(tool("a"));
-        pending.input(None, r#"{"file_path":"a"}"#);
-        pending.start(tool("b"));
-        pending.input(None, r#"{"file_path":"b"}"#);
-        let calls: Vec<_> = pending.drain().collect();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].input["file_path"], "a");
-        assert_eq!(calls[1].input["file_path"], "b");
-        assert!(pending.is_empty());
-        pending.start(tool("old"));
-        pending.clear();
-        pending.start(tool("new"));
-        pending.input(Some("old"), "stale");
-        pending.input(None, r#"{"file_path":"new"}"#);
-        assert!(pending.finish(Some("old")).is_none());
-        assert_eq!(pending.finish(None).unwrap().input["file_path"], "new");
-    }
-}
+#[path = "keyed_tool_tests.rs"]
+mod keyed_tool_tests;

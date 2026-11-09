@@ -400,12 +400,18 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         // The previous process intentionally preserved these modes across exec.
         // Reassert idempotent modes because terminals, multiplexers, or an older
         // process may have cleared them during the handoff. Do not push Kitty's
-        // stack-based keyboard enhancement flags again. A later normal exit must
-        // still disable every inherited mode, so retain them in the guard.
+        // stack-based keyboard enhancement flags again: the exec handoff left the
+        // previous process's entry on the stack, so record that this process
+        // now owns it and a later normal exit must pop it. Without adopting,
+        // every cleanup gate would skip the pop and leave the shell in CSI u
+        // mode after the restarted process exits.
         let modes = inherited_modes.unwrap_or(fallback_modes);
+        if modes.keyboard_enhanced {
+            tui::adopt_keyboard_enhancement_ownership();
+        }
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -429,7 +435,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         };
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -518,6 +524,7 @@ fn run_result_will_exec(run_result: &crate::tui::RunResult, extra_exec: bool) ->
         || run_result.rebuild_session.is_some()
         || run_result.update_session.is_some()
         || run_result.restart_session.is_some()
+        || run_result.hibernate_session.is_some()
 }
 
 fn export_tui_exec_handoff(state: &TuiRuntimeState) {
@@ -613,18 +620,150 @@ fn signal_crash_reason(sig: i32) -> String {
 fn handle_termination_signal(sig: i32) -> ! {
     mark_current_session_crashed(signal_crash_reason(sig));
 
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stderr(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
+    // Record termination before the terminal cleanup runs. The cleanup may
+    // skip its restore while an editor owns the terminal and then release the
+    // kitty state lock while this process is still alive: an editor reclaim
+    // racing into that gap must observe the flag and refuse to re-arm modes,
+    // or the shell inherits escape sequences once jcode exits (greptile
+    // #4232838288). Recording first also keeps the normal path intact: a
+    // reclaim that slips in before the cleanup still leaves ownership clear,
+    // so the cleanup runs its full restore.
+    crate::tui::record_termination_started();
+
+    if signal_cleanup_terminal_modes_to(signal_cleanup_stream()) {
+        // The signal handler can fire at any point of the TUI lifetime, including
+        // while the kitty keyboard protocol is active (Ctrl+C races the cleanup
+        // below). Pop only when this process still owns an unbalanced kitty entry:
+        // the pop is a no-op on terminals with no kitty stack, and skipping it when
+        // a suspended editor already popped ours (or pushed its own) avoids
+        // removing someone else's keyboard settings. Leaving jcode's own entry
+        // unpopped would leave the terminal in CSI u mode so the following shell
+        // echoes raw key sequences like `e1;1:3u` after jcode exits (issue #898).
+        crate::tui::disable_keyboard_enhancement();
+    }
 
     if let Some(session_id) = get_current_session() {
         print_session_resume_hint(&session_id);
     }
 
     std::process::exit(128 + sig);
+}
+
+fn signal_cleanup_terminal_modes_to(mut writer: impl Write) -> bool {
+    // The ownership check and the restore writes run under the kitty state
+    // lock so an in-flight editor handoff cannot split them: the handoff
+    // publishes ownership under the same lock after its restores finished
+    // (greptile #4230626960). Without the lock, a signal could observe
+    // ownership set while jcode's modes were still armed, skip the cleanup,
+    // and exit leaving the shell in raw mode.
+    crate::tui::with_kitty_state_lock(|| {
+        if crate::tui::editor_owns_terminal() {
+            return false;
+        }
+
+        let _ = crossterm::terminal::disable_raw_mode();
+        // On Windows crossterm's DisableMouseCapture reports
+        // is_ansi_code_supported() == false and takes the WinAPI path, so it
+        // never writes the VT mouse-tracking reset bytes. jcode armed those
+        // modes itself through sync_windows_vt_mouse_capture, so the reset has
+        // to be written here as well or the shell that inherits the pane keeps
+        // receiving mouse events.
+        #[cfg(windows)]
+        let _ = writer.write_all(WINDOWS_VT_MOUSE_DISABLE);
+        let _ = crossterm::execute!(
+            writer,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        true
+    })
+}
+
+/// Stream the signal cleanup must target: stdout, the interactive terminal
+/// the TUI requires, where `setup_terminal` enabled every mode this cleanup
+/// disables. Writing to stderr would miss the terminal whenever stderr is
+/// redirected and leave the modes armed after jcode exits.
+#[cfg(any(unix, windows))]
+fn signal_cleanup_stream() -> std::io::Stdout {
+    std::io::stdout()
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod signal_cleanup_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that flip the shared editor ownership flag so one
+    /// test's clear cannot interleave with another's check.
+    static SIGNAL_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EditorOwnershipGuard;
+
+    impl EditorOwnershipGuard {
+        fn new(owns_terminal: bool) -> Self {
+            crate::tui::set_editor_terminal_ownership(owns_terminal);
+            Self
+        }
+    }
+
+    impl Drop for EditorOwnershipGuard {
+        fn drop(&mut self) {
+            crate::tui::set_editor_terminal_ownership(false);
+        }
+    }
+
+    #[test]
+    fn signal_cleanup_skips_terminal_modes_while_editor_owns_terminal() {
+        let _test_lock = SIGNAL_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _ownership = EditorOwnershipGuard::new(true);
+        let mut output = Vec::new();
+
+        assert!(!signal_cleanup_terminal_modes_to(&mut output));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn signal_cleanup_waits_for_in_flight_editor_handoff() {
+        // Greptile #4230626960: the cleanup must not observe a half-applied
+        // handoff (flag published while jcode's modes are still armed). The
+        // publication and reclaim hold the kitty state lock, so the cleanup
+        // waits for them instead of racing the flag.
+        let _test_lock = SIGNAL_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _ownership = EditorOwnershipGuard::new(false);
+
+        let cleanup = crate::tui::with_kitty_state_lock(|| {
+            let cleanup = std::thread::spawn(|| {
+                let mut sink = Vec::new();
+                let ran = signal_cleanup_terminal_modes_to(&mut sink);
+                (ran, sink.is_empty())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !cleanup.is_finished(),
+                "cleanup ran without waiting for the handoff lock"
+            );
+            // Mark the editor as owning the terminal so the released cleanup
+            // takes the early-return path and writes nothing to the terminal.
+            crate::tui::set_editor_terminal_ownership(true);
+            cleanup
+        });
+
+        let (ran, sink_empty) = cleanup.join().expect("cleanup thread");
+        assert!(!ran);
+        assert!(sink_empty);
+    }
+
+    #[test]
+    fn signal_cleanup_targets_stdout_not_stderr() {
+        // Same stream object as setup_terminal enables modes on. A write via
+        // this handle lands on the interactive terminal even when stderr is
+        // redirected to a file or pipe.
+        let _stream = signal_cleanup_stream();
+    }
 }
 
 #[cfg(unix)]
@@ -657,7 +796,64 @@ pub fn spawn_session_signal_watchers() {
     spawn_one(libc::SIGQUIT, SignalKind::quit());
 }
 
-#[cfg(not(unix))]
+/// On Windows there is no Unix signal equivalent, so an abrupt termination
+/// (herdr closing the pane, console window close, logoff) skipped the
+/// terminal cleanup entirely: the process died without leaving the terminal
+/// and the shell inherited raw mode, the alternate screen, bracketed paste
+/// and the VT mouse tracking modes. The Win32 console control handler is the
+/// Windows counterpart of the Unix signal watcher and reuses the same cleanup
+/// path, so both platforms restore the same set of modes.
+#[cfg(windows)]
+pub fn spawn_session_signal_watchers() {
+    install_windows_console_ctrl_handler();
+}
+
+/// Register the Win32 console control handler that restores the terminal modes
+/// before an abrupt termination ends the process.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/console/handlerc-routine
+///
+/// The handler runs on a foreign thread, so it cannot rely on the normal
+/// teardown (`TuiRuntimeGuard::finish`/`Drop`); it performs the restore
+/// itself and then exits.
+#[cfg(windows)]
+fn install_windows_console_ctrl_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(windows_console_ctrl_handler), 1);
+    }
+}
+
+/// The console control handler: restore the terminal modes, then exit.
+///
+/// `dw_ctrl_type` covers CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT,
+/// CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT. All of them mean the process is
+/// about to be terminated, so all of them need the same restore.
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_ctrl_handler(dw_ctrl_type: u32) -> i32 {
+    let _ = dw_ctrl_type;
+    // Record the termination before the cleanup runs, so an editor that
+    // reclaims the terminal in this window does not re-arm the modes.
+    crate::tui::record_termination_started();
+
+    if signal_cleanup_terminal_modes_to(signal_cleanup_stream()) {
+        crate::tui::disable_keyboard_enhancement();
+    }
+
+    if let Some(session_id) = get_current_session() {
+        print_session_resume_hint(&session_id);
+    }
+
+    // STATUS_CONTROL_C_EXIT is the conventional exit code for a process
+    // terminated through a console control event.
+    std::process::exit(WINDOWS_TERMINATION_EXIT_CODE as i32);
+}
+
+/// The exit code the Windows console control handler terminates with.
+#[cfg(windows)]
+const WINDOWS_TERMINATION_EXIT_CODE: u32 = 0xC000_013A;
+
+#[cfg(not(any(unix, windows)))]
 pub fn spawn_session_signal_watchers() {}
 
 #[cfg(test)]

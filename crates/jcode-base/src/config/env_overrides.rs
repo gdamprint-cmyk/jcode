@@ -7,6 +7,9 @@ impl Config {
         reason = "Environment override parsing is intentionally explicit and grouped by config area"
     )]
     pub(crate) fn apply_env_overrides(&mut self) {
+        if let Ok(value) = std::env::var("JCODE_BROWSER_HANDOFF") {
+            self.tools.browser_handoff = value == "1" || value.eq_ignore_ascii_case("true");
+        }
         // Server/operator behavior
         if let Ok(v) = std::env::var("JCODE_WAKE_MODE")
             && let Some(parsed) = WakeMode::parse(&v)
@@ -38,6 +41,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("JCODE_EFFORT_DECREASE_KEY") {
             self.keybindings.effort_decrease = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_SPEED_INCREASE_KEY") {
+            self.keybindings.speed_increase = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_SPEED_DECREASE_KEY") {
+            self.keybindings.speed_decrease = v;
         }
         if let Ok(v) = std::env::var("JCODE_CENTERED_TOGGLE_KEY") {
             self.keybindings.centered_toggle = v;
@@ -78,17 +87,29 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_DIAGRAM_PANE_TOGGLE_KEY") {
             self.keybindings.diagram_pane_toggle = v;
         }
+        if let Ok(v) = std::env::var("JCODE_DIAGRAM_PANE_VISIBILITY_TOGGLE_KEY") {
+            self.keybindings.diagram_pane_visibility_toggle = v;
+        }
         if let Ok(v) = std::env::var("JCODE_TYPING_SCROLL_LOCK_TOGGLE_KEY") {
             self.keybindings.typing_scroll_lock_toggle = v;
         }
         if let Ok(v) = std::env::var("JCODE_DIFF_MODE_CYCLE_KEY") {
             self.keybindings.diff_mode_cycle = v;
         }
+        if let Ok(v) = std::env::var("JCODE_COMMIT_LOG_KEY") {
+            self.keybindings.commit_log = v;
+        }
         if let Ok(v) = std::env::var("JCODE_INFO_WIDGET_TOGGLE_KEY") {
             self.keybindings.info_widget_toggle = v;
         }
         if let Ok(v) = std::env::var("JCODE_NEW_TERMINAL_KEY") {
             self.keybindings.new_terminal = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_VOICE_INPUT_KEY") {
+            self.keybindings.voice_input = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_DICTATION_RECORDER") {
+            self.dictation.recorder = v;
         }
 
         // Dictation
@@ -136,6 +157,11 @@ impl Config {
             && let Ok(parsed) = v.trim().parse::<usize>()
         {
             self.tools.mcp_tools_token_threshold = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_CODEMODE")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.tools.codemode = parsed;
         }
 
         // ACP adapter
@@ -264,6 +290,11 @@ impl Config {
                 self.display.external_sessions = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_RESUME_PROJECT_SCOPE") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.resume_project_scope = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_PERFORMANCE") {
             let trimmed = v.trim().to_lowercase();
             if matches!(trimmed.as_str(), "auto" | "full" | "reduced" | "minimal") {
@@ -320,7 +351,51 @@ impl Config {
         }
 
         // Features
-        if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
+        //
+        // reference: ~/.jcode/research/2026-11-04-hindsight-memory-backend-and-refresh.md
+        // reference: no prior art, searched the jcode repo and the Hindsight docs for an existing
+        // provider-scoped enable flag; the global JCODE_MEMORY_ENABLED switch has no per-backend
+        // equivalent, so the split below is the smallest change that keeps the two backends apart.
+        //
+        // MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false` in
+        // the user environment. That flag was written for the JEV backend,
+        // whose recall costs a model call per query and was therefore turned
+        // off for cost. The Hindsight backend makes NO model call (local
+        // pgvector + BM25 + graph + a local cross-encoder), so the same flag
+        // must not disable it.
+        //
+        // `JCODE_HINDSIGHT_MEMORY_ENABLED` was already present in the
+        // environment but referenced by NO code path, so it had no effect at
+        // all. It is now the explicit switch for the Hindsight backend and it
+        // is read INDEPENDENTLY of `JCODE_MEMORY_ENABLED`, so that:
+        //
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=true`  -> memory runs;
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=false` -> memory is off;
+        //   * unset / unparseable                   -> memory runs.
+        //
+        // The unset case means "enabled" on purpose. Falling back to the
+        // global flag would re-open the exact bug this branch fixes: the
+        // global flag is a JEV-cost switch, and a user who set it to false
+        // for that reason never asked for the local backend to be silenced.
+        // The only way to turn the Hindsight backend off is to say so.
+        let hindsight_selected = self
+            .agents
+            .memory_provider
+            .eq_ignore_ascii_case("hindsight");
+        if hindsight_selected {
+            match std::env::var("JCODE_HINDSIGHT_MEMORY_ENABLED") {
+                Ok(hindsight_value) => {
+                    if let Some(hindsight_enabled) = parse_env_bool(&hindsight_value) {
+                        self.features.memory = hindsight_enabled;
+                    } else {
+                        self.features.memory = true;
+                    }
+                }
+                Err(_) => {
+                    self.features.memory = true;
+                }
+            }
+        } else if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.memory = parsed;
             }
@@ -333,6 +408,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_ENABLE_MERMAID") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.mermaid = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MERMAID_HALFBLOCKS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.mermaid_halfblocks = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_CHECK_UPDATES") {
@@ -383,20 +463,9 @@ impl Config {
                 Some(trimmed.to_string())
             };
         }
-        for (key, target) in [
-            (
-                "JCODE_SWARM_ROOT_EFFORT",
-                &mut self.agents.swarm_root_effort,
-            ),
-            (
-                "JCODE_SWARM_DEEP_ROOT_EFFORT",
-                &mut self.agents.swarm_deep_root_effort,
-            ),
-        ] {
-            if let Ok(value) = std::env::var(key) {
-                let value = value.trim();
-                *target = (!value.is_empty()).then(|| value.to_string());
-            }
+        if let Ok(value) = std::env::var("JCODE_SWARM_ROOT_EFFORT") {
+            let value = value.trim();
+            self.agents.swarm_root_effort = (!value.is_empty()).then(|| value.to_string());
         }
         if let Ok(v) = std::env::var("JCODE_SWARM_SPAWN_MODE") {
             if let Some(parsed) = SwarmSpawnMode::parse(&v) {
@@ -413,8 +482,46 @@ impl Config {
                 self.agents.swarm_max_concurrent_agents = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_SWARM_STALL_AFTER_SECS") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                self.agents.swarm_stall_after_secs = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_SWARM_STALL_NUDGE") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.agents.swarm_stall_nudge = true,
+                "0" | "false" | "no" | "off" => self.agents.swarm_stall_nudge = false,
+                _ => {}
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_MEMORY_JEV_PROVIDER") {
             self.agents.memory_jev_provider = v.trim().to_ascii_lowercase();
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_PROVIDER") {
+            self.agents.memory_provider = v.trim().to_ascii_lowercase();
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_HINDSIGHT_LIMIT") {
+            if let Ok(limit) = v.trim().parse::<usize>() {
+                self.agents.memory_hindsight_limit = limit;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_REFRESH_TOOL_CALLS") {
+            if let Ok(calls) = v.trim().parse::<usize>() {
+                self.agents.memory_refresh_tool_calls = calls;
+            }
+        }
+        for (key, target) in [
+            ("JCODE_MEMORY_JEV_MODEL", &mut self.agents.memory_jev_model),
+            (
+                "JCODE_BROWSER_JEV_MODEL",
+                &mut self.agents.browser_jev_model,
+            ),
+            ("JCODE_VOICE_JEV_MODEL", &mut self.agents.voice_jev_model),
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                let value = value.trim();
+                *target = (!value.is_empty()).then(|| value.to_string());
+            }
         }
         if let Ok(v) = std::env::var("JCODE_MEMORY_MODEL") {
             let trimmed = v.trim();
@@ -513,6 +620,15 @@ impl Config {
             self.hooks.pre_tool_transform_timeout_ms = parsed;
         }
         hook_env_override(&mut self.hooks.post_tool, "JCODE_HOOK_POST_TOOL");
+        hook_env_override(
+            &mut self.hooks.post_tool_feedback,
+            "JCODE_HOOK_POST_TOOL_FEEDBACK",
+        );
+        if let Ok(v) = std::env::var("JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+        {
+            self.hooks.post_tool_feedback_timeout_ms = parsed;
+        }
         if let Ok(v) = std::env::var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS") {
             if let Ok(parsed) = v.trim().parse::<u64>() {
                 self.hooks.pre_tool_timeout_ms = parsed;
@@ -553,6 +669,22 @@ impl Config {
             && !v.trim().is_empty()
         {
             self.websearch.searxng_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_WEBSEARCH_PREFER_NATIVE")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.websearch.prefer_native = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_WEBSEARCH_NATIVE_MAX_USES")
+            && let Ok(parsed) = v.trim().parse::<u32>()
+        {
+            self.websearch.native_max_uses = (parsed > 0).then_some(parsed);
+        }
+        if let Ok(v) = std::env::var("JCODE_WEBSEARCH_NATIVE_ALLOWED_DOMAINS") {
+            self.websearch.native_allowed_domains = parse_env_list(&v);
+        }
+        if let Ok(v) = std::env::var("JCODE_WEBSEARCH_NATIVE_BLOCKED_DOMAINS") {
+            self.websearch.native_blocked_domains = parse_env_list(&v);
         }
 
         if let Ok(v) = std::env::var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES") {
@@ -742,6 +874,17 @@ impl Config {
             }
         }
 
+        if let Ok(v) = std::env::var("JCODE_HIBERNATION_IDLE_SECS") {
+            if let Ok(seconds) = v.trim().parse::<u64>() {
+                self.session.hibernation_idle_secs = seconds;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_HIBERNATION_MODE") {
+            if let Some(mode) = jcode_config_types::HibernationMode::parse(&v) {
+                self.session.hibernation_mode = mode;
+            }
+        }
+
         // Power management
         if let Ok(v) = std::env::var("JCODE_PREVENT_SLEEP_WHILE_STREAMING") {
             if let Some(parsed) = parse_env_bool(&v) {
@@ -834,6 +977,11 @@ impl Config {
             && parsed > 0
         {
             self.provider.retry_backoff_cap_secs = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_REQUEST_COMPRESSION")
+            && !v.trim().is_empty()
+        {
+            self.provider.request_compression = v.trim().to_ascii_lowercase();
         }
 
         // Copilot premium mode: env var overrides config

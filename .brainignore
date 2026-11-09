@@ -1,0 +1,12 @@
+# Paths the Entire Brain seed and code-index gates must not treat as source.
+# Both the repository-context seed and the Graph code index honour this file
+# on top of .gitignore.
+#
+# .claude/settings.local.json is written by `entire enable` / `entire graph setup`
+# (the SubagentStart hook). It is local tool state, never source, and leaving it
+# untracked made the brain refuse to build repository context from a "dirty"
+# worktree.
+#
+# No leading slash: the Brain matcher compares the pattern against the git
+# path (".claude/settings.local.json"), and a rooted pattern never matches.
+.claude/settings.local.json

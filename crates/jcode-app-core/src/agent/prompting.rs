@@ -3,6 +3,37 @@ use crate::logging;
 use crate::message::{Message, ToolDefinition};
 
 impl Agent {
+    pub(crate) fn runtime_skills_snapshot(&self) -> serde_json::Value {
+        let registry = self.current_skills_snapshot();
+        let mut loaded = registry.list();
+        loaded.sort_by(|a, b| a.name.cmp(&b.name));
+        let skills: Vec<_> = loaded
+            .iter()
+            .map(|skill| {
+                serde_json::json!({
+                    "name": skill.name, "description": skill.description,
+                    "path": skill.path, "allowed_tools": skill.allowed_tools,
+                })
+            })
+            .collect();
+        let endorsed: Vec<_> = crate::skill::endorsed_skills().iter().map(|skill| serde_json::json!({
+            "name": skill.name, "description": skill.description, "category": skill.category,
+            "source": skill.source, "install": skill.install, "installed": registry.contains(skill.name),
+        })).collect();
+        serde_json::json!({"skills": skills, "endorsed": endorsed, "active_skill": self.active_skill})
+    }
+
+    pub(crate) fn runtime_agent_model_overrides(&self) -> serde_json::Value {
+        serde_json::json!(self.session.agent_model_overrides)
+    }
+
+    pub(crate) async fn runtime_context_snapshot(&self) -> serde_json::Value {
+        let mut context = self.debug_context().await;
+        context["messages"] = serde_json::json!(self.session.visible_conversation_messages());
+        context["context_window"] = serde_json::json!(self.provider_context_window());
+        context
+    }
+
     /// Explicitly prepare/freeze the same tool surface used by provider turns.
     /// Unlike `debug_context`, this may update the tool cache. It never calls a provider.
     pub async fn prepare_debug_context(&mut self) -> serde_json::Value {
@@ -68,14 +99,26 @@ impl Agent {
         let session_id = &self.session.id;
 
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
-        let pending = if fresh_user_turn {
-            crate::memory::take_pending_memory_for_project(
-                session_id,
-                self.session.working_dir.as_deref(),
-            )
-        } else {
-            None
-        };
+        // A refresh is also due when the agent has been working for a while
+        // without a user message. MEASURED 2026-11-04: the agent can run for
+        // hours of tool calls with no user turn, and a recall gated purely on
+        // `fresh_user_turn` therefore never arrives during that work.
+        let refresh_every = crate::config::config().agents.memory_refresh_tool_calls;
+        let tool_calls_due = refresh_every > 0
+            && crate::memory::tool_calls_since_refresh(session_id) >= refresh_every;
+
+        // Take the pending payload on EVERY provider iteration, not only at a
+        // fresh user turn. MEASURED 2026-11-04: the recall is prepared in the
+        // background, so a payload raised during autonomous tool work sat in
+        // the queue until the user spoke again - the agent worked for hours
+        // without the memory it had already fetched. The payload is removed
+        // from the queue when taken, and the injected-set/TTL bookkeeping
+        // suppresses repeats, so taking it every iteration cannot duplicate
+        // an injection.
+        let pending = crate::memory::take_pending_memory_for_project(
+            session_id,
+            self.session.working_dir.as_deref(),
+        );
 
         // Use the persistent memory-agent pipeline as the single source of truth.
         // Running both this and the legacy MemoryManager background retrieval path
@@ -86,7 +129,16 @@ impl Agent {
         // for each provider continuation without creating an additional injection
         // opportunity. One update per user turn keeps memory current while avoiding
         // redundant 512-token inference during tool-heavy agent loops.
-        if fresh_user_turn {
+        if tool_calls_due {
+            // Forced: the focused query rarely changes during autonomous
+            // work, and the normal repeat suppression would swallow the
+            // scheduled refresh.
+            crate::memory_agent::update_context_sync_with_dir_forced(
+                session_id,
+                messages,
+                self.session.working_dir.clone(),
+            );
+        } else if fresh_user_turn {
             crate::memory_agent::update_context_sync_with_dir(
                 session_id,
                 messages,
@@ -94,24 +146,13 @@ impl Agent {
             );
         }
 
-        pending
-    }
-
-    fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {
-        let Some(reminder) = self
-            .current_turn_system_reminder
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        else {
-            return;
-        };
-
-        if !split.dynamic_part.is_empty() {
-            split.dynamic_part.push_str("\n\n");
+        // Reset only when a refresh was actually requested, so the counter
+        // keeps accumulating across iterations until the cadence fires.
+        if tool_calls_due {
+            crate::memory::reset_tool_calls_since_refresh(session_id);
         }
-        split.dynamic_part.push_str("# System Reminder\n\n");
-        split.dynamic_part.push_str(reminder);
+
+        pending
     }
 
     /// Build split system prompt for better caching
@@ -127,21 +168,14 @@ impl Agent {
             };
         }
 
-        let skills = self.current_skills_snapshot();
-        let skill_prompt = self
-            .active_skill
-            .as_ref()
-            .and_then(|name| skills.get(name).map(|skill| skill.get_prompt().to_string()));
+        // The active skill prompt is announced once in the transcript when the
+        // skill is activated (see `announce_active_skill`). Keeping it out of
+        // the system prompt means switching skills never invalidates the cache.
+        let skill_prompt: Option<String> = None;
 
-        let available_skills: Vec<crate::prompt::SkillInfo> = self
-            .current_skills_snapshot()
-            .list()
-            .iter()
-            .map(|skill| crate::prompt::SkillInfo {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-            })
-            .collect();
+        // Frozen per session so skill installs never rewrite the cached
+        // system prefix. Later installs are announced in the transcript.
+        let available_skills = &self.prompt_skills_snapshot;
 
         let working_dir = self
             .session
@@ -149,19 +183,13 @@ impl Agent {
             .as_ref()
             .map(std::path::PathBuf::from);
 
-        let (mut split, _context_info) = crate::prompt::build_system_prompt_split_with_agents_md(
+        let (split, _context_info) = crate::prompt::build_system_prompt_split_with_agents_md(
             skill_prompt.as_deref(),
-            &available_skills,
+            available_skills,
             self.session.is_canary,
             memory_prompt,
             working_dir.as_deref(),
             self.agents_md_snapshot.clone(),
-        );
-
-        self.append_current_turn_system_reminder(&mut split);
-        crate::prompt::append_swarm_effort_directive(
-            &mut split,
-            self.provider.reasoning_effort().as_deref(),
         );
 
         split

@@ -1,3 +1,8 @@
+// reference: no prior art, searched the jcode repo for an existing
+// per-backend memory kill switch; the env-override pattern is the one in
+// crates/jcode-base/src/config/env_overrides.rs, and the sibling test
+// `mermaid_environment_override_uses_standard_boolean_values` below is
+// the shape this test follows.
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
     McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
@@ -12,6 +17,20 @@ fn restore_env_var(key: &str, previous: Option<OsString>) {
     } else {
         crate::env::remove_var(key);
     }
+}
+
+#[test]
+fn hibernation_environment_override_accepts_seconds_and_zero_but_not_invalid_values() {
+    let _lock = crate::storage::lock_test_env();
+    let key = "JCODE_HIBERNATION_IDLE_SECS";
+    let previous = std::env::var_os(key);
+    for (value, expected) in [("60", 60), (" 0 ", 0), ("-1", 1800), ("invalid", 1800)] {
+        crate::env::set_var(key, value);
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        assert_eq!(config.session.hibernation_idle_secs, expected, "{value}");
+    }
+    restore_env_var(key, previous);
 }
 
 struct GeminiConfigEnv {
@@ -154,6 +173,19 @@ fn swarm_spawn_mode_defaults_to_inline() {
 }
 
 #[test]
+fn swarm_stall_watchdog_defaults_and_parses() {
+    let defaults = Config::default().agents;
+    assert_eq!(defaults.swarm_stall_after_secs, 600);
+    assert!(!defaults.swarm_stall_nudge);
+
+    let cfg: Config =
+        toml::from_str("[agents]\nswarm_stall_after_secs = 0\nswarm_stall_nudge = true\n")
+            .expect("stall watchdog settings should parse");
+    assert_eq!(cfg.agents.swarm_stall_after_secs, 0);
+    assert!(cfg.agents.swarm_stall_nudge);
+}
+
+#[test]
 fn swarm_max_concurrent_agents_defaults_to_safe_live_worker_budget() {
     // Keep enough parallelism for deep fan-out without allowing recursive ad hoc
     // spawns to grow until the 1000-member hard cap exhausts machine memory.
@@ -182,6 +214,92 @@ fn mermaid_environment_override_uses_standard_boolean_values() {
     restore_env_var("JCODE_ENABLE_MERMAID", previous);
 }
 
+/// The Hindsight backend must survive `JCODE_MEMORY_ENABLED=false`.
+///
+/// MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false` in the
+/// user environment. That flag was written for the JEV backend, whose recall
+/// costs a model call per query and was therefore turned off for cost. The
+/// Hindsight backend makes NO model call (local pgvector + BM25 + graph +
+/// a local cross-encoder reranker), so the flag must not disable it.
+///
+/// The symptom this pins: with the flag on, `features.memory` was false, so
+/// `build_memory_prompt_nonblocking_shared` returned early and the memory
+/// pipeline never ran at all. Nothing was injected, nothing was consumed,
+/// and the memory log stayed silent - which reads exactly like "memory
+/// arrives too late and gets ignored".
+#[test]
+fn hindsight_backend_survives_the_jev_era_memory_disabled_flag() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_memory = std::env::var_os("JCODE_MEMORY_ENABLED");
+    let previous_hindsight = std::env::var_os("JCODE_HINDSIGHT_MEMORY_ENABLED");
+
+    crate::env::set_var("JCODE_MEMORY_ENABLED", "false");
+
+    // Hindsight selected + the explicit hindsight switch on: memory must run.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "true");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.features.memory,
+        "the Hindsight backend must run even when the native pipeline is off"
+    );
+
+    // The explicit switch off: memory must not run.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "false");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "JCODE_HINDSIGHT_MEMORY_ENABLED=false must disable the Hindsight backend"
+    );
+
+    // The explicit switch off must also work when the global flag is ABSENT,
+    // which is the normal case for a machine that never set the JEV-cost
+    // switch. Reading the Hindsight switch only inside the global-flag branch
+    // would silently ignore it here.
+    //
+    // reference: ~/.jcode/research/2026-11-04-hindsight-memory-backend-and-refresh.md
+    // reference: no prior art, searched the jcode repo for an existing provider-scoped
+    // enable-flag test; the switch is new, so the test states the contract directly.
+    crate::env::remove_var("JCODE_MEMORY_ENABLED");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "JCODE_HINDSIGHT_MEMORY_ENABLED=false must disable the Hindsight backend even when \
+         JCODE_MEMORY_ENABLED is unset"
+    );
+
+    // Unset Hindsight switch + the global flag off: memory still runs. Falling
+    // back to the global flag would re-open the exact bug this test pins.
+    crate::env::set_var("JCODE_MEMORY_ENABLED", "false");
+    crate::env::remove_var("JCODE_HINDSIGHT_MEMORY_ENABLED");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "hindsight".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.features.memory,
+        "an unset JCODE_HINDSIGHT_MEMORY_ENABLED must not fall back to the JEV-cost flag"
+    );
+
+    // A different backend still follows the global flag: the Hindsight switch
+    // must not silently re-enable the JEV path.
+    crate::env::set_var("JCODE_HINDSIGHT_MEMORY_ENABLED", "true");
+    let mut cfg = Config::default();
+    cfg.agents.memory_provider = "jev".to_string();
+    cfg.apply_env_overrides();
+    assert!(
+        !cfg.features.memory,
+        "the JEV backend must still follow JCODE_MEMORY_ENABLED"
+    );
+
+    restore_env_var("JCODE_HINDSIGHT_MEMORY_ENABLED", previous_hindsight);
+    restore_env_var("JCODE_MEMORY_ENABLED", previous_memory);
+}
+
 #[test]
 fn auto_poke_feature_defaults_on_and_parses_false() {
     assert!(Config::default().features.auto_poke);
@@ -189,6 +307,30 @@ fn auto_poke_feature_defaults_on_and_parses_false() {
     let cfg: Config =
         toml::from_str("[features]\nauto_poke = false\n").expect("features.auto_poke should parse");
     assert!(!cfg.features.auto_poke);
+}
+
+#[test]
+fn todo_gate_diagnostics_defaults_off_and_requires_explicit_opt_in() {
+    assert!(!Config::default().features.todo_gate_diagnostics);
+    let omitted: Config = toml::from_str("[features]\nauto_poke = true\n").unwrap();
+    assert!(!omitted.features.todo_gate_diagnostics);
+    for enabled in [true, false] {
+        let cfg: Config =
+            toml::from_str(&format!("[features]\ntodo_gate_diagnostics = {enabled}\n")).unwrap();
+        assert_eq!(cfg.features.todo_gate_diagnostics, enabled);
+    }
+}
+
+#[test]
+fn todo_gate_digest_defaults_off_and_requires_explicit_opt_in() {
+    assert!(!Config::default().features.todo_gate_digest);
+    let omitted: Config = toml::from_str("[features]\nauto_poke = true\n").unwrap();
+    assert!(!omitted.features.todo_gate_digest);
+    let enabled: Config = toml::from_str("[features]\ntodo_gate_digest = true\n").unwrap();
+    assert!(enabled.features.todo_gate_digest);
+    assert!(enabled.features.auto_poke);
+    let disabled: Config = toml::from_str("[features]\ntodo_gate_digest = false\n").unwrap();
+    assert!(!disabled.features.todo_gate_digest);
 }
 
 #[test]
@@ -256,6 +398,50 @@ fn latex_rendering_environment_override_accepts_aliases() {
     cfg.apply_env_overrides();
     assert_eq!(cfg.display.latex_rendering, LatexRenderingMode::Image);
     restore_env_var("JCODE_LATEX_RENDERING", previous);
+}
+
+/// The /latex command persists through set_latex_rendering, which is a
+/// read-modify-write over the real config.toml. Pin the whole roundtrip at
+/// this layer: write, then parse the file back and confirm the mode and an
+/// unrelated sibling setting both survive, so a future refactor cannot make
+/// the setter rewrite the file without keeping other keys.
+#[test]
+fn set_latex_rendering_roundtrips_through_config_toml() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let previous_latex = std::env::var_os("JCODE_LATEX_RENDERING");
+    crate::env::remove_var("JCODE_LATEX_RENDERING");
+
+    // Seed a non-default sibling key so the test can catch a rewrite that
+    // drops it.
+    let seed = temp.path().join("config.toml");
+    std::fs::write(
+        &seed,
+        "[display]\ncentered = false\nlatex_rendering = \"unicode\"\n",
+    )
+    .expect("seed config");
+
+    Config::set_latex_rendering(LatexRenderingMode::None).expect("save mode");
+
+    let raw = std::fs::read_to_string(&seed).expect("read config back");
+    assert!(
+        raw.contains("latex_rendering = \"none\""),
+        "mode must be persisted, got: {raw}"
+    );
+    assert!(
+        raw.contains("centered = false"),
+        "unrelated display keys must survive the rewrite, got: {raw}"
+    );
+
+    let reloaded = Config::load_strict().expect("config parses after the write");
+    assert_eq!(reloaded.display.latex_rendering, LatexRenderingMode::None);
+    assert!(!reloaded.display.centered);
+
+    restore_env_var("JCODE_LATEX_RENDERING", previous_latex);
+    restore_env_var("JCODE_HOME", previous_home);
+    Config::invalidate_cache();
 }
 
 #[test]
@@ -334,6 +520,93 @@ fn test_env_override_swarm_model() {
     assert_eq!(cfg.agents.swarm_model, None);
 
     restore_env_var("JCODE_SWARM_MODEL", prev);
+}
+
+// reference: crates/jcode-config-types/src/lib.rs - AgentsConfig::validate_swarm_model_request
+// and AgentsConfig::is_swarm_inherit_sentinel are the mechanism under test here.
+#[test]
+fn swarm_model_selection_defaults_off_even_with_an_allowlist() {
+    let agents = Config::default().agents;
+    assert!(!agents.swarm_model_selection);
+    assert!(agents.swarm_model_allowlist.is_empty());
+    assert!(agents.validate_swarm_model_request(None).is_ok());
+    for model in ["", "  ", "claude-api:claude-opus-4-8"] {
+        assert!(agents.validate_swarm_model_request(Some(model)).is_err());
+    }
+    // The inherit sentinel requests no override, so it is accepted even while
+    // agent-selected models are disabled: it means "use the default".
+    for model in ["inherit", "coordinator", "INHERIT", " inherit "] {
+        assert!(
+            agents.validate_swarm_model_request(Some(model)).is_ok(),
+            "{model:?}"
+        );
+    }
+    let cfg: Config =
+        toml::from_str("[agents]\nswarm_model_allowlist = [\"claude-api:claude-opus-4-8\"]\n")
+            .unwrap();
+    assert!(
+        cfg.agents
+            .validate_swarm_model_request(Some("claude-api:claude-opus-4-8"))
+            .is_err()
+    );
+}
+
+#[test]
+fn swarm_model_rejection_names_the_requested_model_and_allowed_routes() {
+    let cfg: Config = toml::from_str(
+        "[agents]\nswarm_model_selection = true\nswarm_model_allowlist = [\"nous-free:beam\", \"opencode-go:beam-free\"]\n"
+    )
+    .unwrap();
+    let error = cfg
+        .agents
+        .validate_swarm_model_request(Some("nous-free:wrong"))
+        .expect_err("a route outside the allowlist must be refused");
+    assert!(error.contains("nous-free:wrong"), "{error}");
+    assert!(error.contains("nous-free:beam"), "{error}");
+    assert!(error.contains("opencode-go:beam-free"), "{error}");
+
+    let empty: Config =
+        toml::from_str("[agents]\nswarm_model_selection = true\nswarm_model_allowlist = []\n")
+            .unwrap();
+    let error = empty
+        .agents
+        .validate_swarm_model_request(Some("nous-free:beam"))
+        .expect_err("an empty allowlist refuses every concrete route");
+    assert!(error.contains("allowlist is empty"), "{error}");
+}
+
+#[test]
+fn swarm_model_selection_requires_opt_in_and_exact_route_match() {
+    let cfg: Config = toml::from_str(
+        "[agents]\nswarm_model_selection = true\nswarm_model_allowlist = [\"claude:claude-opus-4-8\"]\n"
+    ).unwrap();
+    assert!(cfg.agents.validate_swarm_model_request(None).is_ok());
+    assert!(
+        cfg.agents
+            .validate_swarm_model_request(Some("claude:claude-opus-4-8"))
+            .is_ok()
+    );
+    for model in [
+        "claude-api:claude-opus-4-8",
+        "claude-opus-4-8",
+        "Claude:claude-opus-4-8",
+        "claude:claude-opus-4-8 ",
+        "",
+        "  ",
+    ] {
+        assert!(
+            cfg.agents
+                .validate_swarm_model_request(Some(model))
+                .is_err(),
+            "{model:?}"
+        );
+    }
+    let cfg: Config = toml::from_str("[agents]\nswarm_model_selection = true\n").unwrap();
+    assert!(
+        cfg.agents
+            .validate_swarm_model_request(Some("claude:claude-opus-4-8"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -660,6 +933,8 @@ fn tool_config_acp_profile_allows_core_coding_plus_batch() {
     assert!(allowed.contains("agentgrep"));
     assert!(allowed.contains("batch"));
     assert!(allowed.contains("mcp"));
+    assert!(allowed.contains("edit"));
+    assert!(!allowed.contains("replace"));
     assert!(!allowed.contains("swarm"));
     assert!(!allowed.contains("subagent"));
     assert!(!allowed.contains("side_panel"));
@@ -688,6 +963,8 @@ fn tool_config_minimal_profile_allows_core_coding_tools() {
     assert!(allowed.contains("apply_patch"));
     assert!(allowed.contains("agentgrep"));
     assert!(!allowed.contains("browser"));
+    assert!(allowed.contains("edit"));
+    assert!(!allowed.contains("replace"));
     assert!(!allowed.contains("swarm"));
 }
 
@@ -1150,120 +1427,8 @@ fn test_env_override_diff_mode_full_inline() {
     }
 }
 
-#[test]
-fn test_env_override_trusted_external_auth_splits_source_and_path_entries() {
-    let _guard = crate::storage::lock_test_env();
-    let prev = std::env::var_os("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES");
-    crate::env::set_var(
-        "JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES",
-        "legacy_source,claude_code_credentials|/tmp/auth.json",
-    );
-
-    let mut cfg = Config::default();
-    cfg.apply_env_overrides();
-
-    assert_eq!(cfg.auth.trusted_external_sources, vec!["legacy_source"]);
-    assert_eq!(
-        cfg.auth.trusted_external_source_paths,
-        vec!["claude_code_credentials|/tmp/auth.json"]
-    );
-
-    if let Some(prev) = prev {
-        crate::env::set_var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES", prev);
-    } else {
-        crate::env::remove_var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES");
-    }
-}
-
-#[test]
-fn test_external_auth_source_allowed_for_path_matches_saved_entry() {
-    let _guard = crate::storage::lock_test_env();
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let path = dir.path().join("auth.json");
-    std::fs::write(&path, "{}\n").expect("write auth file");
-
-    let canonical = std::fs::canonicalize(&path).expect("canonical path");
-    let mut cfg = Config::default();
-    cfg.auth.trusted_external_source_paths = vec![format!(
-        "test_source|{}",
-        canonical.to_string_lossy().to_ascii_lowercase()
-    )];
-
-    assert!(cfg.external_auth_source_allowed_for_path_config("test_source", &path));
-}
-
-#[test]
-fn test_external_auth_source_allowed_for_path_ignores_broad_legacy_entry() {
-    let _guard = crate::storage::lock_test_env();
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let path = dir.path().join("auth.json");
-    std::fs::write(&path, "{}\n").expect("write auth file");
-
-    let mut cfg = Config::default();
-    cfg.auth.trusted_external_sources = vec!["test_source".to_string()];
-
-    assert!(!cfg.external_auth_source_allowed_for_path_config("test_source", &path));
-}
-
-/// Regression test for issue #349: a removed/unknown `update_channel` value
-/// (older configs could contain `"manual"`) must not fail the whole config
-/// parse. A hard parse failure during the reload handoff left the reload
-/// marker stuck in `starting` and clients re-requested the reload forever.
-#[test]
-fn unknown_update_channel_value_falls_back_to_stable_instead_of_failing_parse() {
-    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"manual\"\n")
-        .expect("unknown update_channel must not fail config parse");
-    assert_eq!(
-        cfg.features.update_channel,
-        super::UpdateChannel::Stable,
-        "unknown channel should fall back to the default"
-    );
-
-    // Other settings in the same config must survive the fallback.
-    let cfg: Config = toml::from_str(
-        "[features]\nupdate_channel = \"manual\"\nmemory = false\n\n[display]\ncentered = true\n",
-    )
-    .expect("config with unknown update_channel should parse");
-    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Stable);
-    assert!(!cfg.features.memory);
-    assert!(cfg.display.centered);
-}
-
-#[test]
-fn known_update_channel_values_still_parse() {
-    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"main\"\n")
-        .expect("main update_channel should parse");
-    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Main);
-
-    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"stable\"\n")
-        .expect("stable update_channel should parse");
-    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Stable);
-}
-
-#[test]
-fn update_channel_parse_accepts_known_aliases_and_rejects_unknown() {
-    use super::UpdateChannel;
-    assert_eq!(UpdateChannel::parse("stable"), Some(UpdateChannel::Stable));
-    assert_eq!(UpdateChannel::parse("release"), Some(UpdateChannel::Stable));
-    assert_eq!(UpdateChannel::parse("main"), Some(UpdateChannel::Main));
-    assert_eq!(UpdateChannel::parse("nightly"), Some(UpdateChannel::Main));
-    assert_eq!(UpdateChannel::parse("edge"), Some(UpdateChannel::Main));
-    assert_eq!(UpdateChannel::parse(" Main "), Some(UpdateChannel::Main));
-    assert_eq!(UpdateChannel::parse("manual"), None);
-    assert_eq!(UpdateChannel::parse(""), None);
-}
-
-impl Config {
-    fn external_auth_source_allowed_for_path_config(&self, source_id: &str, path: &Path) -> bool {
-        let Ok(entry) = Self::trusted_external_auth_path_entry(source_id, path) else {
-            return false;
-        };
-        self.auth
-            .trusted_external_source_paths
-            .iter()
-            .any(|value| value.trim().eq_ignore_ascii_case(&entry))
-    }
-}
+#[path = "config_preference_tests.rs"]
+mod preferences;
 
 #[test]
 fn populate_context_limits_from_config_ref_seeds_global_cache() {
@@ -1548,12 +1713,40 @@ fn sponsors_optout_survives_config_save_and_reload() {
             );
             let saved = std::fs::read_to_string(&path).expect("read saved config");
             let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
-            assert_eq!(saved["sponsors"]["enabled"].as_bool(), Some(false));
+            assert_eq!(
+                saved
+                    .get("sponsors")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false),
+                false
+            );
         }
     }
 
     restore_env_var("JCODE_HOME", prev_home);
     Config::invalidate_cache();
+}
+
+#[test]
+fn integration_discovery_is_opt_in() {
+    assert!(!Config::default().sponsors.enabled);
+    for raw in [
+        "",
+        "[sponsors]\n",
+        "[sponsors]\nendpoint = 'https://example.com'\n",
+    ] {
+        let config: Config = toml::from_str(raw).expect("parse config");
+        assert!(!config.sponsors.enabled, "must be disabled for {raw:?}");
+    }
+    let config: Config = toml::from_str("[sponsors]\nenabled = true\n").expect("parse opt-in");
+    assert!(config.sponsors.enabled);
+    let rendered = toml::to_string_pretty(&config).expect("serialize opt-in");
+    let reloaded: Config = toml::from_str(&rendered).expect("reload opt-in");
+    assert!(
+        reloaded.sponsors.enabled,
+        "explicit opt-in must survive saving"
+    );
 }
 
 #[test]
@@ -1578,82 +1771,63 @@ fn config_reload_generation_increments_on_cache_invalidation() {
 }
 
 #[test]
-fn swarm_root_effort_config_defaults_and_independent_modes() {
+fn swarm_root_effort_config_defaults_and_validation() {
     let defaults = Config::default();
-    assert_eq!(defaults.agents.root_effort_for_swarm(false), "max");
-    assert_eq!(defaults.agents.root_effort_for_swarm(true), "max");
-    let cfg: Config = toml::from_str(
-        "[agents]\nswarm_root_effort = 'low'\nswarm_deep_root_effort = ' High '\nswarm_effort = 'medium'\n",
-    ).unwrap();
-    assert_eq!(cfg.agents.root_effort_for_swarm(false), "low");
-    assert_eq!(cfg.agents.root_effort_for_swarm(true), "high");
+    assert_eq!(defaults.agents.root_effort_for_swarm(), "low");
+    let cfg: Config =
+        toml::from_str("[agents]\nswarm_root_effort = ' High '\nswarm_effort = 'medium'\n")
+            .unwrap();
+    assert_eq!(cfg.agents.root_effort_for_swarm(), "high");
     assert_eq!(cfg.agents.swarm_effort.as_deref(), Some("medium"));
-    assert!(cfg.display_string().contains("Swarm root effort: low"));
-    assert!(
-        cfg.display_string()
-            .contains("Deep swarm root effort: high")
-    );
+    assert!(cfg.display_string().contains("Swarm root effort: high"));
+    assert!(!cfg.display_string().contains("Deep swarm"));
     let serialized = toml::to_string(&cfg).unwrap();
     let round_trip: Config = toml::from_str(&serialized).unwrap();
-    assert_eq!(round_trip.agents.root_effort_for_swarm(true), "high");
+    assert_eq!(round_trip.agents.root_effort_for_swarm(), "high");
 
     for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
         let cfg: Config =
             toml::from_str(&format!("[agents]\nswarm_root_effort = '{level}'")).unwrap();
-        assert_eq!(cfg.agents.root_effort_for_swarm(false), level);
-        assert_eq!(cfg.agents.root_effort_for_swarm(true), "max");
+        assert_eq!(cfg.agents.root_effort_for_swarm(), level);
     }
     for invalid in ["", "swarm", "swarm-deep", "turbo"] {
-        let cfg: Config = toml::from_str(&format!("[agents]\nswarm_root_effort = '{invalid}'\nswarm_deep_root_effort = '{invalid}'\nswarm_effort = 'low'")).unwrap();
-        assert_eq!(cfg.agents.root_effort_for_swarm(false), "max");
-        assert_eq!(cfg.agents.root_effort_for_swarm(true), "max");
+        let cfg: Config = toml::from_str(&format!(
+            "[agents]\nswarm_root_effort = '{invalid}'\nswarm_effort = 'low'"
+        ))
+        .unwrap();
+        assert_eq!(cfg.agents.root_effort_for_swarm(), "low");
         assert_eq!(cfg.agents.swarm_effort.as_deref(), Some("low"));
     }
+    // Legacy configs that still set the removed deep key keep parsing.
+    let legacy: Config = toml::from_str("[agents]\nswarm_deep_root_effort = 'high'\n").unwrap();
+    assert_eq!(legacy.agents.root_effort_for_swarm(), "low");
 }
 
 #[test]
 fn swarm_root_effort_env_overrides_and_shared_resolution() {
     let _guard = crate::storage::lock_test_env();
-    let keys = ["JCODE_SWARM_ROOT_EFFORT", "JCODE_SWARM_DEEP_ROOT_EFFORT"];
-    let previous = keys.map(std::env::var_os);
+    let key = "JCODE_SWARM_ROOT_EFFORT";
+    let previous = std::env::var_os(key);
     let fingerprint = config_env_fingerprint();
-    crate::env::set_var(keys[0], "low");
-    crate::env::set_var(keys[1], "high");
+    crate::env::set_var(key, "high");
     assert_ne!(config_env_fingerprint(), fingerprint);
     let mut cfg = Config::default();
     cfg.apply_env_overrides();
-    assert_eq!(cfg.agents.root_effort_for_swarm(false), "low");
-    assert_eq!(cfg.agents.root_effort_for_swarm(true), "high");
-    assert_eq!(
-        crate::prompt::swarm_root_reasoning_effort("swarm"),
-        Some("low")
-    );
-    assert_eq!(
-        crate::prompt::swarm_root_reasoning_effort(" Swarm-Deep "),
-        Some("high")
-    );
+    assert_eq!(cfg.agents.root_effort_for_swarm(), "high");
     assert_eq!(crate::prompt::swarm_root_reasoning_effort("low"), None);
-    crate::env::set_var(keys[0], "none");
+    assert_eq!(
+        crate::prompt::swarm_root_reasoning_effort("swarm-deep"),
+        None
+    );
+    crate::env::set_var(key, "none");
     assert_eq!(
         crate::prompt::swarm_root_reasoning_effort("swarm"),
         Some("none")
     );
-    // Config changes must not turn orchestration off or misrepresent its effort.
-    for mode in ["swarm", "swarm-deep"] {
-        let mut split = crate::prompt::SplitSystemPrompt::default();
-        crate::prompt::append_swarm_effort_directive(&mut split, Some(mode));
-        assert!(split.dynamic_part.contains("swarm"));
-        assert!(!split.dynamic_part.contains("maximum reasoning effort"));
-    }
-    for key in keys {
-        crate::env::set_var(key, " ");
-    }
+    crate::env::set_var(key, " ");
     cfg.apply_env_overrides();
     assert_eq!(cfg.agents.swarm_root_effort, None);
-    assert_eq!(cfg.agents.swarm_deep_root_effort, None);
-    for (key, value) in keys.into_iter().zip(previous) {
-        restore_env_var(key, value);
-    }
+    restore_env_var(key, previous);
 }
 
 #[test]
@@ -1724,4 +1898,55 @@ fn cli_config_save_round_trips_desktop_tables() {
 
     restore_env_var("JCODE_HOME", prev_home);
     Config::invalidate_cache();
+}
+
+/// `display.overscroll_status` was removed; configs that still set it (users
+/// had `"on"` written by older versions) must load without losing settings.
+#[test]
+fn removed_overscroll_status_key_still_loads_config() {
+    let config = toml::from_str::<Config>(
+        "[display]\ncentered = true\noverscroll_status = \"on\"\nusage_display = \"used\"\n",
+    )
+    .expect("legacy key must not break config");
+    assert!(config.display.centered);
+    assert_eq!(config.display.usage_display, "used");
+}
+#[test]
+fn tool_auto_background_timeout_configuration() {
+    assert_eq!(ToolConfig::default().auto_background_timeout_ms, 3_000);
+    for contents in ["", "[tools]\n"] {
+        let config: Config = toml::from_str(contents).unwrap();
+        assert_eq!(config.tools.auto_background_timeout_ms, 3_000);
+    }
+    for timeout in [0_u64, 1, 1250, 60_000, u64::MAX / 2] {
+        let config: Config = toml::from_str(&format!(
+            "[tools]\nauto_background_timeout_ms = {timeout}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.tools.auto_background_timeout_ms, timeout);
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.tools.auto_background_timeout_ms, timeout);
+    }
+    for invalid in ["-1", "1.5", "\"3000\"", "true"] {
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "[tools]\nauto_background_timeout_ms = {invalid}\n"
+            ))
+            .is_err()
+        );
+    }
+}
+#[test]
+fn browser_handoff_defaults_off_and_roundtrips() {
+    for contents in ["", "[tools]\n"] {
+        let config: Config = toml::from_str(contents).unwrap();
+        assert!(!config.tools.browser_handoff);
+    }
+    for enabled in [false, true] {
+        let config: Config =
+            toml::from_str(&format!("[tools]\nbrowser_handoff = {enabled}\n")).unwrap();
+        assert_eq!(config.tools.browser_handoff, enabled);
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(restored.tools.browser_handoff, enabled);
+    }
 }

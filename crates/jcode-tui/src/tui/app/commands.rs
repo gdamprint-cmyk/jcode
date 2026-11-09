@@ -1,3 +1,7 @@
+#[path = "commands_release_prompts.rs"]
+mod release_prompts;
+pub(super) use release_prompts::*;
+
 pub(super) use super::commands_improve::{
     build_improve_prompt, build_improve_resume_prompt, build_refactor_prompt,
     build_refactor_resume_prompt, format_improve_status, format_refactor_status,
@@ -14,12 +18,14 @@ pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
     ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
-    build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
-    handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_forked_session_local,
-    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
-    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
-    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
+    build_judge_startup_message, build_review_startup_message, current_autojudge_model_override,
+    current_autoreview_model_override, current_feedback_target_session_id,
+    current_judge_model_override, current_review_model_override, handle_autojudge_command_local,
+    handle_autoreview_command_local, handle_judge_command_local, handle_observe_command,
+    handle_review_command_local, launch_forked_session_local, launch_prompt_in_new_session_local,
+    maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
+    preferred_one_shot_review_override, prepare_review_spawned_session, queue_review_spawn_remote,
+    reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -113,6 +119,7 @@ pub(super) fn disable_auto_poke(app: &mut App) -> usize {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.auto_poke_attempts = 0;
     app.last_todo_ownership_fingerprint = None;
     app.todo_gate_digest_delivered = false;
     cleared
@@ -246,6 +253,7 @@ pub(super) fn activate_auto_poke(app: &mut App) -> PokeActivation {
     app.todo_confidence_spike_challenged = false;
     app.todo_completion_gate_attempts = 0;
     app.last_auto_poke_fingerprint = None;
+    app.auto_poke_attempts = 0;
     app.last_todo_ownership_fingerprint = None;
     // Re-arming starts a fresh review cycle, so the deferred quality digest is
     // eligible to be delivered again for the upcoming work.
@@ -362,7 +370,12 @@ pub(super) fn create_transfer_session_from_parent(
     parent: &crate::session::Session,
     compaction: Option<crate::session::StoredCompactionState>,
 ) -> anyhow::Result<(String, String)> {
-    let todos = crate::todo::load_todos(parent_session_id).unwrap_or_default();
+    let mut todos = crate::todo::load_todos(parent_session_id).unwrap_or_default();
+    // Background task IDs belong to the parent session. Transfer the work,
+    // not foreign dependencies, and leave the parent's durable todos intact.
+    for todo in &mut todos {
+        todo.waiting_on.clear();
+    }
     let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
     child.compaction = compaction;
@@ -1358,7 +1371,7 @@ pub(super) fn fork_session_with_prompt_local(app: &mut App, prompt: Option<&str>
     // Images attached to the input belong to the prompt being forked off, so
     // they travel with it instead of lingering on the parent's next message.
     let images = if prompt.is_some() {
-        std::mem::take(&mut app.pending_images)
+        app.take_pending_image_payloads()
     } else {
         Vec::new()
     };
@@ -1681,6 +1694,25 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         || handle_judge_command_local(app, trimmed)
         || handle_selfdev_command(app, trimmed)
     {
+        return true;
+    }
+
+    if super::commands_cloud::parse_cloud_command(trimmed).is_some() {
+        let session_id = active_session_id(app);
+        if matches!(
+            super::commands_cloud::parse_cloud_command(trimmed),
+            Some(
+                super::commands_cloud::CloudCommand::Move { .. }
+                    | super::commands_cloud::CloudCommand::MoveSelected { .. }
+            )
+        ) && let Err(error) = app.session.save_prepared()
+        {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Could not save this session before moving it: {error}. Nothing moved."
+            )));
+            return true;
+        }
+        super::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
         return true;
     }
 
@@ -2057,7 +2089,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         }
         history.push_str("\nUse /rewind N to rewind to message N (removes all messages after). After rewinding, use /rewind undo to restore the removed messages.");
 
-        app.push_display_message(DisplayMessage::system(history));
+        app.push_display_message(DisplayMessage::system(history).with_title("Rewind"));
         return true;
     }
 
@@ -2213,44 +2245,6 @@ pub(super) fn build_commit_push_prompt() -> String {
         "After creating the commits, push them to the remote tracking branch with git push (set the upstream with git push -u if the branch has no upstream yet). If the push fails, report the error instead of force-pushing, and never force-push or rewrite already-pushed history. Finally, report the commits created and the push result.",
     );
     prompt
-}
-
-fn build_release_prompt(before_bump_instruction: &str, release_instruction: &str) -> String {
-    let mut prompt = build_commit_push_prompt();
-    prompt.push(' ');
-    prompt.push_str("Then cut a release. Find the last release tag (git describe --tags --abbrev=0 or gh release list) and review everything that changed since it to pick the semver bump: patch for fixes and small internal changes, minor for new features, major only for breaking changes. ");
-    if !before_bump_instruction.is_empty() {
-        prompt.push_str(before_bump_instruction);
-        prompt.push(' ');
-    }
-    prompt.push_str("Bump the version in the root Cargo.toml, refresh Cargo.lock (for example with cargo check), and, if the repo has a changelog/ directory, write a user-facing changelog entry changelog/v<version>.json following changelog/README.md (translate commits into user-visible effects, skip internal-only changes, update changelog/index.json). Commit the version bump together with the changelog entry as one release-metadata commit, and push. ");
-    prompt.push_str(release_instruction);
-    prompt.push_str(" Do not force-push or move existing tags. Finally, report the new version, the commits created, the tag push, and the release status.");
-    prompt
-}
-
-pub(super) fn build_fast_release_prompt() -> String {
-    build_release_prompt(
-        "Before editing Cargo.toml or the changelog for the version bump, run scripts/quick-release.sh --prepare-fast v<version>. It must refresh the warm target/selfdev cache for the Linux x86_64 binary while the existing Cargo version is unchanged and record the prepared commit.",
-        "Then run scripts/quick-release.sh --fast-local v<version>. It must wrap the prepared selfdev binary with the release identity, publish that Linux asset and the GitHub release immediately, and let CI replace it with the portable Linux artifact while adding macOS, Windows, FreeBSD, signatures, and final checksums. Do not run the separate local macOS cross-build or wait for release optimization. If preparation is stale or the release-metadata commit contains code changes, stop instead of publishing a binary that differs from the tag.",
-    )
-}
-
-pub(super) fn build_fast_macos_release_prompt() -> String {
-    build_release_prompt(
-        "Before editing Cargo.toml or the changelog for the version bump, run scripts/quick-release.sh --prepare-fast-macos v<version>. It must cross-build and record the macOS arm64 binary with the future release identity while the release metadata is still unchanged.",
-        "Then run scripts/quick-release.sh --fast-macos-local v<version>. It must validate and publish the prepared macOS arm64 asset and GitHub release immediately, while CI replaces it with the signoff artifact and adds macOS Intel, Linux, Windows, FreeBSD, signatures, and final checksums. If preparation is stale or the release-metadata commit contains code changes, stop instead of publishing a binary that differs from the tag.",
-    )
-}
-
-pub(super) fn build_remote_release_prompt() -> String {
-    let jcode_release = build_release_prompt(
-        "",
-        "Then run scripts/quick-release.sh --remote v<version> to push the tag immediately without any local build. Let the release workflow build, sign, checksum, and publish every platform, and leave publication gated on those remote checks.",
-    );
-    format!(
-        "First identify the repository in the current working directory from its git remote, release documentation, package manifests, existing tags, and CI workflows. Only use the following Jcode-specific procedure when this is the Jcode self-development repository and scripts/quick-release.sh exists: {jcode_release} Otherwise, use the repository's own established release conventions. Inspect its release documentation, workflows, scripts, manifests, tag format, and recent releases before changing anything. Make logical commits for current work without disturbing unrelated changes and push them normally. Determine the next version from this repository's versioning scheme and user-visible changes, update only the version files and changelog formats it actually uses, validate the metadata, commit and push it, then trigger the repository's documented remote release mechanism. Prefer a tag-triggered or workflow-dispatch CI release that performs builds and publication remotely. Do not assume the project uses Cargo, changelog JSON, v-prefixed tags, or scripts/quick-release.sh. Do not build release artifacts locally unless this repository explicitly requires it and no remote release path exists. Never force-push, move an existing tag, bypass remote release gates, or invent a release process. Report the detected release convention, version, commits, tag or workflow invocation, and remote release status."
-    )
 }
 
 pub(super) fn build_triage_prompt(focus: &str) -> String {
@@ -2554,6 +2548,14 @@ fn handle_selfdev_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// `/initiatives` is an explicit request to see the page, so it reopens a side
+/// panel the user closed. Agent-driven panel updates stay hidden.
+fn show_in_side_panel(app: &mut App, snapshot: crate::side_panel::SidePanelSnapshot) {
+    app.side_panel_user_hidden = false;
+    app.side_panel_explicit_hidden = false;
+    app.set_side_panel_snapshot(snapshot);
+}
+
 pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
     let Some(trimmed) = trimmed
         .strip_prefix("/initiatives")
@@ -2570,7 +2572,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(snapshot) => {
-                app.set_side_panel_snapshot(snapshot);
+                show_in_side_panel(app, snapshot);
                 let count = crate::goal::list_relevant_goals(active_working_dir(app).as_deref())
                     .map(|goals| goals.len())
                     .unwrap_or(0);
@@ -2596,7 +2598,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(Some(result)) => {
-                app.set_side_panel_snapshot(result.snapshot);
+                show_in_side_panel(app, result.snapshot);
                 let mut msg = format!("Resumed initiative {}.", result.goal.title);
                 if let Some(next_step) = result.goal.next_steps.first() {
                     msg.push_str(&format!(" Next step: {}", next_step));
@@ -2630,7 +2632,7 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             true,
         ) {
             Ok(Some(result)) => {
-                app.set_side_panel_snapshot(result.snapshot);
+                show_in_side_panel(app, result.snapshot);
                 app.push_display_message(DisplayMessage::system(format!(
                     "Opened initiative {} in the side panel.",
                     result.goal.title
@@ -2767,7 +2769,7 @@ pub(super) fn incomplete_poke_todos(app: &App) -> Vec<crate::todo::TodoItem> {
 }
 
 pub(super) fn build_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    crate::todo::build_auto_poke_message(incomplete.len())
+    crate::todo::build_actionable_poke_message(incomplete)
 }
 
 fn todo_confidence_weight(priority: &str) -> u32 {
@@ -2841,14 +2843,6 @@ pub(super) fn todo_confidence_summary(todos: &[crate::todo::TodoItem]) -> TodoCo
     }
 }
 
-pub(super) fn format_todo_completion_confidence(summary: TodoConfidenceSummary) -> String {
-    summary
-        .completion_average
-        .map(crate::todo::ConfidenceState::from_legacy_score)
-        .map(|state| state.as_str().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 pub(super) fn active_working_dir(app: &App) -> Option<std::path::PathBuf> {
     app.session
         .working_dir
@@ -2857,6 +2851,18 @@ pub(super) fn active_working_dir(app: &App) -> Option<std::path::PathBuf> {
 }
 
 pub(super) fn handle_dictation_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/voice" {
+        app.toggle_voice_input();
+        return true;
+    }
+    if trimmed.starts_with("/voice ") {
+        let key = app.voice_input_key_label().unwrap_or("unbound").to_string();
+        app.push_display_message(DisplayMessage::error(format!(
+            "Usage: /voice (or {key}) starts recording, run it again to send, Esc cancels.\n\
+             Needs a Nari API key (NARI_API_KEY or ~/.config/jcode/nari.env)."
+        )));
+        return true;
+    }
     if trimmed == "/dictate" || trimmed == "/dictation" {
         app.handle_dictation_trigger();
         return true;
@@ -3037,6 +3043,59 @@ fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+pub(super) fn handle_latex_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/latex") else {
+        return false;
+    };
+    let arg = rest.trim();
+
+    let current = crate::config::config().display.latex_rendering;
+    if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
+        app.push_display_message(DisplayMessage::system(format!(
+            "LaTeX rendering: {} (use /latex [on|off|none|unicode|image|status])\n\n  none    - keep raw $...$ source\n  unicode - terminal-friendly text math\n  image   - typeset PNG per formula (needs latex+dvipng or pdflatex+pdftocairo)",
+            current.as_str()
+        )));
+        return true;
+    }
+
+    let mode = match arg.to_ascii_lowercase().as_str() {
+        "on" => Some(crate::config::LatexRenderingMode::Image),
+        "off" => Some(crate::config::LatexRenderingMode::Unicode),
+        _ => crate::config::LatexRenderingMode::parse(arg),
+    };
+    let Some(mode) = mode else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /latex [on|off|none|unicode|image|status]".to_string(),
+        ));
+        return true;
+    };
+
+    match crate::config::Config::set_latex_rendering(mode) {
+        Ok(()) => {
+            let effective = crate::config::config().display.latex_rendering;
+            app.set_status_notice(format!("LaTeX rendering: {}", effective.as_str()));
+            let override_note = if effective != mode {
+                " JCODE_LATEX_RENDERING overrides the saved mode."
+            } else {
+                ""
+            };
+            app.push_display_message(DisplayMessage::system(format!(
+                "Saved LaTeX rendering: {}. Effective mode: {}.{}",
+                mode.as_str(),
+                effective.as_str(),
+                override_note
+            )))
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to set LaTeX rendering to {}: {}. Nothing changed; the session keeps {}.",
+            mode.as_str(),
+            error,
+            crate::config::config().display.latex_rendering.as_str()
+        ))),
+    }
+    true
+}
+
 fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "swarm" | "agent" | "agents" | "subagent" | "subagents" => {
@@ -3176,7 +3235,29 @@ fn run_interactive_editor_with(
     resume: impl FnOnce(),
 ) -> std::io::Result<std::process::ExitStatus> {
     suspend();
+    // Publish only after the restores completed. The flag must never be
+    // observable while jcode's own modes are still armed: a termination
+    // signal firing mid-suspend would skip its cleanup and leave the shell in
+    // raw mode (greptile #4230626960). While the disable writes are in flight
+    // the flag is still false, so a signal in that window restores everything;
+    // the flag is then published under the same kitty state lock the signal
+    // cleanup takes, so cleanup either sees the completed handoff or runs in
+    // full.
+    crate::tui::publish_editor_terminal_handoff();
     let result = command.status();
+    // Reclaim before resume re-arms our modes: while the flag is still set a
+    // termination signal skips its cleanup, which must only happen while the
+    // editor really is the one controlling the tty.
+    crate::tui::reclaim_editor_terminal_handoff();
+    // A termination signal that skipped its cleanup while the editor owned
+    // the terminal recorded termination under the kitty state lock before
+    // this reclaim ran, and the process is exiting. The reclaim leaves
+    // ownership set in that case; re-arming modes now would leave them
+    // enabled on the shell after death because no further cleanup runs
+    // (greptile #4232838288), so skip the resume entirely.
+    if crate::tui::editor_owns_terminal() {
+        return result;
+    }
     resume();
     result
 }
@@ -3184,6 +3265,10 @@ fn run_interactive_editor_with(
 fn suspend_terminal_for_editor() {
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
 
+    // The caller publishes the handoff only after this function returns, so a
+    // termination signal firing between these restores and the publication
+    // runs a full cleanup instead of skipping one (greptile #4230626960).
+    //
     // These commands are safe even when a mode was not enabled. Disable them
     // before leaving the alternate screen so the child receives normal input.
     let _ = crossterm::execute!(
@@ -3197,15 +3282,27 @@ fn suspend_terminal_for_editor() {
 }
 
 fn resume_terminal_after_editor() {
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
 
+    // Defense in depth for the run_interactive_editor_with early return: a
+    // termination signal already recorded that the process is exiting, so
+    // enabling modes here would leave them active on the shell after death
+    // (greptile #4232838288).
+    if crate::tui::editor_owns_terminal() {
+        return;
+    }
+    // The caller reclaimed the handoff before entering here, so a termination
+    // signal arriving while these modes are re-armed runs the full cleanup.
     // Re-enter the TUI before returning to the event loop. The existing
     // ratatui Terminal remains usable and the next loop iteration redraws it.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init));
     let policy = crate::perf::tui_policy();
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     if policy.enable_focus_change {
-        let _ = crossterm::execute!(std::io::stdout(), EnableFocusChange);
+        // Platform dependent: on Windows the reset form is written, because a
+        // focus report cannot be decoded there and its tail would land in the
+        // composer as literal text.
+        let _ = crate::tui::write_focus_reporting_mode_to(&mut std::io::stdout());
     }
     if policy.enable_mouse_capture {
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -3216,59 +3313,8 @@ fn resume_terminal_after_editor() {
 }
 
 #[cfg(all(test, unix))]
-mod interactive_editor_tests {
-    use super::run_interactive_editor_with;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    #[test]
-    fn handoff_waits_for_editor_before_resuming_terminal() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let child_events = Rc::clone(&events);
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "sleep 0.05"]);
-
-        let started = std::time::Instant::now();
-        let status = run_interactive_editor_with(
-            &mut command,
-            {
-                let events = Rc::clone(&events);
-                move || events.borrow_mut().push("suspend")
-            },
-            move || {
-                assert!(
-                    started.elapsed() >= std::time::Duration::from_millis(40),
-                    "terminal resumed before the editor process exited"
-                );
-                child_events.borrow_mut().push("resume");
-            },
-        )
-        .expect("editor command should run");
-
-        assert!(status.success());
-        assert_eq!(&*events.borrow(), &["suspend", "resume"]);
-    }
-
-    #[test]
-    fn handoff_resumes_terminal_after_editor_failure_status() {
-        let resumed = Rc::new(RefCell::new(false));
-        let resumed_after = Rc::clone(&resumed);
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "exit 7"]);
-
-        let status = run_interactive_editor_with(
-            &mut command,
-            || {},
-            move || {
-                *resumed_after.borrow_mut() = true;
-            },
-        )
-        .expect("shell should launch");
-
-        assert_eq!(status.code(), Some(7));
-        assert!(*resumed.borrow());
-    }
-}
+#[path = "commands/interactive_editor_tests.rs"]
+mod interactive_editor_tests;
 
 pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
     if !trimmed.starts_with("/agents") {
@@ -3276,6 +3322,12 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     let rest = trimmed.strip_prefix("/agents").unwrap_or_default().trim();
+    let (global, rest) = match rest.split_once(' ') {
+        Some(("global" | "default", tail)) => (true, tail.trim()),
+        _ if matches!(rest, "global" | "default") => (true, ""),
+        _ => (false, rest),
+    };
+    app.agent_models_global_scope = global;
     if rest.is_empty() {
         app.open_agents_picker();
         return true;
@@ -3283,7 +3335,7 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
 
     let Some(target) = parse_agents_target(rest) else {
         app.push_display_message(DisplayMessage::error(
-            "Usage: /agents or /agents <swarm|review|judge|memory|ambient>".to_string(),
+            "Usage: /agents [default|global] [swarm|review|judge|memory|ambient]".to_string(),
         ));
         return true;
     };
@@ -3393,24 +3445,16 @@ fn handle_reasoning_display_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+pub(super) fn handle_display_settings_command(app: &mut App, trimmed: &str) -> bool {
+    handle_alignment_command(app, trimmed)
+        || handle_reasoning_display_command(app, trimmed)
+        || handle_compact_notifications_command(app, trimmed)
+        || handle_show_agentgrep_output_command(app, trimmed)
+        || handle_tool_call_details_command(app, trimmed)
+}
+
 pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
-    if handle_alignment_command(app, trimmed) {
-        return true;
-    }
-
-    if handle_reasoning_display_command(app, trimmed) {
-        return true;
-    }
-
-    if handle_compact_notifications_command(app, trimmed) {
-        return true;
-    }
-
-    if handle_show_agentgrep_output_command(app, trimmed) {
-        return true;
-    }
-
-    if handle_tool_call_details_command(app, trimmed) {
+    if handle_display_settings_command(app, trimmed) {
         return true;
     }
 
@@ -3712,8 +3756,8 @@ pub(super) fn handle_feedback_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
-/// `/telemetry [everything|no-prompts|nothing]` - show or change the same
-/// three-way telemetry level offered by the onboarding "Telemetry settings"
+/// `/telemetry [all|none|<category> on|off]` - show or change the same
+/// per-category telemetry choices offered by the onboarding "Telemetry settings"
 /// page, so the promise made there ("change this later with /telemetry") holds.
 pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix("/telemetry") else {
@@ -3729,39 +3773,64 @@ pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
         return false;
     }
 
-    use crate::tui::app::onboarding_flow::TelemetryLevel;
-    let arg = rest.trim().to_ascii_lowercase();
-    let level = match arg.as_str() {
-        "" => {
-            let current = TelemetryLevel::current();
-            let detail = match current {
-                TelemetryLevel::Everything => {
-                    "Sending everything, including prompts and transcripts. Thank you."
-                }
-                TelemetryLevel::NoContent => {
-                    "Sending usage stats and crash reports only. No prompts or transcripts."
-                }
-                TelemetryLevel::Nothing => "Sending nothing.",
-            };
-            app.push_display_message(DisplayMessage::system(format!(
-                "{detail}\nChange it with /telemetry everything | no-prompts | nothing."
-            )));
-            app.set_status_notice(current.status_label());
-            return true;
-        }
-        "everything" | "all" => TelemetryLevel::Everything,
-        "no-prompts" | "no-content" | "usage" => TelemetryLevel::NoContent,
-        "nothing" | "off" | "none" => TelemetryLevel::Nothing,
-        other => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Unknown telemetry level \"{other}\". Use everything, no-prompts, or nothing."
-            )));
-            return true;
-        }
+    use crate::telemetry::TelemetryCategory;
+    use crate::tui::app::onboarding_flow::status_label_for;
+    let args: Vec<String> = rest
+        .split_whitespace()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    let mut checked = crate::telemetry::category_settings();
+    let parse_on = |v: &str| match v {
+        "on" | "yes" | "true" | "1" => Some(true),
+        "off" | "no" | "false" | "0" => Some(false),
+        _ => None,
     };
-    level.persist();
-    app.push_display_message(DisplayMessage::system(level.status_label().to_string()));
-    app.set_status_notice(level.status_label());
+    let usage = "Usage: /telemetry [all|none] or /telemetry <category> on|off. Categories: content, usage, crashes, features, cost, accounts.";
+    match args.as_slice() {
+        [] => {
+            let mut text = String::from("Telemetry settings:\n");
+            for (i, category) in TelemetryCategory::ALL.into_iter().enumerate() {
+                text.push_str(&format!(
+                    "  [{}] {} ({}): {}\n",
+                    if checked[i] { "x" } else { " " },
+                    category.label(),
+                    category.key(),
+                    category.caption()
+                ));
+            }
+            if crate::telemetry::opt_out_forced_by_env() {
+                text.push_str("Your environment disables all telemetry (JCODE_NO_TELEMETRY / DO_NOT_TRACK).\n");
+            }
+            text.push_str(usage);
+            app.push_display_message(DisplayMessage::system(text));
+            app.set_status_notice(status_label_for(checked));
+            return true;
+        }
+        [all] if matches!(all.as_str(), "all" | "everything" | "on") => checked = [true; 6],
+        [none] if matches!(none.as_str(), "none" | "nothing" | "off") => checked = [false; 6],
+        [all, value] if all == "all" && parse_on(value).is_some() => {
+            checked = [parse_on(value).unwrap_or(false); 6]
+        }
+        [key, value] => match (TelemetryCategory::from_key(key), parse_on(value)) {
+            (Some(category), Some(on)) => {
+                if let Some(i) = TelemetryCategory::ALL.iter().position(|c| *c == category) {
+                    checked[i] = on;
+                }
+            }
+            _ => {
+                app.push_display_message(DisplayMessage::error(usage.to_string()));
+                return true;
+            }
+        },
+        _ => {
+            app.push_display_message(DisplayMessage::error(usage.to_string()));
+            return true;
+        }
+    }
+    crate::telemetry::set_category_settings(checked);
+    let label = status_label_for(checked);
+    app.push_display_message(DisplayMessage::system(label.clone()));
+    app.set_status_notice(label);
     true
 }
 

@@ -60,7 +60,36 @@ fn title_with_metrics(
     title
 }
 
+/// Map the client state onto the agent state herdr shows. A pending
+/// keypress offer (provider fallback, repo merge) means the turn is over but
+/// the user still has to decide, which is herdr's `blocked`.
+fn herdr_agent_state(
+    is_processing: bool,
+    awaiting_decision: bool,
+) -> crate::tui::herdr::AgentState {
+    if is_processing {
+        crate::tui::herdr::AgentState::Working
+    } else if awaiting_decision {
+        crate::tui::herdr::AgentState::Blocked
+    } else {
+        crate::tui::herdr::AgentState::Idle
+    }
+}
+
 impl App {
+    /// Tell herdr (when running in a herdr pane) whether this client is
+    /// working, blocked or idle and which session to resume. Tick-safe:
+    /// unchanged state is a cheap comparison and reports are sent off-thread.
+    pub(super) fn sync_herdr_agent_state(&self) {
+        if self.suppress_terminal_title_updates || !self.is_remote_client() {
+            return;
+        }
+        let awaiting_decision =
+            self.pending_fallback_offer.is_some() || self.pending_merge_offer.is_some();
+        let state = herdr_agent_state(self.is_processing(), awaiting_decision);
+        crate::tui::herdr::sync(state, self.active_client_session_id());
+    }
+
     pub(super) fn set_terminal_title_base(&self, session_id: &str, base: String) {
         let mut state = self.terminal_title.borrow_mut();
         if state.session_id != session_id {
@@ -198,6 +227,16 @@ mod tests {
         ] {
             assert_eq!(work_label(Duration::from_secs(secs)), expected);
         }
+    }
+
+    #[test]
+    fn herdr_agent_state_maps_a_pending_offer_to_blocked() {
+        use crate::tui::herdr::AgentState;
+        assert_eq!(herdr_agent_state(true, false), AgentState::Working);
+        assert_eq!(herdr_agent_state(false, false), AgentState::Idle);
+        assert_eq!(herdr_agent_state(false, true), AgentState::Blocked);
+        // A running turn wins over a stale offer.
+        assert_eq!(herdr_agent_state(true, true), AgentState::Working);
     }
 
     #[test]
