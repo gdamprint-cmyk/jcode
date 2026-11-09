@@ -635,13 +635,19 @@ pub fn ensure_spawn_lane(
     }
     let mut todos = todos.to_vec();
     let title = title.trim();
+    // The lane card's name must be unique on the coordinator's board: the todo
+    // tool resolves a card by name and refuses to operate on a board that holds
+    // two cards with the same name. Two workers spawned with the same opening
+    // prompt (a common shape for probes) would otherwise produce two cards
+    // named after the same 60-character prefix and poison EVERY later todo
+    // update by the coordinator.
+    // reference: crates/jcode-todo-policy/src/stages.rs:353 - disambiguate_names
+    // applies the same uniqueness rule on the merge path; this is the spawn
+    // path, which never went through it.
+    let content = unique_card_content(&todos, if title.is_empty() { lane } else { title }, lane);
     todos.push(TodoItem {
         id: id_hint.to_string(),
-        content: if title.is_empty() {
-            lane.to_string()
-        } else {
-            title.to_string()
-        },
+        content,
         status: "pending".to_string(),
         priority: "high".to_string(),
         group: Some(lane.to_string()),
@@ -653,6 +659,34 @@ pub fn ensure_spawn_lane(
         ..Default::default()
     });
     (todos, id)
+}
+
+/// Pick a card name that no existing todo already uses.
+///
+/// The base name is kept when it is free. Otherwise the lane label is
+/// appended, and a counter is added if that is taken too.
+fn unique_card_content(todos: &[TodoItem], base: &str, lane: &str) -> String {
+    let base = base.trim();
+    if !todos.iter().any(|todo| todo.content == base) {
+        return base.to_string();
+    }
+    let owner = lane.trim();
+    let candidate = if owner.is_empty() {
+        format!("{base} (2)")
+    } else {
+        format!("{base} ({owner})")
+    };
+    if !todos.iter().any(|todo| todo.content == candidate) {
+        return candidate;
+    }
+    let mut counter = 2;
+    loop {
+        let candidate = format!("{base} ({owner} {counter})");
+        if !todos.iter().any(|todo| todo.content == candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
 }
 
 #[cfg(test)]
@@ -706,5 +740,42 @@ mod spawn_lane_tests {
         let (out, id) = ensure_spawn_lane(&todos, "fix", None, "Fix it", None, "s1");
         assert_eq!(id, "lane::fix");
         assert_eq!(out.last().unwrap().stage, None);
+    }
+
+    #[test]
+    fn two_lanes_with_the_same_title_get_distinct_card_names() {
+        // reference: crates/jcode-todo-policy/src/stages.rs:353 - disambiguate_names
+        // applies the same uniqueness rule on the merge path; the spawn path
+        // needed the equivalent treatment.
+        // Two probe workers spawned with the same opening prompt produce the
+        // same 60-character title. Without unique names the coordinator's board
+        // holds two identically named cards and every later todo update fails
+        // with "duplicate todo name".
+        let title = "You are a REAL swarm worker. Your only job: write the single";
+        let (first, _) = ensure_spawn_lane(&[], "probe-a", Some(1), title, None, "lane-1");
+        let (second, _) = ensure_spawn_lane(&first, "probe-b", Some(1), title, None, "lane-2");
+        let names: Vec<&str> = second.iter().map(|todo| todo.content.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|name| **name == title).count(),
+            1,
+            "the title must be used once: {names:?}"
+        );
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "names must be unique: {names:?}");
+    }
+
+    #[test]
+    fn a_third_lane_with_the_same_title_stays_unique() {
+        let title = "same title";
+        let (first, _) = ensure_spawn_lane(&[], "a", Some(1), title, None, "lane-1");
+        let (second, _) = ensure_spawn_lane(&first, "b", Some(1), title, None, "lane-2");
+        let (third, _) = ensure_spawn_lane(&second, "c", Some(1), title, None, "lane-3");
+        let names: Vec<&str> = third.iter().map(|todo| todo.content.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "names must be unique: {names:?}");
     }
 }
