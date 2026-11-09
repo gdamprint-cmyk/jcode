@@ -5,6 +5,8 @@
 
 use super::*;
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Accept one HTTP request, capture its raw head, and answer with a minimal
@@ -73,6 +75,58 @@ fn captured_probe_request(host: &str, conversation_id: &str) -> String {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("server captured request")
     })
+}
+
+/// reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-provider-core/src/transport.rs (the shared transient-transport classifier the retry uses)
+#[test]
+fn probe_retries_a_transient_transport_fault_and_not_a_real_error() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // A server that closes the FIRST connection without a response, then
+    // answers normally: the retry must recover.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let served = Arc::new(AtomicUsize::new(0));
+    let served_in_thread = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for index in 0..3 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let n = stream.read(&mut vec![0u8; 4096]).unwrap_or(0);
+            let _ = n;
+            served_in_thread.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                // Abrupt close: no response at all -> a transport fault.
+                continue;
+            }
+            let body = "{\"ok\":true}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
+    let url = format!("http://127.0.0.1:{}/probe", addr.port());
+    let response = rt.block_on(async {
+        send_probe_request(
+            || client.post(&url).json(&serde_json::json!({"model": "m"})),
+            Duration::from_secs(10),
+            3,
+        )
+        .await
+    });
+    assert!(response.is_ok(), "probe should recover: {response:?}");
+    assert_eq!(served.load(Ordering::SeqCst), 2, "expected one retry");
 }
 
 #[test]

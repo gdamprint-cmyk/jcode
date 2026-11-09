@@ -77,6 +77,74 @@ fn apply_probe_headers(
     )
 }
 
+/// Format an error together with its whole source chain.
+///
+/// `reqwest::Error::to_string()` returns only the TOP-level message
+/// ("error sending request for url (...)"). The detail that identifies a
+/// transient fault - "client error (SendRequest)", "connection closed before
+/// message completed", "peer closed connection without sending TLS
+/// close_notify" - lives in the `source()` chain, so classifying on
+/// `to_string()` alone silently classifies every transport fault as
+/// permanent, and the retry never fires.
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut current = error.source();
+    while let Some(source) = current {
+        text.push_str(": ");
+        text.push_str(&source.to_string());
+        current = source.source();
+    }
+    text
+}
+
+/// Send a probe request, retrying a TRANSIENT transport fault on a fresh
+/// connection.
+///
+/// The provider-doctor probes used to send once, so a transient transport
+/// fault (a rustls "peer closed connection without sending TLS close_notify",
+/// a reset connection, a DNS hiccup) failed the whole diagnostic run even
+/// though the provider was healthy. The streaming runtime has always retried
+/// these, because `jcode_provider_core::transport::is_transient_transport_error`
+/// classifies them as transient - the doctor path simply never used it.
+///
+/// reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-provider-core/src/transport.rs (the shared transient-transport classifier and its existing tests)
+///
+/// A non-transient error is returned immediately: retrying a 401 or a 400
+/// would only spend the user's balance on a request that cannot succeed.
+async fn send_probe_request(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    timeout: std::time::Duration,
+    attempts: usize,
+) -> anyhow::Result<reqwest::Response> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts.max(1) {
+        match tokio::time::timeout(timeout, build().send()).await {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) => {
+                let message = format_error_chain(&error);
+                if !jcode_provider_core::is_transient_transport_error(&message) {
+                    return Err(anyhow::Error::from(error));
+                }
+                eprintln!(
+                    "provider-doctor: transient transport fault on attempt {attempt}/{attempts}, retrying: {message}"
+                );
+                last_error = Some(anyhow::Error::from(error));
+            }
+            Err(_) => {
+                let message = format!("probe timed out after {timeout:?}");
+                eprintln!(
+                    "provider-doctor: transient transport fault on attempt {attempt}/{attempts}, retrying: {message}"
+                );
+                last_error = Some(anyhow::anyhow!("{message}"));
+            }
+        }
+        if attempt < attempts.max(1) {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("probe request failed")))
+}
+
 /// Set an output-token cap on a chat-completions body using the parameter name
 /// the provider accepts. OpenAI's newer models (gpt-5.x) reject the legacy
 /// `max_tokens` and require `max_completion_tokens`; most OpenAI-compatible and
@@ -198,19 +266,23 @@ pub async fn run_live_openai_compatible_smoke(
         ],
         "stream": false
     });
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_probe_headers(
-        request,
-        &resolved,
-        api_key,
-        &jcode_base::provider_catalog::new_opencode_conversation_id(),
-    );
-    let response = tokio::time::timeout(smoke_timeout(30), request.send())
-        .await
-        .context("timed out running live smoke completion")?
-        .with_context(|| format!("run live {} smoke completion", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(30),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} smoke completion", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
@@ -276,19 +348,23 @@ pub async fn run_live_openai_compatible_stream_smoke(
         "stream": true,
         "stream_options": {"include_usage": true}
     });
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_probe_headers(
-        request,
-        &resolved,
-        api_key,
-        &jcode_base::provider_catalog::new_opencode_conversation_id(),
-    );
-    let response = tokio::time::timeout(smoke_timeout(45), request.send())
-        .await
-        .context("timed out running live stream smoke completion")?
-        .with_context(|| format!("run live {} stream smoke completion", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(45),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} stream smoke completion", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
@@ -396,19 +472,23 @@ pub async fn run_live_openai_compatible_tool_smoke(
     if !resolved.api_base.contains("fptcloud.com") {
         body["tool_choice"] = serde_json::json!("auto");
     }
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_probe_headers(
-        request,
-        &resolved,
-        api_key,
-        &jcode_base::provider_catalog::new_opencode_conversation_id(),
-    );
-    let response = tokio::time::timeout(smoke_timeout(45), request.send())
-        .await
-        .context("timed out running live tool-call smoke completion")?
-        .with_context(|| format!("run live {} tool-call smoke", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(45),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} tool-call smoke", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
