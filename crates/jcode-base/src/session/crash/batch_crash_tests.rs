@@ -1,3 +1,12 @@
+// reference: the idle-vs-interrupted crash rule is implemented in this repo at
+// crates/jcode-base/src/session/crash.rs (`had_streaming_marker`, commit
+// 5c98e34b6 "fix: idle-vs-interrupted disposition in PID crash detector
+// (extends #988)"), and the sibling test
+// `idle_dead_pid_without_streaming_marker_is_not_a_crash` in this file pins the
+// marker semantics. Those pin the DISPOSITION; the two new tests below close
+// the gap they left - the disposition and the REPORTED LIST were separate
+// decisions, so an idle session was correctly marked Closed yet still pushed
+// into the crash list.
 use super::*;
 
 struct HomeGuard(Option<std::ffi::OsString>);
@@ -73,6 +82,139 @@ fn leftover_streaming_marker_means_interrupted() {
     );
 
     crate::env::remove_var("JCODE_HOME");
+}
+
+// reference: crates/jcode-base/src/session/crash.rs - `had_streaming_marker`
+// (commit 5c98e34b6, upstream #988) defines the idle-vs-interrupted rule that
+// these two tests pin at the REPORTED-LIST level.
+//
+// Regression: a session whose owner PID died while the session was IDLE (no
+// leftover streaming marker) is an ordinary close, not a crash. The PID
+// detector marks such a session `Closed` but used to push it into the crash
+// list anyway, so every daemon restart printed a false "N sessions crashed
+// recently" banner naming sessions that never crashed (measured on this host:
+// 9 sessions, all `Closed`, one banner).
+//
+// OLD behaviour: the idle session appears in `find_recent_crashed_sessions()`.
+// NEW behaviour: it does not.
+#[test]
+fn idle_dead_pid_session_is_not_reported_as_crashed() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir()?;
+    let _home = HomeGuard::set(temp.path());
+    std::fs::create_dir_all(temp.path().join("sessions"))?;
+
+    let id = "session_idledead_1770000000000_aaaaaaaaaaaaaaaa";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.status = SessionStatus::Active;
+    // A session with no visible message is not persisted at all, so the
+    // detector would never see it. Give it one real message so the fixture
+    // is a session that genuinely exists on disk.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "idle dead pid fixture".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(session_path(&session.id)?.is_file(), "fixture must exist on disk");
+
+    // Point the ownership marker at a dead PID and leave NO streaming marker:
+    // exactly the state a clean daemon restart leaves behind.
+    let dir = active_pids_dir().expect("active_pids dir");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(id), "999999")?;
+    let streaming = storage::streaming_pids_dir().expect("streaming dir");
+    std::fs::create_dir_all(&streaming)?;
+    assert!(!streaming.join(id).exists(), "no streaming marker means idle");
+
+    let crashed = find_recent_crashed_sessions();
+    assert!(
+        !crashed.iter().any(|(sid, _)| sid == id),
+        "an idle session with a dead owner PID must not be reported as crashed: {crashed:?}"
+    );
+    Ok(())
+}
+
+// reference: crates/jcode-base/src/session/crash.rs - `had_streaming_marker`
+// (commit 5c98e34b6, upstream #988): a leftover streaming marker proves the
+// owner died mid-turn, so that session IS a crash and must still be reported.
+#[test]
+fn interrupted_dead_pid_session_is_still_reported_as_crashed() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir()?;
+    let _home = HomeGuard::set(temp.path());
+    std::fs::create_dir_all(temp.path().join("sessions"))?;
+
+    let id = "session_midturn_1770000000000_aaaaaaaaaaaaaaaa";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.status = SessionStatus::Active;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "interrupted fixture".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(session_path(&session.id)?.is_file(), "fixture must exist on disk");
+
+    let dir = active_pids_dir().expect("active_pids dir");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(id), "999999")?;
+    let streaming = storage::streaming_pids_dir().expect("streaming dir");
+    std::fs::create_dir_all(&streaming)?;
+    std::fs::write(streaming.join(id), "999999")?;
+
+    let crashed = find_recent_crashed_sessions();
+    assert!(
+        crashed.iter().any(|(sid, _)| sid == id),
+        "a session interrupted mid-turn must still be reported as crashed: {crashed:?}"
+    );
+    Ok(())
+}
+
+// reference: crates/jcode-base/src/session/crash.rs - `had_streaming_marker`
+// (commit 5c98e34b6, upstream #988). A session already marked `Crashed` on
+// disk (by another detector path, or an unrecovered earlier crash) keeps that
+// status even with no leftover streaming marker - downgrading it to `Closed`
+// would silently hide a real crash.
+#[test]
+fn already_crashed_session_without_marker_stays_reported_as_crashed() -> anyhow::Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir()?;
+    let _home = HomeGuard::set(temp.path());
+    std::fs::create_dir_all(temp.path().join("sessions"))?;
+
+    let id = "session_alreadycrashed_1770000000000_aaaaaaaaaaaaaaa";
+    let mut session = Session::create_with_id(id.to_string(), None, None);
+    session.status = SessionStatus::Crashed {
+        message: Some("earlier crash".into()),
+    };
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "already crashed fixture".into(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    assert!(session_path(&session.id)?.is_file(), "fixture must exist on disk");
+
+    let dir = active_pids_dir().expect("active_pids dir");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(id), "999999")?;
+    let streaming = storage::streaming_pids_dir().expect("streaming dir");
+    std::fs::create_dir_all(&streaming)?;
+    assert!(!streaming.join(id).exists(), "no streaming marker");
+
+    let crashed = find_recent_crashed_sessions();
+    assert!(
+        crashed.iter().any(|(sid, _)| sid == id),
+        "an already-crashed session must stay reported as crashed: {crashed:?}"
+    );
+    Ok(())
 }
 
 #[test]

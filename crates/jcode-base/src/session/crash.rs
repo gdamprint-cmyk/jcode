@@ -360,15 +360,36 @@ fn find_crashed_via_pid_files() -> Option<Vec<(String, String)>> {
                 // daemon restarts stamping every owned idle session Crashed.
                 // Fail toward crash when the marker dir is unreadable: crash
                 // recovery is fail-noisy, never fail-silent.
+                //
+                // The DISPOSITION and the REPORTED LIST are two separate
+                // decisions, and only the first one was made correctly: an
+                // idle session was correctly marked `Closed`, yet it was
+                // still pushed into the crash list, so every daemon restart
+                // printed a false "N sessions crashed recently" banner
+                // naming sessions that never crashed (measured on this host:
+                // 9 sessions, all `Closed`, one banner). Only a session whose
+                // status actually is `Crashed` may be reported as crashed.
+                //
+                // A session that was ALREADY `Crashed` on disk keeps that
+                // status even without a leftover marker: it genuinely
+                // crashed earlier (another detector path, or a crash the user
+                // has not recovered yet), and downgrading it to `Closed` here
+                // would silently hide a real crash.
+                let was_crashed = matches!(session.status, SessionStatus::Crashed { .. });
                 if had_streaming_marker(&session_id) {
                     session.mark_crashed(Some(format!(
                         "Process {} exited unexpectedly (no shutdown signal captured)",
                         pid
                     )));
-                } else {
+                } else if !was_crashed {
                     session.mark_closed();
                 }
                 let _ = session.save();
+                if !matches!(session.status, SessionStatus::Crashed { .. }) {
+                    // Idle (or otherwise not-crashed) session: an ordinary
+                    // close, not a crash to report.
+                    continue;
+                }
                 let ts = session.last_active_at.unwrap_or(session.updated_at);
                 if ts <= cutoff {
                     continue;
