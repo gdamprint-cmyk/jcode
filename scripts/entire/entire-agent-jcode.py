@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ fb54426
-#                ("fix(adapter): refuse an oversized transcript instead of letting the CLI truncate it")
+# source repo: entire-agent-jcode @ 3aaae7b
+#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
@@ -58,6 +58,27 @@ AGENT_NAME = "jcode"
 #
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
 _CLI_STDOUT_LIMIT_BYTES = 10 * 1024 * 1024
+
+# The CLI sets ENTIRE_CLI_VERSION on every plugin subprocess it runs
+# (cmd/entire/cli/agent/external/external.go:511). That is how the adapter
+# tells "I am answering the CLI's capped pipe" apart from "I am being run
+# directly by a tool that has no such cap".
+#
+# The distinction matters: the 10 MiB limit is a property of the CLI's
+# stdout pipe, not of the transcript. A direct caller (the ETF schema
+# checker, a human running the adapter by hand) reads the whole stdout with
+# no cap, so refusing there would deny a perfectly serviceable full
+# transcript. Refusing only under the CLI keeps the cap's real constraint
+# (never truncate) without denying direct callers.
+_CLI_VERSION_ENV = "ENTIRE_CLI_VERSION"
+
+
+def _called_by_cli() -> bool:
+    """True when the parent process is the Entire CLI's capped stdout pipe."""
+    # Presence, not truthiness: versioninfo.Version is "dev" for a local
+    # build, which is a non-empty value and still means "the CLI is the
+    # parent".
+    return os.environ.get(_CLI_VERSION_ENV) is not None
 
 # Version reported on the ``cli_version`` field of every emitted transcript
 # line. It identifies the producer of the line, not the agent.
@@ -1045,9 +1066,12 @@ def cmd_read_transcript(args) -> int:
     # copy and the checkpoint path (which reads the sidecar FILE, not this
     # pipe) still holds the full history.
     #
+    # The refusal is scoped to the CLI's capped pipe. A direct caller has no
+    # such cap, so it gets the complete transcript.
+    #
     # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
     # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
-    if len(data) > _CLI_STDOUT_LIMIT_BYTES:
+    if _called_by_cli() and not args.allow_oversized and len(data) > _CLI_STDOUT_LIMIT_BYTES:
         sys.stderr.write(
             "[entire-agent-jcode] read-transcript: transcript is "
             f"{len(data)} bytes, above the Entire CLI's stdout limit of "
@@ -1828,6 +1852,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("read-transcript")
     _add_common(sp)
+    # Escape hatch for a direct caller that knows its own stdout is not the
+    # CLI's capped pipe. Never set this when the CLI is the parent: the cap
+    # is then real and the refusal is the correct answer.
+    sp.add_argument("--allow-oversized", action="store_true", dest="allow_oversized")
     sp.set_defaults(func=cmd_read_transcript)
 
     sp = sub.add_parser("compact-transcript")

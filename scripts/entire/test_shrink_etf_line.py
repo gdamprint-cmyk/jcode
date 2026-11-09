@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ fb54426
-#                ("fix(adapter): refuse an oversized transcript instead of letting the CLI truncate it")
+# source repo: entire-agent-jcode @ 3aaae7b
+#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
 # ---------------------------------------------------------------------------
 """Regression tests for the ETF line trimming in entire-agent-jcode.py.
 

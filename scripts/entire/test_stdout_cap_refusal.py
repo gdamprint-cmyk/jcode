@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ fb54426
-#                ("fix(adapter): refuse an oversized transcript instead of letting the CLI truncate it")
+# source repo: entire-agent-jcode @ 3aaae7b
+#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
@@ -19,11 +19,17 @@ the CLI writes the stored sidecar AFTER the read
 stored copy with a partial one and moves the growth baseline into the
 truncated coordinate.
 
-So the adapter REFUSES an oversized transcript: non-zero exit, no transcript
-bytes on stdout, and an explanation on stderr.
+So, when the CLI is the parent, the adapter REFUSES an oversized transcript:
+non-zero exit, no transcript bytes on stdout, and an explanation on stderr.
 
-The negative control is the important half: a transcript UNDER the limit must
-still be served in full, and the refusal must not fire for it.
+The cap is a property of the CLI's stdout PIPE, not of the transcript. The
+CLI marks every plugin subprocess with ENTIRE_CLI_VERSION
+(cmd/entire/cli/agent/external/external.go:511), so the adapter refuses only
+under that marker. A direct caller has no cap and gets the whole transcript.
+
+Both directions are checked here, each with its own negative control:
+  - under the CLI marker: oversized REFUSED, undersized served in full;
+  - without it: oversized served in full.
 
 Usage:  python test_stdout_cap_refusal.py
 """
@@ -37,6 +43,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADAPTER = os.path.join(HERE, "entire-agent-jcode.py")
+
+CLI_STDOUT_LIMIT_BYTES = 10 * 1024 * 1024
 
 CHECKS_RUN = 0
 FAILURES: list[str] = []
@@ -80,15 +88,29 @@ def _is_json_line(line: str) -> bool:
     return True
 
 
-def run_read_transcript(session_path: str, home: str):
+def run_read_transcript(
+    session_path: str,
+    home: str,
+    as_cli: bool,
+    extra_args: list[str] | None = None,
+):
     """Run `read-transcript --session-ref <path>` with JCODE_HOME at `home`.
+
+    `as_cli` sets ENTIRE_CLI_VERSION, which is how the CLI marks a plugin
+    subprocess (cmd/entire/cli/agent/external/external.go:511).
 
     reference: https://docs.entire.io/agents/agent-integration-protocol/commands
     """
     env = dict(os.environ)
     env["JCODE_HOME"] = home
+    env.pop("ENTIRE_CLI_VERSION", None)
+    if as_cli:
+        env["ENTIRE_CLI_VERSION"] = "dev"
+    args = [sys.executable, ADAPTER, "read-transcript", "--session-ref", session_path]
+    if extra_args:
+        args.extend(extra_args)
     proc = subprocess.run(
-        [sys.executable, ADAPTER, "read-transcript", "--session-ref", session_path],
+        args,
         capture_output=True,
         text=True,
         timeout=300,
@@ -102,10 +124,10 @@ with tempfile.TemporaryDirectory() as tmp:
     sessions = os.path.join(home, "sessions")
     os.makedirs(sessions, exist_ok=True)
 
-    print("=== an oversized transcript is REFUSED, not truncated ===")
+    print("=== under the CLI marker: an oversized transcript is REFUSED ===")
     # ~11 MiB of assistant content, above the 10 MiB cap.
     big = make_session(sessions, "session_big", 2700)
-    proc = run_read_transcript(big, home)
+    proc = run_read_transcript(big, home, as_cli=True)
     stderr = proc.stderr or ""
     check(
         "the exit code is non-zero",
@@ -129,9 +151,9 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
     print()
-    print("=== a transcript UNDER the limit is served in full (negative control) ===")
+    print("=== under the CLI marker: a transcript UNDER the limit is served (negative control) ===")
     small = make_session(sessions, "session_small", 10)
-    proc = run_read_transcript(small, home)
+    proc = run_read_transcript(small, home, as_cli=True)
     small_stderr = proc.stderr or ""
     check("the exit code is zero", proc.returncode == 0, f"rc={proc.returncode}")
     check("stdout carries the transcript", len(proc.stdout) > 0, f"{len(proc.stdout)} bytes")
@@ -161,6 +183,41 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
     print()
+    print("=== WITHOUT the CLI marker: the oversized transcript is served in full ===")
+    # A direct caller has no 10 MiB pipe, so refusing would deny a
+    # serviceable full transcript. This is the ETF schema checker's path.
+    proc = run_read_transcript(big, home, as_cli=False)
+    check(
+        "the exit code is zero",
+        proc.returncode == 0,
+        f"rc={proc.returncode} stderr={(proc.stderr or '')[:160]}",
+    )
+    check(
+        "the FULL transcript is on stdout",
+        len(proc.stdout) > CLI_STDOUT_LIMIT_BYTES,
+        f"stdout={len(proc.stdout)}",
+    )
+    check(
+        "every line is valid JSON",
+        all(_is_json_line(line) for line in proc.stdout.splitlines() if line.strip()),
+        "a line failed to parse",
+    )
+
+    print()
+    print("=== --allow-oversized under the CLI marker: served in full ===")
+    proc = run_read_transcript(big, home, as_cli=True, extra_args=["--allow-oversized"])
+    check(
+        "the exit code is zero",
+        proc.returncode == 0,
+        f"rc={proc.returncode} stderr={(proc.stderr or '')[:160]}",
+    )
+    check(
+        "the FULL transcript is on stdout",
+        len(proc.stdout) > CLI_STDOUT_LIMIT_BYTES,
+        f"stdout={len(proc.stdout)}",
+    )
+
+    print()
     print("=== the refusal applies to the FINAL transcript size, not the raw one ===")
     # ONE huge message is trimmed by the adapter's per-line budget
     # (_MAX_LINE_BYTES), so the resulting transcript is small and is served
@@ -172,7 +229,7 @@ with tempfile.TemporaryDirectory() as tmp:
             {"messages": [{"role": "assistant", "content": "y" * (11 * 1024 * 1024)}]},
             handle,
         )
-    proc = run_read_transcript(huge, home)
+    proc = run_read_transcript(huge, home, as_cli=True)
     check(
         "a session with one huge message is served (its line was trimmed)",
         proc.returncode == 0,
