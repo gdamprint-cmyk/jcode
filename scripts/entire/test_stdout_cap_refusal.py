@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 3aaae7b
-#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
+# source repo: entire-agent-jcode @ 091a3ac
+#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
@@ -13,11 +13,15 @@ The Entire CLI caps an external agent's stdout at 10 MiB
 (cmd/entire/cli/agent/external/external.go:530) and aborts with
 "output exceeded 10485760 byte limit".
 
-The adapter must NOT truncate. Truncating would be worse than the error:
-the CLI writes the stored sidecar AFTER the read
-(cmd/entire/cli/lifecycle.go:882), so a truncated answer overwrites a complete
-stored copy with a partial one and moves the growth baseline into the
-truncated coordinate.
+The adapter must NOT truncate. The measured reason is NOT that a truncated
+answer would corrupt the stored sidecar: the CLI's limitedWriter flags the
+overflow and external.go:550-552 returns an error INSTEAD of the bytes, so
+cmd/entire/cli/lifecycle.go:870-875 fails BEFORE the sidecar write at
+lifecycle.go:882, and no truncated sidecar can exist. (0 of 417 stored
+sidecars on this host sit at or within 2% of the cap.) What the refusal buys
+is a SPECIFIC error naming the transcript's actual size, a clear refusal
+instead of a partial stdout, and the stored sidecar left at its previous
+complete contents.
 
 So, when the CLI is the parent, the adapter REFUSES an oversized transcript:
 non-zero exit, no transcript bytes on stdout, and an explanation on stderr.

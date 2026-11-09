@@ -20,13 +20,15 @@ reference: https://raw.githubusercontent.com/entireio/cli/main/transcript/README
 | `entire-agent-jcode-hook.py` | The lifecycle hook. Jcode runs this on session/turn events; it forwards them to `entire hooks jcode <name>`. |
 | `test_transcript_refusal.py` | Regression tests: the adapter must REFUSE to substitute data for a transcript. |
 | `test_shrink_etf_line.py` | Regression tests: trimming an oversized ETF line must never lose a payload. |
+| `test_stdout_cap_refusal.py` | Regression tests: under the CLI's capped pipe the adapter must REFUSE an oversized transcript instead of emitting a partial one. |
+| `test_stdout_cap_boundary.py` | Regression tests: the adapter's stdout must stay strictly under the CLI's 10 MiB cap, including the trailing newline it may append. |
 | `neg_control_old_adapter.py` | Negative control: the new tests must FAIL against the old adapter. |
 | `neg_control_tiny_payload.py` | Negative control: the adapter version that empties a tiny payload must still empty it. |
 | `old_adapter_snapshot.py` | Vendored snapshot of the adapter at `fc457a7`, for the negative control above. |
 | `tiny_payload_snapshot.py` | Vendored snapshot of the adapter at `05cddf4`, for the negative control above. |
 
 The adapter and the hook are ported verbatim from the external adapter
-repository `entire-agent-jcode` at `f4573ad`. The only edit is the provenance
+repository `entire-agent-jcode`. The only edit is the provenance
 header at the top of each file.
 
 ## Running the tests
@@ -34,6 +36,8 @@ header at the top of each file.
 ```
 python scripts/entire/test_transcript_refusal.py
 python scripts/entire/test_shrink_etf_line.py
+python scripts/entire/test_stdout_cap_refusal.py
+python scripts/entire/test_stdout_cap_boundary.py
 python scripts/entire/neg_control_old_adapter.py
 python scripts/entire/neg_control_tiny_payload.py
 ```

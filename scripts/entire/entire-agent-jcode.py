@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 3aaae7b
-#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
+# source repo: entire-agent-jcode @ 091a3ac
+#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
@@ -50,13 +50,34 @@ AGENT_NAME = "jcode"
 # environment variable and no CLI flag overrides it.
 #
 # The adapter uses this constant to REFUSE rather than truncate a transcript
-# that would exceed the cap. Truncating would be worse than the error it
-# replaces: the CLI writes the stored sidecar after this read
-# (cmd/entire/cli/lifecycle.go:882), so a truncated answer overwrites a
-# complete stored copy with a partial one and moves the growth baseline into
-# the truncated coordinate.
+# that would exceed the cap.
+#
+# WHY THE REFUSAL EXISTS, MEASURED (not assumed):
+#   The CLI's limitedWriter keeps the first `limit` bytes and sets its
+#   `truncated` flag; external.go:550-552 then returns
+#   "output exceeded %d byte limit" INSTEAD of the bytes. So the CLI never
+#   stores a truncated transcript: cmd/entire/cli/lifecycle.go:870-875 gets an
+#   error and returns before the sidecar write at lifecycle.go:882. A
+#   truncated sidecar is therefore NOT possible, and the earlier rationale
+#   ("a truncated answer would overwrite a complete stored copy") was wrong.
+#
+#   What the refusal actually buys:
+#     1. A SPECIFIC error instead of a generic one. The CLI's own message
+#        names only the limit; the adapter's names the transcript's ACTUAL
+#        size, so the cause is visible without re-measuring.
+#     2. A clear refusal instead of a partial stdout the caller might read.
+#        The CLI discards the bytes either way, but a direct consumer of the
+#        adapter's stdout that did NOT set the CLI marker still gets the
+#        complete transcript (see _called_by_cli).
+#     3. The stored sidecar stays at its previous COMPLETE contents, so the
+#        growth baseline (SessionState.CheckpointTranscriptSize, compared in
+#        the sanitized coordinate) keeps measuring a complete transcript.
+#        Measured on this host: 0 of 417 stored sidecars sit at or within 2%
+#        of the cap (max 9 923 467 B), which is consistent with "the read
+#        either succeeds whole or fails whole".
 #
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
+# reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
 _CLI_STDOUT_LIMIT_BYTES = 10 * 1024 * 1024
 
 # The CLI sets ENTIRE_CLI_VERSION on every plugin subprocess it runs
@@ -1056,15 +1077,22 @@ def cmd_read_transcript(args) -> int:
     # (cmd/entire/cli/agent/external/external.go:530). A transcript above that
     # limit makes the CLI abort with "output exceeded 10485760 byte limit".
     #
-    # REFUSING here rather than truncating is deliberate. The CLI writes the
-    # stored sidecar AFTER this read
-    # (cmd/entire/cli/lifecycle.go:882), so a truncated answer would OVERWRITE
-    # the sidecar with a partial copy, and the growth baseline
-    # (state.CheckpointTranscriptSize) would then be measured in the
-    # truncated coordinate - which stops the condensation from seeing growth.
-    # A refusal leaves the sidecar untouched: the CLI keeps the last complete
-    # copy and the checkpoint path (which reads the sidecar FILE, not this
-    # pipe) still holds the full history.
+    # REFUSING here rather than truncating is deliberate, but NOT for the
+    # reason previously recorded. The CLI does NOT store a truncated
+    # transcript: its limitedWriter flags the overflow and external.go:550-552
+    # returns an error INSTEAD of the bytes, so lifecycle.go:870-875 fails
+    # before the sidecar write at lifecycle.go:882. The earlier comment here
+    # claimed a truncated answer would overwrite a complete stored copy with a
+    # partial one; that was wrong, and the sidecar measurement agrees
+    # (0 of 417 stored sidecars sit at or within 2% of the cap).
+    #
+    # What the refusal actually buys:
+    #   - a SPECIFIC error: the adapter names the transcript's ACTUAL size,
+    #     where the CLI's own message names only the limit;
+    #   - a clear refusal rather than a partial stdout, for any consumer that
+    #     reads the adapter directly without the CLI marker;
+    #   - the stored sidecar stays at its previous COMPLETE contents, so the
+    #     growth baseline keeps measuring a complete transcript.
     #
     # The refusal is scoped to the CLI's capped pipe. A direct caller has no
     # such cap, so it gets the complete transcript.
