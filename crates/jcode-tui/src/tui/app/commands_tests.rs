@@ -64,6 +64,44 @@ fn subagent_model_pins_a_concrete_model_name() {
     );
 }
 
+/// The subagent model SUMMARY must treat every sentinel spelling as "inherit",
+/// not as a pinned model. A stored sentinel spelling is reachable: the server
+/// runtime command `/subagent-model inherit` used to store the literal string.
+#[test]
+fn subagent_model_summary_treats_every_sentinel_spelling_as_inherit() {
+    let mut app = crate::tui::app::tests::create_test_app();
+    let concrete = super::current_subagent_model_summary(&app);
+    assert!(
+        concrete.starts_with("inherit current"),
+        "with no pin the summary must say inherit, got {concrete}"
+    );
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        " Inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        app.session.subagent_model = Some(sentinel.to_string());
+        let summary = super::current_subagent_model_summary(&app);
+        assert!(
+            summary.starts_with("inherit current"),
+            "the sentinel {sentinel} must render as inherit, got {summary}"
+        );
+        assert!(
+            !summary.contains("fixed"),
+            "the sentinel {sentinel} must not render as a pinned model, got {summary}"
+        );
+    }
+
+    app.session.subagent_model = Some("gpt-5.3-codex".to_string());
+    let summary = super::current_subagent_model_summary(&app);
+    assert!(
+        summary.starts_with("fixed gpt-5.3-codex"),
+        "a concrete model must still render as pinned, got {summary}"
+    );
+}
+
 /// The review/judge overrides must treat every sentinel spelling as "no
 /// explicit override", exactly like the server-side spawn resolver does.
 #[test]

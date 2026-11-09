@@ -588,6 +588,13 @@ pub(super) fn poke_status_message(app: &App) -> String {
 
 pub(super) fn current_subagent_model_summary(app: &App) -> String {
     match app.session.subagent_model.as_deref() {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel is NOT a pinned model, so the
+        // summary must say "inherit" exactly like the resolver decides.
+        Some(model) if crate::config::AgentsConfig::is_swarm_inherit_sentinel(model) => {
+            format!("inherit current ({})", app.provider.model())
+        }
         Some(model) => format!("fixed {}", model),
         None => format!("inherit current ({})", app.provider.model()),
     }

@@ -225,7 +225,14 @@ pub(super) async fn execute(
             match args {
                 [] => {}
                 [arg] if matches!(arg.as_str(), "status" | "show") => {}
-                [model] => agent.set_subagent_model(if model == "default" {
+                // reference: crates/jcode-config-types/src/lib.rs -
+                // AgentsConfig::is_swarm_inherit_sentinel is the single source of
+                // truth for the sentinel vocabulary. A sentinel means "no explicit
+                // override", so it is stored as None rather than as the literal
+                // string, exactly like the TUI /subagent-model paths do.
+                [model] => agent.set_subagent_model(if model == "default"
+                    || crate::config::AgentsConfig::is_swarm_inherit_sentinel(model)
+                {
                     None
                 } else {
                     Some(model.clone())
@@ -656,5 +663,88 @@ mod tests {
         );
         assert!(role_args(&["--model".into()], "swarm").is_err());
         assert!(role_args(&["--continue".into(), "session".into()], "swarm").is_err());
+    }
+
+    /// The `/subagent-model` runtime command must store a sentinel as "no
+    /// explicit override" (None), not as the literal string. Otherwise the
+    /// stored value is later rendered as a PINNED model by the TUI, and the
+    /// swarm spawn resolver sees a concrete route that is not in the allowlist.
+    ///
+    /// reference: crates/jcode-config-types/src/lib.rs -
+    /// AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+    /// for the sentinel vocabulary.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn subagent_model_runtime_command_stores_a_sentinel_as_none() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::TempDir::new().unwrap();
+        let old = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", home.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    crate::env::set_var("JCODE_HOME", value);
+                } else {
+                    crate::env::remove_var("JCODE_HOME");
+                }
+            }
+        }
+        let _restore = Restore(old);
+        let provider: Arc<dyn crate::provider::Provider> = Arc::new(NoInferenceProvider::default());
+        let registry = crate::tool::Registry::new(provider.clone()).await;
+        let mut agent =
+            Agent::new_with_initial_working_dir(provider, registry, home.path().to_str());
+
+        for sentinel in [
+            "inherit",
+            "INHERIT",
+            " Inherit ",
+            "coordinator",
+            "Coordinator",
+        ] {
+            agent.set_subagent_model(Some("openai-api:gpt-5".into())).unwrap();
+            execute(
+                &mut agent,
+                RuntimeCommand::SubagentModel,
+                &[sentinel.into()],
+                true,
+                Value::Null,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                agent.subagent_model(),
+                None,
+                "the sentinel {sentinel} must be stored as no override, not as a literal"
+            );
+        }
+
+        agent.set_subagent_model(Some("openai-api:gpt-5".into())).unwrap();
+        execute(
+            &mut agent,
+            RuntimeCommand::SubagentModel,
+            &["openai-api:gpt-5".into()],
+            true,
+            Value::Null,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent.subagent_model().as_deref(),
+            Some("openai-api:gpt-5"),
+            "a concrete model must still be stored"
+        );
+
+        execute(
+            &mut agent,
+            RuntimeCommand::SubagentModel,
+            &["default".into()],
+            true,
+            Value::Null,
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent.subagent_model(), None, "default must clear the pin");
     }
 }

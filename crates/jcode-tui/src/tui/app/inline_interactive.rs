@@ -636,6 +636,13 @@ impl App {
         picker: &mut InlineInteractiveState,
         configured: Option<&str>,
     ) {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel means "no explicit override",
+        // so a stored sentinel spelling must not be highlighted as a pinned
+        // model, and must leave the inherit row current.
+        let configured = configured
+            .filter(|model| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model));
         picker.entries.retain(|entry| {
             !matches!(
                 entry.action,
