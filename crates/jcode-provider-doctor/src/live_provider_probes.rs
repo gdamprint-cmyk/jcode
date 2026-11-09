@@ -1,7 +1,9 @@
 //! Live OpenAI-compatible provider probes shared by the auth lifecycle driver
 //! and the provider doctor. These are pure HTTP/JSON checks with no test-only
 //! dependencies, so they compile into the shipping binary.
-//!
+//
+// reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-provider-openrouter-runtime/src/request_headers.rs (the streaming path's `x-opencode-session` helper, issue #1167; the probe path now shares it)
+//
 //! The OpenAI-compatible probes hit `/v1/chat/completions` directly. The native
 //! Claude probes ([`run_live_claude_native_*`]) instead drive the production
 //! [`AnthropicProvider`] runtime end-to-end (auth, OAuth preflight, request
@@ -50,6 +52,28 @@ fn apply_provider_auth(
         request,
         &resolved.api_base,
         api_key,
+    )
+}
+
+/// Apply the auth headers AND the per-host headers an OpenAI-compatible
+/// endpoint may require.
+///
+/// OpenCode Go/Zen reject any inference request without a stable
+/// `x-opencode-session` header (HTTP 400 `MissingSessionID`). The streaming
+/// runtime has always sent it; these probes are the NON-STREAMING path, so
+/// without this they reported the route as broken while real agent sessions
+/// on the same route worked.
+fn apply_probe_headers(
+    request: reqwest::RequestBuilder,
+    resolved: &ResolvedOpenAiCompatibleProfile,
+    api_key: &str,
+    conversation_id: &str,
+) -> reqwest::RequestBuilder {
+    let request = apply_provider_auth(request, resolved, api_key);
+    jcode_base::provider_catalog::apply_opencode_session_header(
+        request,
+        &resolved.api_base,
+        conversation_id,
     )
 }
 
@@ -177,7 +201,12 @@ pub async fn run_live_openai_compatible_smoke(
     let request = jcode_base::provider::shared_http_client()
         .post(&url)
         .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
+    let request = apply_probe_headers(
+        request,
+        &resolved,
+        api_key,
+        &jcode_base::provider_catalog::new_opencode_conversation_id(),
+    );
     let response = tokio::time::timeout(smoke_timeout(30), request.send())
         .await
         .context("timed out running live smoke completion")?
@@ -224,6 +253,10 @@ pub async fn run_live_openai_compatible_smoke(
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "live_provider_probes/opencode_session_header_wire_tests.rs"]
+mod opencode_session_header_wire_tests;
+
 pub async fn run_live_openai_compatible_stream_smoke(
     profile: OpenAiCompatibleProfile,
     api_key: &str,
@@ -246,7 +279,12 @@ pub async fn run_live_openai_compatible_stream_smoke(
     let request = jcode_base::provider::shared_http_client()
         .post(&url)
         .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
+    let request = apply_probe_headers(
+        request,
+        &resolved,
+        api_key,
+        &jcode_base::provider_catalog::new_opencode_conversation_id(),
+    );
     let response = tokio::time::timeout(smoke_timeout(45), request.send())
         .await
         .context("timed out running live stream smoke completion")?
@@ -361,7 +399,12 @@ pub async fn run_live_openai_compatible_tool_smoke(
     let request = jcode_base::provider::shared_http_client()
         .post(&url)
         .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
+    let request = apply_probe_headers(
+        request,
+        &resolved,
+        api_key,
+        &jcode_base::provider_catalog::new_opencode_conversation_id(),
+    );
     let response = tokio::time::timeout(smoke_timeout(45), request.send())
         .await
         .context("timed out running live tool-call smoke completion")?

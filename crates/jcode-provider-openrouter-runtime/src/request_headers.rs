@@ -46,32 +46,16 @@ pub(crate) fn apply_kimi_coding_agent_headers(
 }
 
 /// Hosts that require the `x-opencode-session` header (issue #1167).
-pub(crate) fn is_opencode_api_base(api_base: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(api_base) else {
-        return false;
-    };
-    matches!(
-        url.host_str(),
-        Some(host) if host == "opencode.ai" || host.ends_with(".opencode.ai")
-    )
-}
+///
+/// The helper now lives in `jcode-base::provider_catalog` so the streaming
+/// runtime and the non-streaming provider-doctor probes share ONE
+/// implementation; a second copy here could drift and leave the doctor path
+/// without the header again.
+pub(crate) use jcode_base::provider_catalog::apply_opencode_session_header;
+
+#[cfg(test)]
+pub(crate) use jcode_base::provider_catalog::{is_opencode_api_base, OPENCODE_SESSION_HEADER};
 
 pub(crate) fn new_conversation_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    jcode_base::provider_catalog::new_opencode_conversation_id()
 }
-
-/// OpenCode Go/Zen require a stable per-conversation `x-opencode-session`
-/// header on inference requests (rejected from 2026-09-05 without it).
-pub(crate) fn apply_opencode_session_header(
-    req: reqwest::RequestBuilder,
-    api_base: &str,
-    conversation_id: &str,
-) -> reqwest::RequestBuilder {
-    if is_opencode_api_base(api_base) {
-        req.header(OPENCODE_SESSION_HEADER, conversation_id)
-    } else {
-        req
-    }
-}
-
-pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";

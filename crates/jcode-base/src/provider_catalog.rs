@@ -836,6 +836,44 @@ pub fn apply_openai_compatible_catalog_auth(
     request.bearer_auth(api_key)
 }
 
+/// The header OpenCode Go/Zen require on every inference request
+/// (rejected from 2026-09-05 without it).
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether an OpenAI-compatible API base points at an OpenCode host that
+/// requires the `x-opencode-session` header (issue #1167).
+pub fn is_opencode_api_base(api_base: &str) -> bool {
+    let Ok(url) = url::Url::parse(api_base) else {
+        return false;
+    };
+    matches!(
+        url.host_str(),
+        Some(host) if host == "opencode.ai" || host.ends_with(".opencode.ai")
+    )
+}
+
+/// A fresh conversation id for OpenCode's per-conversation session header.
+pub fn new_opencode_conversation_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Apply the `x-opencode-session` header when the target host requires it.
+///
+/// Shared by the streaming runtime and the non-streaming provider-doctor
+/// probes: both talk to the same OpenCode Go/Zen endpoints, and a request that
+/// omits the header is rejected with HTTP 400 `MissingSessionID`.
+pub fn apply_opencode_session_header(
+    request: reqwest::RequestBuilder,
+    api_base: &str,
+    conversation_id: &str,
+) -> reqwest::RequestBuilder {
+    if is_opencode_api_base(api_base) {
+        request.header(OPENCODE_SESSION_HEADER, conversation_id)
+    } else {
+        request
+    }
+}
+
 fn apply_openai_compatible_profile_env_impl(
     profile: Option<OpenAiCompatibleProfile>,
     respect_named_profile_lock: bool,
