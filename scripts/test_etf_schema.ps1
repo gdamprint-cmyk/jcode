@@ -3,6 +3,9 @@
 # reference: https://raw.githubusercontent.com/entireio/cli/main/transcript/README.md
 # reference: https://docs.entire.io/agents/agent-integration-protocol/commands
 #
+# The adapter under test is the PORTED copy in scripts/entire/, not the external
+# adapter repository.
+#
 # Usage: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test_etf_schema.ps1
 #
 # The test has TWO halves:
@@ -24,12 +27,18 @@
 # nor null is a FAILURE. The earlier version of this test only checked that
 # content was not $null, so a spec-violating non-array non-string content
 # passed it.
+#
+# Every negative control names the reason it MUST be rejected for. A control
+# that is rejected for a DIFFERENT reason is a failure: the checker would be
+# wrong for the right-looking reason, and the live checks would still pass.
 
 $ErrorActionPreference = "Stop"
 
 $adapter = $env:ENTIRE_JCODE_ADAPTER
 if (-not $adapter) {
-    $adapter = "C:\Users\WorkShop1\proj\entire-agent-jcode\entire-agent-jcode.py"
+    # The ported adapter, next to this test's repository root.
+    $scriptRoot = Split-Path -Parent $PSCommandPath
+    $adapter = Join-Path $scriptRoot "entire\entire-agent-jcode.py"
 }
 $sessions = $env:JCODE_HOME
 if (-not $sessions) {
@@ -129,6 +138,16 @@ function Get-TranscriptProblems([string[]]$lines) {
         if ($null -ne $obj.content -and $obj.content -isnot [array] -and $obj.content -isnot [string]) {
             $problems.Add("content is neither an array, a string, nor null")
         }
+        # An array content holds BLOCKS: JSON objects. A scalar element (a
+        # string, a number) is not a block.
+        if ($obj.content -is [array]) {
+            foreach ($element in $obj.content) {
+                if ($null -ne $element -and $element -isnot [psobject]) {
+                    $problems.Add("content array holds a non-object block")
+                    break
+                }
+            }
+        }
         # A line whose type is missing must not be counted under a null key:
         # the count table is keyed by the type, and a null key is not an index.
         if ($null -ne $obj.type) {
@@ -169,23 +188,25 @@ function Get-TranscriptProblems([string[]]$lines) {
 Write-Output "=== negative control"
 
 $controls = @(
-    @{ Name = "not JSON at all";            Line = "not json at all" }
-    @{ Name = "truncated JSON";             Line = '{"v":1,"type":"user"' }
-    @{ Name = "v is 2";                     Line = '{"v":2,"type":"user","content":[]}' }
-    @{ Name = "v is a string";              Line = '{"v":"1","type":"user","content":[]}' }
-    @{ Name = "v is a float";                Line = '{"v":1.0,"type":"user","content":[]}' }
-    @{ Name = "v is a boolean";              Line = '{"v":true,"type":"user","content":[]}' }
-    @{ Name = "v is missing";               Line = '{"type":"user","content":[]}' }
-    @{ Name = "type is missing";            Line = '{"v":1,"content":[]}' }
-    @{ Name = "type is a number";           Line = '{"v":1,"type":7,"content":[]}' }
-    @{ Name = "content is a number";        Line = '{"v":1,"type":"user","content":42}' }
-    @{ Name = "content is an object";       Line = '{"v":1,"type":"user","content":{"text":"x"}}' }
-    @{ Name = "content is a boolean";       Line = '{"v":1,"type":"user","content":true}' }
-    @{ Name = "agent is a number";          Line = '{"v":1,"type":"user","agent":42,"content":[]}' }
-    @{ Name = "input_tokens is a string";   Line = '{"v":1,"type":"user","input_tokens":"x","content":[]}' }
-    @{ Name = "user text carries a type";   Line = '{"v":1,"type":"user","content":[{"type":"text","text":"x"}]}' }
-    @{ Name = "reasoning block kept";       Line = '{"v":1,"type":"assistant","content":[{"type":"reasoning","text":"x"}]}' }
-    @{ Name = "tool result status is bad";  Line = '{"v":1,"type":"assistant","content":[{"type":"tool_use","name":"t","input":{},"result":{"output":"o","status":"weird"}}]}' }
+    @{ Name = "not JSON at all";            Line = "not json at all";              Expect = "not valid JSON" }
+    @{ Name = "truncated JSON";             Line = '{"v":1,"type":"user"';        Expect = "not valid JSON" }
+    @{ Name = "v is 2";                     Line = '{"v":2,"type":"user","content":[]}'; Expect = "v is not the integer 1" }
+    @{ Name = "v is a string";              Line = '{"v":"1","type":"user","content":[]}'; Expect = "v is not the integer 1" }
+    @{ Name = "v is a float";                Line = '{"v":1.0,"type":"user","content":[]}'; Expect = "v is not the integer 1" }
+    @{ Name = "v is a boolean";              Line = '{"v":true,"type":"user","content":[]}'; Expect = "v is not the integer 1" }
+    @{ Name = "v is missing";               Line = '{"type":"user","content":[]}'; Expect = "v is not the integer 1" }
+    @{ Name = "type is missing";            Line = '{"v":1,"content":[]}'; Expect = "type is not user/assistant" }
+    @{ Name = "type is a number";           Line = '{"v":1,"type":7,"content":[]}'; Expect = "type is not user/assistant" }
+    @{ Name = "content is a number";        Line = '{"v":1,"type":"user","content":42}'; Expect = "content is neither an array, a string, nor null" }
+    @{ Name = "content is an object";       Line = '{"v":1,"type":"user","content":{"text":"x"}}'; Expect = "content is neither an array, a string, nor null" }
+    @{ Name = "content is a boolean";       Line = '{"v":1,"type":"user","content":true}'; Expect = "content is neither an array, a string, nor null" }
+    @{ Name = "content is a float";         Line = '{"v":1,"type":"user","content":1.5}'; Expect = "content is neither an array, a string, nor null" }
+    @{ Name = "content is an array of strings"; Line = '{"v":1,"type":"user","content":["x"]}'; Expect = "content array holds a non-object block" }
+    @{ Name = "agent is a number";          Line = '{"v":1,"type":"user","agent":42,"content":[]}'; Expect = "agent is not a string" }
+    @{ Name = "input_tokens is a string";   Line = '{"v":1,"type":"user","input_tokens":"x","content":[]}'; Expect = "input_tokens is not an integer" }
+    @{ Name = "user text carries a type";   Line = '{"v":1,"type":"user","content":[{"type":"text","text":"x"}]}'; Expect = "user text blocks carry a type field" }
+    @{ Name = "reasoning block kept";       Line = '{"v":1,"type":"assistant","content":[{"type":"reasoning","text":"x"}]}'; Expect = "reasoning blocks were not dropped" }
+    @{ Name = "tool result status is bad";  Line = '{"v":1,"type":"assistant","content":[{"type":"tool_use","name":"t","input":{},"result":{"output":"o","status":"weird"}}]}'; Expect = "tool_use result has a bad status" }
 )
 
 $controlFailures = 0
@@ -194,9 +215,19 @@ foreach ($control in $controls) {
     if ($result.Problems.Count -eq 0) {
         Write-Output "    FAIL the checker ACCEPTED: $($control.Name)"
         $controlFailures++
-    } else {
-        Write-Output "    ok  rejected: $($control.Name) -> $($result.Problems[0])"
+        continue
     }
+    # The rejection must be for the EXPECTED reason, not just any reason.
+    $matched = $false
+    foreach ($problem in $result.Problems) {
+        if ($problem -like "*$($control.Expect)*") { $matched = $true; break }
+    }
+    if (-not $matched) {
+        Write-Output "    FAIL the checker rejected '$($control.Name)' for the WRONG reason -> $($result.Problems[0]) (expected '*$($control.Expect)*')"
+        $controlFailures++
+        continue
+    }
+    Write-Output "    ok  rejected: $($control.Name) -> $($result.Problems[0])"
 }
 # The good cases must NOT be rejected, or the checker rejects everything.
 $good = @(
