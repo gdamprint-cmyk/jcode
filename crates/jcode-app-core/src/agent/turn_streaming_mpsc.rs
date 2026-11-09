@@ -18,10 +18,6 @@ impl Agent {
         // A new turn starts with no research lookup observed, so the
         // research-first gate is rearmed for this turn.
         crate::tool::research_gate::reset_research_state(&self.session.id);
-        // The tool-loop guardrail counters are per turn.
-        // reference: crates/jcode-app-core/src/tool/loop_guardrails.rs
-        //   (`reset_for_turn` clears every counter).
-        crate::tool::loop_guardrails::reset_for_turn(&self.session.id);
         let _runtime_activity =
             crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.ensure_session_lease()?;

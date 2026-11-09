@@ -1050,54 +1050,6 @@ impl Default for HooksConfig {
     }
 }
 
-/// Tool-loop guardrail configuration.
-///
-/// A per-turn counter set that detects and stops the model from repeating the
-/// same failing or no-progressing tool call. Warnings are always on; hard
-/// stops are opt-in so an interactive session keeps flowing.
-// reference: C:\Users\WorkShop1\AppData\Local\hermes\hermes-agent\agent\tool_guardrails.py
-//   - `ToolCallGuardrailConfig` and its defaults.
-// reference: C:\Users\WorkShop1\AppData\Local\hermes\hermes-agent\website\docs\user-guide\configuration.md
-//   - the official `tool_loop_guardrails` config section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolLoopGuardrailsConfig {
-    /// Inject warnings into the tool result so the model self-corrects.
-    pub warnings_enabled: bool,
-    /// Also BLOCK the call past the hard-stop threshold.
-    pub hard_stop_enabled: bool,
-    /// Identical failing call repeated N times -> warn.
-    pub exact_failure_warn_after: u32,
-    /// Identical failing call repeated N times -> block.
-    pub exact_failure_block_after: u32,
-    /// Same tool failing N times (different args) -> warn.
-    pub same_tool_failure_warn_after: u32,
-    /// Same tool failing N times (different args) -> block.
-    pub same_tool_failure_block_after: u32,
-    /// Same result, no progress, N times -> warn.
-    pub no_progress_warn_after: u32,
-    /// Same result, no progress, N times -> block.
-    pub no_progress_block_after: u32,
-    /// Per-turn ceiling on web-search calls. 0 disables the cap.
-    pub max_web_searches_per_turn: u32,
-}
-
-impl Default for ToolLoopGuardrailsConfig {
-    fn default() -> Self {
-        Self {
-            warnings_enabled: true,
-            hard_stop_enabled: false,
-            exact_failure_warn_after: 2,
-            exact_failure_block_after: 5,
-            same_tool_failure_warn_after: 3,
-            same_tool_failure_block_after: 8,
-            no_progress_warn_after: 2,
-            no_progress_block_after: 5,
-            max_web_searches_per_turn: 50,
-        }
-    }
-}
-
 /// Research-first gate configuration.
 ///
 /// A substantial new source file may not be written until a qualifying research
