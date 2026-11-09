@@ -2,8 +2,8 @@
 # ---------------------------------------------------------------------------
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
-# source repo: entire-agent-jcode @ 3aaae7b
-#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
+# source repo: entire-agent-jcode @ 26a19cc
+#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/hooks_cmd.go
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/

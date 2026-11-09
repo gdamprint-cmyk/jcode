@@ -3,7 +3,7 @@
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # source repo: entire-agent-jcode @ 3aaae7b
-#                ("fix(adapter): scope the oversized-transcript refusal to the CLI's capped pipe")
+#                ("fix(adapter): correct the stdout-cap refusal rationale with the measured mechanism")
 # ---------------------------------------------------------------------------
 # reference: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # reference: https://docs.entire.io/agents/agent-integration-protocol/lifecycle
