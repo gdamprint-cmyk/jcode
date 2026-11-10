@@ -820,6 +820,13 @@ const CURATED_MODEL_IDS: &[&str] = &[
     "incidents-and-fixes",
     "machine-hazards",
     "agent-coordination",
+    // The goals the owner has PARKED, waiting on a decision or a condition.
+    // MEASURED 2026-11-11 on the live bank: this model was MISSING from the
+    // 15-model roster, so `active-work` (the goals progressing right now)
+    // was the only source about the owner's work - and the goals waiting on
+    // the owner were invisible to the agent. Created on 2026-11-11 with the
+    // measured owner scope (owner:primary + the global untagged leaf).
+    "waiting-goals",
 ];
 
 /// Whether a mental model is one of the curated, owner-facing models.
