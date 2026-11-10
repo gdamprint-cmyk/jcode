@@ -1,5 +1,11 @@
 //! User-configurable lifecycle hooks.
 //!
+//! reference: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+//!   (read 2026-11-11) - the anonymous-pipe blocking rule that the concurrent
+//!   stdin/stdout handling below implements: "If the pipe buffer is full before
+//!   all bytes are written, WriteFile does not return until another process or
+//!   thread uses ReadFile to make more buffer space available."
+//!
 //! Hooks are external commands that jcode runs at well-defined lifecycle
 //! points so other programs can observe or gate agent behavior without
 //! forking jcode. They are configured in `[hooks]` in config.toml (or
@@ -24,6 +30,29 @@
 //!
 //! Hook processes get `JCODE_HOOKS_DISABLED=1` in their environment so a
 //! hook that itself invokes jcode does not recursively trigger hooks.
+//!
+//! PIPE DEADLOCK (fixed 2026-11-11)
+//! -------------------------------
+//! The runner used to write the whole tool-input JSON into the child's stdin
+//! and only then read the child's stdout. On Windows an anonymous pipe has a
+//! small buffer, and per Microsoft's CreatePipe documentation
+//! (https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe)
+//! "If the pipe buffer is full before all bytes are written, WriteFile does not
+//! return until another process or thread uses ReadFile to make more buffer
+//! space available."
+//!
+//! A hook that does not read stdin AND writes more than the pipe buffer to
+//! stdout therefore deadlocks both sides: the parent blocks in write(stdin)
+//! while the child blocks in write(stdout). The runner then hits its timeout
+//! and the hook contributes nothing.
+//!
+//! MEASURED on this host: all six configured `post_tool_feedback` hooks timed
+//! out that way, 653 times across two log files, and each timeout cost the
+//! user 10 s of dead time per tool call.
+//!
+//! The fix is to handle stdin and stdout CONCURRENTLY: one task writes stdin
+//! (and drops it, signalling EOF), another reads stdout to EOF. Neither side
+//! can block the other, so a hook is free to ignore stdin entirely.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -326,16 +355,47 @@ pub async fn transform_tool_input(
         // A child that never reads stdin can block `write_all` once the pipe
         // fills. Keep that write under the same deadline as process completion
         // so a transformer always fails open within its configured timeout.
+        //
+        // stdin and stdout are handled CONCURRENTLY (see the PIPE DEADLOCK note
+        // in the module header): a sequential write-then-read deadlocks when the
+        // transformer ignores stdin and writes more than the pipe buffer.
+        //
+        // reference: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+        //   (read 2026-11-11) - "If the pipe buffer is full before all bytes are
+        //   written, WriteFile does not return until another process or thread uses
+        //   ReadFile to make more buffer space available."
         let output = match tokio::time::timeout(timeout, async {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(serialized.as_bytes()).await?;
-            }
-            child.wait_with_output().await
+            let stdout_pipe = child.stdout.take();
+            let stdin_pipe = child.stdin.take();
+            let payload = serialized.as_bytes().to_vec();
+            let writer = tokio::spawn(async move {
+                if let Some(mut stdin) = stdin_pipe {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(&payload).await;
+                }
+            });
+            let reader = tokio::spawn(async move {
+                if let Some(mut stdout) = stdout_pipe {
+                    use tokio::io::AsyncReadExt;
+                    let mut buffer = Vec::new();
+                    let _ = stdout.read_to_end(&mut buffer).await;
+                    buffer
+                } else {
+                    Vec::new()
+                }
+            });
+            let status = child.wait().await;
+            let _ = writer.await;
+            let stdout = reader.await.unwrap_or_default();
+            Ok::<_, std::io::Error>((status, stdout))
         })
         .await
         {
-            Ok(Ok(output)) if output.status.success() => output,
+            Ok(Ok((status, stdout))) if status.success() => std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            },
             Ok(Ok(_)) | Ok(Err(_)) | Err(_) => continue,
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -582,17 +642,55 @@ async fn run_pre_tool_command(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(tool_input_json.as_bytes()).await;
-        // Closing stdin signals EOF to hooks that read the whole input.
-        drop(stdin);
-    }
+    // Write stdin and read stdout concurrently (see the PIPE DEADLOCK note in
+    // the module header): a hook that ignores stdin and writes more than the
+    // pipe buffer to stdout would deadlock a sequential write-then-read.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+    //   (read 2026-11-11) - "If the pipe buffer is full before all bytes are
+    //   written, WriteFile does not return until another process or thread uses
+    //   ReadFile to make more buffer space available."
+    let stdin_pipe = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let payload = tool_input_json.as_bytes().to_vec();
+    let writer = tokio::spawn(async move {
+        if let Some(mut stdin) = stdin_pipe {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(&payload).await;
+            // Closing stdin signals EOF to hooks that read the whole input.
+            drop(stdin);
+        }
+    });
+    let reader = tokio::spawn(async move {
+        let mut stdout_buffer = Vec::new();
+        if let Some(mut stdout) = stdout_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = stdout.read_to_end(&mut stdout_buffer).await;
+        }
+        let mut stderr_buffer = Vec::new();
+        if let Some(mut stderr) = stderr_pipe {
+            use tokio::io::AsyncReadExt;
+            let _ = stderr.read_to_end(&mut stderr_buffer).await;
+        }
+        (stdout_buffer, stderr_buffer)
+    });
 
     let timeout =
         std::time::Duration::from_millis(crate::config::config().hooks.pre_tool_timeout_ms.max(1));
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
+    let output = match tokio::time::timeout(timeout, async {
+        let status = child.wait().await;
+        let _ = writer.await;
+        let (stdout, stderr) = reader.await.unwrap_or_default();
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    })
+    .await
+    {
+        Ok(Ok((status, stdout, stderr))) => std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
         Ok(Err(error)) => {
             crate::logging::warn(&format!(
                 "Hook 'pre_tool' command '{command_line}' failed: {error} (allowing tool call)"
@@ -700,18 +798,51 @@ async fn run_post_tool_feedback_command(
     };
     // Keep the stdin write under the deadline too: a hook that never reads
     // stdin could otherwise block once the pipe fills.
+    //
+    // stdin and stdout are handled CONCURRENTLY (see the PIPE DEADLOCK note in
+    // the module header): a sequential write-then-read deadlocks when the hook
+    // ignores stdin and writes more than the pipe buffer to stdout.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+    //   (read 2026-11-11) - "If the pipe buffer is full before all bytes are
+    //   written, WriteFile does not return until another process or thread uses
+    //   ReadFile to make more buffer space available." Draining stdout while
+    //   stdin is being written is what keeps the two sides from deadlocking.
     let output = match tokio::time::timeout(timeout, async {
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            // A hook that exits without reading stdin closes the pipe; that
-            // is fine, its stdout still counts.
-            let _ = stdin.write_all(tool_input_json.as_bytes()).await;
-        }
-        child.wait_with_output().await
+        let stdout_pipe = child.stdout.take();
+        let stdin_pipe = child.stdin.take();
+        let payload = tool_input_json.as_bytes().to_vec();
+        let writer = tokio::spawn(async move {
+            if let Some(mut stdin) = stdin_pipe {
+                use tokio::io::AsyncWriteExt;
+                // A hook that exits without reading stdin closes the pipe; that
+                // is fine, its stdout still counts.
+                let _ = stdin.write_all(&payload).await;
+                // Dropping stdin signals EOF to hooks that read the whole input.
+            }
+        });
+        let reader = tokio::spawn(async move {
+            if let Some(mut stdout) = stdout_pipe {
+                use tokio::io::AsyncReadExt;
+                let mut buffer = Vec::new();
+                let _ = stdout.read_to_end(&mut buffer).await;
+                buffer
+            } else {
+                Vec::new()
+            }
+        });
+        let status = child.wait().await;
+        let _ = writer.await;
+        let stdout = reader.await.unwrap_or_default();
+        Ok::<_, std::io::Error>((status, stdout))
     })
     .await
     {
-        Ok(Ok(output)) => output,
+        Ok(Ok((status, stdout))) => std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        },
         Ok(Err(error)) => {
             crate::logging::warn(&format!(
                 "Hook 'post_tool_feedback' command '{command_line}' failed: {error}"
