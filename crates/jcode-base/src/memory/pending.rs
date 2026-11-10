@@ -1051,6 +1051,80 @@ mod scoped_tests {
         });
     }
 
+    /// The mental-model ids must take part in the injected-set bookkeeping.
+    ///
+    /// MEASURED 2026-11-10: only the FACT ids were tracked, so a model
+    /// whose text was already in the transcript could be delivered again on
+    /// the next turn - the "the same thing every time" complaint had a
+    /// second cause. The model ids are tracked with a `model:` prefix so
+    /// they cannot collide with Hindsight fact ids.
+    ///
+    /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
+    ///   (`id` is the "Unique mental model ID"; it is stable across
+    ///   refreshes, so it is a valid dedup key for an already delivered
+    ///   model).
+    #[test]
+    fn an_already_delivered_model_is_not_delivered_again() {
+        fixture(|| {
+            let ids = vec!["fact-1".to_string(), "model:active-work".to_string()];
+            set_pending_memory_external(
+                "models",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids.clone(),
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("models", None).is_some());
+            assert!(is_memory_injected("models", "model:active-work"));
+
+            // The SAME payload on the next turn must not reach the model
+            // again: every element of it is already known.
+            set_pending_memory_external(
+                "models",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids,
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("models", None).is_none(),
+                "an already delivered model set must not be delivered again"
+            );
+        });
+    }
+
+    /// A payload with a NEW fact alongside an already delivered model is
+    /// still delivered: the suppression is per-element, not per-payload.
+    #[test]
+    fn a_new_fact_alongside_a_known_model_is_delivered() {
+        fixture(|| {
+            set_pending_memory_external(
+                "mixed",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                1,
+                vec!["model:active-work".to_string()],
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("mixed", None).is_some());
+
+            set_pending_memory_external(
+                "mixed",
+                "# Memory\n\n## Relevant facts\n\n- fact one\n- fact two".to_string(),
+                2,
+                vec!["model:active-work".to_string(), "fact-two".to_string()],
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("mixed", None).is_some(),
+                "a payload with a new fact must still be delivered"
+            );
+        });
+    }
+
     #[test]
     fn distinct_sessions_keep_independent_pending_and_injected_state() {
         fixture(|| {

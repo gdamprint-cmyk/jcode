@@ -311,12 +311,28 @@ impl MemoryAgent {
                 Ok(recall) => {
                     if let Some(prompt) = crate::memory_hindsight::format_recall_block(&recall) {
                         let count = recall.facts.len();
-                        let ids: Vec<String> = recall
+                        // The ids tracked for the injected-set bookkeeping
+                        // cover the FACTS and the MODELS.
+                        //
+                        // MEASURED 2026-11-10: only the fact ids were
+                        // tracked, so a model whose text was already in the
+                        // transcript could be delivered again on the next
+                        // turn - the "same thing every time" complaint had a
+                        // second cause here. The model ids are prefixed so
+                        // they cannot collide with Hindsight fact ids.
+                        let mut ids: Vec<String> = recall
                             .facts
                             .iter()
                             .map(|fact| fact.id.clone())
                             .filter(|id| !id.is_empty())
                             .collect();
+                        ids.extend(
+                            recall
+                                .models
+                                .iter()
+                                .map(|model| format!("model:{}", model.id))
+                                .filter(|id| id.len() > "model:".len()),
+                        );
                         // EXTERNAL publication: these memories live in the
                         // Hindsight bank, not in the local graph, so the
                         // project-scoped path would reject the selection.

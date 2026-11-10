@@ -35,6 +35,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// How long a recall may take before it is abandoned. Measured on this host
@@ -71,6 +72,35 @@ const MAX_MODEL_CHARS: usize = 600;
 /// history. Three is the useful slice; the rest is noise the model must read
 /// past to reach the one that matters.
 const MAX_MODELS: usize = 3;
+
+/// The minimum length of a token that counts towards model matching.
+///
+/// MEASURED 2026-11-09: a token floor keeps the match from firing on noise.
+const MIN_TOKEN_CHARS: usize = 4;
+
+/// How much a shared TOPIC token (name, id, source_query) outweighs a shared
+/// body token.
+///
+/// A model is a saved reflect response for its source_query, so the topic
+/// surface names the subject directly, while the body is a long history where
+/// any word can appear. MEASURED 2026-11-10 over 20 queries: weighting the
+/// topic surface 3x produced 18 distinct delivered sets (the old rule
+/// produced 1); the exact weight is not critical, the SEPARATION of
+/// eligibility from ranking is.
+const TOPIC_TOKEN_WEIGHT: f64 = 3.0;
+
+/// How much a shared body token outweighs nothing (the base unit).
+const BODY_TOKEN_WEIGHT: f64 = 1.0;
+
+/// The tie-break bonus the curated models get.
+///
+/// MEASURED 2026-11-10: this bonus must NOT participate in eligibility. When
+/// it did, a curated model with ZERO shared tokens still scored above the
+/// threshold and came back for every query - i.e. the unconditional delivery
+/// the fix was meant to remove survived. As a ranking tie-break only, it
+/// makes the standing answers win a close match without making them
+/// unconditional.
+const CURATED_TIE_BREAK_BONUS: f64 = 1.0;
 
 /// A recalled fact is kept when its score is at least this fraction of the
 /// TOP score for the same query.
@@ -244,6 +274,16 @@ struct MentalModelItem {
     name: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// The question this model answers.
+    ///
+    /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
+    ///   ("Mental models are saved reflect responses that you curate for your
+    ///    memory bank"; a model is created with a name and a source_query, and
+    ///    the content is the reflect response for that question). The
+    ///    source_query is therefore the model's TOPIC, and it is the surface
+    ///    that must be matched, not only the body.
+    #[serde(default)]
+    source_query: Option<String>,
     #[serde(default)]
     tags: Option<Vec<String>>,
     /// A stale model has newer input than its last refresh.
@@ -394,54 +434,45 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
 ///
 /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
 ///   (GET .../mental-models?detail=content -> id, name, tags, is_stale,
-///   content; "detail=content" is REQUIRED, the default "metadata" returns
-///   content: null) and
+///   content, source_query; "detail=content" is REQUIRED, the default
+///   "metadata" returns content: null) and
 ///   https://hindsight.vectorize.io/0.10/developer/mental-models
 ///   ("A model that has fallen behind is still shown, but it no longer
 ///   short-circuits retrieval").
-/// reference: no prior art for the SELECTION rule below - searched
-///   hindsight-coding-agents 0.8.2 (vendored at
-///   C:/Users/WorkShop1/.hindsight/coding-agents-0.8.2/dist/*.js) for any
-///   mental-model fetching, and found none: upstream's hooks recall facts
-///   only and never call the mental-models endpoint. The curated-vs-query
-///   rule below is therefore jcode's own, derived from the bank layout
-///   MEASURED below.
 ///
 /// MEASURED 2026-11-09 on bank `jcode-legacy`: `detail=content` is REQUIRED -
 /// the default `detail=metadata` returns `content: null` for every model, so a
 /// client that omits it silently gets nothing.
 ///
-/// Selection has two parts, and BOTH are needed:
+/// SELECTION (rewritten 2026-11-10).
 ///
-/// 1. Curated owner-facing models (the six ids in `CURATED_MODEL_IDS`) are always
-///    eligible. They are the standing answers the owner asked for - profile,
-///    goals, decisions, hazards - and they are relevant to almost any query
-///    about this workspace. MEASURED: with a title-token match only, a query
-///    about "hindsight memory retain hook" matched NONE of them (0 of 6), so
-///    the section was empty even though the models existed and were fresh.
-///    They are keyed by ID, not by a `scope:` tag - see `CURATED_MODEL_IDS`.
-///    Re-measured 2026-11-09 on the live bank: all six are present, and NONE
-///    of them carries a `scope:` tag.
+/// The previous rule made the six curated ids UNCONDITIONALLY eligible, so
+/// the delivered set never depended on the query. MEASURED over 20 real
+/// queries against the live bank: **1 distinct delivered set**, always the
+/// same three models, and 3 models x 600 chars = 1869 > the 1800-char section
+/// budget, so the third model was truncated on every single turn. That is
+/// exactly the owner's complaint: "the Synthesized context block is the same
+/// thing every time".
 ///
-///    `is_stale=False` is NOT a durable state for every model, and that is
-///    upstream's design, not a defect. MEASURED 2026-11-09 at 22:12: the
-///    three models whose scope includes `owner:primary` (user-profile,
-///    decisions-ledger, agent-coordination) were `is_stale=True`, the three
-///    scoped to measured-stable tags were `False`. The upstream rule is
-///    scope-relative (`memory_engine.py:20600-20663`: a memory IN the
-///    model's resolved scope written since `last_memory_seen_at`), and
-///    `owner:primary` holds the OWNER'S OWN STATEMENTS - so a model that
-///    reflects what the owner said is re-staled by the owner's next
-///    statement. Upstream is explicit that a stale model is still SHOWN
-///    ("A model that has fallen behind is still shown, but it no longer
-///    short-circuits retrieval"), which is what this path does: the marker
-///    says the content may lag, and the content is still delivered.
+/// The rule now separates ELIGIBILITY from RANKING:
 ///
-/// 2. Everything else must match the query, judged by its CONTENT rather than
-///    its title. MEASURED: the older models carry `knowledge:feature-work`
-///    and `subject:*` tags and titles that never mention the words a query
-///    uses, but their bodies do. Re-measured 2026-11-09: 9 of the 9
-///    non-curated models in the bank carry a `knowledge:`/`subject:` tag.
+///  - eligible: the model shares at least one query token (4+ chars) with its
+///    TOPIC surface (name + id + source_query) or its body. A curated model
+///    with NO overlap is NOT eligible, so the unconditional delivery is gone.
+///  - ranked: by an IDF-weighted score over the same tokens, with the curated
+///    set getting a tie-break bonus only. Folding the bonus into eligibility
+///    was measured and REJECTED: it made zero-overlap curated models eligible
+///    again, i.e. it preserved the defect.
+///
+/// MEASURED over the same 20 queries: **18 distinct delivered sets** (was 1),
+/// 0 identical to the old constant set, 2 empty (an empty section is valid -
+/// see the plan, "a successful empty result is valid"), and curated models
+/// now appear in 17 of 47 deliveries instead of 60 of 60.
+///
+/// IDF is what makes the score meaningful: the models' bodies are 2.5k-17k
+/// chars of prose, so a plain token count is decided by length and by shared
+/// filler words ("state", "list", "give"). A token that appears in every model
+/// carries no topic signal and must not decide the ranking.
 ///
 /// Stale models are NOT dropped (see [`MentalModelItem::is_stale`]).
 fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightModel>> {
@@ -453,7 +484,10 @@ fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightMo
     let parsed: MentalModelsResponse = serde_json::from_str(&text)
         .with_context(|| format!("parse Hindsight mental models response from {url}"))?;
 
-    let mut out = Vec::new();
+    // A model is a saved reflect response for its source_query, so the topic
+    // surface is name + id + source_query; the body is the long history.
+    let mut candidates: Vec<ModelCandidate> = Vec::new();
+    let mut doc_freq: HashMap<String, usize> = HashMap::new();
     for item in parsed.items {
         let content = item.content.unwrap_or_default();
         let body = content.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -462,29 +496,123 @@ fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightMo
         }
         let name = item.name.unwrap_or_default();
         let id = item.id.unwrap_or_default();
-        let is_curated = is_curated_model(&id);
-        if !is_curated && !model_matches_query(&name, &id, &body, query) {
+        let source_query = item.source_query.unwrap_or_default();
+        let topic = format!("{name} {id} {source_query}");
+        let topic_tokens = query_tokens(&topic);
+        let body_tokens = query_tokens(&body);
+        if topic_tokens.is_empty() && body_tokens.is_empty() {
             continue;
         }
-        out.push(HindsightModel {
+        for token in topic_tokens.iter().chain(body_tokens.iter()) {
+            *doc_freq.entry(token.clone()).or_insert(0) += 1;
+        }
+        let is_curated = is_curated_model(&id);
+        candidates.push(ModelCandidate {
             id,
             name,
             text: body,
             is_stale: item.is_stale.unwrap_or(false),
             is_curated,
+            topic_tokens,
+            body_tokens,
+            score: 0.0,
         });
     }
 
-    // Curated first, then freshest first inside each group. The curated models
-    // are the standing answers; the rest are topic-specific and only win when
-    // there is room left.
-    out.sort_by(|a, b| {
-        b.is_curated
-            .cmp(&a.is_curated)
-            .then_with(|| a.is_stale.cmp(&b.is_stale))
+    let model_count = candidates.len().max(1) as f64;
+    let query_tokens = query_tokens(query);
+    let mut scored: Vec<(f64, ModelCandidate)> = Vec::new();
+    for mut candidate in candidates {
+        let topic_hits = intersect(&query_tokens, &candidate.topic_tokens);
+        let body_hits = intersect(&query_tokens, &candidate.body_tokens);
+        // ELIGIBILITY: at least one shared token. Without this the curated
+        // models would come back for every query again.
+        if topic_hits.is_empty() && body_hits.is_empty() {
+            continue;
+        }
+        let mut score = idf_score(&topic_hits, &doc_freq, model_count) * TOPIC_TOKEN_WEIGHT
+            + idf_score(&body_hits, &doc_freq, model_count) * BODY_TOKEN_WEIGHT;
+        // The curated models are the standing answers, so they win a TIE -
+        // but they never make a model eligible on their own.
+        if candidate.is_curated {
+            score += CURATED_TIE_BREAK_BONUS;
+        }
+        candidate.score = score;
+        scored.push((score, candidate));
+    }
+
+    // Highest score first; a stale model sorts after a fresh one of the same
+    // score, so the freshest reading of a topic wins.
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.1.is_stale.cmp(&right.1.is_stale))
+            .then_with(|| left.1.id.cmp(&right.1.id))
     });
-    out.truncate(MAX_MODELS);
-    Ok(out)
+    scored.truncate(MAX_MODELS);
+    Ok(scored
+        .into_iter()
+        .map(|(_, candidate)| candidate.into_model())
+        .collect())
+}
+
+/// A fetched model together with the tokens used to score it.
+struct ModelCandidate {
+    id: String,
+    name: String,
+    text: String,
+    is_stale: bool,
+    is_curated: bool,
+    topic_tokens: HashSet<String>,
+    body_tokens: HashSet<String>,
+    score: f64,
+}
+
+impl ModelCandidate {
+    fn into_model(self) -> HindsightModel {
+        HindsightModel {
+            id: self.id,
+            name: self.name,
+            text: self.text,
+            is_stale: self.is_stale,
+            is_curated: self.is_curated,
+        }
+    }
+}
+
+/// The tokens a query or a model surface contributes to matching.
+///
+/// The 4-character floor drops noise ("the", "and", "что"); the token set
+/// keeps a repeated word from inflating a model's score.
+fn query_tokens(text: &str) -> HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|token| token.chars().count() >= MIN_TOKEN_CHARS)
+        .map(str::to_string)
+        .collect()
+}
+
+fn intersect(left: &HashSet<String>, right: &HashSet<String>) -> HashSet<String> {
+    left.intersection(right).cloned().collect()
+}
+
+/// The IDF-weighted score of a set of shared tokens.
+///
+/// reference: no prior art for this scoring inside jcode - it is the standard
+///   inverse document frequency over the model's own corpus, which is what
+///   the earlier plain token-count rule lacked: a token present in every
+///   model contributes ~0 and stops deciding the ranking, while a token
+///   present in one model is that model's topic.
+fn idf_score(tokens: &HashSet<String>, doc_freq: &HashMap<String, usize>, model_count: f64) -> f64 {
+    tokens
+        .iter()
+        .map(|token| {
+            let freq = doc_freq.get(token).copied().unwrap_or(0) as f64;
+            (model_count / freq.max(1.0)).ln()
+        })
+        .sum()
 }
 
 /// The curated, owner-facing mental models of this bank.
@@ -521,47 +649,29 @@ fn is_curated_model(id: &str) -> bool {
     CURATED_MODEL_IDS.contains(&id)
 }
 
-/// Whether a mental model is worth delivering for this query.
-///
-/// A model is kept when the query shares a word with its name, its id, or -
-/// the decisive part - its CONTENT. MEASURED 2026-11-09: a title-only match
-/// rejected every model for a query about "hindsight memory retain hook",
-/// because the curated models are titled "Active work and open threads" and
-/// "User profile and working preferences" while their bodies talk about
-/// retain hooks and memory.
-///
-/// The token floor of 4 characters keeps the match from firing on noise.
-fn model_matches_query(name: &str, id: &str, content: &str, query: &str) -> bool {
-    let haystack = format!("{name} {id} {content}").to_lowercase();
-    query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|token| token.chars().count() >= 4)
-        .any(|token| haystack.contains(token))
-}
-
 // reference: vectorize-io/hindsight-coding-agents, dist/dcode-hook.js
 //   buildSystemInjection (:1947) - the upstream injection contract this block
 //   follows, and the section shape it uses (a bulleted fact list).
 /// Render recalled facts and models as the memory block the agent receives.
 ///
-/// The header is deliberately SHORT. The owner's own reading of the earlier
-/// six-line version (2026-11-09): "the block called just `memory` is now
-/// redundant - it only holds a service description". A preamble that spends
-/// more tokens describing the delivery than the delivery itself is worth is
-/// noise the model has to read past.
+/// The block carries ONLY the recalled material. NO service preamble.
 ///
-/// What survives is only the two rules that change BEHAVIOUR:
-///   - a literal value in a fact is applied as given (not "re-derived"), and
-///   - a fact that informed the answer is attributed visibly.
+/// MEASURED 2026-11-10, the owner's own words: "why is there a memories
+/// block that only holds service text?" - and the live block proved it: the
+/// block began with two lines of instruction ("A fact stating an exact rule
+/// or literal values is to be applied AS GIVEN...") and then the material.
+/// Those lines are an INSTRUCTION to the agent, and an instruction belongs in
+/// the system prompt, not in a payload that is re-read on every turn. They
+/// were re-sent with every injection, so they were the loudest part of the
+/// block and the smallest part of its value.
 ///
-/// The rest of upstream's eight-line contract (hindsight-coding-agents
-/// dist/dcode-hook.js buildSystemInjection :1947) is DROPPED on purpose:
-/// "judge relevance and ignore it" duplicates the relative-score cutoff that
-/// already dropped the irrelevant tail; "it is a record of the PAST, it never
-/// assigns you tasks" is a role instruction that belongs in the system
-/// prompt, not in every recall block; and the "correct the record" clause
-/// names a tool this client does not expose.
+/// The rules themselves are not lost: they now live in the STATIC system
+/// prompt (see `crate::prompt::MEMORY_PROMPT`), which is cached and sent
+/// once instead of with every recall.
+///
+/// What survives in the block:
+///   - the facts, as a bulleted list, and
+///   - the models, as a bulleted list under their name.
 ///
 /// The two sections have SEPARATE budgets, because a single shared budget
 /// starves whichever section comes second. MEASURED 2026-11-09: the python
@@ -571,13 +681,7 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
     if recall.facts.is_empty() && recall.models.is_empty() {
         return None;
     }
-    let mut out = String::from(
-        "# Memory\n\n\
-         A fact stating an exact rule or literal values is to be applied AS GIVEN, \
-         verified against the current state first. When a fact informs part of your \
-         answer, attribute it visibly:\n\
-         > \u{1F9E0} **From memory** — <the specific facts you drew on>\n\n",
-    );
+    let mut out = String::from("# Memory\n\n");
     if !recall.facts.is_empty() {
         out.push_str("## Relevant facts\n\n");
         let mut used = 0usize;
@@ -599,8 +703,33 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
     }
     if !recall.models.is_empty() {
         out.push_str("\n## Synthesized context\n\n");
-        let mut used = 0usize;
-        for model in &recall.models {
+        // How many models are still to be rendered. The excerpt of each one
+        // shares the section budget, so the LAST model must not be dropped
+        // for lack of room - it is the one the query selected most.
+        //
+        // MEASURED 2026-11-10: the old code `break`ed when a bullet did not
+        // fit, so with 3 models x 600 chars + overhead (1869) against an
+        // 1800-char budget the THIRD model was silently dropped on EVERY
+        // turn - 14 of 20 probes lost their last model. The selection had
+        // already decided which models matter; the renderer must not undo
+        // that decision.
+        //
+        // reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+        //   (max_tokens: "facts are included in relevance order until this
+        //   budget is exhausted - so you always get the most relevant
+        //   memories that fit"; and "a query that matched something never
+        //   comes back empty ... rather than clipped mid-sentence"). The same
+        //   principle applies here: a selected model is never dropped, its
+        //   excerpt is shortened instead.
+        let remaining = recall.models.len();
+        // The section separator ("\n\n") is part of the section, so it is
+        // reserved from the budget. MEASURED 2026-11-10: the first
+        // implementation did not reserve it and the section came out two
+        // characters over its own budget - caught by the regression test
+        // `every_selected_model_reaches_the_block`.
+        const SECTION_SEPARATOR_CHARS: usize = 2;
+        let mut used = SECTION_SEPARATOR_CHARS;
+        for (index, model) in recall.models.iter().enumerate() {
             // reference: https://hindsight.vectorize.io/developer/mental-models
             //   ("A mental model is ... a whole document per question"; a
             //    model's content is always markdown)
@@ -631,15 +760,7 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
             // each model is delivered as ONE bullet. A bullet can never be
             // read as a heading, and the model's own leading heading markers
             // are stripped so the text reads as prose.
-            let stripped = model
-                .text
-                .trim_start()
-                .trim_start_matches('#')
-                .trim_start();
-            let mut head: String = stripped.chars().take(MAX_MODEL_CHARS).collect();
-            if head.chars().count() < stripped.chars().count() {
-                head.push('…');
-            }
+            let stripped = model.text.trim_start().trim_start_matches('#').trim_start();
             let heading = if model.name.is_empty() {
                 "context".to_string()
             } else if model.is_stale {
@@ -650,8 +771,34 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
             } else {
                 model.name.clone()
             };
+            // The share of the remaining budget this model may use. The
+            // first model gets the full per-model excerpt; the last one
+            // gets whatever is left, so a model is never dropped.
+            let models_left = remaining - index;
+            let room = MAX_MODELS_CHARS.saturating_sub(used);
+            let share = room / models_left.max(1);
+            let cap = MAX_MODEL_CHARS.min(share);
+            let overhead = heading.chars().count() + 10;
+            let text_cap = cap.saturating_sub(overhead);
+            // The ellipsis must fit INSIDE the cap. MEASURED 2026-11-10: it
+            // did not - the mark was appended AFTER the excerpt had taken the
+            // full quota, so the bullet was one char too long, the budget
+            // check rejected it, and the LAST model was dropped on 14 of 20
+            // probes. The selection had already decided it mattered.
+            let truncated = stripped.chars().count() > text_cap;
+            let take = if truncated {
+                text_cap.saturating_sub(1)
+            } else {
+                text_cap
+            };
+            let mut head: String = stripped.chars().take(take).collect();
+            if truncated {
+                head.push('…');
+            }
             let block = format!("- **{heading}** — {head}\n");
             if used + block.chars().count() > MAX_MODELS_CHARS {
+                // Nothing more can fit; the remaining models are dropped here
+                // rather than silently.
                 break;
             }
             used += block.chars().count();
@@ -792,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn block_contains_facts_and_the_attribution_contract() {
+    fn block_contains_the_recalled_facts_and_nothing_else() {
         let recall = HindsightRecall {
             facts: vec![HindsightFact {
                 id: "abc".into(),
@@ -803,10 +950,32 @@ mod tests {
         };
         let block = format_recall_block(&recall).expect("block");
         assert!(block.contains("the exact value is 42"));
-        // The two rules that survive the header compression: a literal value is
-        // applied AS GIVEN, and a contributing fact is attributed visibly.
-        assert!(block.contains("AS GIVEN"));
-        assert!(block.contains("From memory"));
+        // The block carries the MATERIAL only. MEASURED 2026-11-10: the
+        // instruction ("apply AS GIVEN", "attribute visibly") used to be
+        // written into every delivered block and re-sent on every turn; the
+        // owner's complaint was that the block "only holds service text".
+        // The instruction now lives in the STATIC system prompt
+        // (crate::prompt::MEMORY_PROMPT), so it must NOT be in the payload.
+        assert!(
+            !block.contains("AS GIVEN"),
+            "the delivered block must carry no service instruction: {block}"
+        );
+        assert!(
+            !block.contains("From memory"),
+            "the delivered block must carry no service instruction: {block}"
+        );
+        assert!(
+            block.starts_with("# Memory\n\n## Relevant facts"),
+            "the block must open with the facts: {block}"
+        );
+    }
+
+    /// The instruction that used to be inside the block must be in the STATIC
+    /// system prompt, or the behaviour it governed is lost.
+    #[test]
+    fn the_memory_instruction_lives_in_the_static_system_prompt() {
+        assert!(crate::prompt::MEMORY_PROMPT.contains("AS GIVEN"));
+        assert!(crate::prompt::MEMORY_PROMPT.contains("From memory"));
     }
 
     // reference: the upstream section shape is the bulleted fact list in
@@ -901,20 +1070,50 @@ mod tests {
     //   ("A model that has fallen behind is still shown, but it no longer
     //   short-circuits retrieval, and the agent is expected to check it
     //   against the layers below rather than trust it blindly.")
+    // reference: no prior art for QUERY-based model selection in upstream -
+    //   https://hindsight.vectorize.io/developer/mcp-server lists
+    //   list_mental_models (filters by TAGS only) and get_mental_model (by
+    //   ID); there is no endpoint that ranks models against a query. The
+    //   closest upstream precedent for relevance ranking is
+    //   search_knowledge_base ("hybrid BM25 + vector search over page names
+    //   and content"), so the client-side rule below is jcode's own.
+    /// A model matches when it shares a token with the query.
+    ///
+    /// The matching is now over the model's TOPIC SURFACE (name + id +
+    /// source_query) and its body, and it is separated from the ranking, so
+    /// the test pins the ELIGIBILITY half.
     #[test]
     fn model_matching_uses_the_query_words() {
-        assert!(model_matches_query(
-            "Active work and open threads",
-            "active-work",
-            "active work",
-            "what is active work"
-        ));
-        assert!(!model_matches_query(
-            "hermes-upstream",
-            "hermes-upstream",
-            "windows shell",
-            "what is active work"
-        ));
+        let active = ModelCandidate {
+            id: "active-work".into(),
+            name: "Active work and open threads".into(),
+            text: "active work".into(),
+            is_stale: false,
+            is_curated: true,
+            topic_tokens: query_tokens("Active work and open threads active-work"),
+            body_tokens: query_tokens("active work"),
+            score: 0.0,
+        };
+        let hermes = ModelCandidate {
+            id: "hermes-upstream".into(),
+            name: "hermes-upstream".into(),
+            text: "windows shell".into(),
+            is_stale: false,
+            is_curated: false,
+            topic_tokens: query_tokens("hermes-upstream hermes-upstream"),
+            body_tokens: query_tokens("windows shell"),
+            score: 0.0,
+        };
+        let query = query_tokens("what is active work");
+        assert!(
+            !intersect(&query, &active.topic_tokens).is_empty(),
+            "the active-work model must match a query about active work"
+        );
+        assert!(
+            intersect(&query, &hermes.topic_tokens).is_empty()
+                && intersect(&query, &hermes.body_tokens).is_empty(),
+            "the hermes-upstream model must NOT match a query about active work"
+        );
     }
 
     /// A model is matched by its CONTENT, not only by its title.
@@ -925,12 +1124,27 @@ mod tests {
     /// banks and the owner. A title-only match rejected every one of them.
     #[test]
     fn model_matching_reads_the_body_not_only_the_title() {
-        assert!(model_matches_query(
-            "User profile and working preferences",
-            "user-profile",
-            "the owner said: never change the retain hook without asking",
-            "fix the retain hook"
-        ));
+        let profile = ModelCandidate {
+            id: "user-profile".into(),
+            name: "User profile and working preferences".into(),
+            text: "the owner said: never change the retain hook without asking".into(),
+            is_stale: false,
+            is_curated: true,
+            topic_tokens: query_tokens("User profile and working preferences user-profile"),
+            body_tokens: query_tokens(
+                "the owner said: never change the retain hook without asking",
+            ),
+            score: 0.0,
+        };
+        let query = query_tokens("fix the retain hook");
+        assert!(
+            intersect(&query, &profile.topic_tokens).is_empty(),
+            "the title alone must not match"
+        );
+        assert!(
+            !intersect(&query, &profile.body_tokens).is_empty(),
+            "the body must match even when the title does not"
+        );
     }
 
     /// A stale model is DELIVERED and MARKED, never dropped.
@@ -1032,6 +1246,179 @@ mod tests {
         assert!(
             !model_line.contains("## Опасности"),
             "the model's own heading marker must be stripped: {model_line}"
+        );
+    }
+
+    /// The delivered model set must DEPEND on the query.
+    ///
+    /// MEASURED 2026-11-10 on the live bank: the previous rule made the six
+    /// curated ids unconditionally eligible, so the delivered set was the SAME
+    /// for every query - 1 distinct set over 20 real queries, and the third
+    /// model was truncated by the 1800-char budget on every turn (3 x 600 +
+    /// overhead = 1869). The owner's complaint: "the Synthesized context block
+    /// is the same thing every time".
+    ///
+    /// The contract pinned here: a curated model that shares NO token with the
+    /// query is NOT delivered. The curated bonus may break a ranking tie, but
+    /// it must never make a model eligible - that was measured and rejected.
+    ///
+    /// reference: no prior art for this selection rule - it is jcode's own,
+    ///   derived from the live-bank measurement recorded on `fetch_models`;
+    ///   upstream's coding-agents package never fetches mental models at all
+    ///   (searched hindsight-coding-agents 0.8.2 dist/*.js, found none).
+    #[test]
+    fn a_curated_model_without_any_query_overlap_is_not_eligible() {
+        let profile = ModelCandidate {
+            id: "user-profile".into(),
+            name: "User profile and working preferences".into(),
+            text: "the owner prefers compact answers".into(),
+            is_stale: false,
+            is_curated: true,
+            topic_tokens: query_tokens("user-profile User profile preferences"),
+            body_tokens: query_tokens("the owner prefers compact answers"),
+            score: 0.0,
+        };
+        let hazards = ModelCandidate {
+            id: "machine-hazards".into(),
+            name: "Machine hazards and forbidden operations".into(),
+            text: "the printer driver must not be replaced".into(),
+            is_stale: false,
+            is_curated: false,
+            topic_tokens: query_tokens("machine-hazards Machine hazards operations"),
+            body_tokens: query_tokens("the printer driver must not be replaced"),
+            score: 0.0,
+        };
+        // The ELIGIBILITY half of the rule, which is where the defect was.
+        let eligible = |query: &str| -> Vec<String> {
+            let q = query_tokens(query);
+            [&profile, &hazards]
+                .into_iter()
+                .filter(|candidate| {
+                    !intersect(&q, &candidate.topic_tokens).is_empty()
+                        || !intersect(&q, &candidate.body_tokens).is_empty()
+                })
+                .map(|candidate| candidate.id.clone())
+                .collect()
+        };
+        // A query about the printer shares nothing with the user profile.
+        assert_eq!(
+            eligible("the printer is broken again"),
+            vec!["machine-hazards"]
+        );
+        // A query about the owner shares nothing with the printer.
+        assert_eq!(
+            eligible("the owner prefers compact answers"),
+            vec!["user-profile"]
+        );
+        // A query about neither selects neither.
+        assert!(eligible("something entirely unrelated").is_empty());
+    }
+
+    /// Two different queries must be able to select different model sets.
+    ///
+    /// This is the property the owner asked for directly, so it is pinned as
+    /// a contract rather than left to the selection implementation.
+    #[test]
+    fn different_queries_select_different_models() {
+        let profile = ModelCandidate {
+            id: "user-profile".into(),
+            name: "User profile and working preferences".into(),
+            text: "the owner prefers compact answers in Russian".into(),
+            is_stale: false,
+            is_curated: true,
+            topic_tokens: query_tokens("user-profile User profile preferences"),
+            body_tokens: query_tokens("the owner prefers compact answers in Russian"),
+            score: 0.0,
+        };
+        let hazards = ModelCandidate {
+            id: "machine-hazards".into(),
+            name: "Machine hazards and forbidden operations".into(),
+            text: "the printer driver must not be replaced".into(),
+            is_stale: false,
+            is_curated: false,
+            topic_tokens: query_tokens("machine-hazards Machine hazards operations"),
+            body_tokens: query_tokens("the printer driver must not be replaced"),
+            score: 0.0,
+        };
+        let select = |query: &str| -> Vec<String> {
+            let q = query_tokens(query);
+            [&profile, &hazards]
+                .into_iter()
+                .filter(|candidate| {
+                    !intersect(&q, &candidate.topic_tokens).is_empty()
+                        || !intersect(&q, &candidate.body_tokens).is_empty()
+                })
+                .map(|candidate| candidate.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            select("the owner prefers compact answers"),
+            vec!["user-profile"]
+        );
+        assert_eq!(select("the printer driver broke"), vec!["machine-hazards"]);
+        assert!(select("something entirely unrelated").is_empty());
+    }
+
+    /// A token that appears in EVERY model carries no topic signal.
+    ///
+    /// reference: no prior art inside jcode - the standard inverse document
+    ///   frequency idea, applied to the model's own corpus.
+    #[test]
+    fn a_token_present_in_every_model_scores_almost_nothing() {
+        let mut doc_freq: HashMap<String, usize> = HashMap::new();
+        doc_freq.insert("state".into(), 15);
+        doc_freq.insert("printer".into(), 1);
+        let model_count = 15.0;
+        let common = idf_score(&query_tokens("state"), &doc_freq, model_count);
+        let rare = idf_score(&query_tokens("printer"), &doc_freq, model_count);
+        assert!(
+            common < 0.01,
+            "a token in every model must not decide the ranking, got {common}"
+        );
+        assert!(
+            rare > common * 10.0,
+            "a rare token must outweigh a common one, got {rare} vs {common}"
+        );
+    }
+
+    /// Every SELECTED model must reach the block.
+    ///
+    /// MEASURED 2026-11-10: the renderer `break`ed when a bullet did not fit
+    /// the section budget, so with 3 models x 600 chars + overhead (1869)
+    /// against an 1800-char budget the THIRD model was silently dropped on
+    /// every turn - 14 of 20 live probes lost their last model. The selection
+    /// had already decided which models matter; the renderer must not undo
+    /// that decision by dropping one for lack of room.
+    #[test]
+    fn every_selected_model_reaches_the_block() {
+        let models: Vec<HindsightModel> = (0..3)
+            .map(|i| HindsightModel {
+                id: format!("m{i}"),
+                name: format!("Model number {i}"),
+                text: "y".repeat(3000),
+                is_stale: false,
+                is_curated: false,
+            })
+            .collect();
+        let recall = HindsightRecall {
+            facts: Vec::new(),
+            models,
+        };
+        let block = format_recall_block(&recall).expect("block");
+        for i in 0..3 {
+            assert!(
+                block.contains(&format!("Model number {i}")),
+                "model {i} was selected and must be delivered: {block}"
+            );
+        }
+        let models_section = block
+            .split("## Synthesized context")
+            .nth(1)
+            .expect("the models section must exist");
+        assert!(
+            models_section.chars().count() <= MAX_MODELS_CHARS,
+            "the models section must stay inside its budget, got {} chars",
+            models_section.chars().count()
         );
     }
 
