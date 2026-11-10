@@ -420,6 +420,24 @@ fn message_text(message: &Message) -> &str {
     content_text(&message.content)
 }
 
+/// Strip the harness timestamp prefix ("[2026-11-10T10:11:22.472Z] ") that
+/// `features.message_timestamps` puts in front of every message, so a message
+/// can be compared to an expected body exactly.
+///
+/// reference: no prior art, searched the jcode repo for an existing
+/// timestamp-prefix stripper; the prefix is produced by
+/// `Message::with_timestamps` in crates/jcode-message-types, used by the
+/// request assembly in
+/// crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs.
+fn strip_message_timestamp(message: &str) -> &str {
+    if let Some(rest) = message.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[end + 1..].trim_start();
+    }
+    message
+}
+
 #[test]
 fn agent_drop_removes_its_configured_session_tool_policy() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
@@ -2869,7 +2887,7 @@ mod system_prompt_reminder;
 #[derive(Clone, Default)]
 struct FableGuardrailProvider {
     calls: Arc<std::sync::Mutex<usize>>,
-    prompts_seen: Arc<std::sync::Mutex<Vec<String>>>,
+    prompts_seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
 #[async_trait]
@@ -2887,13 +2905,18 @@ impl Provider for FableGuardrailProvider {
             *calls
         };
         if call > 1 {
-            // Capture EVERY user-role message in the request, not just the
-            // last one. MEASURED 2026-11-10: the harness can append an
-            // ephemeral message AFTER the reconsideration prompt (a memory
-            // injection, a plan-limit notice), so the reconsideration prompt
-            // is not necessarily the last message of the request. Asserting
-            // on `messages.last()` made this test depend on the user's
-            // `features.memory` setting.
+            // Capture each user-role message SEPARATELY. MEASURED 2026-11-10:
+            // the harness can append an ephemeral message AFTER the
+            // reconsideration prompt (a memory injection, a plan-limit notice),
+            // so the reconsideration prompt is not necessarily the last message
+            // of the request. Asserting on `messages.last()` made this test
+            // depend on the user's `features.memory` setting.
+            //
+            // The messages are kept SEPARATE rather than joined, so the
+            // assertions below can require an EXACT match against the staged
+            // prompt. A joined blob would let a recalled memory that merely
+            // paraphrases the prompt satisfy a `contains` check, and the test
+            // would pass without the guardrail ever receiving the prompt.
             //
             // reference: no prior art, searched the jcode repo for an existing
             // multi-message capture helper; the request assembly that makes
@@ -2918,7 +2941,7 @@ impl Provider for FableGuardrailProvider {
                     user_texts.push(text);
                 }
             }
-            self.prompts_seen.lock().unwrap().push(user_texts.join("\n---\n"));
+            self.prompts_seen.lock().unwrap().push(user_texts);
         }
 
         let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
@@ -2988,20 +3011,28 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
     assert_eq!(*calls.lock().unwrap(), 4);
     let prompts = prompts_seen.lock().unwrap();
     assert_eq!(prompts.len(), 3);
-    // Each reconsideration request carried the matching staged prompt.
+    // Each reconsideration request carried the matching staged prompt as its
+    // OWN user message. The match is EXACT, not a substring search: a recalled
+    // memory that paraphrases the prompt must not be able to satisfy it.
+    //
+    // The harness may prefix every message with a timestamp
+    // ("[2026-11-10T10:11:22.472Z] <text>") when `features.message_timestamps`
+    // is on, so the prefix is stripped before the exact comparison.
     let suite = Agent::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS;
-    assert!(
-        prompts[0].contains(suite[0]),
-        "request 2 must carry the first reconsideration prompt, got: {prompts:?}"
-    );
-    assert!(
-        prompts[1].contains(suite[1]),
-        "request 3 must carry the second reconsideration prompt, got: {prompts:?}"
-    );
-    assert!(
-        prompts[2].contains(suite[2]),
-        "request 4 must carry the third reconsideration prompt, got: {prompts:?}"
-    );
+    for (index, expected) in suite.iter().enumerate() {
+        assert!(
+            prompts[index]
+                .iter()
+                .any(|message| strip_message_timestamp(message) == *expected),
+            "request {} must carry the staged reconsideration prompt verbatim, got: {:?}",
+            index + 2,
+            prompts[index]
+        );
+    }
+    // And the staged prompts are distinct, so a wrong prompt cannot satisfy
+    // the wrong slot.
+    assert_ne!(suite[0], suite[1]);
+    assert_ne!(suite[1], suite[2]);
     assert!(
         text.contains("Reconsidered and completed safely"),
         "{text:?}"
