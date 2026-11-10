@@ -45,11 +45,12 @@ pub use activity::{
 use cache::{cache_graph, cached_graph};
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
-    PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
-    clear_pending_memory, clear_pending_payload, has_any_pending_memory, has_pending_memory,
-    is_memory_injected, is_memory_injected_any, mark_memories_injected, mark_memories_known,
-    note_tool_calls, reset_tool_calls_since_refresh, set_pending_memory,
-    set_pending_memory_external, set_pending_memory_for_project, set_pending_memory_with_ids,
+    PendingMemory, append_pending_memory_external, clear_all_injected_memories,
+    clear_all_pending_memory, clear_injected_memories, clear_pending_memory,
+    clear_pending_payload, has_any_pending_memory, has_pending_memory, is_memory_injected,
+    is_memory_injected_any, mark_memories_injected, mark_memories_known, note_tool_calls,
+    reset_tool_calls_since_refresh, set_pending_memory, set_pending_memory_external,
+    set_pending_memory_for_project, set_pending_memory_with_ids,
     set_pending_memory_with_ids_and_display, sync_injected_memories, take_pending_memory,
     take_pending_memory_for_project, tool_calls_since_refresh,
 };

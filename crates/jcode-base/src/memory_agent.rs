@@ -1,5 +1,10 @@
 //! Nonblocking Jev recall coordinator.
 //!
+//! reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+//!   (the upstream recall contract this coordinator publishes against; the
+//!   mental-models half is documented at
+//!   https://hindsight.vectorize.io/developer/mental-models)
+//!
 //! Recall sends scoped local memories directly to Jev's typed Decisions API.
 //! It never loads an embedder or calls a text-generating sidecar. Optional
 //! periodic/final extraction is independent and can be disabled separately.
@@ -126,10 +131,15 @@ fn publish_reopen_notice(session_id: &str, working_dir: Option<&str>) {
         }
     };
     // The notice is external content: it describes what the bank reported and
-    // what `reflect` decided about it. It is published as its own payload so
-    // it cannot displace the recall facts, and it is bound to the project so a
-    // session that changes directory does not pick it up.
-    memory::set_pending_memory_external(
+    // what `reflect` decided about it. It is published on its OWN section so
+    // it cannot be blended into the recall facts, and it is MERGED into the
+    // pending payload rather than replacing it: the session's pending slot
+    // holds one payload, so a plain replace made the notice displace the
+    // recall facts published moments earlier in the same turn.
+    //
+    // reference: crates/jcode-base/src/memory/pending.rs
+    //   (`append_pending_memory_external` - the merging publisher).
+    memory::append_pending_memory_external(
         session_id,
         notice.clone(),
         1,
@@ -349,13 +359,45 @@ impl MemoryAgent {
         // not in that graph. Both end up in the same pending-memory store, so
         // the injection, dedup and TTL machinery below is unchanged.
         if crate::memory_hindsight::provider_enabled() {
-            let recall = match crate::memory_hindsight::recall_configured() {
+            // The trigger half of "reopen a good idea at the right time" runs on its
+    // OWN payload, and it is INDEPENDENT of the recall: a session that recalls
+    // no facts may still have a deferred goal whose condition just became
+    // true.
+    //
+    // MEASURED 2026-11-11 on the source: the notice used to be published
+    // INSIDE the `Ok(recall)` arm, so a session whose recall failed, whose
+    // recall config was invalid, or whose recall was skipped by the
+    // repeat-suppression guard received NO reopen notice at all. The
+    // comment claimed the opposite, and the truth was the reverse: the
+    // session that recalls LEAST was the one that lost the notice. The
+    // trigger reads the goal store and the bank, not the recall result, so
+    // it must not be gated on it.
+    //
+    // It is published AFTER the recall, because the recall publishes with a
+    // REPLACING setter: a notice published first would be displaced by the
+    // recall block. The notice itself publishes with the MERGING setter, so
+    // it lands ON TOP of the recall facts instead of replacing them.
+    //
+    // reference: crates/jcode-base/src/memory/pending.rs
+    //   (`append_pending_memory_external` - the merging publisher).
+    // reference: https://hindsight.vectorize.io/0.10/developer/api/reflect
+    //   (the upstream contract behind the notice: the trigger asks `reflect`
+    //   for a decision about a changed entity, and the decision - not the
+    //   recall - is what makes a deferred goal worth reopening).
+    // reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    //   ("When a trusted source reports a relevant change, resolve the
+    //   product or capability to its entity. Retrieve affected open goals,
+    //   candidate evidence about the change, the original constraint and any
+    //   later cancellation.").
+
+    let recall = match crate::memory_hindsight::recall_configured() {
                 Ok(config) => crate::memory_hindsight::recall(&config, query.as_str()),
                 Err(error) => {
                     crate::memory_log::log_pending_discarded(
                         session_id,
                         &format!("hindsight recall config invalid: {error}"),
                     );
+                    publish_reopen_notice(session_id, session_working_dir.as_deref());
                     return Ok(());
                 }
             };
@@ -427,18 +469,6 @@ impl MemoryAgent {
                             session_working_dir.as_deref(),
                         );
                     }
-                    // The trigger half of "reopen a good idea at the right
-                    // time" runs here too, but on its OWN payload: a session
-                    // that recalls no facts may still have a deferred goal
-                    // whose condition just became true.
-                    //
-                    // reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
-                    //   ("When a trusted source reports a relevant change,
-                    //   resolve the product or capability to its entity.
-                    //   Retrieve affected open goals, candidate evidence
-                    //   about the change, the original constraint and any
-                    //   later cancellation.").
-                    publish_reopen_notice(session_id, session_working_dir.as_deref());
                 }
                 Err(error) => {
                     crate::memory_log::log_pending_discarded(
@@ -447,6 +477,10 @@ impl MemoryAgent {
                     );
                 }
             }
+            // Published after the recall, for BOTH outcomes of the match
+            // above: the notice must reach the agent even when the recall
+            // failed. It merges into the payload the recall queued.
+            publish_reopen_notice(session_id, session_working_dir.as_deref());
             self.sessions
                 .entry(session_id.to_string())
                 .or_default()

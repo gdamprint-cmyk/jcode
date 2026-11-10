@@ -1,3 +1,7 @@
+// reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+//   (upstream contract for the recall block this module publishes; the
+//   mental-models half of it is documented at
+//   https://hindsight.vectorize.io/developer/mental-models)
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -447,6 +451,171 @@ pub fn set_pending_memory_external(
             external: true,
         }),
     );
+}
+
+/// Merge a payload into the one already queued for this session, instead of
+/// replacing it.
+///
+/// The reopen trigger publishes its notice on its OWN payload, because the
+/// notice is external content and must not be blended into the recall facts.
+/// But a session's pending slot holds ONE payload: a plain `insert` made the
+/// reopen notice DISPLACE the recall facts that were published moments
+/// earlier in the same turn, so the agent received the notice INSTEAD of the
+/// recalled context.
+///
+/// MEASURED 2026-11-11 on the source: `store_pending_memory` ended in
+/// `map.insert(session_id, ...)`, while `publish_reopen_notice` ran after
+/// `set_pending_memory_external` inside the same `process_context` call. The
+/// comment in `memory_agent.rs` claimed the notice "cannot displace the
+/// recall facts"; the code did the opposite.
+///
+/// The merge is section-wise, not a blind concatenation: the recall block and
+/// the reopen notice are separate `## ` sections, so a payload that is
+/// already queued with a DIFFERENT top-level section is appended under its
+/// own heading. When both payloads carry the same section, the newer one
+/// replaces that section's text, so a stale notice cannot survive a refresh.
+fn merge_pending_payload(existing: &PendingMemory, added: PendingMemory) -> PendingMemory {
+    /// Split a payload into its top-level `## ` sections, keeping the heading
+    /// with its body.
+    fn sections(prompt: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in prompt.lines() {
+            if line.starts_with("## ") {
+                if let Some(section) = current.take() {
+                    out.push(section);
+                }
+                current = Some((line.to_string(), String::new()));
+            } else if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            } else if !line.trim().is_empty() {
+                // Content before any `## ` heading (the "# Memory" title and
+                // a possible preamble) is kept as its own leading section.
+                match out.first_mut() {
+                    Some((_, body)) => {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                    None => out.push((String::new(), format!("{line}\n"))),
+                }
+            }
+        }
+        if let Some(section) = current.take() {
+            out.push(section);
+        }
+        out
+    }
+
+    let mut merged = existing.clone();
+    let mut prompt = String::new();
+    let mut display = String::new();
+
+    for (heading, body) in sections(&existing.prompt) {
+        prompt.push_str(&heading);
+        prompt.push('\n');
+        prompt.push_str(&body);
+    }
+    for (heading, body) in sections(&added.prompt) {
+        // Same section: the newer payload replaces that section's text, so a
+        // stale notice cannot survive a refresh.
+        let replaced = !heading.is_empty() && existing.prompt.contains(&heading);
+        if replaced {
+            let mut rebuilt = String::new();
+            for (h, b) in sections(&existing.prompt) {
+                if h == heading {
+                    continue;
+                }
+                rebuilt.push_str(&h);
+                rebuilt.push('\n');
+                rebuilt.push_str(&b);
+            }
+            prompt = rebuilt;
+        }
+        prompt.push_str(&heading);
+        prompt.push('\n');
+        prompt.push_str(&body);
+    }
+
+    if let Some(existing_display) = existing.display_prompt.as_ref() {
+        display.push_str(existing_display);
+        display.push_str("\n\n");
+    }
+    if let Some(added_display) = added.display_prompt.as_ref() {
+        display.push_str(added_display);
+    }
+
+    merged.prompt = prompt;
+    merged.display_prompt = if display.trim().is_empty() {
+        None
+    } else {
+        Some(display)
+    };
+    merged.computed_at = added.computed_at;
+    merged.count = existing.count + added.count;
+    let mut ids = existing.memory_ids.clone();
+    for id in added.memory_ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    merged.memory_ids = ids;
+    merged
+}
+
+/// Publish a payload that is ADDITIONAL to whatever is already queued for
+/// this session, rather than replacing it.
+///
+/// Used by publishers that must not displace an existing payload: the reopen
+/// notice is one. When the slot is empty this behaves exactly like
+/// `set_pending_memory_external`.
+pub fn append_pending_memory_external(
+    session_id: &str,
+    prompt: String,
+    count: usize,
+    memory_ids: Vec<String>,
+    display_prompt: Option<String>,
+    project_dir: Option<&str>,
+) {
+    let binding = Some(PendingBinding {
+        project_dir: project_dir.map(str::to_owned),
+        snapshots: HashMap::new(),
+        external: true,
+    });
+    crate::memory_log::log_pending_prepared(session_id, &prompt, count, &memory_ids);
+
+    if let Ok(mut guard) = PENDING_MEMORY.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        match map.get_mut(session_id) {
+            Some(existing) if existing.pending.is_fresh() => {
+                existing.pending = merge_pending_payload(
+                    &existing.pending,
+                    PendingMemory {
+                        prompt,
+                        display_prompt,
+                        computed_at: Instant::now(),
+                        count,
+                        memory_ids,
+                    },
+                );
+            }
+            _ => {
+                map.insert(
+                    session_id.to_string(),
+                    QueuedPendingMemory {
+                        pending: PendingMemory {
+                            prompt,
+                            display_prompt,
+                            computed_at: Instant::now(),
+                            count,
+                            memory_ids,
+                        },
+                        binding,
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// Automatic publishers must retain the entries actually judged by Jev. A
@@ -1056,6 +1225,113 @@ mod scoped_tests {
                 take_pending_memory_for_project("global-switched", Some("/project/a")).is_none()
             );
             assert!(!is_memory_injected("global-switched", &global.id));
+        });
+    }
+
+    /// The reopen notice must not displace the recall facts published in the
+    /// same turn.
+    ///
+    /// MEASURED 2026-11-11 on the source: the pending slot holds ONE payload
+    /// and `store_pending_memory` ended in `map.insert`, so a notice
+    /// published after the recall REPLACED the recall facts. The agent then
+    /// received the notice instead of the recalled context.
+    ///
+    /// reference: crates/jcode-base/src/memory_agent.rs
+    ///   (`publish_reopen_notice` - the publisher that must not displace).
+    #[test]
+    fn an_appended_notice_does_not_displace_the_recall_facts() {
+        fixture(|| {
+            set_pending_memory_external(
+                "merge",
+                "# Memory\n\n## Relevant facts\n\n- fact one\n- fact two".to_string(),
+                2,
+                vec!["fact-1".to_string(), "fact-2".to_string()],
+                None,
+                None,
+            );
+            append_pending_memory_external(
+                "merge",
+                "## Goals worth reopening\n\n- **Ship the thing** -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("merge", None)
+                .expect("the merged payload must still be delivered");
+            assert!(
+                pending.prompt.contains("- fact one"),
+                "the recall facts must survive the notice: {}",
+                pending.prompt
+            );
+            assert!(
+                pending.prompt.contains("Goals worth reopening"),
+                "the notice must survive the merge: {}",
+                pending.prompt
+            );
+            assert_eq!(pending.count, 3, "the counts add up");
+            assert!(
+                pending.memory_ids.contains(&"fact-1".to_string())
+                    && pending.memory_ids.contains(&"reopen:Goals worth reopening".to_string()),
+                "both id sets are tracked: {:?}",
+                pending.memory_ids
+            );
+        });
+    }
+
+    /// A notice that carries the SAME section as the queued payload replaces
+    /// that section, so a stale notice cannot survive a refresh.
+    #[test]
+    fn an_appended_notice_replaces_the_same_section() {
+        fixture(|| {
+            set_pending_memory_external(
+                "same-section",
+                "# Memory\n\n## Goals worth reopening\n\n- old goal -> wait".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            append_pending_memory_external(
+                "same-section",
+                "## Goals worth reopening\n\n- new goal -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("same-section", None)
+                .expect("the payload must be delivered");
+            assert!(
+                !pending.prompt.contains("- old goal"),
+                "the stale section must be replaced: {}",
+                pending.prompt
+            );
+            assert!(
+                pending.prompt.contains("- new goal"),
+                "the fresh section must be present: {}",
+                pending.prompt
+            );
+        });
+    }
+
+    /// Appending to an EMPTY slot behaves exactly like the plain setter: the
+    /// payload is delivered on its own.
+    #[test]
+    fn an_appended_notice_into_an_empty_slot_is_delivered_alone() {
+        fixture(|| {
+            append_pending_memory_external(
+                "empty",
+                "## Goals worth reopening\n\n- goal -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("empty", None)
+                .expect("the payload must be delivered");
+            assert!(pending.prompt.contains("- goal -> reopen"));
+            assert_eq!(pending.count, 1);
         });
     }
 
