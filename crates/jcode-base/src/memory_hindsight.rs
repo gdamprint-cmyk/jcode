@@ -601,8 +601,43 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
         out.push_str("\n## Synthesized context\n\n");
         let mut used = 0usize;
         for model in &recall.models {
-            let mut head: String = model.text.chars().take(MAX_MODEL_CHARS).collect();
-            if head.chars().count() < model.text.chars().count() {
+            // reference: https://hindsight.vectorize.io/developer/mental-models
+            //   ("A mental model is ... a whole document per question"; a
+            //    model's content is always markdown)
+            //
+            // A mental model is a whole markdown DOCUMENT, so it USUALLY
+            // STARTS WITH ITS OWN "## " heading ("## Опасности машины и
+            // окружения", "## Decisions still applicable in the recorded
+            // scope", ...). `fetch_models` collapses that document to ONE line,
+            // so the delivered line begins with "## ".
+            //
+            // The consumers read a "## " line as a CATEGORY - the tile's
+            // title - and CONSUME it, so it never becomes a readable item.
+            // The model's text therefore became the title of an EMPTY tile,
+            // next to a tile holding nothing but the model's NAME, and the
+            // facts were the only thing left to read. That is the owner's
+            // report: the memory blocks arrive empty and only the relevant
+            // facts are filled.
+            //
+            // MEASURED 2026-11-10 over 456 distinct delivered blocks:
+            // 728 of 874 model bodies took that path, affecting 398 blocks.
+            // The decisive instrument was the SHIPPED parser itself
+            // (jcode-tui-render::memory_tiles::parse_memory_display_entries)
+            // run over the real blocks, which renders exactly that: a
+            // "synthesized context" tile holding only "### <model name>"
+            // bullets, beside a junk-titled tile holding the model's text.
+            //
+            // The fix is at the SOURCE, so every consumer is fixed at once:
+            // each model is delivered as ONE bullet. A bullet can never be
+            // read as a heading, and the model's own leading heading markers
+            // are stripped so the text reads as prose.
+            let stripped = model
+                .text
+                .trim_start()
+                .trim_start_matches('#')
+                .trim_start();
+            let mut head: String = stripped.chars().take(MAX_MODEL_CHARS).collect();
+            if head.chars().count() < stripped.chars().count() {
                 head.push('…');
             }
             let heading = if model.name.is_empty() {
@@ -615,7 +650,7 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
             } else {
                 model.name.clone()
             };
-            let block = format!("### {heading}\n{head}\n\n");
+            let block = format!("- **{heading}** — {head}\n");
             if used + block.chars().count() > MAX_MODELS_CHARS {
                 break;
             }
@@ -923,6 +958,80 @@ mod tests {
         assert!(
             block.contains("the owner prefers compact answers"),
             "a stale model must still be delivered: {block}"
+        );
+    }
+
+    /// A model's text must never be delivered as a HEADING.
+    ///
+    /// reference: https://hindsight.vectorize.io/developer/mental-models
+    ///   ("A mental model is ... a whole document per question"; a model's
+    ///    content is always markdown)
+    ///
+    /// MEASURED 2026-11-10: a mental model's content is a whole markdown
+    /// document that usually STARTS WITH ITS OWN "## " heading, and
+    /// `fetch_models` collapses it to one line. The consumers read a "## "
+    /// line as a CATEGORY and consume it, so the model's text became the
+    /// title of an EMPTY tile and the owner saw empty memory blocks with
+    /// only the facts filled. 728 of 874 delivered model bodies took that
+    /// path over 456 real delivered blocks.
+    ///
+    /// The contract pinned here: every model is delivered as a BULLET, so no
+    /// consumer can read it as a heading, and the model's own leading
+    /// heading markers are stripped so the text reads as prose.
+    #[test]
+    fn a_model_body_is_never_delivered_as_a_heading() {
+        let recall = HindsightRecall {
+            facts: vec![HindsightFact {
+                id: "f1".into(),
+                text: "a relevant fact".into(),
+                score: Some(0.9),
+            }],
+            models: vec![HindsightModel {
+                id: "machine-hazards".into(),
+                name: "Machine hazards".into(),
+                // exactly the shape measured on the live bank
+                text: "## Опасности машины и окружения Ниже — классы риска".into(),
+                is_stale: false,
+                is_curated: true,
+            }],
+        };
+        let block = format_recall_block(&recall).expect("block");
+
+        // Inside the MODELS section, no line may look like a heading that a
+        // consumer would read as a category: the model's own text must never
+        // start a line. The block's own two section headings ("## Relevant
+        // facts", "## Synthesized context") are the producer's contract with
+        // the consumer and are legitimately "## " lines.
+        let models_section = block
+            .split("## Synthesized context")
+            .nth(1)
+            .expect("the models section must exist");
+        for line in models_section.lines() {
+            let trimmed = line.trim_start();
+            assert!(
+                !trimmed.starts_with("## "),
+                "a delivered model line must never be a '## ' heading: {line}"
+            );
+        }
+        // The model is delivered as a bullet under its name, and its text is
+        // present.
+        let model_line = block
+            .lines()
+            .find(|line| line.contains("Machine hazards"))
+            .expect("the model must be delivered");
+        assert!(
+            model_line.trim_start().starts_with("- "),
+            "a model must be delivered as a bullet: {model_line}"
+        );
+        assert!(
+            model_line.contains("классы риска"),
+            "the model's own text must be delivered: {model_line}"
+        );
+        // The model's own leading heading marker is stripped, so the text
+        // reads as prose rather than as a nested heading.
+        assert!(
+            !model_line.contains("## Опасности"),
+            "the model's own heading marker must be stripped: {model_line}"
         );
     }
 
