@@ -49,6 +49,7 @@ pub mod generated_image;
 pub mod github;
 pub mod gmail;
 pub mod goal;
+pub mod goal_review;
 pub mod google_calendar;
 pub mod hooks;
 pub mod id;

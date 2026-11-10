@@ -106,6 +106,67 @@ pub struct GoalUpdate {
     pub summary: String,
 }
 
+/// The observable condition that makes a deferred goal worth reconsidering.
+///
+/// This is the plan's "reopen a good idea at the right time" primitive: an
+/// accepted goal that was deferred because a condition did not hold records
+/// WHAT would have to become true, and the goal is then reconsidered when a
+/// trusted source reports a change that bears on that condition.
+///
+/// The condition is deliberately a natural-language sentence plus the terms
+/// that identify it. It is not a machine-checkable predicate: deciding
+/// whether a reported change really satisfies it is a judgement, and the
+/// plan puts that judgement in `reflect`, which returns one of
+/// `wait` / `prepare` / `act_within_authority` / `ask_owner`.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("First complete feature to ship: reopen a good idea at the right time" -
+///   "Record the goal key, the budget constraint, the reason the old option
+///   failed and the evidence that would justify reconsideration"; and "Ask
+///   reflect to return one of `wait`, `prepare`, `act_within_authority` or
+///   `ask_owner`").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GoalReviewCondition {
+    /// The condition in the owner's words, e.g. "a free tier becomes usable".
+    #[serde(default)]
+    pub condition: String,
+    /// Why the goal was deferred: what the old option needed and failed.
+    #[serde(default)]
+    pub blocked_because: String,
+    /// The evidence that would justify reconsidering - what to look for.
+    #[serde(default)]
+    pub evidence_to_look_for: String,
+    /// Terms that identify the entity the condition is about. A reported
+    /// change is matched against these before anything is asked of the
+    /// owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_terms: Vec<String>,
+    /// Whether the owner authorized preparing an artifact once the condition
+    /// holds, or only wanted to be asked.
+    #[serde(default)]
+    pub preparation_authorized: bool,
+    /// When the condition was last assessed, and what the assessment was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assessed_at: Option<DateTime<Utc>>,
+    /// The last decision, so a repeated identical change is not re-proposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_decision: Option<String>,
+    /// The watermark of the evidence the last assessment saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evidence_at: Option<DateTime<Utc>>,
+}
+
+impl GoalReviewCondition {
+    /// Whether this condition carries enough to be worth acting on.
+    ///
+    /// A condition without a statement of what would change is not a
+    /// condition, and a goal with no watch terms cannot be matched against a
+    /// reported change without asking the owner first.
+    pub fn is_usable(&self) -> bool {
+        !self.condition.trim().is_empty() && !self.watch_terms.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Goal {
     pub id: String,
@@ -134,6 +195,15 @@ pub struct Goal {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub updates: Vec<GoalUpdate>,
+    /// The condition under which a deferred goal becomes worth reconsidering.
+    ///
+    /// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    ///   ("Use one accepted, deferred goal with a verifiable external
+    ///   condition ... Record the goal key, the budget constraint, the reason
+    ///   the old option failed and the evidence that would justify
+    ///   reconsideration").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_condition: Option<GoalReviewCondition>,
 }
 
 impl Goal {
@@ -156,6 +226,7 @@ impl Goal {
             created_at: now,
             updated_at: now,
             updates: Vec::new(),
+            review_condition: None,
         }
     }
 

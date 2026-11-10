@@ -34,7 +34,8 @@
 //! in that graph.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -870,6 +871,249 @@ fn post_json(url: &str, body: &serde_json::Value) -> Result<String> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct MemoriesListResponse {
+    #[serde(default)]
+    items: Vec<MemoryListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryListItem {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    fact_type: Option<String>,
+}
+
+/// The memories written to the bank since `since`.
+///
+/// These are the "trusted source reported a relevant change" events of the
+/// reopen feature: the bank's own records of what happened, newest first.
+///
+/// reference: the live server's own OpenAPI (Hindsight 0.10.2),
+/// GET /v1/default/banks/{bank_id}/memories/list with the documented
+/// `time_field`, `start_date` and `limit` query parameters.
+pub fn recent_memories(
+    config: &HindsightConfig,
+    since: DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<HindsightFact>> {
+    let url = format!(
+        "{}/v1/default/banks/{}/memories/list?time_field=created_at&start_date={}&limit={}",
+        config.base_url,
+        config.bank,
+        since.to_rfc3339(),
+        limit.clamp(1, 200),
+    );
+    let raw = get_json(&url)?;
+    let response: MemoriesListResponse = serde_json::from_str(&raw)
+        .with_context(|| format!("parse Hindsight memories list from {url}"))?;
+    Ok(response
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            let text = item.text?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(HindsightFact {
+                id: item.id.unwrap_or_default(),
+                text,
+                score: None,
+            })
+        })
+        .collect())
+}
+
+/// The decision the plan asks `reflect` to return for a deferred goal.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("Ask reflect to return one of `wait`, `prepare`, `act_within_authority`
+///   or `ask_owner` with `goal_id`, `evidence_ids`, `counterevidence_ids`,
+///   `unverified_conditions` and `why_now`. These are fields of a proposed
+///   response schema for Jcode. They are not server-native action commands.").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReopenDecision {
+    /// Nothing changed that bears on the condition. Stay quiet.
+    Wait,
+    /// The condition holds and preparation is authorized: produce the artifact.
+    Prepare,
+    /// The condition holds and the authorized step can be taken directly.
+    ActWithinAuthority,
+    /// The condition may hold, but proceeding needs a new commitment.
+    AskOwner,
+}
+
+impl ReopenDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Prepare => "prepare",
+            Self::ActWithinAuthority => "act_within_authority",
+            Self::AskOwner => "ask_owner",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "wait" => Some(Self::Wait),
+            "prepare" => Some(Self::Prepare),
+            "act_within_authority" => Some(Self::ActWithinAuthority),
+            "ask_owner" => Some(Self::AskOwner),
+            _ => None,
+        }
+    }
+}
+
+/// The structured answer `reflect` gives for one deferred goal.
+#[derive(Debug, Clone, Default)]
+pub struct ReopenAssessment {
+    pub decision: Option<ReopenDecision>,
+    /// The goal this assessment is about, as reflect saw it.
+    pub goal_id: Option<String>,
+    /// Evidence that supports the decision.
+    pub evidence_ids: Vec<String>,
+    /// Evidence that contradicts it.
+    pub counterevidence_ids: Vec<String>,
+    /// Conditions the evidence does not settle.
+    pub unverified_conditions: Vec<String>,
+    /// Why this is worth the owner's attention now.
+    pub why_now: Option<String>,
+    /// The reflect answer in prose, always present.
+    pub text: String,
+}
+
+/// The response schema asked of `reflect` for a reopen assessment.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("with `goal_id`, `evidence_ids`, `counterevidence_ids`,
+///   `unverified_conditions` and `why_now`").
+pub fn reopen_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": ["wait", "prepare", "act_within_authority", "ask_owner"],
+                "description": "What to do about the deferred goal now."
+            },
+            "goal_id": {"type": "string", "description": "The goal key."},
+            "evidence_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Ids of the memories that support the decision."
+            },
+            "counterevidence_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Ids of the memories that contradict it."
+            },
+            "unverified_conditions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Conditions the available evidence does not settle."
+            },
+            "why_now": {"type": "string", "description": "Why this deserves attention now."}
+        },
+        "required": ["decision"]
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ReflectResponse {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    structured_output: Option<serde_json::Value>,
+    #[serde(default)]
+    structured_output_error: Option<String>,
+}
+
+/// Ask `reflect` whether a deferred goal should be reconsidered.
+///
+/// The query carries the goal's own condition, the reason it was deferred and
+/// the reported change. The scope is the workspace plus the global untagged
+/// leaf, the same scope the automatic recall uses, so the assessment sees the
+/// owner's own statements about the goal.
+///
+/// reference: https://hindsight.vectorize.io/0.10/developer/api/reflect
+///   (`response_schema` - "the response includes a `structured_output` field
+///   in addition to the markdown `text`"; `include.facts` - "the `based_on`
+///   object listing the memories, mental models, and directives the agent
+///   actually used"; `structured_output_error` - "Why the structured view
+///   could not be produced ... Treat its presence as retryable").
+pub fn assess_reopen(
+    config: &HindsightConfig,
+    query: &str,
+) -> Result<ReopenAssessment> {
+    let url = format!(
+        "{}/v1/default/banks/{}/reflect",
+        config.base_url, config.bank
+    );
+    let body = serde_json::json!({
+        "query": query,
+        "budget": "low",
+        "max_tokens": 1500,
+        "response_schema": reopen_response_schema(),
+        "include": {"facts": {}},
+        "tag_groups": recall_tag_groups(),
+    });
+    let raw = post_json(&url, &body)?;
+    let response: ReflectResponse = serde_json::from_str(&raw)
+        .with_context(|| format!("parse Hindsight reflect response from {url}"))?;
+
+    let mut assessment = ReopenAssessment {
+        text: response.text.unwrap_or_default(),
+        ..Default::default()
+    };
+
+    if let Some(error) = response.structured_output_error.as_deref() {
+        // The prose answer still exists; the machine-readable half does not.
+        // The plan calls this inconclusive, not a decision.
+        anyhow::bail!("Hindsight reflect produced no structured output: {error}");
+    }
+
+    if let Some(structured) = response.structured_output {
+        let decision = structured
+            .get("decision")
+            .and_then(|value| value.as_str())
+            .and_then(ReopenDecision::parse);
+        assessment.decision = decision;
+        assessment.goal_id = structured
+            .get("goal_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        assessment.evidence_ids = string_list(&structured, "evidence_ids");
+        assessment.counterevidence_ids = string_list(&structured, "counterevidence_ids");
+        assessment.unverified_conditions = string_list(&structured, "unverified_conditions");
+        assessment.why_now = structured
+            .get("why_now")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+    }
+
+    Ok(assessment)
+}
+
+fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1431,6 +1675,89 @@ mod tests {
             ..HindsightConfig::default()
         };
         let result = recall(&config, "anything");
+        assert!(result.is_err(), "an unreachable server is an error");
+    }
+
+    // reference: https://hindsight.vectorize.io/0.10/developer/api/reflect
+    //   and C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    //   ("Ask reflect to return one of `wait`, `prepare`, `act_within_authority`
+    //   or `ask_owner` with `goal_id`, `evidence_ids`, `counterevidence_ids`,
+    //   `unverified_conditions` and `why_now`").
+    /// The plan names exactly the fields the reopen assessment must carry.
+    #[test]
+    fn reopen_response_schema_requires_a_decision_and_lists_the_plan_fields() {
+        let schema = reopen_response_schema();
+        let required = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("required list");
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].as_str(), Some("decision"));
+
+        let properties = schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("properties");
+        for field in [
+            "decision",
+            "goal_id",
+            "evidence_ids",
+            "counterevidence_ids",
+            "unverified_conditions",
+            "why_now",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "the plan requires the {field} field"
+            );
+        }
+
+        let decision_enum = properties
+            .get("decision")
+            .and_then(|value| value.get("enum"))
+            .and_then(|value| value.as_array())
+            .expect("decision enum");
+        let variants: Vec<&str> = decision_enum.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            variants,
+            vec!["wait", "prepare", "act_within_authority", "ask_owner"],
+            "the plan names exactly these four decisions"
+        );
+    }
+
+    #[test]
+    fn the_four_decisions_round_trip_through_their_names() {
+        for decision in [
+            ReopenDecision::Wait,
+            ReopenDecision::Prepare,
+            ReopenDecision::ActWithinAuthority,
+            ReopenDecision::AskOwner,
+        ] {
+            assert_eq!(
+                ReopenDecision::parse(decision.as_str()),
+                Some(decision),
+                "{decision:?} must round trip"
+            );
+        }
+        assert_eq!(
+            ReopenDecision::parse("ACT_WITHIN_AUTHORITY"),
+            Some(ReopenDecision::ActWithinAuthority)
+        );
+        assert_eq!(ReopenDecision::parse("something else"), None);
+    }
+
+    /// An unreachable server must be an error, not a silent "wait".
+    ///
+    /// A silent `wait` would be indistinguishable from "the condition did
+    /// not hold", and the plan treats the two differently: one is a decision,
+    /// the other is a failure to decide.
+    #[test]
+    fn assess_reopen_reports_an_unreachable_server_as_an_error() {
+        let config = HindsightConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            ..HindsightConfig::default()
+        };
+        let result = assess_reopen(&config, "anything");
         assert!(result.is_err(), "an unreachable server is an error");
     }
 }
