@@ -462,6 +462,39 @@ pub fn spawn_detached_without_console_window(
     }
 }
 
+/// Detach a command from the console of the process that runs it.
+///
+/// A Windows console's input mode belongs to the CONSOLE, not to a process, so
+/// a child that shares the parent's console also shares its input mode - and
+/// can reset it. Measured on this host (2026-11-10): the shared server spawned
+/// without these flags inherited the client's console, which left the client's
+/// console cooked (0x8F = PROC|LINE|ECHO|WIN|EXT, no VT input) while the TUI
+/// still believed it owned the terminal, so keystrokes were echoed by the
+/// console instead of reaching the session. The same sharing meant that closing
+/// the client's terminal window killed the server with it.
+///
+/// `CREATE_NO_WINDOW` gives the child its own console with no visible window
+/// and descendants inherit it, so the whole subtree stays invisible.
+/// `CREATE_NEW_PROCESS_GROUP` keeps the client console's Ctrl+C from reaching
+/// the detached process. The two cannot be combined with `DETACHED_PROCESS`,
+/// which is documented as invalid together with `CREATE_NO_WINDOW`.
+///
+/// No-op on Unix: there a console is not the unit of input mode, and the
+/// session detachment is done with `setsid()` in the spawn path.
+pub fn isolate_from_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Reap a detached child without blocking the caller.
 pub fn reap_detached(child: std::process::Child) {
     #[cfg(unix)]

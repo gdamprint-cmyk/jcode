@@ -1436,7 +1436,14 @@ async fn spawn_server_with_lifetime(
         cmd.arg("--model").arg(model);
     }
     cmd.args(serve_subcommand_args(lifetime, std::process::id()));
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // The server must not share the client's console. A console's input mode
+    // belongs to the console, so a server sharing it also shares (and can
+    // reset) the client's input mode, and closing the client's terminal window
+    // kills the server with it. Measured 2026-11-10 on this host.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    crate::platform::isolate_from_console(&mut cmd);
 
     #[cfg(unix)]
     {

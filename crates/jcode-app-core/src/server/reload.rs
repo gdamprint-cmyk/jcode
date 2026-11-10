@@ -26,6 +26,14 @@ fn prepare_server_exec(cmd: &mut std::process::Command, socket_path: &std::path:
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    // A console's input mode belongs to the CONSOLE, not to a process, so a
+    // replacement that shares the daemon's console also shares its input mode.
+    // The daemon inherited the client's console, so the replacement inherited it
+    // too: closing the client's terminal window then killed the server along
+    // with it, and the client's TUI kept believing it owned the terminal.
+    // Detach the replacement from that console.
+    crate::platform::isolate_from_console(cmd);
 }
 
 async fn receive_reload_signal(
