@@ -1833,7 +1833,7 @@ async fn restore_session_rehydrates_injected_memory_ids() {
 }
 
 #[tokio::test]
-async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop() {
+async fn build_memory_prompt_nonblocking_delivers_pending_memory_without_waiting_for_a_user_turn() {
     let _guard = crate::storage::lock_test_env();
     struct RestoreMemoryHome(Option<std::ffi::OsString>);
     impl Drop for RestoreMemoryHome {
@@ -1895,22 +1895,32 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
         Message::tool_result("call_1", "ok", false),
     ];
 
+    // A tool loop is NOT a fresh user turn, but the payload must still be
+    // delivered on the next provider iteration. MEASURED 2026-11-04: the
+    // recall is prepared in the background, so a payload raised during
+    // autonomous tool work used to sit in the queue until the user spoke
+    // again - the agent worked for hours without the memory it had already
+    // fetched. Commit db2d92148 changed the contract from "only at a fresh
+    // user turn" to "on every provider iteration"; this test pins the CURRENT
+    // contract, not the superseded one.
     let pending = agent.build_memory_prompt_nonblocking(&tool_loop_messages, None);
-    assert!(pending.is_none(), "memory should not inject mid tool loop");
-    assert!(crate::memory::has_pending_memory(&session_id));
-    assert!(!crate::memory::is_memory_injected(&session_id, &entry.id));
-
-    let next_turn_messages = vec![Message::user("follow up")];
-    let pending = agent.build_memory_prompt_nonblocking(&next_turn_messages, None);
     assert!(
         pending.is_some(),
-        "memory should inject on the next real user turn"
+        "pending memory must be delivered mid tool loop, not deferred to the next user turn"
     );
     let pending = pending.unwrap();
     assert_eq!(pending.prompt, prompt);
     assert_eq!(pending.memory_ids, vec![entry.id.clone()]);
-    assert!(crate::memory::is_memory_injected(&session_id, &entry.id));
+    // Consumed exactly once: the payload is out of the queue and the
+    // memories are recorded as injected.
     assert!(!crate::memory::has_pending_memory(&session_id));
+    assert!(crate::memory::is_memory_injected(&session_id, &entry.id));
+    // A second iteration must not deliver it again.
+    assert!(
+        agent.build_memory_prompt_nonblocking(&tool_loop_messages, None)
+            .is_none(),
+        "a consumed payload must not be delivered twice"
+    );
 
     crate::memory::clear_all_pending_memory();
 }
@@ -2877,12 +2887,38 @@ impl Provider for FableGuardrailProvider {
             *calls
         };
         if call > 1 {
-            let prompt = messages
-                .last()
-                .map(message_text)
-                .unwrap_or_default()
-                .to_string();
-            self.prompts_seen.lock().unwrap().push(prompt);
+            // Capture EVERY user-role message in the request, not just the
+            // last one. MEASURED 2026-11-10: the harness can append an
+            // ephemeral message AFTER the reconsideration prompt (a memory
+            // injection, a plan-limit notice), so the reconsideration prompt
+            // is not necessarily the last message of the request. Asserting
+            // on `messages.last()` made this test depend on the user's
+            // `features.memory` setting.
+            //
+            // reference: no prior art, searched the jcode repo for an existing
+            // multi-message capture helper; the request assembly that makes
+            // this necessary is the `messages_with_memory` / `stamped` /
+            // `send_messages` chain in
+            // crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs.
+            let mut user_texts = Vec::new();
+            for message in messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+            {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    user_texts.push(text);
+                }
+            }
+            self.prompts_seen.lock().unwrap().push(user_texts.join("\n---\n"));
         }
 
         let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
@@ -2931,6 +2967,10 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
     let provider: Arc<dyn Provider> = Arc::new(fable);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // This test exercises the guardrail recovery path, not memory. Leaving
+    // memory on makes the result depend on the user's `features.memory`
+    // setting and on whatever the background recall happens to have queued.
+    agent.memory_enabled = false;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent
@@ -2948,9 +2988,20 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
     assert_eq!(*calls.lock().unwrap(), 4);
     let prompts = prompts_seen.lock().unwrap();
     assert_eq!(prompts.len(), 3);
-    assert!(prompts[0].contains("concrete harmful action"));
-    assert!(prompts[1].contains("safe portions"));
-    assert!(prompts[2].contains("final, independent policy check"));
+    // Each reconsideration request carried the matching staged prompt.
+    let suite = Agent::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS;
+    assert!(
+        prompts[0].contains(suite[0]),
+        "request 2 must carry the first reconsideration prompt, got: {prompts:?}"
+    );
+    assert!(
+        prompts[1].contains(suite[1]),
+        "request 3 must carry the second reconsideration prompt, got: {prompts:?}"
+    );
+    assert!(
+        prompts[2].contains(suite[2]),
+        "request 4 must carry the third reconsideration prompt, got: {prompts:?}"
+    );
     assert!(
         text.contains("Reconsidered and completed safely"),
         "{text:?}"
