@@ -744,7 +744,7 @@ pub fn send_desktop_notification_rich(
 }
 
 // ---------------------------------------------------------------------------
-// Desktop (notify-send)
+// Desktop (notify-send / Windows toast)
 // ---------------------------------------------------------------------------
 
 fn send_desktop(title: &str, body: &str, urgency: &str) {
@@ -754,7 +754,51 @@ fn send_desktop(title: &str, body: &str, urgency: &str) {
         let _ = urgency;
         send_desktop_notification(title, body);
     }
-    #[cfg(not(target_os = "macos"))]
+    // On Windows there is no notify-send. Without this branch
+    // `desktop_notifications = true` was a silent no-op on this host: the
+    // ambient cycle summary was written to disk and never reached the user.
+    // reference: the same WinRT toast recipe already ships in this repository
+    // (crates/jcode-setup-hints/src/cli_launch_hints.rs:365-389) and was
+    // verified live on this host 2026-11-10 ("TOAST_OK").
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        fn ps_quote(value: &str) -> String {
+            value.replace('`', "``").replace('"', "`\"")
+        }
+
+        let _ = urgency;
+        // A toast body is a single short line; the full summary lives in the
+        // transcript and in the info widget.
+        let short_body: String = body
+            .lines()
+            .find(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(180)
+            .collect();
+        let script = format!(
+            "$title=\"{}\";$body=\"{}\";\
+             [Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;\
+             [Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]>$null;\
+             $xml=New-Object Windows.Data.Xml.Dom.XmlDocument;\
+             $xml.LoadXml(\"<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$body</text></binding></visual></toast>\");\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Jcode').Show([Windows.UI.Notifications.ToastNotification]::new($xml))",
+            ps_quote(title),
+            ps_quote(&short_body)
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         let result = std::process::Command::new("notify-send")
             .arg("--app-name=jcode")

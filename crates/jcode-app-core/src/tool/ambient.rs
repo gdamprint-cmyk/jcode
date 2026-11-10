@@ -282,6 +282,12 @@ struct ScheduleInput {
     context: String,
     #[serde(default)]
     priority: Option<String>,
+    /// Deliver this task to a specific interactive session instead of waking
+    /// the ambient agent. The ambient agent's own session id is a throwaway
+    /// one-shot (`ambient_<timestamp>`), so without an explicit target an
+    /// ambient-scheduled task can never reach the session it is about.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[async_trait]
@@ -316,6 +322,10 @@ impl Tool for ScheduleAmbientTool {
                     "type": "string",
                     "enum": ["low", "normal", "high"],
                     "description": "Priority for this scheduled task (default: normal)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Deliver to this interactive session instead of waking the ambient agent. Use it to hand a concrete result back to the session whose work you improved."
                 }
             }
         })
@@ -333,12 +343,28 @@ impl Tool for ScheduleAmbientTool {
             None
         };
 
+        let target = match params.session_id.as_deref().map(str::trim) {
+            Some(session_id) if !session_id.is_empty() => {
+                ScheduleTarget::Session {
+                    session_id: session_id.to_string(),
+                }
+            }
+            _ => ScheduleTarget::Ambient,
+        };
+
+        // Compute the destination BEFORE `target` is moved into the request:
+        // ScheduleTarget is not Copy, so a later borrow would not compile.
+        let destination = match &target {
+            ScheduleTarget::Session { session_id } => format!(" -> session {session_id}"),
+            _ => String::new(),
+        };
+
         let request = ScheduleRequest {
             wake_in_minutes: params.wake_in_minutes,
             wake_at,
             context: params.context.clone(),
             priority: parse_priority(params.priority.as_deref()),
-            target: ScheduleTarget::Ambient,
+            target,
             created_by_session: ctx.session_id,
             working_dir: None,
             task_description: None,
@@ -360,8 +386,11 @@ impl Tool for ScheduleAmbientTool {
         };
 
         Ok(
-            ToolOutput::new(format!("Scheduled ambient task {} for {}", id, when))
-                .with_title(format!("scheduled: {}", params.context)),
+            ToolOutput::new(format!(
+                "Scheduled ambient task {} for {}{}",
+                id, when, destination
+            ))
+            .with_title(format!("scheduled: {}", params.context)),
         )
     }
 }
@@ -737,6 +766,12 @@ struct ScheduleToolInput {
     success_criteria: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    /// Explicit session to deliver to. Required to reach a session other than
+    /// the caller's own: the ambient agent's session id is a throwaway
+    /// one-shot, so `target: "resume"` from an ambient cycle would deliver to
+    /// a session that is already closed.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[async_trait]
@@ -786,6 +821,10 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "enum": ["resume", "spawn", "ambient"],
                     "description": "Delivery target. Defaults to resuming this session; 'spawn' runs one new child session."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Deliver to this specific session id. Required to reach a session other than your own."
                 }
             }
         })
@@ -855,7 +894,12 @@ impl ScheduleTool {
                 }
             });
 
-        let target = parse_schedule_target(params.target.as_deref(), &ctx.session_id)?;
+        let target = match params.session_id.as_deref().map(str::trim) {
+            Some(session_id) if !session_id.is_empty() => ScheduleTarget::Session {
+                session_id: session_id.to_string(),
+            },
+            _ => parse_schedule_target(params.target.as_deref(), &ctx.session_id)?,
+        };
         let target_summary = format_schedule_target(&target);
 
         let request = ScheduleRequest {

@@ -1,3 +1,5 @@
+// reference: crates/jcode-app-core/src/tool/ambient.rs (ScheduleTool::execute_create -> ScheduleTarget::Session): the delivery target this test pins, plus crates/jcode-app-core/src/ambient/runner.rs (deliver_scheduled_direct_item) which consumes it.
+// reference: no prior art, searched the jcode repo for an existing ambient-to-session delivery test (crates/jcode-app-core/src/tool/ambient/tests.rs, crates/jcode-app-core/src/ambient/runner.rs); the APIs used are serde's field-level default (https://docs.rs/serde/latest/serde/attr.default.html) and tokio's async test macro (https://docs.rs/tokio/latest/tokio/attr.test.html).
 use super::*;
 
 #[test]
@@ -143,6 +145,134 @@ fn test_ambient_inputs_accept_string_numbers_and_bools() {
     assert_eq!(tool.wake_in_minutes, Some(30));
 }
 
+// reference: no prior art, searched the jcode repo for an existing ambient-to-session delivery test (crates/jcode-app-core/src/tool/ambient/tests.rs, crates/jcode-app-core/src/ambient/runner.rs). APIs used: serde field-level default (https://docs.rs/serde/latest/serde/attr.default.html), tokio async test macro (https://docs.rs/tokio/latest/tokio/attr.test.html), tempfile::tempdir (https://docs.rs/tempfile/latest/tempfile/fn.tempdir.html).
+#[test]
+fn test_schedule_input_accepts_explicit_session_id() {
+    let parsed: ScheduleInput = serde_json::from_value(json!({
+        "wake_in_minutes": 0,
+        "context": "Fixed the build you were blocked on",
+        "session_id": "session_abc123"
+    }))
+    .expect("schedule_ambient must accept an explicit session_id");
+    assert_eq!(parsed.session_id.as_deref(), Some("session_abc123"));
+
+    let parsed_tool: ScheduleToolInput = serde_json::from_value(json!({
+        "task": "Hand the result back",
+        "wake_in_minutes": 0,
+        "session_id": "session_abc123"
+    }))
+    .expect("schedule must accept an explicit session_id");
+    assert_eq!(parsed_tool.session_id.as_deref(), Some("session_abc123"));
+}
+
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "test intentionally serializes process-wide JCODE_HOME/env state across async tool execution"
+)]
+async fn test_schedule_ambient_tool_targets_explicit_session() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let tool = ScheduleAmbientTool::new();
+    let input = json!({
+        "wake_in_minutes": 0,
+        "context": "Ambient fixed the flaky test you were waiting on",
+        "session_id": "session_target_xyz"
+    });
+    let ctx = ToolContext {
+        session_id: "ambient_throwaway_session".to_string(),
+        message_id: "msg_1".to_string(),
+        tool_call_id: "call_1".to_string(),
+        working_dir: None,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+
+    let output = tool
+        .execute(input, ctx)
+        .await
+        .expect("schedule_ambient should succeed");
+    assert!(
+        output.output.contains("session session_target_xyz"),
+        "output must name the addressed session: {}",
+        output.output
+    );
+
+    let manager = AmbientManager::new().expect("ambient manager");
+    let scheduled = manager
+        .queue()
+        .items()
+        .first()
+        .expect("scheduled item should exist");
+    assert_eq!(
+        scheduled.target,
+        ScheduleTarget::Session {
+            session_id: "session_target_xyz".to_string()
+        }
+    );
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "test intentionally serializes process-wide JCODE_HOME/env state across async tool execution"
+)]
+async fn test_schedule_tool_targets_explicit_session() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let tool = ScheduleTool::new();
+    let input = json!({
+        "task": "Deliver the ambient result here",
+        "wake_in_minutes": 0,
+        "session_id": "session_target_xyz"
+    });
+    let ctx = ToolContext {
+        session_id: "ambient_throwaway_session".to_string(),
+        message_id: "msg_1".to_string(),
+        tool_call_id: "call_1".to_string(),
+        working_dir: None,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+
+    tool.execute(input, ctx)
+        .await
+        .expect("schedule should succeed");
+
+    let manager = AmbientManager::new().expect("ambient manager");
+    let scheduled = manager
+        .queue()
+        .items()
+        .first()
+        .expect("scheduled item should exist");
+    assert_eq!(
+        scheduled.target,
+        ScheduleTarget::Session {
+            session_id: "session_target_xyz".to_string()
+        }
+    );
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
 #[test]
 fn test_schedule_input_deserialization() {
     let input = json!({
@@ -156,6 +286,7 @@ fn test_schedule_input_deserialization() {
     assert!(parsed.wake_at.is_none());
     assert_eq!(parsed.context, "Check CI results");
     assert_eq!(parsed.priority.as_deref(), Some("normal"));
+    assert!(parsed.session_id.is_none());
 }
 
 #[test]

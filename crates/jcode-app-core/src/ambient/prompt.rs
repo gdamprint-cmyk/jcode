@@ -1,4 +1,5 @@
 // reference: ~/.jcode/research/2026-11-04-always-on/ambient-dead-letter-fix.md (measured write-only ambient queue: the prompt collapses the never-delivered ambient entries instead of rendering every one in full)
+// reference: crates/jcode-app-core/src/ambient/runner.rs (deliver_scheduled_direct_item -> notify_live_session -> handle_notify_session): the delivery path the new "Handing a result back to a session" instruction describes, including the busy-session soft-interrupt fallback.
 use chrono::{DateTime, Utc};
 
 use super::{AmbientState, Priority, ScheduleTarget, ScheduledItem, take_pending_directives};
@@ -535,7 +536,8 @@ pub fn build_ambient_system_prompt(
          Key tools for this cycle (use these exact names):\n\
          - `todo` — plan and track what you'll do this cycle.\n\
          - `end_ambient_cycle` — REQUIRED to finish the cycle (see below).\n\
-         - `schedule_ambient` — schedule your next wake time.\n\
+         - `schedule_ambient` — schedule your next wake time, or deliver a result \
+           to a specific interactive session with `session_id`.\n\
          - `request_permission` — get approval before any code change.\n\
          - `send_message` — keep the user informed.\n\
          Standard tools (`bash`, `read`, `write`, `edit`, `memory`, etc.) are \
@@ -568,6 +570,22 @@ pub fn build_ambient_system_prompt(
          - Canvas (via MCP) — check for upcoming assignments or deadlines\n\
          - Git history — recent commits, open branches, stale PRs\n\
          - Session history — patterns in what the user works on\n\n\
+         ## Handing a result back to a session\n\n\
+         Your own session id is a throwaway one-shot, so a task you schedule for \
+         yourself reaches nobody. When you finish something that materially \
+         improves the work of an interactive session, deliver it to that session \
+         with `schedule_ambient`, passing `session_id` (the interactive \
+         session's id, e.g. `session_...`), `wake_in_minutes: 0`, and a `context` \
+         that says what you did and what the session can reuse. The session's \
+         id is in the 'Recent Sessions' section above.\n\n\
+         Rules, because a background agent writing into someone's live session \
+         is noise if it is careless:\n\
+         - Only for work you actually completed and verified, never for a \
+           status ping, a question, or a routine re-check.\n\
+         - At most one delivery per session per cycle.\n\
+         - Say plainly WHAT you did and WHAT the session can reuse. No preamble.\n\
+         - If the session is busy, the delivery waits as a soft interrupt; keep \
+           it short so it does not derail the user's turn.\n\n\
          When done, you MUST call end_ambient_cycle with a summary of \
          everything you did, including compaction count. Always schedule \
          your next wake time with context for what you plan to do next.\n\n\

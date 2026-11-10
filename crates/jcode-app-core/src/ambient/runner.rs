@@ -868,18 +868,34 @@ impl AmbientRunnerHandle {
 
             match cycle_result {
                 Ok(result) => {
-                    logging::info(&format!(
-                        "Ambient cycle complete: {} memories modified, {} compactions",
-                        result.memories_modified, result.compactions
-                    ));
+                    // A cycle that never called end_ambient_cycle is NOT a
+                    // completed cycle: the agent did not finish its work, and
+                    // on this host it usually means the provider stream died
+                    // (MEASURED 2026-11-10: 10 consecutive cycles ended this
+                    // way, every one with the same OpenRouter/MiniMax stream
+                    // error). Counting it as success reset the backoff, so the
+                    // same dead provider was retried every 30 minutes for
+                    // five hours. An incomplete cycle must back off instead.
+                    let incomplete = matches!(result.status, CycleStatus::Incomplete);
+                    if incomplete {
+                        logging::warn(&format!(
+                            "Ambient cycle incomplete (not counted as success): {}",
+                            result.summary
+                        ));
+                        scheduler.on_rate_limit_hit();
+                    } else {
+                        logging::info(&format!(
+                            "Ambient cycle complete: {} memories modified, {} compactions",
+                            result.memories_modified, result.compactions
+                        ));
+                        scheduler.on_successful_cycle();
+                    }
 
                     // Update state
                     if let Ok(mut mgr) = AmbientManager::new() {
                         let _ = mgr.record_cycle_result(result.clone());
                     }
                     self.apply_completed_cycle(&result).await;
-
-                    scheduler.on_successful_cycle();
 
                     // Save transcript
                     let transcript = crate::safety::AmbientTranscript {
@@ -1112,8 +1128,11 @@ impl AmbientRunnerHandle {
         }
 
         // Agent didn't call end_ambient_cycle - try continuation
-        if run_result.is_err() {
-            logging::warn("Ambient cycle: agent error without calling end_ambient_cycle");
+        let first_error = run_result.err();
+        if let Some(ref error) = first_error {
+            logging::warn(&format!(
+                "Ambient cycle: agent error without calling end_ambient_cycle: {error}"
+            ));
         }
 
         self.set_running_detail("continuation turn").await;
@@ -1123,7 +1142,7 @@ impl AmbientRunnerHandle {
             what you accomplished and schedule your next wake. \
             If you are not done, continue what you were doing.";
 
-        let _ = agent.run_once_capture(continuation).await;
+        let continuation_result = agent.run_once_capture(continuation).await;
 
         // Check again
         if let Some(result) = ambient_tools::take_cycle_result() {
@@ -1141,9 +1160,30 @@ impl AmbientRunnerHandle {
         // Forced end
         ambient_tools::unregister_ambient_session(&ambient_session_id);
         logging::warn("Ambient cycle: forced end after 2 attempts without end_ambient_cycle");
+        // Name the provider failure in the summary. The bare forced-end sentence
+        // ("ended without calling end_ambient_cycle") hides WHY, and the same
+        // sentence repeated ten times is what made this read as a harness bug
+        // instead of a dead provider.
+        // reference: OpenRouter API error handling docs
+        // (https://openrouter.ai/docs/api-reference/errors) - a mid-stream
+        // provider failure arrives as finish_reason="error" with
+        // error.metadata.error_type (provider_unavailable, timeout,
+        // rate_limit_exceeded, ...), so the upstream error text is the
+        // actionable part and must survive into the summary.
+        let forced_error = first_error
+            .or_else(|| continuation_result.err())
+            .map(|error| error.to_string());
+        let summary = match &forced_error {
+            Some(error) => format!(
+                "Cycle failed before end_ambient_cycle (forced end after 2 attempts). Last provider error: {error}"
+            ),
+            None => {
+                "Cycle ended without calling end_ambient_cycle (forced end after 2 attempts)"
+                    .to_string()
+            }
+        };
         let forced = AmbientCycleResult {
-            summary: "Cycle ended without calling end_ambient_cycle (forced end after 2 attempts)"
-                .to_string(),
+            summary,
             memories_modified: 0,
             compactions: 0,
             proactive_work: None,
