@@ -719,22 +719,30 @@ pub fn clear_all_injected_memories() {
 
 /// Clear any pending memory result for a session.
 pub fn clear_pending_memory(session_id: &str) {
+    clear_pending_payload(session_id);
+    clear_injected_memories(session_id);
+}
+
+/// Clear only the QUEUED payload for a session, keeping the bookkeeping of
+/// what was already delivered.
+///
+/// reference: no prior art, searched the Hindsight docs (mental-models,
+/// recall, mcp-server) - upstream has no notion of "what this client already
+/// put in the conversation". That state is the client's own.
+///
+/// MEASURED 2026-11-10 on the live daemon: `clear_pending_memory` used to be
+/// called before EVERY recall, and it also cleared the injected-id set and
+/// the last-injected-set map. Both dedup lines were therefore dead: the same
+/// payload (6 facts + 2 models, identical ids) was delivered twice into one
+/// session 26 seconds apart. The pending payload and the delivered-set
+/// bookkeeping are two different things - a stale QUEUE entry must be
+/// dropped, but a fact the model already saw must stay remembered.
+pub fn clear_pending_payload(session_id: &str) {
     if let Ok(mut guard) = PENDING_MEMORY.lock()
         && let Some(map) = guard.as_mut()
     {
         map.remove(session_id);
     }
-    if let Ok(mut guard) = LAST_INJECTED_PROMPT_SIGNATURE.lock()
-        && let Some(map) = guard.as_mut()
-    {
-        map.remove(session_id);
-    }
-    if let Ok(mut guard) = LAST_INJECTED_MEMORY_SET.lock()
-        && let Some(map) = guard.as_mut()
-    {
-        map.remove(session_id);
-    }
-    clear_injected_memories(session_id);
 }
 
 /// Clear all pending memory state across all sessions.
@@ -1121,6 +1129,51 @@ mod scoped_tests {
             assert!(
                 take_pending_memory_for_project("mixed", None).is_some(),
                 "a payload with a new fact must still be delivered"
+            );
+        });
+    }
+
+    /// Clearing the QUEUED payload must not forget what was already
+    /// delivered.
+    ///
+    /// MEASURED 2026-11-10 on the live daemon: the recall path cleared the
+    /// pending queue AND the injected-id set before every recall, so both
+    /// dedup lines were dead and one session received the identical payload
+    /// (6 facts + 2 models, same ids) twice within 26 seconds.
+    #[test]
+    fn clearing_the_queued_payload_keeps_the_delivered_set() {
+        fixture(|| {
+            let ids = vec!["fact-1".to_string(), "model:active-work".to_string()];
+            set_pending_memory_external(
+                "queue",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids.clone(),
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("queue", None).is_some());
+
+            // The recall path drops the stale queue entry before fetching.
+            clear_pending_payload("queue");
+            assert!(!has_pending_memory("queue"));
+            assert!(
+                is_memory_injected("queue", "model:active-work"),
+                "the delivered set must survive a queue clear"
+            );
+
+            // And the same payload is therefore not delivered again.
+            set_pending_memory_external(
+                "queue",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids,
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("queue", None).is_none(),
+                "an already delivered payload must not reach the model again"
             );
         });
     }

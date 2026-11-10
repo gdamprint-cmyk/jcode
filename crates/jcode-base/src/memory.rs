@@ -46,10 +46,10 @@ use cache::{cache_graph, cached_graph};
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
-    clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
-    is_memory_injected_any, mark_memories_injected, mark_memories_known, note_tool_calls,
-    reset_tool_calls_since_refresh, set_pending_memory, set_pending_memory_external,
-    set_pending_memory_for_project, set_pending_memory_with_ids,
+    clear_pending_memory, clear_pending_payload, has_any_pending_memory, has_pending_memory,
+    is_memory_injected, is_memory_injected_any, mark_memories_injected, mark_memories_known,
+    note_tool_calls, reset_tool_calls_since_refresh, set_pending_memory,
+    set_pending_memory_external, set_pending_memory_for_project, set_pending_memory_with_ids,
     set_pending_memory_with_ids_and_display, sync_injected_memories, take_pending_memory,
     take_pending_memory_for_project, tool_calls_since_refresh,
 };
@@ -1095,7 +1095,10 @@ impl MemoryManager {
                     emit_memory_activity(event_tx.as_ref());
                 }
                 Ok(MemoryRelevanceResult { prompt: None, .. }) => {
-                    clear_pending_memory(&sid);
+                    // No selection this round: drop the queued payload but keep
+                    // the delivered set, so what the model already saw stays
+                    // known.
+                    clear_pending_payload(&sid);
                     set_state(MemoryState::Idle);
                     emit_memory_activity(event_tx.as_ref());
                 }
@@ -1123,7 +1126,9 @@ impl MemoryManager {
     ) -> Result<MemoryRelevanceResult> {
         // Automatic recall is disabled for everyone, including existing configs.
         // Explicit memory-tool recall still uses memory_jev::recall directly.
-        clear_pending_memory(session_id);
+        // Only the queued payload is dropped: the delivered set must survive,
+        // otherwise the same memories are delivered again on the next turn.
+        clear_pending_payload(session_id);
         Ok(MemoryRelevanceResult::default())
     }
 

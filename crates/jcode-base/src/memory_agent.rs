@@ -230,6 +230,8 @@ impl MemoryAgent {
                             working_dir,
                             ..Default::default()
                         };
+                        // The session moved to another project: its delivered
+                        // set belongs to the old scope and must not survive.
                         memory::clear_pending_memory(&session_id);
                     }
                     ss.turns += 1;
@@ -289,7 +291,16 @@ impl MemoryAgent {
         ss.last_query = Some(query.clone());
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
-        memory::clear_pending_memory(session_id);
+        // Only the QUEUED payload is dropped here. The bookkeeping of what
+        // this session already received MUST survive, otherwise the same
+        // facts and models are delivered again on the next turn.
+        //
+        // MEASURED 2026-11-10 on the live daemon: this call used to be
+        // `clear_pending_memory`, which also cleared the injected-id set and
+        // the last-injected-set map. Both dedup lines were dead, and one
+        // session received the identical payload (6 facts + 2 models) twice
+        // within 26 seconds.
+        memory::clear_pending_payload(session_id);
         // The Hindsight backend replaces the remote Jev model for RECALL.
         // It is selected here rather than inside MemoryManager because the
         // two backends produce different things: Jev selects entries from the
