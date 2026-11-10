@@ -43,7 +43,7 @@ async fn assert_model_catalog_service_tier(tier: Option<&'static str>, busy: boo
     let busy_guard = if busy { Some(agent.lock().await) } else { None };
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
-    let (_reader_a, writer_a) = stream_a.into_split();
+    let (reader_a, writer_a) = stream_a.into_split();
     let writer = Arc::new(Mutex::new(writer_a));
 
     tokio::time::timeout(
@@ -56,6 +56,14 @@ async fn assert_model_catalog_service_tier(tier: Option<&'static str>, busy: boo
 
     drop(busy_guard);
     drop(writer);
+    // Close the server end's READ half before reading to EOF. A WINDOWS NAMED
+    // PIPE has no half-close: EOF is only signalled once the pipe instance is
+    // fully closed, so while `reader_a` is alive `read_to_end` below blocks
+    // FOREVER. MEASURED 2026-11-10: this test hung the whole
+    // `cargo test -p jcode-app-core server::` binary on Windows.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations
+    drop(reader_a);
 
     let mut bytes = Vec::new();
     stream_b

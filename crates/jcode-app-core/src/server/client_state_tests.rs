@@ -544,7 +544,7 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
     let connections = Arc::new(RwLock::new(HashMap::new()));
     let count = Arc::new(RwLock::new(1));
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
-    let (_reader, write_half) = stream.into_split();
+    let (reader, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
     let busy_guard = agent.lock().await;
 
@@ -606,6 +606,24 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
 
     drop(busy_guard);
     drop(writer);
+    // Close the server end's READ half before reading to EOF.
+    //
+    // On Unix the transport is a UnixStream pair: dropping the write half
+    // sends FIN, so `read_to_end` below sees EOF even though the read half of
+    // the same end is still open. A WINDOWS NAMED PIPE has no half-close -
+    // EOF is only signalled when the pipe instance is fully closed (the server
+    // closes it with DisconnectNamedPipe/CloseHandle). While this read half is
+    // still alive the pipe stays open, the client never observes EOF, and
+    // `read_to_end` blocks FOREVER. MEASURED 2026-11-10: this test hung the
+    // whole `cargo test -p jcode-app-core` binary on Windows (CPU frozen at
+    // 129.09 across three 15s samples); dropping this one handle makes it pass
+    // in 0.98s.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations
+    // reference: crates/jcode-transport/src/windows.rs (Stream::pair builds a
+    // named pipe) vs crates/jcode-transport/src/unix.rs (a UnixStream pair,
+    // which does half-close).
+    drop(reader);
     let mut bytes = Vec::new();
     peer.read_to_end(&mut bytes).await.unwrap();
     let events: Vec<crate::protocol::ServerEvent> = std::io::Cursor::new(bytes)
@@ -748,7 +766,7 @@ async fn assert_history_service_tier_and_pdf_capability(
     let client_count = Arc::new(RwLock::new(1usize));
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
-    let (_reader_a, writer_a) = stream_a.into_split();
+    let (reader_a, writer_a) = stream_a.into_split();
     let writer = Arc::new(Mutex::new(writer_a));
 
     if racing_turn {
@@ -819,6 +837,14 @@ async fn assert_history_service_tier_and_pdf_capability(
 
     drop(busy_guard);
     drop(writer);
+    // Close the server end's READ half before reading to EOF. A WINDOWS NAMED
+    // PIPE has no half-close: EOF arrives only when the pipe instance is
+    // fully closed, so while `reader_a` is alive `read_to_end` below blocks
+    // FOREVER. MEASURED 2026-11-10: this is the same hang that froze the
+    // whole `cargo test -p jcode-app-core` binary.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations
+    drop(reader_a);
 
     let mut bytes = Vec::new();
     stream_b
