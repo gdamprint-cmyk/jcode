@@ -585,3 +585,102 @@ pub fn render_memory_tiles(
 
     all_lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SHIPPED renderer must render the CURRENT memory block shape.
+    ///
+    /// MEASURED 2026-11-10: the memory payload was changed so that it starts
+    /// with `# Memory`, carries `## Relevant facts`, and delivers every mental
+    /// model as a BULLET (`- **name** - text`) instead of a heading. The
+    /// renderer groups entries by their `## ` category, so the delivered
+    /// categories must be exactly the two the payload defines.
+    ///
+    /// reference: no prior art, searched the Hindsight docs (mental-models,
+    /// recall, mcp-server) - the block FORMAT is Jcode's own; upstream only
+    /// supplies the facts and the models.
+    #[test]
+    fn the_current_memory_block_renders_into_two_categorised_tiles() {
+        let block = "# Memory\n\n\
+             ## Relevant facts\n\
+             \n\
+             - The database port is 5432\n\
+             - Build with cargo build\n\n\
+             ## Synthesized context\n\
+             \n\
+             - **Active work** - The Hermes joint manual governs the operator exchange.\n\
+             - **Incidents** - The Jaccard metric does not separate SAME-FACT.\n";
+
+        let entries = parse_memory_display_entries(block);
+        let tiles = group_into_tiles(entries);
+
+        let categories: Vec<&str> = tiles.iter().map(|tile| tile.category.as_str()).collect();
+        assert_eq!(
+            categories,
+            vec!["Relevant facts", "Synthesized context"],
+            "the block must render as the two categories it defines"
+        );
+
+        // The model bullet must arrive as CONTENT, not as a category.
+        let synth = tiles
+            .iter()
+            .find(|tile| tile.category == "Synthesized context")
+            .expect("the synthesized context tile");
+        assert_eq!(synth.items.len(), 2);
+        assert!(
+            synth.items[0].content.contains("Active work"),
+            "the model's name must be in the item: {:?}",
+            synth.items[0].content
+        );
+        assert!(
+            synth.items[0].content.contains("Hermes joint manual"),
+            "the model's own text must be in the item: {:?}",
+            synth.items[0].content
+        );
+
+        // And the whole thing renders into lines without panicking.
+        let lines = render_memory_tiles(&tiles, 100, Style::default(), Style::default(), None);
+        assert!(!lines.is_empty(), "the tiles must render");
+        let rendered: String = lines.iter().map(|line| line.to_string()).collect();
+        assert!(
+            rendered.contains("Active work"),
+            "the rendered output must show the model: {rendered}"
+        );
+    }
+
+    /// The service preamble must never become a CATEGORY.
+    ///
+    /// The renderer treats a `## ` line as a category and everything else as
+    /// an item of the current category. The preamble is plain prose, so it
+    /// lands as an item of the default category ("memory") - it never
+    /// becomes a category of its own.
+    ///
+    /// This is why the instruction had to leave the payload: it was rendered
+    /// as the first thing the owner saw, above the actual memories.
+    #[test]
+    fn the_service_preamble_never_becomes_a_category() {
+        let block = "# Memory\n\n\
+             A fact stating an exact rule is to be applied AS GIVEN.\n\
+             Attribute it visibly: > From memory - <the facts you drew on>\n\n\
+             ## Relevant facts\n\
+             \n\
+             - The database port is 5432\n";
+
+        let tiles = group_into_tiles(parse_memory_display_entries(block));
+        let categories: Vec<&str> = tiles.iter().map(|tile| tile.category.as_str()).collect();
+        assert!(
+            !categories.iter().any(|category| category.contains("AS GIVEN")),
+            "the preamble must not become a category: {categories:?}"
+        );
+        assert!(
+            !categories.iter().any(|category| category.contains("From memory")),
+            "the preamble must not become a category: {categories:?}"
+        );
+        assert!(
+            categories.contains(&"Relevant facts"),
+            "the real memories must still be a category: {categories:?}"
+        );
+    }
+}
