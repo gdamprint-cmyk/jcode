@@ -384,7 +384,7 @@ pub async fn transform_tool_input(
                     Vec::new()
                 }
             });
-            let status = child.wait().await;
+            let status = child.wait().await?;
             let _ = writer.await;
             let stdout = reader.await.unwrap_or_default();
             Ok::<_, std::io::Error>((status, stdout))
@@ -679,7 +679,7 @@ async fn run_pre_tool_command(
     let timeout =
         std::time::Duration::from_millis(crate::config::config().hooks.pre_tool_timeout_ms.max(1));
     let output = match tokio::time::timeout(timeout, async {
-        let status = child.wait().await;
+        let status = child.wait().await?;
         let _ = writer.await;
         let (stdout, stderr) = reader.await.unwrap_or_default();
         Ok::<_, std::io::Error>((status, stdout, stderr))
@@ -831,7 +831,7 @@ async fn run_post_tool_feedback_command(
                 Vec::new()
             }
         });
-        let status = child.wait().await;
+        let status = child.wait().await?;
         let _ = writer.await;
         let stdout = reader.await.unwrap_or_default();
         Ok::<_, std::io::Error>((status, stdout))
