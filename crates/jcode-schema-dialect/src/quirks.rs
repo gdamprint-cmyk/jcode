@@ -231,13 +231,44 @@ mod tests {
 
     /// A store that cannot be written must degrade to "learn it again", never
     /// to a failed turn.
+    ///
+    /// Two properties are required for this test to mean anything, and both
+    /// used to be violated on Windows:
+    ///
+    /// 1. The store must be genuinely unwritable. The old path,
+    ///    "/proc/definitely-not-writable/quirks.json", is a Linux convention
+    ///    only. Per `std::path::Path::has_root`, on Windows a path that "has
+    ///    no prefix and begins with a separator" (e.g. `\windows`) HAS a root,
+    ///    so the leading "/" resolved to the current drive's root and the
+    ///    directory tree was created - the write SUCCEEDED and the test never
+    ///    reached the branch it exists to cover. A path whose parent is a
+    ///    regular file cannot be written on either platform, needs no
+    ///    privileges, and leaves nothing behind.
+    ///
+    /// 2. The test must be idempotent. The store is keyed by path and cached
+    ///    in memory, so a file left behind by a previous run made
+    ///    `record_keyword` return false ("already known") and the test failed
+    ///    on the SECOND run - a failure that looks like a product bug but is
+    ///    the test's own leftover state. A keyword unique to this run removes
+    ///    the dependency on the previous run's leftovers.
+    ///
+    /// reference: https://doc.rust-lang.org/std/path/struct.Path.html#method.has_root
     #[test]
     fn an_unwritable_store_still_reports_what_it_learned() {
-        use_test_path(PathBuf::from("/proc/definitely-not-writable/quirks.json"));
-        assert!(record_keyword("gemini", "somethingNew"));
-        assert_eq!(
-            learned_for("gemini").rejected_keywords,
-            vec!["somethingNew".to_string()]
-        );
+        // The parent is a regular file, so the best-effort write in
+        // `with_store` genuinely fails on Windows and Linux alike.
+        let blocker = std::env::temp_dir().join("jcode-quirks-unwritable-blocker");
+        std::fs::write(&blocker, b"this is a file, not a directory").expect("write blocker file");
+        use_test_path(blocker.join("quirks.json"));
+
+        // Unique per run, so a leftover store from an earlier run cannot make
+        // this look like a product regression.
+        let keyword = format!("somethingNew-{}", std::process::id());
+        assert!(record_keyword("gemini", &keyword));
+        assert_eq!(learned_for("gemini").rejected_keywords, vec![keyword]);
+        // The store could not be written, so nothing was persisted. This is
+        // what makes the test meaningful: it proves the branch was reached.
+        assert!(!blocker.join("quirks.json").exists());
+        let _ = std::fs::remove_file(&blocker);
     }
 }
