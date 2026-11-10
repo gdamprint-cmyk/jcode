@@ -296,6 +296,153 @@ pub fn record_assessment(condition: &mut GoalReviewCondition, assessment: &Reope
     condition.last_evidence_at = Some(Utc::now());
 }
 
+/// One goal that was assessed during a sweep, and what came of it.
+///
+/// The plan requires the verified outcome OR the rejection to be retained and
+/// linked to the same goal, so the assessment is kept even when it was a
+/// `wait`: a rejected match must not be proposed again unchanged.
+#[derive(Debug, Clone)]
+pub struct GoalAssessment {
+    pub goal_id: String,
+    pub decision: Option<ReopenDecision>,
+    /// The newest report time the sweep saw. This becomes the goal's
+    /// watermark, so the same events are not examined again.
+    pub evidence_at: Option<DateTime<Utc>>,
+    /// Whether the owner should hear about this.
+    pub worth_notifying: bool,
+}
+
+/// The memory-block section a reopen notice is delivered as.
+///
+/// The shipped TUI renderer groups the injected block by its `## ` headings,
+/// so the notice must arrive under a heading of its own to become its own
+/// tile rather than being swallowed by the facts section.
+pub const REOPEN_SECTION: &str = "Reopen candidates";
+
+/// Render the reopen notices into the memory block.
+///
+/// Only a notice that is worth telling the owner about is rendered: a `wait`
+/// is silence by design, and the plan requires silence for an unrelated
+/// event, a stale warning or a previously declined suggestion.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("If proceeding requires a new commitment, present the choice with the
+///   evidence and prepared next step.").
+pub fn render_reopen_block(notable: &[ReopenOutcome]) -> Option<String> {
+    let mut out = String::new();
+    for outcome in notable {
+        let decision = outcome
+            .assessment
+            .decision
+            .map(|decision| decision.as_str().to_string())
+            .unwrap_or_else(|| "inconclusive".to_string());
+        out.push_str(&format!(
+            "- **{}** (`{}`) -> {}\n",
+            outcome.candidate.goal_title, outcome.candidate.goal_id, decision
+        ));
+        out.push_str(&format!(
+            "  condition: {}\n",
+            outcome.candidate.condition.trim()
+        ));
+        if let Some(why_now) = outcome.assessment.why_now.as_deref() {
+            out.push_str(&format!("  why now: {why_now}\n"));
+        }
+        if !outcome.candidate.matched_terms.is_empty() {
+            out.push_str(&format!(
+                "  matched: {}\n",
+                outcome.candidate.matched_terms.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "  reported change: {}\n",
+            outcome
+                .assessment
+                .text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+        ));
+    }
+    if out.trim().is_empty() {
+        return None;
+    }
+    Some(format!("## {REOPEN_SECTION}\n\n{out}"))
+}
+
+/// The window the trigger looks at: the oldest evidence any armed goal has
+/// already seen.
+///
+/// A goal with no recorded evidence is examined over the default window, so a
+/// fresh condition gets a chance to fire without waiting a day.
+pub fn sweep_window(armed: &[(Goal, GoalReviewCondition)]) -> DateTime<Utc> {
+    const DEFAULT_WINDOW_HOURS: i64 = 24;
+    let oldest = armed
+        .iter()
+        .filter_map(|(_, condition)| condition.last_evidence_at)
+        .min();
+    oldest.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(DEFAULT_WINDOW_HOURS))
+}
+
+/// Run the trigger half: examine the bank's new events against the armed
+/// goals, retain the outcome or the rejection against each goal, and render
+/// the notices that deserve the owner's attention.
+///
+/// This is the whole "reopen a good idea at the right time" path on the live
+/// turn: the plan's `reflect` decides, this function wires it to the durable
+/// goals and hands the result to the memory block.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("When a trusted source reports a relevant change, resolve the product
+///   or capability to its entity. Retrieve affected open goals, candidate
+///   evidence about the change, the original constraint and any later
+///   cancellation."; "Retain the verified outcome or rejection and link it
+///   to the same goal.").
+pub fn run_trigger(working_dir: Option<&std::path::Path>) -> Result<Option<String>> {
+    let goals = crate::goal::list_relevant_goals(working_dir)?;
+    let armed = armed_goals(&goals);
+    if armed.is_empty() {
+        // No goal carries an armed condition: nothing can be reopened, and
+        // the plan requires silence.
+        return Ok(None);
+    }
+    let config = crate::memory_hindsight::recall_configured()?;
+    let since = sweep_window(&armed);
+    let sweep = sweep_for_reopens(&config, &goals, since, 50)?;
+
+    // Retain the outcome OR the rejection against the same goal, so the same
+    // event is not proposed again and a rejected match is not re-asked.
+    for assessment in &sweep.assessments {
+        let Some(goal) = goals.iter().find(|goal| goal.id == assessment.goal_id) else {
+            continue;
+        };
+        let Some(mut condition) = goal.review_condition.clone() else {
+            continue;
+        };
+        condition.last_assessed_at = Some(Utc::now());
+        if let Some(decision) = assessment.decision {
+            condition.last_decision = Some(decision.as_str().to_string());
+        }
+        // The evidence watermark is the REPORT time of the event, not now:
+        // otherwise the next sweep would skip every event that arrived while
+        // this one was being assessed.
+        condition.last_evidence_at = assessment.evidence_at.or(condition.last_evidence_at);
+        let update = crate::goal::GoalUpdateInput {
+            review_condition: Some(Some(condition)),
+            ..Default::default()
+        };
+        if let Err(error) = crate::goal::update_goal(&goal.id, Some(goal.scope), working_dir, update)
+        {
+            crate::logging::warn(&format!(
+                "[goal_review] could not retain the assessment for {}: {error}",
+                goal.id
+            ));
+        }
+    }
+
+    Ok(render_reopen_block(&sweep.notable))
+}
+
 /// Whether a goal was cancelled after its condition was recorded.
 ///
 /// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
@@ -360,6 +507,22 @@ pub struct ReopenSweep {
     pub armed_goals: usize,
     /// How many events were examined.
     pub events_examined: usize,
+    /// How many events were skipped as Jcode's own conversation echo.
+    ///
+    /// MEASURED 2026-11-10 on the live bank: 197 of the 200 most recent
+    /// events carried `auto-retained`. Without this filter the trigger would
+    /// almost always be talking to itself.
+    pub own_echo_skipped: usize,
+    /// The newest report time among the examined events.
+    ///
+    /// This is the watermark the next sweep starts from, so an event is
+    /// examined once and not re-proposed on every later turn.
+    pub watermark: Option<DateTime<Utc>>,
+    /// What every armed goal was assessed to.
+    ///
+    /// The plan requires the outcome OR the rejection to be retained and
+    /// linked to the same goal, so a `wait` is recorded too.
+    pub assessments: Vec<GoalAssessment>,
 }
 
 /// The goals that carry an ARMED condition: usable, and not yet cancelled.
@@ -414,8 +577,39 @@ pub fn sweep_for_reopens(
     let events = recent_memories(config, since, limit)?;
     sweep.events_examined = events.len();
 
+    // The trigger half, as the plan describes it: a trusted source reports a
+    // relevant change -> the affected open goals are retrieved -> the change
+    // is assessed -> the outcome or the rejection is retained against the
+    // same goal.
+    //
+    // reference: https://hindsight.vectorize.io/0.10/developer/api/webhooks
+    //   ("retain.completed and consolidation.completed can mark evidence
+    //   ready and trigger targeted reevaluation ... Assess a single changed
+    //   condition at a time; retain a watermark and last decision.").
+    // reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    //   ("Require evidence of a material change before repeating a
+    //   suggestion."; "Retain the verified outcome or rejection and link it
+    //   to the same goal.").
     for event in &events {
+        // The report time is the watermark: an event is examined once.
+        if let Some(mentioned) = event.mentioned_at {
+            sweep.watermark = Some(match sweep.watermark {
+                Some(current) if current >= mentioned => current,
+                _ => mentioned,
+            });
+        }
+        // Jcode's own conversation is not a change in the world.
+        if event.is_own_echo() {
+            sweep.own_echo_skipped += 1;
+            continue;
+        }
         for (goal, condition) in &armed {
+            // An event the goal already saw is not a material change.
+            if let Some(seen) = condition.last_evidence_at
+                && event.mentioned_at.is_some_and(|at| at <= seen)
+            {
+                continue;
+            }
             let (score, matched) = match_score(condition, &event.text);
             if !is_relevant(score) {
                 continue;
@@ -431,6 +625,12 @@ pub fn sweep_for_reopens(
                 matched_terms: matched,
             };
             let outcome = assess_candidate(config, &candidate, &event.text)?;
+            sweep.assessments.push(GoalAssessment {
+                goal_id: goal.id.clone(),
+                decision: outcome.assessment.decision,
+                evidence_at: event.mentioned_at,
+                worth_notifying: outcome.worth_notifying,
+            });
             if outcome.worth_notifying {
                 sweep.notable.push(outcome);
             }
@@ -626,5 +826,115 @@ mod tests {
             review_state(&goal),
             ReviewState::Assessed { .. }
         ));
+    }
+
+    /// Jcode's own conversation is not a change in the world.
+    ///
+    /// MEASURED 2026-11-10 on the live bank: 197 of the 200 most recent
+    /// events carried `auto-retained`. Without this filter the trigger would
+    /// almost always be reacting to Jcode talking to itself.
+    #[test]
+    fn our_own_conversation_echo_is_recognised() {
+        let echo = crate::memory_hindsight::BankEvent {
+            id: "echo".to_string(),
+            text: "we discussed the free tier".to_string(),
+            tags: vec![
+                crate::memory_hindsight::OWN_ECHO_TAG.to_string(),
+                "origin:jcode".to_string(),
+            ],
+            mentioned_at: Some(Utc::now()),
+        };
+        assert!(echo.is_own_echo());
+
+        let external = crate::memory_hindsight::BankEvent {
+            id: "external".to_string(),
+            text: "the provider opened a free tier".to_string(),
+            tags: vec!["owner:primary".to_string()],
+            mentioned_at: Some(Utc::now()),
+        };
+        assert!(
+            !external.is_own_echo(),
+            "an externally sourced change must not be treated as our echo"
+        );
+    }
+
+    /// The watermark is the OLDEST evidence any armed goal has seen: a goal
+    /// that already saw an event must not be shown it again, but a goal that
+    /// has seen nothing must still get a window to fire in.
+    ///
+    /// reference: https://hindsight.vectorize.io/0.10/developer/api/webhooks
+    ///   ("your endpoint may receive the same event more than once - use the
+    ///   operation_id field to deduplicate if needed"; at-least-once
+    ///   delivery is why a watermark is required rather than trusting each
+    ///   event to arrive once).
+    #[test]
+    fn the_sweep_window_starts_at_the_oldest_seen_evidence() {
+        let mut older = condition(&["free"], "text");
+        older.last_evidence_at = Some(Utc::now() - chrono::Duration::hours(5));
+        let mut newer = condition(&["tier"], "text");
+        newer.last_evidence_at = Some(Utc::now() - chrono::Duration::hours(1));
+
+        let goal = goal_with(condition(&["free"], "text"));
+        let window = sweep_window(&[(goal.clone(), older), (goal, newer)]);
+        let oldest = Utc::now() - chrono::Duration::hours(5);
+        assert!(
+            window <= oldest + chrono::Duration::minutes(1),
+            "the window must not start after the oldest evidence: {window}"
+        );
+    }
+
+    /// A goal with no recorded evidence gets a window of its own.
+    #[test]
+    fn a_goal_that_saw_nothing_still_gets_a_window() {
+        let goal = goal_with(condition(&["free"], "text"));
+        let window = sweep_window(&[(goal, condition(&["free"], "text"))]);
+        let day_ago = Utc::now() - chrono::Duration::hours(24);
+        assert!(
+            window <= day_ago + chrono::Duration::minutes(1),
+            "the default window must reach back a day: {window}"
+        );
+    }
+
+    /// A notice is delivered under its own heading, so the shipped renderer
+    /// gives it its own tile instead of swallowing it into the facts.
+    #[test]
+    fn a_notice_is_rendered_under_its_own_heading() {
+        let outcome = ReopenOutcome {
+            candidate: ReopenCandidate {
+                goal_id: "produce-the-deliverable".to_string(),
+                goal_title: "Produce the deliverable".to_string(),
+                condition: "a free tier becomes usable".to_string(),
+                blocked_because: "the only feasible tool required payment".to_string(),
+                evidence_to_look_for: "a usable free tier".to_string(),
+                preparation_authorized: true,
+                match_score: 0.5,
+                matched_terms: vec!["free".to_string()],
+            },
+            assessment: ReopenAssessment {
+                decision: Some(ReopenDecision::Prepare),
+                why_now: Some("the free tier is usable now".to_string()),
+                text: "The provider now offers a usable free tier.".to_string(),
+                ..Default::default()
+            },
+            worth_notifying: true,
+        };
+
+        let block = render_reopen_block(std::slice::from_ref(&outcome)).expect("a notice");
+        assert!(
+            block.starts_with("## Reopen candidates"),
+            "the notice must carry its own heading: {block}"
+        );
+        assert!(block.contains("produce-the-deliverable"));
+        assert!(block.contains("prepare"));
+        assert!(
+            !block.contains("## Relevant facts"),
+            "the notice must not pretend to be a facts section: {block}"
+        );
+    }
+
+    /// No notice, no block: a `wait` is silence by design.
+    #[test]
+    fn no_notice_renders_no_block() {
+        assert!(render_reopen_block(&[]).is_none());
     }
 }

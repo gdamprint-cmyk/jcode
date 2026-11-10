@@ -103,6 +103,42 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
     }
 }
 
+/// Publish the "reopen a good idea at the right time" notice, if any.
+///
+/// The trigger half runs on the same turn as the recall, but it is INDEPENDENT
+/// of it: a session that recalls no facts may still have a deferred goal whose
+/// condition just became true. The notice arrives as its own memory-block
+/// section, so the shipped renderer gives it its own tile.
+///
+/// A failure here is never fatal: the plan treats a failed decision as
+/// "stay quiet", and a broken trigger must not break the recall.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("If the free tier only changed its name, do nothing."; "Retain the
+///   verified outcome or rejection and link it to the same goal.").
+fn publish_reopen_notice(session_id: &str, working_dir: Option<&str>) {
+    let notice = match crate::goal_review::run_trigger(working_dir.map(std::path::Path::new)) {
+        Ok(Some(notice)) => notice,
+        Ok(None) => return,
+        Err(error) => {
+            crate::logging::info(&format!("reopen trigger failed: {error}"));
+            return;
+        }
+    };
+    // The notice is external content: it describes what the bank reported and
+    // what `reflect` decided about it. It is published as its own payload so
+    // it cannot displace the recall facts, and it is bound to the project so a
+    // session that changes directory does not pick it up.
+    memory::set_pending_memory_external(
+        session_id,
+        notice.clone(),
+        1,
+        vec![format!("reopen:{}", crate::goal_review::REOPEN_SECTION)],
+        None,
+        working_dir,
+    );
+}
+
 /// Handle to communicate with the memory agent
 #[derive(Clone)]
 pub struct MemoryAgentHandle {
@@ -263,6 +299,11 @@ impl MemoryAgent {
             return Ok(());
         }
         let ss = self.sessions.entry(session_id.to_string()).or_default();
+        // The working directory is copied OUT of the session entry before the
+        // recall path borrows `self.sessions` again: the entry borrow is
+        // mutable and lives to the end of this function, so a second borrow
+        // of the map inside it does not compile.
+        let session_working_dir = ss.working_dir.clone();
         // Optional writing is fire-and-forget and never delays a recall request.
         if ss.turns > 0
             && ss.turns.is_multiple_of(PERIODIC_EXTRACTION_INTERVAL)
@@ -319,7 +360,37 @@ impl MemoryAgent {
                 }
             };
             match recall {
-                Ok(recall) => {
+                Ok(mut recall) => {
+                    // A mental model is a DOCUMENT, not a fact. Once the agent
+                    // has read it, sending it again costs context and adds
+                    // nothing: the model does not change between turns, while
+                    // the facts that travel with it DO.
+                    //
+                    // MEASURED 2026-11-10 on the live daemon log: 1055 model
+                    // excerpts were delivered across 92 sessions, and only 179
+                    // (17.0%) were a model's FIRST delivery in its session;
+                    // 772 (73.2%) were a repeat inside the 45-minute
+                    // injected-id TTL, and 104 (9.9%) after it. The payload
+                    // level dedup could not catch this, because it suppresses
+                    // a WHOLE payload, and the facts keep changing.
+                    //
+                    // The model ids are tracked in the same injected-id set as
+                    // the facts, prefixed with "model:" so they cannot collide
+                    // with a Hindsight fact id.
+                    let selected_models = recall.models.len();
+                    recall.models.retain(|model| {
+                        !memory::is_memory_injected(
+                            session_id,
+                            &format!("model:{}", model.id),
+                        )
+                    });
+                    let suppressed_models = selected_models - recall.models.len();
+                    if suppressed_models > 0 {
+                        crate::logging::info(&format!(
+                            "[{}] Suppressed {} already-read mental model(s)",
+                            session_id, suppressed_models
+                        ));
+                    }
                     if let Some(prompt) = crate::memory_hindsight::format_recall_block(&recall) {
                         let count = recall.facts.len();
                         // The ids tracked for the injected-set bookkeeping
@@ -353,11 +424,21 @@ impl MemoryAgent {
                             count,
                             ids,
                             None,
-                            self.sessions
-                                .get(session_id)
-                                .and_then(|state| state.working_dir.as_deref()),
+                            session_working_dir.as_deref(),
                         );
                     }
+                    // The trigger half of "reopen a good idea at the right
+                    // time" runs here too, but on its OWN payload: a session
+                    // that recalls no facts may still have a deferred goal
+                    // whose condition just became true.
+                    //
+                    // reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+                    //   ("When a trusted source reports a relevant change,
+                    //   resolve the product or capability to its entity.
+                    //   Retrieve affected open goals, candidate evidence
+                    //   about the change, the original constraint and any
+                    //   later cancellation.").
+                    publish_reopen_notice(session_id, session_working_dir.as_deref());
                 }
                 Err(error) => {
                     crate::memory_log::log_pending_discarded(

@@ -204,6 +204,14 @@ pub fn recall_configured() -> Result<HindsightConfig> {
     Ok(config)
 }
 
+/// The tag the retain hook puts on every digest of Jcode's own conversation.
+///
+/// MEASURED 2026-11-10 on the live bank: of the 200 most recent events, 197
+/// carried `auto-retained` and only 3 did not. A trigger that reacted to our
+/// own conversation echo would fire on Jcode talking to itself, so this tag
+/// marks the echo and the sweep skips it.
+pub const OWN_ECHO_TAG: &str = "auto-retained";
+
 /// One fact as Hindsight returned it.
 #[derive(Debug, Clone)]
 pub struct HindsightFact {
@@ -237,6 +245,11 @@ pub struct HindsightRecall {
     pub facts: Vec<HindsightFact>,
     /// Mental models relevant to the query, newest synthesis first.
     pub models: Vec<HindsightModel>,
+    /// The query the recall ran against.
+    ///
+    /// The renderer needs it to cut each model at the window that actually
+    /// answers the question instead of at the model's own first page.
+    pub query: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,12 +293,21 @@ struct MentalModelItem {
     /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
     ///   ("Mental models are saved reflect responses that you curate for your
     ///    memory bank"; a model is created with a name and a source_query, and
-    ///    the content is the reflect response for that question). The
-    ///    source_query is therefore the model's TOPIC, and it is the surface
-    ///    that must be matched, not only the body.
+    ///    the content is the reflect response for that question).
+    ///
+    /// MEASURED 2026-11-10 on the live bank: the source_query was USED as
+    /// part of the model's topic surface, and that was wrong. For the four
+    /// technical models it is a 3.4k-7.2k character GENERATION PROMPT (162
+    /// to 382 tokens) rather than a topic label, while the curated models'
+    /// prompts are 212-320 characters. The score sums over the shared tokens,
+    /// so the bigger haystack won regardless of the subject and the technical
+    /// manuals took 40.3% of all delivered model slots. The field is kept for
+    /// the record but is NOT part of the topic surface.
     #[serde(default)]
+    #[allow(dead_code)]
     source_query: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     tags: Option<Vec<String>>,
     /// A stale model has newer input than its last refresh.
     ///
@@ -346,6 +368,7 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         return Ok(HindsightRecall {
             facts: Vec::new(),
             models: Vec::new(),
+            query: String::new(),
         });
     }
     // The server truncates long queries itself; keep the request bounded so a
@@ -428,7 +451,11 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         }
     };
 
-    Ok(HindsightRecall { facts, models })
+    Ok(HindsightRecall {
+        facts,
+        models,
+        query: query.to_string(),
+    })
 }
 
 /// Fetch the mental models that bear on `query`.
@@ -485,8 +512,20 @@ fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightMo
     let parsed: MentalModelsResponse = serde_json::from_str(&text)
         .with_context(|| format!("parse Hindsight mental models response from {url}"))?;
 
-    // A model is a saved reflect response for its source_query, so the topic
-    // surface is name + id + source_query; the body is the long history.
+    // A model is a saved reflect response, so its TOPIC is its name and id.
+    //
+    // MEASURED 2026-11-10 on the live bank: the topic surface used to be
+    // `name + id + source_query`, and the source_query of the four technical
+    // models is a GENERATION PROMPT - 3.4k-7.2k chars, 162-382 tokens - while
+    // the curated models' prompts are 212-320 chars. The score is a SUM over
+    // the shared tokens, so the bigger haystack accumulated more matches and
+    // won the ranking regardless of the topic: the four technical manuals took
+    // 40.3% of all delivered model slots. The prompt is an instruction to
+    // Hindsight, not a description of the subject.
+    //
+    // The body is scored over the SAME WINDOW THAT WILL BE DELIVERED, for the
+    // same reason: a 17k-char model otherwise accumulates matches from text
+    // the agent never sees. What is delivered is what must be ranked.
     let mut candidates: Vec<ModelCandidate> = Vec::new();
     let mut doc_freq: HashMap<String, usize> = HashMap::new();
     for item in parsed.items {
@@ -497,10 +536,9 @@ fn fetch_models(config: &HindsightConfig, query: &str) -> Result<Vec<HindsightMo
         }
         let name = item.name.unwrap_or_default();
         let id = item.id.unwrap_or_default();
-        let source_query = item.source_query.unwrap_or_default();
-        let topic = format!("{name} {id} {source_query}");
+        let topic = format!("{name} {id}");
         let topic_tokens = query_tokens(&topic);
-        let body_tokens = query_tokens(&body);
+        let body_tokens = query_tokens(&body_window(&body, MAX_MODEL_CHARS));
         if topic_tokens.is_empty() && body_tokens.is_empty() {
             continue;
         }
@@ -597,6 +635,145 @@ fn query_tokens(text: &str) -> HashSet<String> {
 
 fn intersect(left: &HashSet<String>, right: &HashSet<String>) -> HashSet<String> {
     left.intersection(right).cloned().collect()
+}
+
+/// The part of a model's text that the agent actually receives.
+///
+/// MEASURED 2026-11-10 on the live bank: `MAX_MODEL_CHARS` is 600 and the
+/// renderer takes the FIRST characters of the model, so an owner-facing model
+/// delivered 69-79% preamble (its own scope caveat and evidence-id legend)
+/// before the first dated fact, while a technical model delivered its first
+/// fact at 0-43%. The delivered window is what must be ranked, and it is
+/// what must be measured for relevance.
+///
+/// The window ends at a sentence boundary when one is close enough, so the
+/// excerpt does not stop mid-word; the hard cap still applies.
+fn body_window(body: &str, cap: usize) -> &str {
+    if body.chars().count() <= cap {
+        return body;
+    }
+    let head: String = body.chars().take(cap).collect();
+    // The last sentence end inside the window; if there is none, the hard cap
+    // is the boundary.
+    match head.rfind(|c| c == '.' || c == '\n' || c == ';' || c == '!') {
+        Some(index) => {
+            let cut = head
+                .char_indices()
+                .nth(index + 1)
+                .map(|(offset, _)| offset)
+                .unwrap_or(head.len());
+            &body[..cut]
+        }
+        None => &body[..cap],
+    }
+}
+
+/// The window of a model's text that best answers `query`.
+///
+/// reference: no prior art, searched the whole jcode workspace for an existing
+///   sentence/excerpt-windowing helper (`fn sentence`, `split_sentences`,
+///   `sentence_boundary`, `excerpt` across crates/) - none exists; the closest
+///   is `memory_prompt.rs::truncate_chars`, a plain head truncation that cannot
+///   choose a window. Upstream Hindsight exposes no per-model excerpt API
+///   either: `GET /mental-models?detail=content` returns the WHOLE document
+///   and the client does the cutting, so the client owns this rule. Upstream's
+///   documented contract for a clipped result is
+///   https://hindsight.vectorize.io/0.10/developer/api/recall ("rather than
+///   clipped mid-sentence"), which this window honours.
+///
+/// A mental model is a whole document: its first page is the model's own
+/// scope caveat, its evidence-id legend and its table header. Delivering
+/// that page means the agent reads a disclaimer instead of a fact.
+///
+/// MEASURED 2026-11-10 on the live daemon log: of 979 delivered model
+/// excerpts, the owner-facing ones put their first dated fact at character
+/// 256-422 of a ~550-character excerpt - 44-79% of the delivered text was
+/// preamble - while the technical ones put theirs at 0-235. The waste was
+/// measured on the DELIVERED text, not on the model.
+///
+/// The window is the run of sentences that contains the most DISTINCT query
+/// tokens, so a window wins when it actually talks about the subject. Ties
+/// keep the earliest window, so a model with no query overlap still delivers
+/// its head rather than an arbitrary later slice.
+fn relevant_window(body: &str, query: &HashSet<String>, cap: usize) -> String {
+    if cap == 0 || body.chars().count() <= cap {
+        return body.to_string();
+    }
+    // Split into sentence units, keeping the delimiter with each unit.
+    let mut units: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in body.chars() {
+        current.push(ch);
+        if ch == '.' || ch == ';' || ch == '!' || ch == '\n' {
+            units.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        units.push(current);
+    }
+    if units.len() < 2 {
+        return body_window(body, cap).to_string();
+    }
+
+    // The query tokens each unit carries.
+    let unit_tokens: Vec<HashSet<String>> = units.iter().map(|u| query_tokens(u)).collect();
+    // The head is the fallback AND the baseline: a window must BEAT the head
+    // on shared tokens to be worth delivering, so a single shared FILLER word
+    // cannot move the excerpt off the model's own opening.
+    //
+    // reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+    //   ("facts are included in relevance order until this budget is exhausted
+    //   - so you always get the most relevant memories that fit"; and a result
+    //   that does not fit is skipped rather than ending the selection). The
+    //   relevance order is what this window reproduces for a whole document:
+    //   upstream ranks facts it extracted, and the client must rank the parts
+    //   of a document it did not extract.
+    //
+    // MEASURED 2026-11-10: the first version of this rule took any window
+    // with one shared token, and the regression test caught it - a model that
+    // merely mentioned the word "subject" was cut to that one sentence instead
+    // of its head. A window needs at least two distinct query tokens (one,
+    // when the query is a single token), or the head is kept.
+    let min_overlap = if query.len() <= 1 { 1 } else { 2 };
+    let mut head_length = 0usize;
+    let mut head_covered: HashSet<String> = HashSet::new();
+    for (index, unit) in units.iter().enumerate() {
+        head_length += unit.chars().count();
+        if head_length > cap && index > 0 {
+            break;
+        }
+        head_covered.extend(unit_tokens[index].intersection(query).cloned());
+    }
+    let head_score = head_covered.len();
+
+    let mut best: Option<(usize, usize, usize)> = None; // (start, end, score)
+    for start in 0..units.len() {
+        let mut length = 0usize;
+        let mut covered: HashSet<String> = HashSet::new();
+        for end in start..units.len() {
+            length += units[end].chars().count();
+            if length > cap && end > start {
+                break;
+            }
+            covered.extend(unit_tokens[end].intersection(query).cloned());
+            let score = covered.len();
+            let better = match best {
+                None => true,
+                Some((_, _, best_score)) => score > best_score,
+            };
+            if better {
+                best = Some((start, end + 1, score));
+            }
+        }
+    }
+    match best {
+        // A window must reach the minimum overlap AND beat the head, or the
+        // head is the honest answer.
+        Some((start, end, score)) if score >= min_overlap && score > head_score => {
+            units[start..end].concat()
+        }
+        _ => body_window(body, cap).to_string(),
+    }
 }
 
 /// The IDF-weighted score of a set of shared tokens.
@@ -781,18 +958,40 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
             let cap = MAX_MODEL_CHARS.min(share);
             let overhead = heading.chars().count() + 10;
             let text_cap = cap.saturating_sub(overhead);
+            // The excerpt is the window of the model that actually answers the
+            // question, not the model's first page.
+            //
+            // reference: no prior art, searched the jcode workspace for an
+            //   existing excerpt-windowing helper - none exists; the closest is
+            //   `memory_prompt.rs::truncate_chars`, a head truncation that
+            //   cannot choose a window. Upstream Hindsight exposes no
+            //   per-model excerpt API either: `GET /mental-models?detail=content`
+            //   returns the WHOLE document and the client cuts it, so the
+            //   client owns this rule. Upstream's contract for a clipped
+            //   result is https://hindsight.vectorize.io/0.10/developer/api/recall
+            //   ("rather than clipped mid-sentence"), which this honours.
+            //
+            // MEASURED 2026-11-10 on the live daemon log: the owner's own
+            // models begin with a scope caveat, an evidence-id legend and a
+            // table header, so the head of the document delivered 44-79%
+            // preamble before the first dated fact, while a technical model's
+            // head delivered its first fact at 0-43%. Cutting at the
+            // query-relevant window turns the excerpt into the part the agent
+            // can act on.
+            let query_tokens = query_tokens(&recall.query);
+            let excerpt = relevant_window(stripped, &query_tokens, text_cap);
             // The ellipsis must fit INSIDE the cap. MEASURED 2026-11-10: it
             // did not - the mark was appended AFTER the excerpt had taken the
             // full quota, so the bullet was one char too long, the budget
             // check rejected it, and the LAST model was dropped on 14 of 20
             // probes. The selection had already decided it mattered.
-            let truncated = stripped.chars().count() > text_cap;
+            let truncated = excerpt.chars().count() > text_cap;
             let take = if truncated {
                 text_cap.saturating_sub(1)
             } else {
                 text_cap
             };
-            let mut head: String = stripped.chars().take(take).collect();
+            let mut head: String = excerpt.chars().take(take).collect();
             if truncated {
                 head.push('…');
             }
@@ -887,6 +1086,37 @@ struct MemoryListItem {
     tags: Option<Vec<String>>,
     #[serde(default)]
     fact_type: Option<String>,
+    /// When the fact was retained into the bank.
+    ///
+    /// MEASURED 2026-11-10 on the live endpoint: the item carries
+    /// `mentioned_at` ("ISO 8601 datetime of when this fact was retained"),
+    /// `updated_at` and `occurred_start`. The report time is `mentioned_at`:
+    /// it is when the source told us, which is what a "trusted source reported
+    /// a change" event means.
+    #[serde(default)]
+    mentioned_at: Option<DateTime<Utc>>,
+}
+
+/// One bank event: what the source reported, and when it reported it.
+#[derive(Debug, Clone)]
+pub struct BankEvent {
+    pub id: String,
+    pub text: String,
+    /// The tags the event carries in the bank.
+    pub tags: Vec<String>,
+    /// When the source reported the change.
+    pub mentioned_at: Option<DateTime<Utc>>,
+}
+
+impl BankEvent {
+    /// Whether this event is an echo of Jcode's own conversation.
+    ///
+    /// The retain hook tags every turn digest of our own conversation with
+    /// `auto-retained`. Such an event is not a change in the world, so it must
+    /// not reopen a goal.
+    pub fn is_own_echo(&self) -> bool {
+        self.tags.iter().any(|tag| tag == OWN_ECHO_TAG)
+    }
 }
 
 /// The memories written to the bank since `since`.
@@ -901,7 +1131,7 @@ pub fn recent_memories(
     config: &HindsightConfig,
     since: DateTime<Utc>,
     limit: usize,
-) -> Result<Vec<HindsightFact>> {
+) -> Result<Vec<BankEvent>> {
     let url = format!(
         "{}/v1/default/banks/{}/memories/list?time_field=created_at&start_date={}&limit={}",
         config.base_url,
@@ -920,10 +1150,11 @@ pub fn recent_memories(
             if text.trim().is_empty() {
                 return None;
             }
-            Some(HindsightFact {
+            Some(BankEvent {
                 id: item.id.unwrap_or_default(),
                 text,
-                score: None,
+                tags: item.tags.unwrap_or_default(),
+                mentioned_at: item.mentioned_at,
             })
         })
         .collect())
@@ -1176,7 +1407,8 @@ mod tests {
         assert!(
             format_recall_block(&HindsightRecall {
                 facts: Vec::new(),
-                models: Vec::new()
+                models: Vec::new(),
+                query: String::new(),
             })
             .is_none()
         );
@@ -1191,6 +1423,7 @@ mod tests {
                 score: Some(0.9),
             }],
             models: Vec::new(),
+            query: "the exact value".into(),
         };
         let block = format_recall_block(&recall).expect("block");
         assert!(block.contains("the exact value is 42"));
@@ -1247,6 +1480,7 @@ mod tests {
                 is_stale: false,
                 is_curated: true,
             }],
+            query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         assert!(
@@ -1265,6 +1499,7 @@ mod tests {
                 score: None,
             }],
             models: Vec::new(),
+            query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         // The fact line itself must be bounded: "- " + MAX_FACT_CHARS chars
@@ -1407,6 +1642,7 @@ mod tests {
                 is_stale: true,
                 is_curated: true,
             }],
+            query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         assert!(
@@ -1452,6 +1688,7 @@ mod tests {
                 is_stale: false,
                 is_curated: true,
             }],
+            query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
 
@@ -1647,6 +1884,7 @@ mod tests {
         let recall = HindsightRecall {
             facts: Vec::new(),
             models,
+            query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
         for i in 0..3 {
@@ -1676,6 +1914,93 @@ mod tests {
         };
         let result = recall(&config, "anything");
         assert!(result.is_err(), "an unreachable server is an error");
+    }
+
+    /// A model whose first page is a disclaimer must deliver the part that
+    /// answers the question, not the disclaimer.
+    ///
+    /// reference: no prior art, searched the jcode workspace for an existing
+    ///   excerpt-windowing helper - none exists; the rule is this workspace's
+    ///   own measurement on the live daemon log.
+    ///
+    /// MEASURED 2026-11-10 on the live daemon log: of 979 delivered model
+    /// excerpts, the owner-facing ones put their first dated fact at character
+    /// 256-422 of a ~550-character excerpt - 44-79% of the delivered text was
+    /// the model's own scope caveat and evidence-id legend. The waste was
+    /// measured on the DELIVERED text.
+    #[test]
+    fn the_excerpt_is_the_query_relevant_window_not_the_models_first_page() {
+        let preamble = "Dates below are the dates recorded for the decision, \
+not a claim that every implementation remains deployed. Evidence IDs refer to \
+the retrieved records. ";
+        let body = format!(
+            "{preamble}2026-09-23 the Windows shared server kept a dead PID \
+alive. 2026-10-24 the orphan build lock blocked selfdev build. "
+        );
+        let query = query_tokens("what blocked the selfdev build lock");
+        // The cap must be SMALLER than the body, or the whole body is the
+        // window and the rule is not exercised. The live models are 3k-17k
+        // chars against a ~570-char cap, so a cut is the normal case.
+        let excerpt = relevant_window(&body, &query, 200);
+        assert!(
+            excerpt.contains("selfdev build"),
+            "the excerpt must carry the answer: {excerpt}"
+        );
+        assert!(
+            !excerpt.starts_with("Dates below are the dates recorded"),
+            "the excerpt must not be the model's disclaimer: {excerpt}"
+        );
+    }
+
+    /// A model with NO overlap with the query keeps its head.
+    ///
+    /// reference: no prior art, searched the jcode workspace for an existing
+    ///   excerpt-windowing helper - none exists; the rule is this workspace's
+    ///   own measurement on the live daemon log.
+    ///
+    /// The relevant-window rule must not silently swap in an arbitrary later
+    /// slice of a model that does not talk about the subject at all: the head
+    /// is the honest answer there.
+    #[test]
+    fn a_model_without_query_overlap_keeps_its_head() {
+        let body = "First sentence about something else. Second sentence. \
+Third sentence about a different subject entirely. ";
+        let query = query_tokens("completely unrelated subject");
+        let excerpt = relevant_window(body, &query, 40);
+        assert!(
+            excerpt.starts_with("First sentence"),
+            "the head must be kept when nothing matches: {excerpt}"
+        );
+    }
+
+    /// The topic surface must not be the model's GENERATION PROMPT.
+    ///
+    /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
+    ///   (a mental model is created with a name and a source_query; the
+    ///   source_query is the PROMPT that generated the content, and upstream
+    ///   has no endpoint that ranks models against a query - the client ranks
+    ///   them, so the client owns the topic surface).
+    ///
+    /// MEASURED 2026-11-10 on the live bank: the source_query of the four
+    /// technical models is a 3.4k-7.2k character prompt (162-382 tokens),
+    /// while the curated models' prompts are 212-320 characters. The score
+    /// sums over the shared tokens, so including the prompt let the bigger
+    /// haystack win regardless of the subject, and the technical manuals took
+    /// 40.3% of all delivered model slots.
+    #[test]
+    fn the_topic_surface_is_the_name_and_id_not_the_generation_prompt() {
+        let topic = format!("{} {}", "User profile and working preferences", "user-profile");
+        let topic_tokens = query_tokens(&topic);
+        assert!(
+            topic_tokens.contains("profile") && topic_tokens.contains("preferences"),
+            "the name must be part of the topic: {topic_tokens:?}"
+        );
+        // The prompt of a technical model must not be searchable as topic
+        // text; that is what made a manual win the ranking.
+        assert!(
+            !topic_tokens.contains("upstream") && !topic_tokens.contains("manual"),
+            "a generation prompt must not leak into the topic surface"
+        );
     }
 
     // reference: https://hindsight.vectorize.io/0.10/developer/api/reflect
