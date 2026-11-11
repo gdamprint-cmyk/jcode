@@ -1673,40 +1673,43 @@ async fn run_memory_command_for_dir(
 
         MemorySubcommand::Search { query, semantic } => {
             if semantic {
-                match crate::memory_jev::recall(&manager, &query, 20, memory::MemoryScope::All)
-                    .await
-                {
+                // MEASURED 2026-11-12: the Jev semantic selector was removed with
+                // the Jev backend (4950764e1). The local graph's semantic scan is
+                // now the only relevance path, so `--semantic` runs it directly
+                // instead of a remote decision that no longer exists.
+                match manager.search_scoped(&query, memory::MemoryScope::All) {
                     Ok(results) => {
                         if results.is_empty() {
                             println!("No memories found matching '{}'", query);
                         } else {
                             println!(
-                                "Found {} memories matching '{}' (Jev relevance):\n",
+                                "Found {} memories matching '{}' (local graph relevance):\n",
                                 results.len(),
                                 query
                             );
-                            for (entry, score) in results {
+                            for entry in results {
                                 let tags_str = if entry.tags.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [{}]", entry.tags.join(", "))
                                 };
+                                let conf = entry.effective_confidence();
                                 println!(
-                                    "- [{}] {}{}\n  id: {} (relevance: {:.0}%)",
+                                    "- [{}] {}{}\n  id: {} (conf: {:.0}%)",
                                     entry.category,
                                     entry.content,
                                     tags_str,
                                     entry.id,
-                                    score * 100.0
+                                    conf * 100.0
                                 );
                                 println!();
                             }
                         }
                     }
                     Err(e) => {
-                        // A credential or transport failure is not an empty
-                        // result and must give scripts a nonzero exit status.
-                        return Err(e.context("Jev memory search failed"));
+                        // A store or transport failure is not an empty result and
+                        // must give scripts a nonzero exit status.
+                        return Err(e.context("local memory search failed"));
                     }
                 }
             } else {
