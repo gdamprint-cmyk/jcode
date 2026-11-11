@@ -230,6 +230,22 @@ pub struct McpServerConfig {
     /// extraction) can raise it here (issues #802, #1174).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Whether this server must run once PER PROJECT DIRECTORY instead of once
+    /// for the whole daemon (default: false).
+    ///
+    /// A shared stdio server inherits the daemon's working directory, so a
+    /// server that resolves its context from the process cwd (a git
+    /// repository, a language-server index) would answer for the wrong
+    /// project in every session outside that directory. Marking it
+    /// `per_project` makes the pool key the server process by the session's
+    /// working directory, so one process serves all sessions in the same
+    /// project while a different project gets its own process.
+    ///
+    /// This is the middle ground between `shared: true` (one process for the
+    /// whole daemon, wrong project) and `shared: false` (one process per
+    /// session, N processes for the same project).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_project: bool,
 }
 
 impl McpServerConfig {
@@ -627,6 +643,10 @@ impl McpConfig {
                             enabled,
                             disabled: None,
                             timeout_secs: None,
+                            per_project: server
+                                .get("per_project")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
                         },
                     );
                 }
