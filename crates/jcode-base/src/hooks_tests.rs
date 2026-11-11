@@ -1,5 +1,129 @@
 use super::*;
 
+/// A hook that never reads stdin AND writes more than the pipe buffer to stdout
+/// used to deadlock the runner: it wrote the whole tool-input JSON into the
+/// child's stdin and only then read the child's stdout, while the child was
+/// blocked writing to a full stdout pipe.
+///
+/// MEASURED on this host (2026-11-11): all six configured `post_tool_feedback`
+/// hooks timed out at exactly 10000 ms, 653 times across two log files.
+///
+/// The hook below ignores stdin and prints far more than the pipe buffer, so a
+/// sequential write-then-read runner would hang until its timeout and return
+/// nothing. The concurrent runner returns the payload.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe
+///   (read 2026-11-11) - "If the pipe buffer is full before all bytes are
+///   written, WriteFile does not return until another process or thread uses
+///   ReadFile to make more buffer space available."
+///
+/// The hook is a Python script because that is what every hook on this host
+/// actually is; `tempfile::TempDir` cleans the script up when it goes out of
+/// scope (https://docs.rs/tempfile/latest/tempfile/struct.TempDir.html).
+#[cfg(windows)]
+#[tokio::test]
+async fn post_tool_feedback_hook_that_ignores_stdin_does_not_deadlock() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+
+    // A hook that ignores stdin and writes 200 KB to stdout.
+    let script = temp.path().join("ignore_stdin.py");
+    std::fs::write(
+        &script,
+        "import sys\n\
+         sys.stdout.write('X' * 200000)\n\
+         sys.stdout.flush()\n",
+    )
+    .expect("write hook script");
+
+    let python = which_python().expect("python on PATH");
+    // The path must use forward slashes: `parse_hook_command` treats a
+    // backslash as an escape character even INSIDE double quotes
+    // (crates/jcode-terminal-launch/src/lib.rs), so a raw `C:\Users\...`
+    // argument would be mangled into `C:Users...` and python would fail to
+    // find the script.
+    let script_arg = script.display().to_string().replace('\\', "/");
+    let command = format!("\"{}\" \"{}\"", python, script_arg);
+
+    let _env = feedback_test_config(&command, 10_000);
+    // The config is cached process-wide; the env override above only takes
+    // effect once the cache is invalidated.
+    crate::config::invalidate_config_cache();
+    let big_input = "x".repeat(100_000);
+
+    let started = std::time::Instant::now();
+    let output = run_post_tool_feedback(
+        &HookEvent::new("post_tool").session_id("ses_deadlock"),
+        &big_input,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let text = output.expect("the hook's stdout must reach the caller");
+    // The runner caps the captured stdout at FEEDBACK_LIMIT, so the caller
+    // receives the truncation marker, not the raw 200 KB.
+    assert!(
+        text.len() >= FEEDBACK_LIMIT,
+        "expected the full truncated payload, got {} bytes",
+        text.len()
+    );
+    assert!(
+        text.contains("[feedback truncated]"),
+        "the hook wrote more than FEEDBACK_LIMIT, so the payload must be marked as truncated: {text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(9),
+        "the runner must not have waited for its timeout: {:?}",
+        elapsed
+    );
+}
+
+/// Locate a Python interpreter for the hook script above.
+#[cfg(windows)]
+fn which_python() -> Option<String> {
+    for candidate in ["python", "python3", "py"] {
+        if let Ok(output) = std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+        {
+            if output.status.success() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Set the `post_tool_feedback` hook command and its timeout, restoring both
+/// when the returned guard is dropped.
+#[cfg(windows)]
+fn feedback_test_config(hook: &str, timeout_ms: u64) -> impl Drop + use<> {
+    struct EnvReset(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..) {
+                match previous {
+                    Some(value) => crate::env::set_var(key, value),
+                    None => crate::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let reset = EnvReset(vec![
+        (
+            "JCODE_HOOK_POST_TOOL_FEEDBACK",
+            std::env::var_os("JCODE_HOOK_POST_TOOL_FEEDBACK"),
+        ),
+        (
+            "JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS",
+            std::env::var_os("JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS"),
+        ),
+    ]);
+    crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK", hook);
+    crate::env::set_var("JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS", timeout_ms.to_string());
+    reset
+}
+
 #[test]
 fn payload_json_includes_event_and_lowercased_fields() {
     let event = HookEvent::new("turn_end")
