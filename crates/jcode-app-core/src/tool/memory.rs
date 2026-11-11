@@ -219,11 +219,14 @@ impl Tool for MemoryTool {
                         result
                     }
                     "jev" | "semantic" | "cascade" => {
+                        // reference: https://hindsight.vectorize.io/developer/api/retain
+                        // (retention is Hindsight-owned; this branch is now the local
+                        // graph's own semantic scan, not a remote Jev decision)
                         let query = match &input.query {
                             Some(q) => q.clone(),
                             None => {
                                 return Err(anyhow::anyhow!(
-                                    "query required for Jev recall (including semantic/cascade aliases)"
+                                    "query required for recall (semantic/cascade are aliases)"
                                 ));
                             }
                         };
@@ -235,10 +238,8 @@ impl Tool for MemoryTool {
                         let results = if limit == 0 {
                             Ok(Vec::new())
                         } else {
-                            crate::memory_jev::recall(&manager, &query, limit, scope).await
+                            manager.search_scoped(&query, scope)
                         };
-                        // A missing Jev credential or failed request must not leave
-                        // the widget busy or silently fall back to unjudged recall.
                         memory::set_state(MemoryState::Idle);
                         let results = results?;
 
@@ -259,26 +260,22 @@ impl Tool for MemoryTool {
                                 results.len(),
                                 query
                             );
-                            for (entry, score) in results {
+                            for entry in results {
                                 let tags_str = if entry.tags.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [{}]", entry.tags.join(", "))
                                 };
                                 out.push_str(&format!(
-                                    "- [{}] {}{}\n  id: {} (relevance: {:.0}%)\n\n",
-                                    entry.category,
-                                    entry.content,
-                                    tags_str,
-                                    entry.id,
-                                    score * 100.0
+                                    "- [{}] {}{}\n  id: {}\n\n",
+                                    entry.category, entry.content, tags_str, entry.id
                                 ));
                             }
                             Ok(ToolOutput::new(out))
                         }
                     }
                     other => Err(anyhow::anyhow!(
-                        "Unknown mode: {}. Use recent or jev (semantic/cascade are Jev aliases)",
+                        "Unknown mode: {}. Use recent or semantic (cascade is an alias)",
                         other
                     )),
                 }

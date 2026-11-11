@@ -626,36 +626,22 @@ swarm_stall_after_secs = 600
 # Env override: JCODE_SWARM_STRIP_LAYOUT
 # swarm_strip_layout = "vertical"
 #
-# Recall uses Jev typed Decisions directly, without embeddings or a sidecar LLM.
-# Provider values: auto, jcode, openrouter, typesafe, laya, aimlapi.
-# auto prefers Jcode, then OpenRouter, TypeSafe, AI/ML API credentials.
-# laya uses a local/self-hosted laya-serve (/v1/systemone, default http://127.0.0.1:8080,
-# override via JCODE_LAYA_BASE_URL or LAYA_BASE_URL, optional LAYA_API_KEY in laya.env).
-# Env override: JCODE_MEMORY_JEV_PROVIDER
-# memory_jev_provider = "auto"
-# Optional per-purpose Jev Decisions model overrides. Unset preserves the
-# selected provider's existing model. Environment overrides take precedence.
-# Env overrides: JCODE_MEMORY_JEV_MODEL, JCODE_BROWSER_JEV_MODEL, JCODE_VOICE_JEV_MODEL
-# memory_jev_model = "typesafe/jev-1.14"
-# browser_jev_model = "typesafe/jev-1.14"
-# voice_jev_model = "typesafe/jev-1.14"
-# Minimum relevance probability (0.8..=1.0). Invalid values fail closed.
-# memory_jev_threshold = 0.8
-# BYOK: OPENROUTER_API_KEY, TYPESAFE_API_KEY, or AIMLAPI_API_KEY.
-# Jcode requires an eligible subscription and gateway memory_jev capability.
-# With a Jcode login and an older gateway, explicitly select a BYOK provider.
-# No fallback after entitlement, auth, billing, or network failure; no silent BYOK spend.
-# Memories remain local; the query and candidate memories go to the selected provider.
-# No keys? Local memory list/search/remember/forget still work.
+# Recall runs on the self-hosted Hindsight server: semantic + BM25 + graph +
+# temporal arms fused by RRF, then a local cross-encoder reranker. No model
+# credentials and no per-turn model call.
+# Env override: JCODE_MEMORY_PROVIDER
+# memory_provider = "hindsight"
+# Hindsight base URL and bank id. Unset = http://127.0.0.1:8888 and jcode-legacy.
+# Env overrides: HINDSIGHT_API_URL, HINDSIGHT_BANK
+# memory_hindsight_url = "http://127.0.0.1:8888"
+# memory_hindsight_bank = "jcode-legacy"
 #
-# Optional text-generating extraction is separate from recall. Disable it to
-# learn only through the main agent's explicit memory writes.
+# Optional model override for extraction only, never recall.
 # (OpenAI defaults to gpt-5.6-luna with reasoning effort "none").
-# Env overrides: JCODE_MEMORY_SIDECAR_ENABLED, JCODE_MEMORY_MODEL
-# memory_sidecar_enabled = true
+# Env override: JCODE_MEMORY_MODEL
 # memory_model = "gpt-5.6-luna"
 # Legacy memory_rerank_* and memory_embedding_* settings are accepted for
-# backwards compatibility, but have no effect on Jev recall.
+# backwards compatibility, but have no effect on Hindsight recall.
 
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.

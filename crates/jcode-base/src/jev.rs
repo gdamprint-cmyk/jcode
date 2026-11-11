@@ -151,11 +151,10 @@ impl JevProvider {
 }
 
 fn configured_model_override(purpose: JevPurpose) -> Option<String> {
+    // MEASURED 2026-11-11: the memory-Jev purpose is gone, so a memory model
+    // override no longer exists. Browser and voice keep their own.
     let (env, configured) = match purpose {
-        JevPurpose::Memory => (
-            "JCODE_MEMORY_JEV_MODEL",
-            crate::config::config().agents.memory_jev_model.clone(),
-        ),
+        JevPurpose::Memory => ("JCODE_MEMORY_JEV_MODEL", None),
         JevPurpose::Browser => (
             "JCODE_BROWSER_JEV_MODEL",
             crate::config::config().agents.browser_jev_model.clone(),
@@ -257,10 +256,11 @@ impl JevClient {
     }
 
     fn resolve(purpose: JevPurpose) -> Result<(JevProvider, String, String, Option<String>)> {
-        let selector = purpose.selector_with(
-            |key| std::env::var(key),
-            || crate::config::config().agents.memory_jev_provider.clone(),
-        )?;
+        // MEASURED 2026-11-11: the memory-Jev selection path was removed. This
+        // resolver still serves browser and voice Jev, which have their own
+        // per-purpose provider override; only the removed memory default is
+        // gone, so the selector falls back to each purpose's own env key.
+        let selector = purpose.selector_with(|key| std::env::var(key), String::new)?;
         // Unlike the API-key helper, this does not consult registered
         // cross-provider fallback resolvers or the shared compatible slot.
         let load = |env: &str, file: &str| {

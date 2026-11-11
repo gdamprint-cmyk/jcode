@@ -494,9 +494,6 @@ impl Config {
                 _ => {}
             }
         }
-        if let Ok(v) = std::env::var("JCODE_MEMORY_JEV_PROVIDER") {
-            self.agents.memory_jev_provider = v.trim().to_ascii_lowercase();
-        }
         if let Ok(v) = std::env::var("JCODE_MEMORY_PROVIDER") {
             self.agents.memory_provider = v.trim().to_ascii_lowercase();
         }
@@ -511,7 +508,6 @@ impl Config {
             }
         }
         for (key, target) in [
-            ("JCODE_MEMORY_JEV_MODEL", &mut self.agents.memory_jev_model),
             (
                 "JCODE_BROWSER_JEV_MODEL",
                 &mut self.agents.browser_jev_model,
@@ -530,11 +526,6 @@ impl Config {
             } else {
                 Some(trimmed.to_string())
             };
-        }
-        if let Ok(v) = std::env::var("JCODE_MEMORY_SIDECAR_ENABLED") {
-            if let Some(parsed) = parse_env_bool(&v) {
-                self.agents.memory_sidecar_enabled = parsed;
-            }
         }
         if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BACKEND") {
             let trimmed = v.trim();

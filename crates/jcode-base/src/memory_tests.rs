@@ -1,5 +1,6 @@
 // reference: ~/.jcode/research/2026-11-04-always-on/recall-first-turn.md
 use super::*;
+use ranking::prefilter_for_jev;
 
 #[test]
 fn manager_without_project_dir_does_not_use_process_cwd() {
@@ -1123,7 +1124,7 @@ fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
 }
 
 #[test]
-fn jev_recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
+fn recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
     let mut entries: Vec<MemoryEntry> = (0..2000)
         .map(|i| {
             MemoryEntry::new(
@@ -1139,12 +1140,10 @@ fn jev_recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
     let kept = prefilter_for_jev(entries, "update the fundraising CRM notes for the SAFE");
     assert!(kept.len() <= MAX_JEV_RECALL_CANDIDATES);
     assert!(kept.iter().any(|e| e.content.contains("fundraising CRM")));
-    // At most three Jev batches of 24 per recall instead of ~84 for this store.
-    assert!(kept.len().div_ceil(crate::memory_jev::MAX_BATCH_ENTRIES) <= 3);
 }
 
 #[test]
-fn jev_recall_prefilter_leaves_small_stores_untouched() {
+fn recall_prefilter_leaves_small_stores_untouched() {
     let entries: Vec<MemoryEntry> = (0..10)
         .map(|i| MemoryEntry::new(MemoryCategory::Fact, format!("note {i}")))
         .collect();

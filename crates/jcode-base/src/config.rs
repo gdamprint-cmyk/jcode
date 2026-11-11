@@ -95,26 +95,20 @@ snippet_pointer = "/summary"
 
 #[cfg(test)]
 #[test]
-fn agents_jev_models_parse_and_default_unset() {
+fn agents_browser_and_voice_jev_models_parse_and_default_unset() {
     let config: AgentsConfig = toml::from_str(
         r#"
-memory_jev_model = "typesafe/jev-1.14"
 browser_jev_model = "typesafe/jev-1.14"
 voice_jev_model = "typesafe/jev-1.14"
 "#,
     )
     .unwrap();
     assert_eq!(
-        config.memory_jev_model.as_deref(),
-        Some("typesafe/jev-1.14")
-    );
-    assert_eq!(
         config.browser_jev_model.as_deref(),
         Some("typesafe/jev-1.14")
     );
     assert_eq!(config.voice_jev_model.as_deref(), Some("typesafe/jev-1.14"));
     let defaults = AgentsConfig::default();
-    assert!(defaults.memory_jev_model.is_none());
     assert!(defaults.browser_jev_model.is_none());
     assert!(defaults.voice_jev_model.is_none());
 }
@@ -229,14 +223,12 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MEMORY_PROVIDER",
     "JCODE_MEMORY_HINDSIGHT_LIMIT",
     "JCODE_MEMORY_REFRESH_TOOL_CALLS",
-    "JCODE_MEMORY_JEV_PROVIDER",
     "JCODE_BROWSER_HANDOFF",
     "JCODE_BROWSER_JEV_PROVIDER",
     "JCODE_VOICE_JEV_PROVIDER",
     "JCODE_LAYA_BASE_URL",
     "LAYA_BASE_URL",
     "LAYA_API_KEY",
-    "JCODE_MEMORY_JEV_MODEL",
     "JCODE_BROWSER_JEV_MODEL",
     "JCODE_VOICE_JEV_MODEL",
     "JCODE_ENABLE_MERMAID",

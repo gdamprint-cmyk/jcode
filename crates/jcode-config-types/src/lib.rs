@@ -533,15 +533,14 @@ pub struct AgentsConfig {
     /// as chips on a single row.
     #[serde(default)]
     pub swarm_strip_layout: SwarmStripLayout,
-    /// Jev Decisions provider for recall: auto, openrouter, typesafe, laya,
-    /// aimlapi, or jcode. Auto uses a provider-specific BYOK credential before Jcode.
-    #[serde(default = "default_memory_jev_provider")]
-    pub memory_jev_provider: String,
-    /// Retrieval backend for automatic memory recall: `jev` (remote Jev model,
-    /// the historical default) or `hindsight` (a self-hosted Hindsight server:
-    /// semantic + BM25 + graph + temporal arms fused by RRF, then a local
-    /// cross-encoder reranker). `hindsight` needs no model credentials and
-    /// makes no per-turn model call.
+    /// Retrieval backend for automatic memory recall. Hindsight is the only
+    /// backend: a self-hosted server (semantic + BM25 + graph + temporal arms
+    /// fused by RRF, then a local cross-encoder reranker). It needs no model
+    /// credentials and makes no per-turn model call.
+    ///
+    /// MEASURED 2026-11-11: the remote Jev selection path was removed. The
+    /// value is kept so an older config.toml still parses; `jev` is treated as
+    /// Hindsight, and `memory_provider_enabled` is the single gate.
     #[serde(default = "default_memory_provider")]
     pub memory_provider: String,
     /// Hindsight base URL when `memory_provider = "hindsight"`.
@@ -559,31 +558,22 @@ pub struct AgentsConfig {
     /// user-turn refresh is unaffected.
     #[serde(default = "default_memory_refresh_tool_calls")]
     pub memory_refresh_tool_calls: usize,
-    /// Optional model override for memory Jev Decisions.
-    pub memory_jev_model: Option<String>,
     /// Optional model override for browser Jev Decisions.
     pub browser_jev_model: Option<String>,
     /// Optional model override for voice Jev Decisions.
     pub voice_jev_model: Option<String>,
-    /// Minimum Jev relevance probability. Invalid values fail closed.
-    #[serde(default = "default_memory_jev_threshold")]
-    pub memory_jev_threshold: f32,
     /// Optional model override for memory extraction only, never recall.
     pub memory_model: Option<String>,
-    /// Whether optional automatic memory extraction may use a text-generating
-    /// sidecar. Recall always uses Jev and is independent of this setting.
-    #[serde(default = "default_memory_sidecar_enabled")]
-    pub memory_sidecar_enabled: bool,
-    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
+    /// Legacy setting, retained for config compatibility. Hindsight recall ignores it.
     #[serde(default = "default_memory_rerank_cadence")]
     pub memory_rerank_cadence: usize,
-    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
+    /// Legacy setting, retained for config compatibility. Hindsight recall ignores it.
     #[serde(default = "default_memory_rerank_votes")]
     pub memory_rerank_votes: usize,
-    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
+    /// Legacy setting, retained for config compatibility. Hindsight recall ignores it.
     #[serde(default = "default_memory_rerank_min_agree")]
     pub memory_rerank_min_agree: usize,
-    /// Legacy benchmark/debug embedding backend. Jev recall never uses it.
+    /// Legacy benchmark/debug embedding backend. The local graph ignores it.
     #[serde(default = "default_memory_embedding_backend")]
     pub memory_embedding_backend: String,
     /// OpenAI embedding model name when `memory_embedding_backend = "openai"`.
@@ -632,12 +622,8 @@ fn default_memory_embedding_backend() -> String {
     "local".to_string()
 }
 
-fn default_memory_jev_provider() -> String {
-    "auto".to_string()
-}
-
 fn default_memory_provider() -> String {
-    "jev".to_string()
+    "hindsight".to_string()
 }
 
 fn default_memory_hindsight_limit() -> usize {
@@ -646,14 +632,6 @@ fn default_memory_hindsight_limit() -> usize {
 
 fn default_memory_refresh_tool_calls() -> usize {
     30
-}
-
-fn default_memory_jev_threshold() -> f32 {
-    0.8
-}
-
-fn default_memory_sidecar_enabled() -> bool {
-    true
 }
 
 fn default_memory_rerank_cadence() -> usize {
@@ -679,18 +657,14 @@ impl Default for AgentsConfig {
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
-            memory_jev_provider: default_memory_jev_provider(),
             memory_provider: default_memory_provider(),
             memory_hindsight_url: None,
             memory_hindsight_bank: None,
             memory_hindsight_limit: default_memory_hindsight_limit(),
             memory_refresh_tool_calls: default_memory_refresh_tool_calls(),
-            memory_jev_model: None,
             browser_jev_model: None,
             voice_jev_model: None,
-            memory_jev_threshold: default_memory_jev_threshold(),
             memory_model: None,
-            memory_sidecar_enabled: default_memory_sidecar_enabled(),
             memory_rerank_cadence: default_memory_rerank_cadence(),
             memory_rerank_votes: default_memory_rerank_votes(),
             memory_rerank_min_agree: default_memory_rerank_min_agree(),
