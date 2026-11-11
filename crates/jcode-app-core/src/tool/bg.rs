@@ -3,7 +3,7 @@
 //! Allows the agent to list, wait on, inspect, read output from, and manage
 //! background tasks.
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolExecutionMode, ToolOutput};
 use crate::background;
 use crate::bus::BackgroundTaskStatus;
 use anyhow::Result;
@@ -23,6 +23,31 @@ fn default_watch_wake() -> bool {
 
 fn default_wait_return_on_progress() -> bool {
     true
+}
+
+// reference: feature commit b861f370a "feat(bg): stall watchdog wakes the agent
+// when a background task goes quiet" promises "bg wait returns immediately when
+// the watchdog fires"; docs/TOOL_BACKGROUND_TIMEOUT.md; changelog/v0.61.0.json
+// ("A stall watchdog logs long silent hangs during active work so they can be
+// diagnosed"). Web search for a public doc found no prior art: the bg tool is
+// internal to jcode.
+/// Stall watchdog window for `wait`: the explicit request if given, otherwise
+/// half the capped budget so a stall returns with a reason and the output tail
+/// instead of burning the whole budget into a bare timeout.
+///
+/// `None` when the budget is zero (an immediate check): arming there would
+/// leave a live 30s watchdog nobody asked for.
+///
+/// Do not pass the full `capped_wait`: `wait()` races its `Timeout` arm against
+/// the `BackgroundTaskStalled` bus arm, and equal deadlines make the outcome
+/// nondeterministic. The clamp to
+/// [`background::BackgroundTaskManager::MIN_STALL_WAKE_SECONDS`] is applied
+/// inside the manager, which returns the effective window.
+fn derive_stall_window(requested: Option<u64>, capped_wait: u64) -> Option<u64> {
+    if capped_wait == 0 {
+        return None;
+    }
+    Some(requested.unwrap_or(capped_wait / 2))
 }
 
 const DEFAULT_WAIT_SECONDS: u64 = 60;
@@ -74,8 +99,10 @@ struct BgInput {
     /// Whether to wake on completion when using watch/delivery (default: true)
     #[serde(default)]
     wake: Option<bool>,
-    /// For watch/delivery: also arm a stall watchdog that wakes the agent after
-    /// this many seconds with no new output or progress (resets on activity)
+    /// For wait: arm a stall watchdog that wakes the agent after this many seconds
+    /// with no new output or progress (resets on activity). Default is half
+    /// max_wait_seconds; min 30 (the manager clamps up). For watch/delivery: arm on
+    /// an existing task. An explicit request overrides the wait default.
     #[serde(default)]
     stall_wake_seconds: Option<u64>,
     /// Max seconds to block when using wait (default: 60, capped at 3600)
@@ -543,7 +570,7 @@ impl Tool for BgTool {
                 "dry_run": { "type": "boolean", "description": "For cleanup, report what would be removed without deleting." },
                 "notify": { "type": "boolean", "description": "When using delivery/watch/subscribe, whether to notify on completion. Defaults to true." },
                 "wake": { "type": "boolean", "description": "When using delivery/watch/subscribe, whether to wake on completion. Defaults to true." },
-                "stall_wake_seconds": { "type": "integer", "description": "For delivery/watch: also wake after N seconds without output/progress (min 30). For jobs that may hang." },
+                "stall_wake_seconds": { "type": "integer", "description": "For wait: arm a stall watchdog that wakes after N seconds without output/progress (min 30, resets on activity). Default is half max_wait_seconds. For delivery/watch: arm on an existing task. For jobs that may hang." },
                 "max_wait_seconds": { "type": "integer", "description": "For wait: max seconds to block. Default 60, cap 3600, 0 = immediate check." },
                 "return_on_progress": { "type": "boolean", "description": "For wait: return on the first progress/checkpoint event too. Defaults to true." },
                 "wait_mode": { "type": "string", "enum": ["any", "all", "first_failure"], "description": "For multi-task wait, return on any completion, all completions, or first failure. Defaults to any." },
@@ -808,6 +835,14 @@ impl Tool for BgTool {
                         "Missing task_id; provide a task_id or use latest=true"
                     ));
                 };
+                // A quiet task is the failure mode `wait` exists to catch, so arm the
+                // stall watchdog for a fraction of the budget we are willing to block.
+                // A stall then returns with a reason and the output tail instead of a
+                // bare timeout.
+                let stall_armed = match derive_stall_window(params.stall_wake_seconds, capped_wait) {
+                    Some(requested) => manager.arm_stall_watchdog(&task_id, requested).await,
+                    None => None,
+                };
                 let blocking = if capped_wait > 0 {
                     manager
                         .status(&task_id)
@@ -849,10 +884,18 @@ impl Tool for BgTool {
                             background::BackgroundTaskWaitReason::Stalled => {
                                 "Background task stall watchdog fired: no output or progress for its stall window. The task is still running; inspect it and decide whether to keep waiting or cancel.\n\n".to_string()
                             }
-                            background::BackgroundTaskWaitReason::Timeout => format!(
-                                "No terminal event before max wait of {}s. Check again with `bg action=\"wait\" task_id=\"{}\"` or inspect status/output.\n\n",
-                                capped_wait, task_id
-                            ),
+                            background::BackgroundTaskWaitReason::Timeout => {
+                                let mut message = format!(
+                                    "No terminal event before max wait of {}s. Check again with `bg action=\"wait\" task_id=\"{}\"` or inspect status/output.\n\n",
+                                    capped_wait, task_id
+                                );
+                                if stall_armed.is_some() {
+                                    message.push_str(
+                                        "Stall watchdog is still armed, so a later quiet window will wake the agent.\n\n",
+                                    );
+                                }
+                                message
+                            }
                         };
                         output.push_str(&format_task_details(&task));
                         if requested_wait > MAX_WAIT_SECONDS {
@@ -902,6 +945,7 @@ impl Tool for BgTool {
                                 "wait_reason": reason_str,
                                 "timed_out": matches!(reason, background::BackgroundTaskWaitReason::Timeout),
                                 "max_wait_seconds": capped_wait,
+                                "stall_wake_seconds": stall_armed,
                                 "return_on_progress": params.return_on_progress.unwrap_or_else(default_wait_return_on_progress),
                                 "exit_code": task.exit_code,
                                 "progress": task.progress,
@@ -983,6 +1027,92 @@ mod tests {
         assert_eq!(branches[0]["type"], json!("string"));
         assert_eq!(branches[1]["type"], json!("array"));
         assert_eq!(branches[1]["items"]["type"], json!("string"));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_stall_window_is_half_the_budget_and_honours_an_explicit_request() {
+        assert_eq!(derive_stall_window(Some(120), 600), Some(120));
+        assert_eq!(derive_stall_window(None, 600), Some(300));
+        assert_eq!(derive_stall_window(None, 60), Some(30));
+        assert_eq!(derive_stall_window(None, 10), Some(5)); // clamped to 30 inside the manager
+        assert_eq!(derive_stall_window(None, 0), None); // immediate check: never arm
+        assert_eq!(derive_stall_window(Some(120), 0), None);
+    }
+
+    // reference: tokio::time docs (docs.rs/tokio/latest/tokio/time/index.html,
+    // "Pausing time" + `test-util` feature) for `#[tokio::test(start_paused =
+    // true)]`, which auto-advances the virtual clock when the runtime is idle;
+    // and feature commit b861f370a, which promises `bg wait returns immediately
+    // when the watchdog fires`.
+    //
+    // The arithmetic test above cannot prove the arm call happens. This test
+    // drives the real tool: `wait` must arm the watchdog BEFORE it blocks, so a
+    // task that produces nothing returns with `stalled` instead of burning the
+    // whole budget into a bare `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_arms_stall_watchdog_so_a_quiet_task_reports_stalled() -> Result<()> {
+        let manager = background::global();
+        let session = "bg-wait-stall-test";
+        let info = manager
+            .spawn_with_notify(
+                "bash",
+                Some("quiet task".to_string()),
+                session,
+                false,
+                false,
+                |_output_path| async move {
+                    // Hang well past the derived stall window, producing no output.
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Ok(background::TaskResult::completed(Some(0)))
+                },
+            )
+            .await;
+
+        let ctx = ToolContext {
+            session_id: session.to_string(),
+            message_id: "m".to_string(),
+            tool_call_id: "c".to_string(),
+            working_dir: None,
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+
+        let out = BgTool::new()
+            .execute(
+                json!({
+                    "action": "wait",
+                    "task_id": info.task_id,
+                    "max_wait_seconds": 600,
+                    "return_on_progress": false,
+                    "intent": "wait for the quiet task",
+                }),
+                ctx,
+            )
+            .await?;
+
+        // Before the fix: "timeout" at 600s, because nothing armed the watchdog.
+        // After the fix: "stalled" at capped_wait / 2 = 300s.
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m.get("wait_reason")),
+            Some(&json!("stalled")),
+            "bg wait must arm a stall watchdog; metadata={:?}",
+            out.metadata
+        );
+        assert_eq!(
+            out.metadata.as_ref().and_then(|m| m.get("stall_wake_seconds")),
+            Some(&json!(300)),
+            "the armed window must be reported back to the agent"
+        );
+
+        let status = manager
+            .status(&info.task_id)
+            .await
+            .ok_or_else(|| anyhow!("status should exist"))?;
+        assert_eq!(status.stall_wake_seconds, Some(300));
+
+        manager.cancel(&info.task_id).await?;
         Ok(())
     }
 

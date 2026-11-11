@@ -417,6 +417,7 @@ async fn test_list_shows_disabled_configured_server() {
             enabled: Some(false),
             disabled: None,
             timeout_secs: None,
+            per_project: false,
         },
     );
     let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
