@@ -220,6 +220,23 @@ pub struct HindsightFact {
     pub text: String,
     /// Final ranking score, when the server reported one.
     pub score: Option<f64>,
+    /// The date the fact was TRUE, when the bank carries one.
+    ///
+    /// MEASURED 2026-11-11 (owner directive): only SOME facts arrived with a
+    /// date, because the date was whatever the extractor happened to write into
+    /// the fact text. The bank stores the date as a COLUMN (`mentioned_at` /
+    /// `occurred_start` / `updated_at`), so the renderer can stamp EVERY fact
+    /// with it and let the agent defend against a stale fact by date.
+    ///
+    /// reference: https://hindsight.vectorize.io/developer/api/retain
+    ///   (the retain `timestamp` parameter is injected into the fact-extraction
+    ///   prompt, so relative dates like "last Monday" resolve against a real
+    ///   anchor and the extracted fact carries a date)
+    /// reference: https://hindsight.vectorize.io/api-reference
+    ///   (GET .../memories/list returns `mentioned_at`, `occurred_start`,
+    ///   `occurred_end`, `updated_at`; recall results carry `occurred_start` /
+    ///   `occurred_end`)
+    pub dated: Option<String>,
 }
 
 /// One mental model excerpt as Hindsight returned it.
@@ -266,6 +283,22 @@ struct RecallResult {
     text: Option<String>,
     #[serde(default)]
     scores: Option<RecallScores>,
+    /// The event time the fact is true for. `mentioned_at` is when the source
+    /// said it; `occurred_start`/`occurred_end` bracket the event itself.
+    ///
+    /// reference: https://hindsight.vectorize.io/api-reference
+    ///   (recall results carry mentioned_at, occurred_start, occurred_end)
+    ///
+    /// MEASURED 2026-11-11 against the live recall endpoint: a result carries
+    /// `mentioned_at` plus `occurred_start`/`occurred_end`, and the latter are
+    /// NULL for facts whose extractor set no event date. So the event time wins
+    /// when present and `mentioned_at` is the universal fallback.
+    #[serde(default)]
+    mentioned_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    occurred_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    occurred_end: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +468,7 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
             id: item.id.unwrap_or_default(),
             text: cleaned,
             score,
+            dated: fact_date(item.mentioned_at, item.occurred_start, item.occurred_end),
         });
         if facts.len() >= config.limit {
             break;
@@ -456,6 +490,30 @@ pub fn recall(config: &HindsightConfig, query: &str) -> Result<HindsightRecall> 
         models,
         query: query.to_string(),
     })
+}
+
+/// The date a recalled fact is true for, as a short ISO stamp.
+///
+/// Priority: the event itself (`occurred_start`), then when the source said it
+/// (`mentioned_at`). The first is the date the fact was TRUE; `mentioned_at` is
+/// the universal fallback because the live recall endpoint fills it for every
+/// fact, while `occurred_start` is NULL whenever the extractor set no event date.
+/// A fact with neither is returned as `None` and the renderer stamps it
+/// explicitly as undated - it must not silently look current.
+fn fact_date(
+    mentioned_at: Option<DateTime<Utc>>,
+    occurred_start: Option<DateTime<Utc>>,
+    occurred_end: Option<DateTime<Utc>>,
+) -> Option<String> {
+    let moment = occurred_start.or(mentioned_at);
+    let moment = moment?;
+    let mut stamp = moment.format("%Y-%m-%d").to_string();
+    if let Some(end) = occurred_end
+        && end.format("%Y-%m-%d").to_string() != stamp
+    {
+        stamp.push_str(&format!("..{}", end.format("%Y-%m-%d")));
+    }
+    Some(stamp)
 }
 
 /// Fetch the mental models that bear on `query`.
@@ -875,7 +933,12 @@ pub fn format_recall_block(recall: &HindsightRecall) -> Option<String> {
             if head.chars().count() < fact.text.chars().count() {
                 head.push('…');
             }
-            let line = format!("- {head}\n");
+            // EVERY fact carries its date. MEASURED 2026-11-11 (owner directive):
+            // some facts had a date only because the extractor wrote one into the
+            // text; a fact without a bank date looked current, which is how stale
+            // facts survived. An explicit `(undated)` is the honest marker.
+            let dated = fact.dated.as_deref().unwrap_or("undated");
+            let line = format!("- [{dated}] {head}\n");
             // The bound is enforced HERE, at the rendering boundary, not only in
             // `recall`: this is the single place every fact passes through, so
             // the block cannot carry an unbounded line whatever produced it.
@@ -1439,6 +1502,49 @@ mod tests {
         );
     }
 
+    /// EVERY delivered fact carries its date, and a fact with no bank date is
+    /// marked `undated` rather than looking current.
+    ///
+    /// MEASURED 2026-11-11 (owner directive): some facts arrived dated only
+    /// because the extractor wrote a date into the text, so a fact without one
+    /// was indistinguishable from a current fact. The renderer now stamps every
+    /// fact from the bank's own date column.
+    #[test]
+    fn every_fact_line_carries_a_date_and_undated_is_explicit() {
+        let recall = HindsightRecall {
+            facts: vec![
+                HindsightFact {
+                    id: "dated".into(),
+                    text: "a fact with a bank date".into(),
+                    score: Some(0.9),
+                    dated: Some("2026-11-11".into()),
+                },
+                HindsightFact {
+                    id: "undated".into(),
+                    text: "a fact with no bank date".into(),
+                    score: Some(0.8),
+                    dated: None,
+                },
+            ],
+            models: Vec::new(),
+            query: String::new(),
+        };
+        let block = format_recall_block(&recall).expect("block");
+        let fact_lines: Vec<&str> = block
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect();
+        assert_eq!(fact_lines.len(), 2, "both facts must be delivered: {block}");
+        for line in &fact_lines {
+            assert!(
+                line.contains("[2026-11-11]") || line.contains("[undated]"),
+                "every fact line must carry a date stamp, got: {line}"
+            );
+        }
+        assert!(block.contains("[2026-11-11]"), "the dated fact keeps its date");
+        assert!(block.contains("[undated]"), "the undated fact is marked honestly");
+    }
+
     #[test]
     fn block_contains_the_recalled_facts_and_nothing_else() {
         let recall = HindsightRecall {
@@ -1446,6 +1552,7 @@ mod tests {
                 id: "abc".into(),
                 text: "the exact value is 42".into(),
                 score: Some(0.9),
+                dated: Some("2026-11-11".into()),
             }],
             models: Vec::new(),
             query: "the exact value".into(),
@@ -1494,6 +1601,7 @@ mod tests {
                 id: format!("f{i}"),
                 text: format!("fact number {i} {}", "x".repeat(400)),
                 score: Some(0.9),
+                dated: Some("2026-11-11".into()),
             })
             .collect();
         let recall = HindsightRecall {
@@ -1522,20 +1630,23 @@ mod tests {
                 id: "x".into(),
                 text: "a".repeat(MAX_FACT_CHARS * 2),
                 score: None,
+                dated: Some("2026-11-11".into()),
             }],
             models: Vec::new(),
             query: String::new(),
         };
         let block = format_recall_block(&recall).expect("block");
-        // The fact line itself must be bounded: "- " + MAX_FACT_CHARS chars
-        // + the ellipsis marker.
+        // The fact TEXT must be bounded: "- " + "[YYYY-MM-DD]" + MAX_FACT_CHARS
+        // chars + the ellipsis marker. The date stamp is a fixed prefix, so it is
+        // part of the line but not part of the fact's own budget.
         let fact_line = block
             .lines()
             .find(|line| line.starts_with("- "))
             .expect("a fact line");
+        let prefix = "- [2026-11-11] ";
         assert!(
-            fact_line.chars().count() <= MAX_FACT_CHARS + 4,
-            "the fact line must be truncated to MAX_FACT_CHARS, got {} chars",
+            fact_line.chars().count() <= MAX_FACT_CHARS + prefix.len() + 1,
+            "the fact text must be truncated to MAX_FACT_CHARS, got {} chars",
             fact_line.chars().count()
         );
         assert!(!block.contains(&"a".repeat(MAX_FACT_CHARS + 1)));
@@ -1704,6 +1815,7 @@ mod tests {
                 id: "f1".into(),
                 text: "a relevant fact".into(),
                 score: Some(0.9),
+                dated: Some("2026-11-11".into()),
             }],
             models: vec![HindsightModel {
                 id: "machine-hazards".into(),
