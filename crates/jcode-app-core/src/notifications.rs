@@ -790,13 +790,45 @@ fn send_desktop(title: &str, body: &str, urgency: &str) {
             ps_quote(title),
             ps_quote(&short_body)
         );
-        let _ = std::process::Command::new("powershell")
+        let child = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+
+        match child {
+            Ok(mut child) => {
+                // A toast is fire-and-forget for the caller, but the spawn result
+                // and the PowerShell exit status are otherwise invisible: this
+                // branch was the only channel with no `logging::` call at all, so
+                // "toast was dispatched" could not be told from "powershell never
+                // ran". Log both, without blocking the ambient cycle on the wait.
+                logging::info(&format!("Desktop toast spawned: {}", title));
+                let log_title = title.to_string();
+                std::thread::spawn(move || match child.wait() {
+                    Ok(status) if status.success() => {
+                        logging::info(&format!("Desktop toast exited ok: {}", log_title));
+                    }
+                    Ok(status) => {
+                        logging::warn(&format!(
+                            "Desktop toast exited with {}: {}",
+                            status, log_title
+                        ));
+                    }
+                    Err(e) => {
+                        logging::warn(&format!(
+                            "Desktop toast wait failed: {}: {}",
+                            e, log_title
+                        ));
+                    }
+                });
+            }
+            Err(e) => {
+                logging::warn(&format!("Desktop toast spawn failed: {}: {}", e, title));
+            }
+        }
     }
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
