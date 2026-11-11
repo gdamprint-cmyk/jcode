@@ -1126,6 +1126,30 @@ impl BankEvent {
     }
 }
 
+/// The URL that lists the bank's memories written since `since`.
+///
+/// MEASURED 2026-11-11: a raw `+00:00` offset in the query string made EVERY
+/// reopen trigger fail. The server decodes `+` in a query value as a space,
+/// so the timestamp arrived as '2026-11-10T01:24:15.828887300 00:00' and the
+/// endpoint answered 400 "Invalid start_date". The trigger therefore never
+/// fired once: 1292 consecutive failures in the daemon log. Two changes, both
+/// measured against the live server (http://localhost:8888): the `Z` form
+/// carries no `+` at all, and the percent-encoding makes the value safe for
+/// any query parser.
+fn recent_memories_url(config: &HindsightConfig, since: DateTime<Utc>, limit: usize) -> String {
+    let start = urlencoding::encode(
+        &since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .into_owned();
+    format!(
+        "{}/v1/default/banks/{}/memories/list?time_field=created_at&start_date={}&limit={}",
+        config.base_url,
+        config.bank,
+        start,
+        limit.clamp(1, 200),
+    )
+}
+
 /// The memories written to the bank since `since`.
 ///
 /// These are the "trusted source reported a relevant change" events of the
@@ -1139,13 +1163,7 @@ pub fn recent_memories(
     since: DateTime<Utc>,
     limit: usize,
 ) -> Result<Vec<BankEvent>> {
-    let url = format!(
-        "{}/v1/default/banks/{}/memories/list?time_field=created_at&start_date={}&limit={}",
-        config.base_url,
-        config.bank,
-        since.to_rfc3339(),
-        limit.clamp(1, 200),
-    );
+    let url = recent_memories_url(config, since, limit);
     let raw = get_json(&url)?;
     let response: MemoriesListResponse = serde_json::from_str(&raw)
         .with_context(|| format!("parse Hindsight memories list from {url}"))?;
@@ -2091,5 +2109,75 @@ Third sentence about a different subject entirely. ";
         };
         let result = assess_reopen(&config, "anything");
         assert!(result.is_err(), "an unreachable server is an error");
+    }
+
+    /// The `start_date` query value must survive a query-string parser.
+    ///
+    /// MEASURED 2026-11-11 against the live server: the raw `+00:00` offset
+    /// arrived as `... 00:00` (a `+` in a query value decodes to a space) and
+    /// the endpoint answered 400 "Invalid start_date" - 1292 consecutive
+    /// failures, so the reopen trigger never fired once. This test pins the
+    /// SHIPPED URL, not a reconstruction: it asserts that the built URL
+    /// carries neither a `+` nor a space in the value, and that decoding the
+    /// value gives back the same instant.
+    #[test]
+    fn the_start_date_query_value_is_url_safe() {
+        let config = HindsightConfig {
+            base_url: "http://localhost:8888".to_string(),
+            bank: "jcode-legacy".to_string(),
+            ..HindsightConfig::default()
+        };
+        let since = DateTime::parse_from_rfc3339("2026-11-10T01:24:15.828887+00:00")
+            .expect("fixture parses")
+            .with_timezone(&Utc);
+        let url = recent_memories_url(&config, since, 50);
+        let value = url
+            .split("start_date=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("the url carries a start_date value")
+            .to_string();
+
+        assert!(
+            !value.contains('+'),
+            "a raw + breaks the query value: {value}"
+        );
+        assert!(
+            !value.contains(' '),
+            "a space breaks the query value: {value}"
+        );
+
+        // Decoding it back must give the same instant to the millisecond,
+        // which is the precision the `Z` form keeps.
+        let decoded = urlencoding::decode(&value)
+            .expect("the encoded value decodes")
+            .into_owned();
+        let parsed = DateTime::parse_from_rfc3339(&decoded).expect("decoded parses");
+        assert_eq!(
+            parsed.with_timezone(&Utc).timestamp_millis(),
+            since.timestamp_millis()
+        );
+    }
+
+    /// A raw (unencoded) timestamp must NOT be what the code sends.
+    ///
+    /// This is the negative control for the test above: it reproduces the
+    /// defect deliberately and shows that the value the OLD code produced
+    /// would have carried a `+` that a query parser turns into a space.
+    #[test]
+    fn the_old_unencoded_timestamp_would_have_broken() {
+        let since = DateTime::parse_from_rfc3339("2026-11-10T01:24:15.828887+00:00")
+            .expect("fixture parses")
+            .with_timezone(&Utc);
+        let old = since.to_rfc3339();
+        assert!(
+            old.contains('+'),
+            "the old form is the one that failed: {old}"
+        );
+        let decoded_like_a_query_parser = old.replace('+', " ");
+        assert!(
+            decoded_like_a_query_parser.contains(' '),
+            "a query parser turns the + into a space: {decoded_like_a_query_parser}"
+        );
     }
 }
