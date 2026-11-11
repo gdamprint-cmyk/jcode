@@ -124,7 +124,22 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
 fn publish_reopen_notice(session_id: &str, working_dir: Option<&str>) {
     let notice = match crate::goal_review::run_trigger(working_dir.map(std::path::Path::new)) {
         Ok(Some(notice)) => notice,
-        Ok(None) => return,
+        Ok(None) => {
+            // MEASURED 2026-11-11: the trigger had no success log line, so a
+            // broken path (1695 failures) and a quiet one (no relevant event)
+            // looked identical in the daemon log. Silence is only
+            // interpretable once the trigger says it examined the bank and
+            // found nothing to propose.
+            //
+            // info, not debug: `jcode_logging::debug` only writes when
+            // JCODE_TRACE is set (crates/jcode-logging/src/lib.rs:324), so a
+            // debug line would be invisible exactly when the log is the
+            // instrument.
+            crate::logging::info(
+                "reopen trigger: examined the bank, no deferred goal matches a new event",
+            );
+            return;
+        }
         Err(error) => {
             crate::logging::info(&format!("reopen trigger failed: {error}"));
             return;
@@ -136,6 +151,14 @@ fn publish_reopen_notice(session_id: &str, working_dir: Option<&str>) {
     // pending payload rather than replacing it: the session's pending slot
     // holds one payload, so a plain replace made the notice displace the
     // recall facts published moments earlier in the same turn.
+    //
+    // MEASURED 2026-11-11: without a success line, "the path stopped failing"
+    // could not be told from "the path reached the agent". This line is what
+    // makes the two observable states different.
+    crate::logging::info(&format!(
+        "reopen notice published ({} chars) for session {session_id}",
+        notice.chars().count()
+    ));
     //
     // reference: crates/jcode-base/src/memory/pending.rs
     //   (`append_pending_memory_external` - the merging publisher).
