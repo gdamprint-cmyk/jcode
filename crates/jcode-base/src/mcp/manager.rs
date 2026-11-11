@@ -370,8 +370,12 @@ impl McpManager {
             let mut handles = self.pool_handles.write().await;
             if handles.remove(name).is_some() {
                 if let Some(pool) = &self.pool {
-                    pool.release_handles(&self.session_id, &[name.to_string()])
-                        .await;
+                    pool.release_handles(
+                        &self.session_id,
+                        &[name.to_string()],
+                        self.project_dir.as_deref(),
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -396,7 +400,12 @@ impl McpManager {
             let names: Vec<String> = handles.keys().cloned().collect();
             handles.clear();
             if let Some(pool) = &self.pool {
-                pool.release_handles(&self.session_id, &names).await;
+                pool.release_handles(
+                    &self.session_id,
+                    &names,
+                    self.project_dir.as_deref(),
+                )
+                .await;
             }
         }
 

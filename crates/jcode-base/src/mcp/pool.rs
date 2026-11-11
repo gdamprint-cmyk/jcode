@@ -268,16 +268,25 @@ impl SharedMcpPool {
         session_id: &str,
         project_dir: Option<&std::path::Path>,
     ) -> HashMap<String, McpHandle> {
-        let handles = self.handles.read().await;
-        let result: HashMap<String, McpHandle> = handles
-            .iter()
-            .filter(|(key, handle)| !handle.is_closed() && key.matches_dir(project_dir))
-            .map(|(key, handle)| (key.name.clone(), handle.clone()))
-            .collect();
+        let mut acquired: Vec<PoolKey> = Vec::new();
+        let result: HashMap<String, McpHandle> = {
+            let handles = self.handles.read().await;
+            let mut result: HashMap<String, McpHandle> = HashMap::new();
+            for (key, handle) in handles.iter() {
+                if handle.is_closed() || !key.matches_dir(project_dir) {
+                    continue;
+                }
+                acquired.push(key.clone());
+                result.insert(key.name.clone(), handle.clone());
+            }
+            result
+        };
 
+        // Count the keys actually handed out: a per-project process is keyed by
+        // its project directory, so a global key would misattribute the count.
         let mut refs = self.ref_counts.lock().await;
-        for name in result.keys() {
-            *refs.entry(PoolKey::global(name)).or_insert(0) += 1;
+        for key in acquired {
+            *refs.entry(key).or_insert(0) += 1;
         }
 
         if !result.is_empty() {
@@ -293,13 +302,21 @@ impl SharedMcpPool {
 
     /// Release handles when a session disconnects.
     /// Decrements reference counts.
-    pub async fn release_handles(&self, session_id: &str, server_names: &[String]) {
+    pub async fn release_handles(
+        &self,
+        session_id: &str,
+        server_names: &[String],
+        project_dir: Option<&std::path::Path>,
+    ) {
         let mut refs = self.ref_counts.lock().await;
-        for name in server_names {
-            if let Some(count) = refs.get_mut(&PoolKey::global(name)) {
+        // Decrement only the keys this session could have acquired: the
+        // daemon-wide key and the per-project key for its own directory.
+        for (key, count) in refs.iter_mut() {
+            if server_names.contains(&key.name) && key.matches_dir(project_dir) {
                 *count = count.saturating_sub(1);
             }
         }
+        refs.retain(|_, count| *count > 0);
 
         if !server_names.is_empty() {
             crate::logging::info(&format!(
