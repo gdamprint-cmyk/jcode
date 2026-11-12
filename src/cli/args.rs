@@ -1144,7 +1144,7 @@ pub(crate) enum MemoryCommand {
         /// Search query
         query: String,
 
-        /// Use Jev relevance decisions instead of local keyword search (requires Jev access)
+        /// Use the local graph's semantic scan instead of local keyword search
         #[arg(short, long)]
         semantic: bool,
     },

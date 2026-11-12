@@ -633,10 +633,15 @@ pub(super) async fn execute_debug_command(
 
     if trimmed == "trigger_extraction" {
         let agent = agent.lock().await;
+        // MEASURED 2026-11-11 (Jev removal, 4950764e1): local sidecar extraction
+        // is gone; retention is Hindsight's retain pipeline. The command stays so
+        // scripts keep working, and it reports the ownership change explicitly.
         let count = agent.extract_session_memories().await;
         let payload = serde_json::json!({
             "extracted": count,
             "message_count": agent.message_count(),
+            "owner": "hindsight",
+            "note": "retention is Hindsight-owned; local extraction is a no-op",
         });
         return Ok(serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()));
     }

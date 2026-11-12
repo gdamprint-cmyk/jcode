@@ -64,7 +64,7 @@ async fn memory_cli_project_import_fails_without_durable_project_store() {
 }
 
 #[tokio::test]
-async fn memory_cli_semantic_requires_jev_but_keyword_search_remains_local() {
+async fn memory_cli_semantic_uses_the_local_graph_and_keyword_search_stays_local() {
     let _guard = crate::storage::lock_test_env();
     let keys = [
         "JCODE_HOME",
@@ -86,7 +86,7 @@ async fn memory_cli_semantic_requires_jev_but_keyword_search_remains_local() {
     manager
         .remember_project(crate::memory::MemoryEntry::new(
             crate::memory::MemoryCategory::Fact,
-            "cli-jev-probe without embedding",
+            "cli-semantic-probe without embedding",
         ))
         .unwrap();
     assert!(
@@ -98,17 +98,16 @@ async fn memory_cli_semantic_requires_jev_but_keyword_search_remains_local() {
     );
 
     let command = |semantic| MemorySubcommand::Search {
-        query: "cli-jev-probe".into(),
+        query: "cli-semantic-probe".into(),
         semantic,
     };
-    run_memory_command_for_dir(command(false), Some(project.clone()))
-        .await
-        .expect("local keyword search must remain available without credentials");
-    let error = run_memory_command_for_dir(command(true), Some(project))
-        .await
-        .expect_err("--semantic must report missing Jev access, not silently use embeddings");
-    assert!(error.to_string().contains("Jev memory search failed"));
-    assert!(!format!("{error:#}").contains("cli-jev-probe"));
+    // MEASURED 2026-11-11 (Jev removal, 4950764e1): `--semantic` is the local
+    // graph's semantic scan, so both arms work without any credential.
+    for semantic in [false, true] {
+        run_memory_command_for_dir(command(semantic), Some(project.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("semantic={semantic} must not require a remote backend: {e:#}"));
+    }
 
     // Scope still comes from the explicit directory, never the process cwd.
     run_memory_command_for_dir(command(true), Some(temp.path().join("empty-project")))

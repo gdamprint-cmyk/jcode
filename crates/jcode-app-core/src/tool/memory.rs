@@ -513,7 +513,6 @@ mod tests {
                 "JCODE_API_KEY",
                 "TYPESAFE_API_KEY",
                 "AIMLAPI_API_KEY",
-                "JCODE_MEMORY_JEV_PROVIDER",
             ];
             let previous = keys
                 .into_iter()
