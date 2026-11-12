@@ -1094,7 +1094,23 @@ impl Registry {
         // a new request, so it leaves the gate as it was.
         if plan_declaration::plan_declaration_state(&ctx.session_id)
             == plan_declaration::PlanDeclarationState::AwaitingDeclaration
-            && !crate::todo::declaration::tool_allowed_before_plan_declared(resolved_name, false)
+            && !{
+                let declaration_ok = crate::todo::declaration::tool_allowed_before_plan_declared(
+                    resolved_name,
+                    false,
+                );
+                let bash_ok = resolved_name != "bash"
+                    || input
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|command| {
+                            crate::todo::declaration::bash_command_allowed_before_plan_declared(
+                                command,
+                                ctx.working_dir.as_deref(),
+                            )
+                        });
+                declaration_ok || bash_ok
+            }
         {
             anyhow::bail!(
                 "{}",

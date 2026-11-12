@@ -199,7 +199,8 @@ async fn a_session_without_a_request_is_not_gated() {
 }
 
 /// Read-only tools stay allowed while the gate is closed: the agent has to be
-/// able to look at the code before it can name the plan items.
+/// able to look at the code before it can name the plan items. `initiative` is
+/// read-only too, and was being blocked before the declaration.
 #[tokio::test]
 async fn read_only_tools_stay_allowed_before_the_plan_is_declared() {
     let _env_lock = crate::storage::lock_test_env();
@@ -207,16 +208,63 @@ async fn read_only_tools_stay_allowed_before_the_plan_is_declared() {
     plan_declaration::forget_plan_declaration(session);
 
     plan_declaration::note_user_request(session, "fix the failing test", false);
-    for tool in ["read", "todo", "goal"] {
+    for tool in ["read", "todo", "goal", "initiative"] {
         assert!(
             crate::todo::declaration::tool_allowed_before_plan_declared(tool, false),
             "{tool} must be allowed before the plan is declared"
         );
     }
+    // A bare `bash` tool name is still refused: the gate judges the command.
     assert!(
         !crate::todo::declaration::tool_allowed_before_plan_declared("bash", false),
         "bash must be refused before the plan is declared"
     );
+    plan_declaration::forget_plan_declaration(session);
+}
+
+/// `bash` is both an analysis tool and a work tool. A read-only command must
+/// run before the plan is declared; a catastrophic one must still be refused.
+#[tokio::test]
+async fn read_only_bash_runs_before_the_plan_and_catastrophic_bash_does_not() {
+    let _env_lock = crate::storage::lock_test_env();
+    let session = "plan-declaration-gate-bash";
+    plan_declaration::forget_plan_declaration(session);
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = registry_with_work_tool("bash", ran.clone());
+
+    plan_declaration::note_user_request(session, "inspect the working tree", false);
+
+    registry
+        .execute(
+            "bash",
+            serde_json::json!({ "command": "git log --oneline -5" }),
+            gate_context(session),
+        )
+        .await
+        .expect("a read-only analysis command must run before the plan is declared");
+    assert_eq!(ran_count(&ran), 1);
+
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .expect("a home directory is required to test home destruction");
+    let home = home.to_string_lossy().replace('\\', "/");
+    let error = registry
+        .execute(
+            "bash",
+            serde_json::json!({ "command": format!("rm -rf {home}") }),
+            gate_context(session),
+        )
+        .await
+        .expect_err("a catastrophic command must be refused before the plan is declared");
+    assert!(error.to_string().contains("todo"), "{error}");
+    assert_eq!(ran_count(&ran), 1, "the catastrophic command must not have run");
+
+    let error = registry
+        .execute("bash", serde_json::json!({}), gate_context(session))
+        .await
+        .expect_err("a bash call without a command must be refused before the plan is declared");
+    assert!(error.to_string().contains("todo"), "{error}");
+    assert_eq!(ran_count(&ran), 1, "the commandless bash call must not have run");
     plan_declaration::forget_plan_declaration(session);
 }
 
@@ -238,4 +286,14 @@ fn the_gate_module_is_reachable_from_the_app_core_surface() {
         plan_declaration::plan_declaration_state("plan-declaration-gate-unreachable"),
         plan_declaration::PlanDeclarationState::NotArmed
     );
+}
+
+/// The reminder exists and names both halves of the contract: analysis first,
+/// declaration before the first work tool.
+#[test]
+fn the_reminder_names_analysis_first_and_declaration_before_work() {
+    let reminder = plan_declaration::plan_declaration_reminder();
+    assert!(reminder.contains("todo"), "{reminder}");
+    assert!(reminder.contains("first pass"), "{reminder}");
+    assert!(reminder.contains("before the first work tool"), "{reminder}");
 }

@@ -9,6 +9,7 @@ description = "Pure todo quality-gate and auto-poke policy shared by Jcode clien
 jcode-task-types = { path = "../jcode-task-types" }
 jcode-storage = { path = "../jcode-storage" }
 jcode-logging = { path = "../jcode-logging" }
+jcode-command-risk = { path = "../jcode-command-risk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

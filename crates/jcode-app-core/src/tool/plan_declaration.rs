@@ -57,6 +57,13 @@ impl PlanDeclarationState {
 static SESSION_PLAN_DECLARATIONS: LazyLock<RwLock<HashMap<String, PlanDeclarationState>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// The reminder appended to a new request's turn, so the first analysis pass
+/// is not blocked and the declaration is still required before the first work
+/// tool.
+pub fn plan_declaration_reminder() -> &'static str {
+    crate::todo::declaration::PLAN_DECLARATION_REMINDER_MESSAGE
+}
+
 /// The gate state for a session.
 // reference: crates/jcode-app-core/src/tool/mod.rs - `Registry::execute` reads
 // this state to decide whether a work tool is refused before the plan for the

@@ -143,9 +143,17 @@ impl RiskContext {
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(std::path::PathBuf::from)
+    // `$HOME` is the POSIX spelling and is absent on Windows; `USERPROFILE`
+    // is the native equivalent. Without this fallback `rm -rf C:/Users/<u>`
+    // cannot be recognised as catastrophic on a Windows host.
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            return Some(std::path::PathBuf::from(value));
+        }
+    }
+    None
 }
 
 /// Commands that destroy data as their primary purpose.

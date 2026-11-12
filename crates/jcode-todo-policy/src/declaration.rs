@@ -21,10 +21,20 @@
 // plan snapshot, returning a message for the model).
 // reference: no prior art for this exact gate; searched the jcode repo for
 // "declaration", "gate" and "before plan" and found only prompt-overlay text.
+// reference: crates/jcode-command-risk/src/lib.rs (assess / RiskLevel::runs_immediately)
+// is the primary source for the bash read-only/destructive decision; the same
+// classifier is already used by crates/jcode-app-core/src/tool/bash_destructive_gate.rs.
+
+use std::path::Path;
+
+/// The reminder appended to a new request's turn: the analysis may start
+/// immediately, but the plan for this request has to be declared before the
+/// first work tool runs.
+pub const PLAN_DECLARATION_REMINDER_MESSAGE: &str = "New request: the first pass is yours - read and analyse before committing to a plan. Declare the todo plan for this request as soon as you start acting on it, and before the first work tool call. If analysis shows the request needs no work items, declare that plan anyway and then finish.";
 
 /// The message returned to the model when a work tool runs before the plan
 /// for the current request was declared.
-pub const PLAN_DECLARATION_REQUIRED_MESSAGE: &str = "Before doing any work for a new request, update the todo plan: add the new items for this request and declare them. Then continue with the work.";
+pub const PLAN_DECLARATION_REQUIRED_MESSAGE: &str = "Declare the plan for this request first: call the todo tool, add the new items for this request and declare them. Then continue with the work.";
 
 /// Tools that are part of declaring or reading the plan. They are always
 /// allowed: a plan declaration must not be blocked by the plan gate.
@@ -51,6 +61,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "side_panel",
     "todo",
     "goal",
+    "initiative",
 ];
 
 /// Whether a tool call is allowed before the plan for the current request has
@@ -70,6 +81,25 @@ pub fn tool_allowed_before_plan_declared(tool: &str, plan_declared: bool) -> boo
         return true;
     }
     !is_work_tool(tool)
+}
+
+/// Whether a `bash` command is analysis-only and therefore safe to run before
+/// the plan for the current request is declared.
+///
+/// `bash` is BOTH an analysis tool and a work tool: `git log`, `dir`, `grep`
+/// and `cargo check` are how the agent forms the plan, so refusing all of them
+/// blocks the first pass. The destructive-command classifier already separates
+/// read-only from destructive commands, so this reuses it instead of a second
+/// list: a command the classifier would DENY outright (home, root, credentials)
+/// is work, and everything it allows is analysis.
+// reference: crates/jcode-command-risk/src/lib.rs (assess / RiskLevel::is_absolute_deny)
+// reference: crates/jcode-app-core/src/tool/bash_destructive_gate.rs (the same
+// classifier the destructive gate uses).
+pub fn bash_command_allowed_before_plan_declared(command: &str, working_dir: Option<&Path>) -> bool {
+    let ctx = jcode_command_risk::RiskContext::from_env(working_dir.map(Path::to_path_buf));
+    !jcode_command_risk::assess(command, &ctx)
+        .level
+        .is_absolute_deny()
 }
 
 /// Whether the tool is one that performs work, i.e. one the plan gate guards.
