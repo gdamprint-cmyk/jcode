@@ -839,12 +839,18 @@ impl Agent {
             "Announcing {} late MCP tool(s) in the transcript (tool list stays cache-stable)",
             fresh.len()
         ));
-        self.add_message(
+        // This is a server-written notice, not the user's own words. Persist it
+        // as Role::User (the model must treat it as a continuation prompt) but
+        // tag the display role so a transcript reader does not show it as the
+        // user's message. MEASURED 2026-11-12: these entries appeared as
+        // unattributed user messages in live journals.
+        self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
                 text,
                 cache_control: None,
             }],
+            Some(crate::session::StoredDisplayRole::System),
         );
     }
 

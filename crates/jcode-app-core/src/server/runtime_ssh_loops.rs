@@ -375,13 +375,23 @@ pub(super) async fn run_reserved_followups(
         };
         // Persisted budgets are committed before the request. A daemon restart
         // cannot turn a failing continuation into an unlimited retry loop.
-        let result = super::client_lifecycle::process_reserved_message_streaming_mpsc(
+        //
+        // A follow-up is a synthetic continuation the harness wrote, not the
+        // user's own words. Persist it as Role::User so the model treats it as a
+        // continuation turn, and tag the display role so a transcript reader
+        // does not show it as the user's message.
+        // MEASURED 2026-11-12: these entries appeared as unattributed user
+        // messages in live journals (`jcode run` sessions).
+        let display_role = crate::todo::is_synthetic_user_message(&followup.message)
+            .then_some(crate::session::StoredDisplayRole::System);
+        let result = super::client_lifecycle::process_reserved_message_streaming_mpsc_with_display_role(
             agent,
             lease,
             &followup.message,
             Vec::new(),
             None,
             event_tx.clone(),
+            display_role,
         )
         .await;
         let result = super::turn_failover::retry_turn_with_server_failover(

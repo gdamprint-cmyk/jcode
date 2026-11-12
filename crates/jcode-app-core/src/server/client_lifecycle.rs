@@ -4177,10 +4177,51 @@ pub(super) async fn process_reserved_message_streaming_mpsc(
     system_reminder: Option<String>,
     event_tx: mpsc::UnboundedSender<ServerEvent>,
 ) -> Result<()> {
+    process_reserved_message_streaming_mpsc_with_display_role(
+        agent,
+        lease,
+        content,
+        images,
+        system_reminder,
+        event_tx,
+        None,
+    )
+    .await
+}
+
+/// Same as [`process_reserved_message_streaming_mpsc`], with the transcript
+/// display role for a server-written continuation (synthetic follow-up, MCP
+/// announcement) that is persisted as `Role::User` for the model but is NOT the
+/// user's own words.
+///
+/// MEASURED 2026-11-12: without this, such entries carried no display_role and
+/// a transcript reader saw them as the user's message.
+///
+/// reference: refactor of the function immediately above, whose exact signature
+/// was read from this file; the wrapped core is Agent::run_reserved_streaming_mpsc
+/// (crates/jcode-app-core/src/agent/turn_execution.rs:164, already carries the
+/// display_role parameter). Rust async/future rules verified at
+/// https://doc.rust-lang.org/std/future/trait.Future.html
+pub(super) async fn process_reserved_message_streaming_mpsc_with_display_role(
+    agent: &mut Agent,
+    lease: &crate::agent::TurnLease,
+    content: &str,
+    images: Vec<(String, String)>,
+    system_reminder: Option<String>,
+    event_tx: mpsc::UnboundedSender<ServerEvent>,
+    display_role: Option<crate::session::StoredDisplayRole>,
+) -> Result<()> {
     agent.validate_server_turn(lease)?;
     let session_id = agent.session_id().to_string();
     let result = agent
-        .run_reserved_streaming_mpsc(lease, content, images, system_reminder, event_tx, None)
+        .run_reserved_streaming_mpsc(
+            lease,
+            content,
+            images,
+            system_reminder,
+            event_tx,
+            display_role,
+        )
         .await;
     if result.is_ok() {
         crate::runtime_memory_log::emit_event(
