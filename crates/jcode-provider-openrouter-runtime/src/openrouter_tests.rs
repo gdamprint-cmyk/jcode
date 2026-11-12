@@ -3297,6 +3297,39 @@ fn named_profile_supports_reasoning_effort_config_override() {
     );
 }
 
+/// `supports_reasoning_effort = true` must put `none` on the wire.
+///
+/// Measured 2026-11-12 against the Nous endpoint: `reasoning_effort: none`
+/// suppresses thinking entirely (0 reasoning tokens in 9/9 runs vs 419..3999
+/// without the field). The heuristic (model-family) path keeps dropping `none`,
+/// because a model that never reasons tolerates its absence better; the explicit
+/// profile opt-in must not.
+#[test]
+fn explicit_effort_opt_in_sends_none_to_the_wire() {
+    let opted_in = OpenRouterProvider {
+        profile_id: Some("nous-free".into()),
+        reasoning_effort_support: Some(true),
+        ..make_custom_compatible_provider()
+    };
+    opted_in.set_model("meituan/longcat-2.5:free").unwrap();
+    opted_in.set_reasoning_effort("none").unwrap();
+    let mut request = serde_json::json!({});
+    assert!(
+        opted_in.apply_resolved_reasoning_effort(&mut request, "none", false),
+        "an explicitly opted-in profile must be able to disable thinking"
+    );
+    assert_eq!(request["reasoning_effort"], "none");
+
+    // The heuristic path still drops `none` for a GPT-family model with no
+    // explicit opt-in: unchanged behaviour for OpenAI itself.
+    let heuristic = make_custom_compatible_provider();
+    heuristic.set_model("gpt-5.5").unwrap();
+    heuristic.set_reasoning_effort("none").unwrap();
+    let mut request = serde_json::json!({});
+    assert!(!heuristic.apply_resolved_reasoning_effort(&mut request, "none", false));
+    assert!(request.get("reasoning_effort").is_none());
+}
+
 /// Issue #352: named profiles construct with the user's configured
 /// `openai_reasoning_effort` when the profile supports effort, instead of
 /// silently ignoring the config.

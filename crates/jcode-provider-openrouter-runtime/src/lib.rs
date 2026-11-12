@@ -900,7 +900,13 @@ impl OpenRouterProvider {
                 "xhigh" => "high",
                 other => other,
             };
-            if effort == "none" {
+            if effort == "none" && !self.openai_none_opt_in() {
+                // The dedicated `deepseek` profile has no explicit opt-in, so
+                // it keeps the historical behaviour. A profile that set
+                // `supports_reasoning_effort = true` does reach this branch
+                // (the explicit override wins here too) and must be able to
+                // disable thinking: measured 2026-11-12, the Nous endpoint
+                // honours `none` (0 reasoning tokens in 9/9 runs).
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
@@ -911,7 +917,14 @@ impl OpenRouterProvider {
             } else {
                 effort
             };
-            if effort == "none" {
+            if effort == "none" && !self.openai_none_opt_in() {
+                // OpenAI treats `none` as "no reasoning", but a model that
+                // never reasons tolerates its absence better than its
+                // presence, so the heuristic (model-family) detection keeps
+                // dropping it. A profile that explicitly opts in via
+                // `supports_reasoning_effort = true` does want it on the wire:
+                // measured 2026-11-12, the Nous endpoint honours `none` (0
+                // reasoning tokens in 9/9 runs vs 419..3999 without the field).
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
@@ -929,6 +942,18 @@ impl OpenRouterProvider {
 
     fn profile_supports_reasoning_effort(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
+    }
+
+    /// Did the user explicitly opt this profile into `/effort` via
+    /// `supports_reasoning_effort = true` in config.toml?
+    ///
+    /// That flag is a deliberate statement that the endpoint honours the
+    /// OpenAI `reasoning_effort` vocabulary, including `none`, so it must not
+    /// be overridden by the model-name heuristic. Only the on direction counts:
+    /// `Some(false)` means "no effort at all", which `available_efforts`
+    /// already reports as an empty ladder.
+    fn openai_none_opt_in(&self) -> bool {
+        self.reasoning_effort_support == Some(true)
     }
 
     fn profile_supports_openai_reasoning_effort(profile_id: Option<&str>) -> bool {
