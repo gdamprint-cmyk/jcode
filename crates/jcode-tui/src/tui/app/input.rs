@@ -4118,6 +4118,18 @@ impl App {
         // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
         // (note_user_request - the runtime state this arms).
         crate::tool::plan_declaration::note_user_request(&self.session.id, &input, false);
+        let turn_reminder = merge_turn_reminders(
+            mission_turn_reminder(&self.session.id),
+            self.take_cloud_recovery_reminder(),
+        );
+        let plan_declaration_reminder = matches!(
+            crate::tool::plan_declaration::plan_declaration_state(&self.session.id),
+            crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+        )
+        .then(crate::tool::plan_declaration::plan_declaration_reminder);
+        let turn_reminder =
+            merge_turn_reminders(turn_reminder, plan_declaration_reminder.map(str::to_string));
+        self.append_turn_system_reminder(turn_reminder);
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
             content: input.clone(),
@@ -4167,11 +4179,6 @@ impl App {
             });
             self.session.add_message(Role::User, blocks);
         }
-        let reminder = merge_turn_reminders(
-            mission_turn_reminder(&self.session.id),
-            self.take_cloud_recovery_reminder(),
-        );
-        self.append_turn_system_reminder(reminder);
         crate::telemetry::record_turn();
         self.session_save_pending = true;
 
@@ -4247,8 +4254,19 @@ impl App {
 
             let turn_reminder =
                 merge_turn_reminders(reminder, mission_turn_reminder(&self.session.id));
-            let turn_reminder =
+            let mut turn_reminder =
                 merge_turn_reminders(turn_reminder, self.take_cloud_recovery_reminder());
+            // A queued real prompt armed the gate below; ask for the
+            // declaration after the analysis, not before it.
+            if matches!(
+                crate::tool::plan_declaration::plan_declaration_state(&self.session.id),
+                crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+            ) {
+                let plan_reminder =
+                    crate::tool::plan_declaration::plan_declaration_reminder().to_string();
+                turn_reminder = merge_turn_reminders(turn_reminder, Some(plan_reminder));
+            }
+            self.append_turn_system_reminder(turn_reminder);
 
             if has_combined {
                 // A queued real prompt is a new request, so it arms the plan
@@ -4289,7 +4307,6 @@ impl App {
                     display_role,
                 );
             }
-            self.append_turn_system_reminder(turn_reminder);
             self.session_save_pending = true;
             self.clear_streaming_render_state();
             self.stream_buffer.clear();

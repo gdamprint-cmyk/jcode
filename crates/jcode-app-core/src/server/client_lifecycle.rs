@@ -1123,6 +1123,23 @@ pub(super) async fn handle_client(
                     &content,
                     false,
                 );
+                // The reminder travels with the turn, so the first analysis pass
+                // is not blocked by the gate and the declaration is still asked
+                // for before the first work tool.
+                let system_reminder = match crate::tool::plan_declaration::plan_declaration_state(
+                    &client_session_id,
+                ) {
+                    crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration => {
+                        let reminder = crate::tool::plan_declaration::plan_declaration_reminder();
+                        Some(match system_reminder {
+                            Some(existing) if !existing.trim().is_empty() => {
+                                format!("{existing}\n\n{reminder}")
+                            }
+                            _ => reminder.to_string(),
+                        })
+                    }
+                    _ => system_reminder,
+                };
                 start_processing_message(
                     ProcessingMessage {
                         id,

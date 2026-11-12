@@ -42,6 +42,13 @@ impl Agent {
         // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
         // (note_user_request - the runtime state this arms).
         crate::tool::plan_declaration::note_user_request(&self.session.id, user_message, false);
+        // The reminder travels with the prompt, so the analysis pass is not
+        // blocked by the gate and the declaration is still asked for.
+        if crate::tool::plan_declaration::plan_declaration_state(&self.session.id)
+            == crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+        {
+            self.append_turn_system_reminder(crate::tool::plan_declaration::plan_declaration_reminder())?;
+        }
         self.announce_late_mcp_tools().await;
         self.announce_late_skills();
         let input_id = self.add_message(
@@ -223,6 +230,13 @@ impl Agent {
         // the next turn when it disappeared.
         if let Some(reminder) = system_reminder {
             self.append_turn_system_reminder(&reminder)?;
+        }
+        // A real request that reached this turn armed the gate in the caller.
+        // Ask for the declaration after the analysis, not before it.
+        if crate::tool::plan_declaration::plan_declaration_state(&self.session.id)
+            == crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+        {
+            self.append_turn_system_reminder(crate::tool::plan_declaration::plan_declaration_reminder())?;
         }
         crate::telemetry::record_turn();
         let turn_started_at = Instant::now();

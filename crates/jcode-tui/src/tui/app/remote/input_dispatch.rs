@@ -25,11 +25,26 @@ pub(in crate::tui::app) async fn begin_remote_send(
     // (note_user_request - the runtime state this arms).
     crate::tool::plan_declaration::note_user_request(&app.session.id, &content, is_system);
     let recovery = app.cloud_recovery_reminder();
-    let system_reminder = match (system_reminder, recovery.as_ref()) {
+    let mut system_reminder = match (system_reminder, recovery.as_ref()) {
         (Some(reminder), Some(recovery)) => Some(format!("{reminder}\n\n{recovery}")),
         (None, Some(recovery)) => Some(recovery.clone()),
         (reminder, None) => reminder,
     };
+    // The reminder travels with the turn, so the first analysis pass is not
+    // blocked by the gate and the declaration is still asked for before the
+    // first work tool.
+    if !is_system
+        && crate::tool::plan_declaration::plan_declaration_state(&app.session.id)
+            == crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+    {
+        let reminder = crate::tool::plan_declaration::plan_declaration_reminder();
+        system_reminder = Some(match system_reminder {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{existing}\n\n{reminder}")
+            }
+            _ => reminder.to_string(),
+        });
+    }
     let msg_id = remote
         .send_message_with_images_reminder_and_skill(
             content.clone(),
