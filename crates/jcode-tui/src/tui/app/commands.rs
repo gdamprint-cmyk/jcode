@@ -300,12 +300,15 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             )));
 
             app.add_provider_message(Message::user(&poke_msg));
-            app.session.add_message(
+            // Synthetic continuation: not user-authored. Tag at the write site
+            // so the persisted transcript does not show it as the user's words.
+            app.session.add_message_with_display_role(
                 Role::User,
                 vec![ContentBlock::Text {
                     text: poke_msg,
                     cache_control: None,
                 }],
+                Some(crate::session::StoredDisplayRole::System),
             );
             let _ = app.session.save();
 

@@ -4268,12 +4268,25 @@ impl App {
                     self.provider.reasoning_effort().as_deref(),
                 );
                 self.add_provider_message(Message::user(&combined));
-                self.session.add_message(
+                // A queued synthetic continuation (auto-poke, gate, [auto]
+                // follow-up) is persisted as Role::User so the model treats it
+                // as a continuation turn, but it is NOT user-authored. Tag it
+                // with the display role at the write site so the transcript
+                // says who actually spoke, instead of relying on a prefix list
+                // to re-detect it on every later read.
+                //
+                // MEASURED 2026-11-12: 15 such entries across the 12 newest
+                // journals carried no display_role.
+                // record: ~/.jcode/research/2026-11-12-user-message-attribution.md
+                let display_role = crate::todo::is_synthetic_user_message(&combined)
+                    .then_some(crate::session::StoredDisplayRole::System);
+                self.session.add_message_with_display_role(
                     Role::User,
                     vec![ContentBlock::Text {
                         text: combined.clone(),
                         cache_control: None,
                     }],
+                    display_role,
                 );
             }
             self.append_turn_system_reminder(turn_reminder);

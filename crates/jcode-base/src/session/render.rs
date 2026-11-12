@@ -69,9 +69,13 @@ fn is_internal_system_reminder(msg: &super::StoredMessage) -> bool {
 /// notice instead). Re-rendered history must not resurrect them as the user's
 /// "last prompt" after a reload/resume/remote attach, so they render with the
 /// system role.
+///
+/// The display role is accepted as well as required-to-be-absent: writers now tag
+/// synthetic continuations with `System` at the write site, and a tagged message
+/// must still render as the short summary. MEASURED 2026-11-12, before this
+/// relaxation a tagged entry rendered as the raw gate instruction text instead.
 fn is_auto_poke_user_message(msg: &super::StoredMessage) -> bool {
     matches!(msg.role, Role::User)
-        && msg.display_role.is_none()
         && msg
             .content
             .iter()

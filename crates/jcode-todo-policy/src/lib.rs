@@ -809,6 +809,43 @@ pub fn is_auto_poke_message(message: &str) -> bool {
         || trimmed.starts_with(PRE_BUDGET_TODO_LONG_SESSION_REVIEW_MESSAGE)
 }
 
+/// True when `message` is any synthetic continuation the harness writes as a
+/// user-role turn without being user-authored.
+///
+/// `is_auto_poke_message` covers the todo gate family by prefix. This covers the
+/// wider class: every continuation whose own text declares it is not a user
+/// message (`[auto] ...`, `[automated follow-up - not a user message] ...`,
+/// `[SYSTEM: ...]`), plus the auto-poke family. A transcript writer should use
+/// this to set `display_role = System` at the write site, so the persisted record
+/// says who actually spoke instead of relying on a prefix list to re-detect it
+/// later.
+///
+/// MEASURED 2026-11-12: 15 user-role entries across the 12 newest journals had no
+/// `display_role`, so a reader of the transcript saw them as the user's words.
+/// record: ~/.jcode/research/2026-11-12-user-message-attribution.md
+pub fn is_synthetic_user_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // The synthetic producers mark their output on the FIRST line, so the
+    // marker is matched on the whole line rather than as a bare substring. A
+    // user writing "[auto] is the prefix I use in my own notes" is genuine
+    // authorship and must not be re-labelled: MEASURED 2026-11-12, the loose form
+    // produced exactly that false positive and the test caught it.
+    if trimmed.lines().next().is_some_and(
+        |first| first.trim_end() == "[auto]" || first.starts_with("[auto] "),
+    ) {
+        return true;
+    }
+    if trimmed.starts_with("[automated follow-up - not a user message]")
+        || trimmed.starts_with("[SYSTEM:")
+    {
+        return true;
+    }
+    is_auto_poke_message(trimmed)
+}
+
 /// Short, user-facing stand-in for a synthetic auto-poke/gate continuation.
 ///
 /// The continuations themselves are written for the model and name specific

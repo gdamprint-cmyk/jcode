@@ -29,8 +29,17 @@ fn display_message_from_stored_message(
     {
         return Some(swarm);
     }
+    // A tagged synthetic continuation (auto-poke, gate, [auto] follow-up) is
+    // persisted as Role::User so the model treats it as a continuation turn, but
+    // it is NOT user-authored. The field is authoritative; the prefix check below
+    // still catches entries written before the tag existed.
     match message.display_role {
-        Some(crate::session::StoredDisplayRole::System) => Some(DisplayMessage::system(text)),
+        Some(crate::session::StoredDisplayRole::System) => {
+            if let Some(summary) = crate::todo::auto_poke_display_summary(&text) {
+                return Some(DisplayMessage::system(summary.to_string()));
+            }
+            Some(DisplayMessage::system(text))
+        }
         Some(crate::session::StoredDisplayRole::BackgroundTask) => None,
         None => match message.role {
             Role::User => {
