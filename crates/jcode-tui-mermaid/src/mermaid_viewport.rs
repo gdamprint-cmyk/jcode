@@ -1804,7 +1804,14 @@ mod kitty_viewport_leak_tests {
         let path = std::env::temp_dir().join(format!(
             "jcode-kitty-source-{}-{}.png",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            // Thread names carry the `::` module path, which Windows rejects as
+            // a path component (os error 123, InvalidFilename). Sanitise before
+            // the name reaches a filename.
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace("::", "_")
+                .replace(['/', '\\'], "_")
         ));
         fs::write(&path, &png).expect("write fixture");
 

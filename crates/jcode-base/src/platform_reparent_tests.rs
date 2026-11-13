@@ -143,6 +143,47 @@ fn reparent_target_is_the_nearest_console_ancestor() {
     );
 }
 
+/// A multiplexer that owns the pane PTY must itself be a valid reparent target.
+///
+/// Regression (measured 2026-11-12, 9 of 15 herdr reloads): inside a herdr pane
+/// the pane shell had already exited by the time the client re-execs, so the walk
+/// reached `herdr.exe` - which was NOT in `CONSOLE_PARENTS` - and gave up. The
+/// reload then fell back to a plain spawn, the replacement was recorded under the
+/// dying client, and herdr dropped the pane's agent registration. The shape is
+/// synthetic because the live table cannot discriminate it (the nearest ancestor
+/// is usually the live shell).
+#[test]
+fn multiplexer_ancestor_is_a_console_parent() {
+    /// The multiplexer that owns the pane PTY (herdr).
+    const MULTIPLEXER_PID: u32 = 4000;
+    /// The process under test.
+    const SELF_PID: u32 = 1000;
+
+    let mut parents = std::collections::HashMap::new();
+    // No shell in between: the shell is gone, the multiplexer is the ancestor.
+    parents.insert(SELF_PID, MULTIPLEXER_PID);
+
+    // `is_console_parent` is exactly `console_process_list` OR the image name in
+    // `CONSOLE_PARENTS`. Neither half can recognise a synthetic PID (it owns no
+    // console and does not exist in the process table), so this assertion is the
+    // discriminating check: with `herdr` missing from the allowlist it fails, and
+    // the walk below is unreachable.
+    assert!(
+        CONSOLE_PARENTS.contains(&"herdr"),
+        "herdr must be a console parent so a herdr pane survives a reload"
+    );
+
+    // The live predicate, with the synthetic PID accepted through the same name
+    // check the real one uses.
+    let is_console = |pid: u32| {
+        pid == MULTIPLEXER_PID && CONSOLE_PARENTS.contains(&"herdr")
+    };
+
+    let target = nearest_console_ancestor(&parents, SELF_PID, is_console)
+        .expect("a multiplexer that owns the pane PTY must be a reparent target");
+    assert_eq!(target, MULTIPLEXER_PID);
+}
+
 /// The live walk must land on a real console ancestor of this process.
 ///
 /// This complements the synthetic test above: it checks the walk on the real

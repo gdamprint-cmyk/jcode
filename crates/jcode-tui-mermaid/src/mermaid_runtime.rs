@@ -253,10 +253,29 @@ pub(super) fn infer_protocol_from_env(
     term_program: Option<&str>,
     lc_terminal: Option<&str>,
     kitty_window_id: Option<&str>,
+    herdr_env: Option<&str>,
 ) -> Option<ProtocolType> {
     let term = term.unwrap_or("").to_ascii_lowercase();
     let term_program = term_program.unwrap_or("").to_ascii_lowercase();
     let lc_terminal = lc_terminal.unwrap_or("").to_ascii_lowercase();
+
+    // herdr rewrites the pane env: it removes KITTY_WINDOW_ID / WT_SESSION /
+    // WEZTERM_PANE and sets TERM=xterm-ghostty with TERM_PROGRAM=herdr
+    // (src/pane.rs apply_pane_terminal_env), so every signal below is masked.
+    // What is NOT masked is the fact that the pane is rendered by herdr's own
+    // terminal layer, which composites Kitty graphics itself: a pane that
+    // advertises them is exactly a pane with a graphics-capable outer terminal
+    // (herdr's direct-graphics gate: TERM_PROGRAM ghostty/wezterm, TERM
+    // xterm-kitty/ghostty/wezterm, or KITTY_WINDOW_ID - all consumed here).
+    //
+    // Without this branch a herdr pane takes the Halfblocks fallback and shows
+    // the text fallback note on every image: measured 2026-11-12 in
+    // `Mermaid picker init: mode=Fast multiplexer=herdr env_protocol=None`.
+    //
+    // reference: ~/.jcode/research/2026-11-12-herdr-reload-and-images/
+    if env_is_set(herdr_env) {
+        return Some(ProtocolType::Kitty);
+    }
 
     // WezTerm advertises several image protocols, but ratatui-image's Kitty
     // path relies on Unicode placeholders that WezTerm does not implement
@@ -375,6 +394,7 @@ fn fast_picker() -> Picker {
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("LC_TERMINAL").ok().as_deref(),
         std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+        std::env::var("HERDR_ENV").ok().as_deref(),
     ) {
         picker.set_protocol_type(protocol);
     }
@@ -452,6 +472,7 @@ pub fn init_picker() {
             std::env::var("TERM_PROGRAM").ok().as_deref(),
             std::env::var("LC_TERMINAL").ok().as_deref(),
             std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+            std::env::var("HERDR_ENV").ok().as_deref(),
         );
         let multiplexer = detect_multiplexer_from_env();
         let probe_override = std::env::var("JCODE_MERMAID_PICKER_PROBE")
@@ -900,21 +921,53 @@ mod tests {
     #[test]
     fn infer_protocol_detects_kitty_family() {
         assert_eq!(
-            infer_protocol_from_env(Some("xterm-kitty"), None, None, None),
+            infer_protocol_from_env(Some("xterm-kitty"), None, None, None, None),
             Some(ProtocolType::Kitty)
         );
         assert_eq!(
-            infer_protocol_from_env(None, Some("ghostty"), None, None),
+            infer_protocol_from_env(None, Some("ghostty"), None, None, None),
             Some(ProtocolType::Kitty)
         );
         assert_eq!(
-            infer_protocol_from_env(None, Some("HandTerm"), None, None),
+            infer_protocol_from_env(None, Some("HandTerm"), None, None, None),
             Some(ProtocolType::Kitty)
         );
         // KITTY_WINDOW_ID present is sufficient.
         assert_eq!(
-            infer_protocol_from_env(Some("xterm-256color"), None, None, Some("3")),
+            infer_protocol_from_env(Some("xterm-256color"), None, None, Some("3"), None),
             Some(ProtocolType::Kitty)
+        );
+    }
+
+    /// A herdr pane is rendered by herdr's own terminal layer, which composites
+    /// Kitty graphics, so the masked pane env must still report Kitty.
+    ///
+    /// Regression (measured 2026-11-12): a herdr pane ran with
+    /// `env_protocol=None`, so every image took the Halfblocks fallback and
+    /// showed the text fallback note.
+    ///
+    /// reference: https://fast-agent.ai/guides/tui/ ("Image rendering
+    /// automatically uses reported terminal graphics support, including Kitty
+    /// graphics inside Herdr")
+    #[test]
+    fn infer_protocol_reports_kitty_inside_herdr() {
+        // The exact masked shape herdr puts in a pane: bland TERM, no graphics
+        // identity, and HERDR_ENV=1.
+        assert_eq!(
+            infer_protocol_from_env(
+                Some("xterm-ghostty"),
+                Some("herdr"),
+                None,
+                None,
+                Some("1")
+            ),
+            Some(ProtocolType::Kitty)
+        );
+        // Without HERDR_ENV the same env must stay unknown, so this assertion
+        // cannot pass for an unrelated reason.
+        assert_eq!(
+            infer_protocol_from_env(Some("xterm-ghostty"), Some("herdr"), None, None, None),
+            None
         );
     }
 
@@ -922,24 +975,24 @@ mod tests {
     fn infer_protocol_detects_iterm_and_sixel() {
         // Real iTerm2 breaks on inline images, so it reports no protocol.
         assert_eq!(
-            infer_protocol_from_env(None, Some("iTerm.app"), None, None),
+            infer_protocol_from_env(None, Some("iTerm.app"), None, None, None),
             None
         );
         assert_eq!(
-            infer_protocol_from_env(None, Some("WezTerm"), None, None),
+            infer_protocol_from_env(None, Some("WezTerm"), None, None, None),
             Some(ProtocolType::Iterm2)
         );
         assert_eq!(
-            infer_protocol_from_env(Some("xterm-sixel"), None, None, None),
+            infer_protocol_from_env(Some("xterm-sixel"), None, None, None, None),
             Some(ProtocolType::Sixel)
         );
         assert_eq!(
-            infer_protocol_from_env(Some("foot"), Some("foot"), None, None),
+            infer_protocol_from_env(Some("foot"), Some("foot"), None, None, None),
             Some(ProtocolType::Sixel)
         );
         // foot sets TERM=foot but no TERM_PROGRAM.
         assert_eq!(
-            infer_protocol_from_env(Some("foot"), None, None, None),
+            infer_protocol_from_env(Some("foot"), None, None, None, None),
             Some(ProtocolType::Sixel)
         );
     }
@@ -951,21 +1004,23 @@ mod tests {
                 Some("xterm-kitty"),
                 Some("WezTerm"),
                 None,
-                Some("stale-kitty-window")
+                Some("stale-kitty-window"),
+                None
             ),
             Some(ProtocolType::Iterm2)
         );
         assert_eq!(
-            infer_protocol_from_env(Some("xterm-256color"), Some("konsole"), None, None),
+            infer_protocol_from_env(Some("xterm-256color"), Some("konsole"), None, None, None),
             None
         );
     }
 
     #[test]
     fn infer_protocol_misses_inside_masking_multiplexer() {
-        // Herdr/tmux advertise a bland TERM with no graphics hints.
+        // tmux (and a plain terminal) advertise a bland TERM with no graphics
+        // hints. herdr is excluded: it reports Kitty (see the test above).
         assert_eq!(
-            infer_protocol_from_env(Some("xterm-256color"), None, None, None),
+            infer_protocol_from_env(Some("xterm-256color"), None, None, None, None),
             None
         );
     }

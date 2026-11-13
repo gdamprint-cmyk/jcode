@@ -59,6 +59,14 @@ const CONSOLE_PARENTS: &[&str] = &[
     "mintty",
     "conhost",
     "openconsole",
+    // Terminal multiplexers that own a real pane PTY. `herdr` renders each pane
+    // itself and keeps the outer terminal's identity out of the pane env, so a
+    // pane shell (`pwsh`) is its direct child. Without `herdr` here the walk
+    // finds no console ancestor: the shell already exited when the reparent runs
+    // and its recorded parent is the multiplexer, which is not a shell name.
+    // Measured 2026-11-12: 9 of 15 reloads in herdr panes fell back to a plain
+    // spawn with "no console program was found among our ancestors".
+    "herdr",
 ];
 
 /// Spawn `cmd` so the new process is recorded as a child of our parent.
