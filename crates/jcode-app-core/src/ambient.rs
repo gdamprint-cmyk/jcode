@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod directives;
+mod harbor;
 mod manager;
 pub(crate) mod paths;
 mod persistence;
@@ -23,6 +24,7 @@ mod ambient_dead_letter_tests;
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
 };
+pub use harbor::{HarborStatus, harbor_dir, prompt_section as harbor_prompt_section, run_pass as harbor_run_pass};
 pub use manager::AmbientManager;
 pub use persistence::{AmbientLock, ScheduledQueue};
 #[cfg(test)]

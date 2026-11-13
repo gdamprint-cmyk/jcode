@@ -1020,7 +1020,12 @@ impl AmbientRunnerHandle {
 
         let active_sessions = *self.inner.active_user_sessions.read().await;
 
-        let system_prompt = ambient::build_ambient_system_prompt(
+        // Harbor's deterministic landing pass runs before the prompt is built so its
+        // result is visible to the agent this cycle. Safe: it never builds, never
+        // reloads, and its own acceptance checker gates it.
+        let harbor = ambient::harbor_run_pass();
+
+        let mut system_prompt = ambient::build_ambient_system_prompt(
             &state,
             &queue_items,
             &graph_health,
@@ -1029,6 +1034,11 @@ impl AmbientRunnerHandle {
             &budget,
             active_sessions,
         );
+        let harbor_section = ambient::harbor_prompt_section(&harbor);
+        if !harbor_section.is_empty() {
+            system_prompt.push('\n');
+            system_prompt.push_str(&harbor_section);
+        }
 
         let initial_message = "Begin your ambient cycle. Check the scheduled queue, assess memory graph health, and plan your work using the `todo` tool.".to_string();
 
