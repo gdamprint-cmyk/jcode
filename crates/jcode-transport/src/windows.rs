@@ -11,6 +11,18 @@ use tokio::net::windows::named_pipe::{
 /// e.g. `/run/user/1000/jcode.sock` -> `\\.\pipe\jcode`
 /// e.g. `/run/user/1000/jcode/myserver.sock` -> `\\.\pipe\jcode-myserver`
 fn path_to_pipe_name(path: &Path) -> String {
+    path_to_pipe_name_with(path, canonical_parent)
+}
+
+/// The pipe name for `path`, with the parent-directory resolution injected.
+///
+/// The resolution is a parameter so the normalization can be tested against a
+/// path whose short spelling is derived at runtime, instead of being pinned to
+/// whatever this machine happens to have.
+fn path_to_pipe_name_with(
+    path: &Path,
+    resolve_parent: fn(&Path) -> Option<std::path::PathBuf>,
+) -> String {
     let stem: String = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -20,13 +32,94 @@ fn path_to_pipe_name(path: &Path) -> String {
         .take(32)
         .collect();
     let stem = if stem.is_empty() { "jcode" } else { &stem };
-    let normalized = path
+    let resolved = resolve_for_hash(path, resolve_parent);
+    let normalized = resolved
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
     let digest = Sha256::digest(normalized.as_bytes());
     let hash = hex::encode(digest);
     format!(r"\\.\pipe\{}-{}", stem, &hash[..16])
+}
+
+/// The path whose STRING is hashed into the pipe name.
+///
+/// The parent directory is resolved, so two spellings of one directory hash to
+/// the same pipe. The final component is kept as written: the socket is
+/// unlinked and recreated on bind, so the NAME is what matters, not whatever
+/// it happened to point at.
+///
+/// Falls back to the raw path when the parent cannot be resolved (it does not
+/// exist yet, or the process may not read it). Two unresolvable paths still
+/// compare consistently with each other.
+fn resolve_for_hash(
+    path: &Path,
+    resolve_parent: fn(&Path) -> Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => match resolve_parent(parent) {
+            Some(canonical) => canonical.join(file_name),
+            None => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Resolve the parent directory of a socket path to its canonical spelling.
+///
+/// WHY THIS EXISTS (measured 2026-11-14 on this host)
+///
+/// The pipe name is a hash of the path STRING, so two spellings of one
+/// directory produce two DIFFERENT pipes and therefore two independent
+/// daemons that cannot see each other. Windows hands a Scheduled Task the 8.3
+/// short spelling of `%TEMP%` (`C:\Users\WORKSH~1\...`) while an interactive
+/// shell gets the long one (`C:\Users\WorkShop1\...`), and the daemon derives
+/// its socket from `std::env::temp_dir()`. MEASURED: the two spellings hash to
+/// `d6352b96b284a42d` and `5e984a5ce3694442` - two pipes, two daemons, one
+/// shared session database.
+///
+/// Resolving the PARENT fixes that: `std::fs::canonicalize` expands an 8.3
+/// name to its long form. MEASURED on this host: canonicalizing
+/// `C:\Users\WORKSH~1\AppData\Local\Temp\jcode-WorkShop1` yields
+/// `C:\Users\WorkShop1\AppData\Local\Temp\jcode-WorkShop1`, and hashing THAT
+/// gives `5e984a5ce3694442` - the same pipe the long spelling produces.
+///
+/// Only the parent is resolved. The final component is kept as written, for
+/// the same reason `resolved_socket_identity` keeps it: the socket file is
+/// unlinked and recreated on bind, so the name is what matters, not whatever
+/// it happened to point at.
+///
+/// Falls back to the raw path when the parent cannot be resolved (it does not
+/// exist yet, or the process may not read it). Two unresolvable paths still
+/// compare consistently with each other.
+fn canonical_parent(parent: &Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(parent)
+        .ok()
+        // `canonicalize` returns a VERBATIM path (`\\?\C:\...`) on Windows.
+        // That prefix is not part of the path the SDK hashes, so keeping it
+        // would change the pipe name for every path - breaking the contract
+        // pinned by `pipe_name_matches_the_typescript_sdk`.
+        //
+        // reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+        // reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew
+        .map(|resolved| strip_verbatim_prefix(&resolved))
+}
+
+/// Drop the `\\?\` verbatim prefix from a Windows path.
+///
+/// `\\?\C:\dir` becomes `C:\dir`; `\\?\UNC\server\share` becomes
+/// `\\server\share`. A path without the prefix is returned unchanged.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Listener wraps a Windows named pipe server, providing an accept loop
@@ -700,6 +793,7 @@ pub fn stream_pair() -> io::Result<(Stream, Stream)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -986,5 +1080,146 @@ mod tests {
             !is_socket_path(&path),
             "a pipe with no server must be reported as absent"
         );
+    }
+
+    /// The short (8.3) spelling of a directory must name the SAME pipe as the
+    /// long spelling.
+    ///
+    /// The pipe name is a hash of the path STRING, so two spellings of one
+    /// directory used to produce two pipes and therefore two independent
+    /// daemons. MEASURED 2026-11-14 on this host: a Scheduled Task received
+    /// `C:\Users\WORKSH~1\...` while an interactive shell received
+    /// `C:\Users\WorkShop1\...`, and the two hashed to `d6352b96b284a42d` and
+    /// `5e984a5ce3694442` - two daemons holding the same session database.
+    ///
+    /// The short spelling is obtained from the OS at run time, not pinned to a
+    /// literal, so the test does not depend on this machine's user name and
+    /// fails loudly if the OS stops producing one.
+    ///
+    /// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew
+    #[test]
+    fn the_short_spelling_of_a_directory_names_the_same_pipe() {
+        let long_dir = std::env::temp_dir().join(format!(
+            "jcode-short-spelling-{}-{}",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&long_dir).expect("create the long-named directory");
+
+        let short_dir = short_path_spelling(&long_dir);
+        assert!(
+            short_dir.is_some(),
+            "the OS must produce an 8.3 spelling for this test to mean anything"
+        );
+        let short_dir = short_dir.expect("checked above");
+        assert_ne!(
+            short_dir, long_dir,
+            "the 8.3 spelling must differ from the long one, otherwise this test is vacuous"
+        );
+
+        let long_socket = long_dir.join("jcode.sock");
+        let short_socket = short_dir.join("jcode.sock");
+
+        assert_eq!(
+            path_to_pipe_name(&long_socket),
+            path_to_pipe_name(&short_socket),
+            "two spellings of one directory must name ONE pipe, or two daemons start"
+        );
+    }
+
+    /// The negative control for the test above: WITHOUT the parent resolution
+    /// the two spellings do produce different pipe names. If this ever passes,
+    /// the test above proves nothing.
+    #[test]
+    fn without_the_parent_resolution_the_two_spellings_do_differ() {
+        fn no_resolution(_parent: &Path) -> Option<std::path::PathBuf> {
+            None
+        }
+
+        let long_dir = std::env::temp_dir().join(format!(
+            "jcode-short-spelling-nc-{}-{}",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&long_dir).expect("create the long-named directory");
+        let short_dir = short_path_spelling(&long_dir).expect("the OS must produce an 8.3 spelling");
+        assert_ne!(short_dir, long_dir, "the 8.3 spelling must differ");
+
+        assert_ne!(
+            path_to_pipe_name_with(&long_dir.join("jcode.sock"), no_resolution),
+            path_to_pipe_name_with(&short_dir.join("jcode.sock"), no_resolution),
+            "without the resolution the spellings must differ, or the fix proves nothing"
+        );
+    }
+
+    /// A directory that cannot be resolved falls back to the raw path.
+    ///
+    /// The pipe names pinned by `pipe_name_matches_the_typescript_sdk` use
+    /// paths whose parent does not exist. Resolving them must not change their
+    /// hash, or the SDK contract would break for every path that is not yet
+    /// created.
+    #[test]
+    fn an_unresolvable_parent_keeps_the_raw_path() {
+        let path = Path::new(r"C:\a\b\jcode.sock");
+        assert_eq!(
+            path_to_pipe_name(path),
+            r"\\.\pipe\jcode-52dfdb00b2f35a71",
+            "a path whose parent does not exist must hash exactly as before"
+        );
+    }
+
+    /// The `\\?\` verbatim prefix must not reach the hash.
+    ///
+    /// MEASURED 2026-11-14: `std::fs::canonicalize` on Windows returns
+    /// `\\?\C:\Users\WorkShop1\...`. Hashing that verbatim string gives
+    /// `2713a047a605d211` instead of `5e984a5ce3694442`, which would change
+    /// every pipe name on the machine and break the pinned SDK contract.
+    #[test]
+    fn the_verbatim_prefix_is_stripped_before_hashing() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\Users\WorkShop1\AppData")),
+            Path::new(r"C:\Users\WorkShop1\AppData")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share")),
+            Path::new(r"\\server\share")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\plain\path")),
+            Path::new(r"C:\plain\path"),
+            "a path without the prefix must be left alone"
+        );
+    }
+
+    /// The 8.3 spelling of `path`, as the OS reports it.
+    ///
+    /// Returns `None` when the OS declines to produce one (the volume has 8.3
+    /// name generation disabled), which the caller treats as "this test cannot
+    /// run here" rather than as a failure of the code under test.
+    ///
+    /// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew
+    fn short_path_spelling(path: &Path) -> Option<std::path::PathBuf> {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0u16; wide.len() + 64];
+        let written = unsafe {
+            GetShortPathNameW(
+                wide.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        };
+        if written == 0 || written as usize >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(written as usize);
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &buffer[..written as usize],
+        )))
     }
 }
