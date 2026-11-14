@@ -905,8 +905,11 @@ impl OpenRouterProvider {
                 // it keeps the historical behaviour. A profile that set
                 // `supports_reasoning_effort = true` does reach this branch
                 // (the explicit override wins here too) and must be able to
-                // disable thinking: measured 2026-11-12, the Nous endpoint
-                // honours `none` (0 reasoning tokens in 9/9 runs).
+                // disable thinking: measured 2026-11-12/14, the Nous endpoint
+                // honours `none` - the whole `completion_tokens_details`
+                // block and `message.reasoning_content` are ABSENT (not a
+                // zero token count), 11/11 runs in that series and 64 more
+                // raw-confirmed later.
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
@@ -923,8 +926,11 @@ impl OpenRouterProvider {
                 // presence, so the heuristic (model-family) detection keeps
                 // dropping it. A profile that explicitly opts in via
                 // `supports_reasoning_effort = true` does want it on the wire:
-                // measured 2026-11-12, the Nous endpoint honours `none` (0
-                // reasoning tokens in 9/9 runs vs 419..3999 without the field).
+                // measured 2026-11-12/14, the Nous endpoint honours `none`:
+                // the `completion_tokens_details` block and
+                // `message.reasoning_content` are ABSENT (not a zero token
+                // count), 11/11 runs in that series vs 419..3999 reasoning
+                // tokens without the field.
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
