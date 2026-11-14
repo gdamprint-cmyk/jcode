@@ -157,6 +157,48 @@ fn nearest_console_ancestor(
     None
 }
 
+/// Whether our direct parent process is a console program (a terminal shell).
+///
+/// The exec supervisor uses this to decide whether its own lifetime gates the
+/// pane shell's wait for a foreground job. Only a console parent waits for
+/// its child as a job; a GUI parent (explorer.exe, a terminal emulator) does
+/// not, so keeping the process alive would not keep the shell from grabbing
+/// the console input.
+pub fn parent_is_console_shell() -> bool {
+    let self_pid = unsafe { GetCurrentProcessId() };
+    let Some(parent_pid) = process_parent_map().get(&self_pid).copied() else {
+        return false;
+    };
+    if parent_pid == 0 || parent_pid == self_pid {
+        return false;
+    }
+    is_console_parent(parent_pid)
+}
+
+/// Whether a process with the given executable name is attached to this
+/// console, other than this process itself.
+///
+/// The exec supervisor uses this to recognise its successor: the successor is
+/// another instance of the same binary, attached to the same console. When the
+/// successor re-execs itself, its PID dies but the next client is already in
+/// the console, and the supervisor must keep waiting for that one.
+///
+/// `None` means the console could not be scanned (no console attached, or
+/// the API refused). The caller treats that as "unknown", never as "gone".
+pub fn console_has_other_process_with_name(exe_name: &str) -> Option<bool> {
+    let processes = console_process_list()?;
+    let self_pid = unsafe { GetCurrentProcessId() };
+    for pid in processes {
+        if pid == self_pid {
+            continue;
+        }
+        if process_image_name(pid).as_deref() == Some(exe_name) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// The recorded parent of every process (Toolhelp `th32ParentProcessID`).
 ///
 /// One snapshot for the whole walk: taking a snapshot per level would make the

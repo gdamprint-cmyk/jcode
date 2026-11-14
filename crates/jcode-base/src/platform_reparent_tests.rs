@@ -380,6 +380,55 @@ fn console_process_list_never_panics_and_contains_this_process() {
     }
 }
 
+/// The exec supervisor must recognise a client in the console by its
+/// executable name, and must not count itself.
+///
+/// The supervisor uses this to decide whether the pane still hosts a client:
+/// the successor is another instance of the same binary, attached to the same
+/// console. Counting itself would make the supervisor wait for its own
+/// lifetime and never release the pane.
+#[test]
+fn console_client_lookup_matches_the_executable_name_format() {
+    // The name the supervisor uses comes from `current_exe().file_stem()`,
+    // lowercased and without the extension. The console lookup compares it
+    // against `process_image_name`, which strips the directory, drops the
+    // ".exe" suffix and lowercases. The two must agree, otherwise the
+    // supervisor can never see its own successor.
+    let exe = std::env::current_exe().expect("current_exe");
+    let expected = exe
+        .file_stem()
+        .expect("file stem")
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let self_pid = std::process::id();
+    assert_eq!(
+        process_image_name(self_pid).as_deref(),
+        Some(expected.as_str()),
+        "the process' own image name must match the supervisor's own exe name"
+    );
+
+    // This process is in the console, but it must not count itself.
+    let found = console_has_other_process_with_name(&expected);
+    if let Some(found) = found {
+        assert!(
+            !found,
+            "the supervisor must not count itself as a console client (pid {self_pid})"
+        );
+    }
+}
+
+/// An unknown executable name must never be reported as present.
+#[test]
+fn console_client_lookup_reports_an_unknown_name_as_absent() {
+    let found = console_has_other_process_with_name("jcode-no-such-executable-8f3a1c");
+    if let Some(found) = found {
+        assert!(
+            !found,
+            "an executable that does not exist must not be reported as a console client"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Environment block
 //
