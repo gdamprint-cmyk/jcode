@@ -3302,7 +3302,7 @@ fn named_profile_supports_reasoning_effort_config_override() {
 /// Measured 2026-11-12/14 against the Nous endpoint: `reasoning_effort: none`
 /// suppresses thinking entirely - the `completion_tokens_details` block and
 /// `message.reasoning_content` are ABSENT (not a zero token count), in 11/11
-/// runs of that series and 64 further raw-confirmed runs, vs 419..3999
+/// runs of that series and 64 further raw-confirmed runs, vs 552..3999
 /// reasoning tokens without the field. The heuristic (model-family) path keeps
 /// dropping `none`, because a model that never reasons tolerates its absence
 /// better; the explicit profile opt-in must not.

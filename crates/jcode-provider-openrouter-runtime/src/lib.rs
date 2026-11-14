@@ -929,7 +929,7 @@ impl OpenRouterProvider {
                 // measured 2026-11-12/14, the Nous endpoint honours `none`:
                 // the `completion_tokens_details` block and
                 // `message.reasoning_content` are ABSENT (not a zero token
-                // count), 11/11 runs in that series vs 419..3999 reasoning
+                // count), 11/11 runs in that series vs 552..3999 reasoning
                 // tokens without the field.
                 return false;
             }
