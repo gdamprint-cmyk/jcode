@@ -2208,31 +2208,26 @@ pub(super) async fn handle_client(
             }
 
             Request::PersistSession { id } => {
-                // Never wait for the agent lock here: this actor owns the
+                // Never wait for the agent lock inside this actor: it owns the
                 // socket, and blocking would leave an interrupt (Escape,
-                // Alt+B) unread until the running turn ends. A busy agent is
-                // rejected instead, and the client retries at the turn
-                // boundary.
-                let result = match agent.try_lock() {
-                    Ok(mut agent_guard) => agent_guard.persist_session_now(),
-                    Err(_) => {
-                        send_agent_busy_error(
+                // Alt+B) unread until the running turn ends. Persist in its own
+                // task instead: the actor returns to its read loop immediately
+                // and the session is still written once the turn releases the
+                // lock. This is the same pattern handle_compact uses.
+                let agent = Arc::clone(&agent);
+                let tx = client_event_tx.clone();
+                crate::runtime_activity::spawn(async move {
+                    let mut agent_guard = agent.lock().await;
+                    let result = agent_guard.persist_session_now();
+                    drop(agent_guard);
+                    let _ = tx.send(match result {
+                        Ok(()) => ServerEvent::Done { id },
+                        Err(error) => ServerEvent::Error {
                             id,
-                            "persist_session",
-                            &client_session_id,
-                            client_is_processing,
-                            &client_event_tx,
-                        );
-                        continue;
-                    }
-                };
-                let _ = client_event_tx.send(match result {
-                    Ok(()) => ServerEvent::Done { id },
-                    Err(error) => ServerEvent::Error {
-                        id,
-                        message: crate::util::format_error_chain(&error),
-                        retry_after_secs: None,
-                    },
+                            message: crate::util::format_error_chain(&error),
+                            retry_after_secs: None,
+                        },
+                    });
                 });
             }
 
