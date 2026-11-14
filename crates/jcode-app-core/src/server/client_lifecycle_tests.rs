@@ -1,4 +1,8 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
+// reference: https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html
+// `Mutex::try_lock` returns Err(TryLockError) without waiting, unlike
+// `lock().await` which queues on a FIFO basis; the busy-agent tests below
+// rely on that non-waiting rejection so the connection actor keeps reading.
 use super::*;
 use crate::message::{ContentBlock, Message, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
@@ -247,6 +251,92 @@ async fn busy_session_background_tool_signal_fires_via_registry_fallback() {
 
     // Cleanup so the global registry does not leak across tests.
     crate::server::state::remove_background_tool_signal(session_id);
+}
+
+#[tokio::test]
+async fn busy_agent_message_acceptance_does_not_wait_for_agent_lock() {
+    // Regression: the connection actor used to await the agent mutex inside
+    // start_processing_message. A turn owned by another attachment held that
+    // mutex for the whole turn, so the actor never returned to its read loop
+    // and every interrupt (Escape, Alt+B) stayed unread in the socket buffer
+    // until the turn ended. A busy agent must be rejected immediately.
+    let _guard = crate::storage::lock_test_env();
+    let _env = IsolatedReloadRecoveryEnv::new();
+    let session_id = "session_busy_message_acceptance";
+    let provider: Arc<dyn Provider> = Arc::new(PanicOnForkProvider {
+        forked: Arc::new(AtomicBool::new(false)),
+    });
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let mut session = crate::session::Session::create_with_id(session_id.into(), None, None);
+    session.model = Some("busy-message".into());
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider, registry, session, None,
+    )));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+    let members = Arc::new(RwLock::new(HashMap::new()));
+    let swarms = Arc::new(RwLock::new(HashMap::new()));
+    let history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (swarm_tx, _) = broadcast::channel(8);
+    let swarm = SwarmStatusRefs {
+        members: &members,
+        swarms_by_id: &swarms,
+        event_history: &history,
+        event_counter: &counter,
+        event_tx: &swarm_tx,
+    };
+    let mut processing = false;
+    let mut message_id = None;
+    let mut processing_session = None;
+    let mut task = None;
+    let mut state = ProcessingState {
+        client_is_processing: &mut processing,
+        message_id: &mut message_id,
+        session_id: &mut processing_session,
+        task: &mut task,
+    };
+
+    // Another attachment owns the running turn and holds the agent mutex.
+    // Read the count BEFORE taking the guard: a second `agent.lock()` would
+    // queue behind the guard we are about to hold and never return.
+    let initial_messages = agent.lock().await.message_count();
+    let busy_agent_lock = agent.lock().await;
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        start_processing_message(
+            ProcessingMessage {
+                id: 42,
+                content: "must not stall the actor".into(),
+                images: Vec::new(),
+                system_reminder: None,
+                active_skill: None,
+                server_failover: false,
+            },
+            session_id,
+            &mut state,
+            &agent,
+            &event_tx,
+            &done_tx,
+            Vec::new(),
+            &swarm,
+        )
+        .await;
+    })
+    .await
+    .expect("message acceptance must not wait for the agent mutex");
+
+    // The client re-queues a follow-up on exactly this busy string.
+    assert!(matches!(
+        event_rx.recv().await.unwrap(),
+        ServerEvent::Error { id: 42, message, .. } if message == "Already processing a message"
+    ));
+    assert!(!*state.client_is_processing);
+    assert!(state.task.is_none());
+    assert!(done_rx.try_recv().is_err());
+
+    drop(busy_agent_lock);
+    assert_eq!(agent.lock().await.message_count(), initial_messages);
 }
 
 #[tokio::test]

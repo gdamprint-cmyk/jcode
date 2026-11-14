@@ -1,3 +1,9 @@
+// reference: https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html
+// reference: https://docs.rs/tokio/latest/tokio/time/fn.timeout.html
+// The connection actor owns its socket, so it must never await the Agent
+// mutex: a blocking wait there leaves Escape / Alt+B / soft-interrupt
+// requests unread in the socket buffer for the whole turn. `try_lock` never
+// waits, and `tokio::time::timeout` cancels the pending lock future.
 use super::client_actions::{
     AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
@@ -207,13 +213,44 @@ async fn refresh_session_control_handle(
                     stop_signal,
                 );
             }
-            let agent_guard = agent.lock().await;
-            crate::logging::warn(&format!(
-                "refresh_session_control_handle: acquired agent lock for session {} after {}ms",
-                session_id,
-                started.elapsed().as_millis()
-            ));
-            agent_guard
+            // The agent is busy and no soft-interrupt queue is registered for
+            // this session. Waiting for the mutex would stall the connection
+            // actor and leave interrupts unread, so bound the wait: after the
+            // timeout the handle degrades to cancel-only (Escape still works).
+            match tokio::time::timeout(Duration::from_millis(5000), agent.lock()).await {
+                Ok(agent_guard) => {
+                    crate::logging::warn(&format!(
+                        "refresh_session_control_handle: acquired agent lock for session {} after {}ms",
+                        session_id,
+                        started.elapsed().as_millis()
+                    ));
+                    agent_guard
+                }
+                Err(_) => {
+                    crate::logging::warn(&format!(
+                        "refresh_session_control_handle: gave up waiting for the busy agent lock of session {} after {}ms; using a cancel-only handle",
+                        session_id,
+                        started.elapsed().as_millis()
+                    ));
+                    let stop_signal = fallback_stop_signal.unwrap_or_else(InterruptSignal::new);
+                    // Keep a real queue. A fresh empty queue would strand the
+                    // interrupts already queued for the running turn: the
+                    // Agent owns its queue, but the Agent lock is exactly what
+                    // we could not get. The session-scoped registry holds the
+                    // same Arc for a live session, so prefer it.
+                    let soft_interrupt_queue = soft_interrupt_queues
+                        .read()
+                        .await
+                        .get(session_id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+                    return SessionControlHandle::cancel_only(
+                        session_id,
+                        soft_interrupt_queue,
+                        stop_signal,
+                    );
+                }
+            }
         }
     };
     SessionControlHandle::new(
@@ -1062,8 +1099,14 @@ pub(super) async fn handle_client(
                     | Request::RunSubagent { .. }
             )
         {
-            agent.lock().await.activate_concurrency_tracking();
-            provisional_session = false;
+            // The agent can be busy with another turn while this provisional
+            // connection commits ownership. Waiting here would stall the whole
+            // actor, so a busy agent simply keeps the provisional state; the
+            // next request retries the commit.
+            if let Ok(mut agent_guard) = agent.try_lock() {
+                agent_guard.activate_concurrency_tracking();
+                provisional_session = false;
+            }
         }
 
         if let Err(message) = resolve_target_subscribe_working_dir(
@@ -1386,8 +1429,22 @@ pub(super) async fn handle_client(
                 }
 
                 let rewind_result = {
-                    let mut agent_guard = agent.lock().await;
-                    agent_guard.rewind_to_message(message_index)
+                    // The per-connection busy check above does not cover a turn
+                    // owned by another attachment, so the agent can still be
+                    // busy here. Never wait for it: this actor owns the socket.
+                    match agent.try_lock() {
+                        Ok(mut agent_guard) => agent_guard.rewind_to_message(message_index),
+                        Err(_) => {
+                            send_agent_busy_error(
+                                id,
+                                "rewind",
+                                &client_session_id,
+                                client_is_processing,
+                                &client_event_tx,
+                            );
+                            continue;
+                        }
+                    }
                 };
 
                 match rewind_result {
@@ -1449,8 +1506,21 @@ pub(super) async fn handle_client(
                 }
 
                 let undo_result = {
-                    let mut agent_guard = agent.lock().await;
-                    agent_guard.undo_rewind()
+                    // Never wait for the agent lock: this actor owns the socket
+                    // and a blocked read leaves interrupts unread.
+                    match agent.try_lock() {
+                        Ok(mut agent_guard) => agent_guard.undo_rewind(),
+                        Err(_) => {
+                            send_agent_busy_error(
+                                id,
+                                "rewind_undo",
+                                &client_session_id,
+                                client_is_processing,
+                                &client_event_tx,
+                            );
+                            continue;
+                        }
+                    }
                 };
 
                 match undo_result {
@@ -1586,7 +1656,11 @@ pub(super) async fn handle_client(
                     target_session_id.as_deref(),
                     system_prompt.as_deref(),
                 ) {
-                    agent.lock().await.set_system_prompt(prompt);
+                    // Never wait for the agent lock here: this actor owns the
+                    // socket and a blocked read leaves interrupts unread.
+                    if let Ok(mut agent_guard) = agent.try_lock() {
+                        agent_guard.set_system_prompt(prompt);
+                    }
                 }
                 // Every Subscribe carries an authoritative snapshot. An empty
                 // snapshot must clear terminal vars inherited by the daemon
@@ -1704,8 +1778,10 @@ pub(super) async fn handle_client(
                             break;
                         }
                     } else {
-                        if provisional_session {
-                            agent.lock().await.activate_concurrency_tracking();
+                        if provisional_session
+                            && let Ok(mut agent_guard) = agent.try_lock()
+                        {
+                            agent_guard.activate_concurrency_tracking();
                         }
                         handle_subscribe(
                             id,
@@ -1736,8 +1812,10 @@ pub(super) async fn handle_client(
                         .await;
                     }
                 } else {
-                    if provisional_session {
-                        agent.lock().await.activate_concurrency_tracking();
+                    if provisional_session
+                        && let Ok(mut agent_guard) = agent.try_lock()
+                    {
+                        agent_guard.activate_concurrency_tracking();
                     }
                     handle_subscribe(
                         id,
@@ -1880,8 +1958,14 @@ pub(super) async fn handle_client(
             } => {
                 let pre_resume_session_id = client_session_id.clone();
                 let resume_working_dir = {
-                    let agent_guard = agent.lock().await;
-                    agent_guard.working_dir().map(str::to_string)
+                    // A busy agent must not stall this actor: it owns the
+                    // socket, and a blocked read leaves interrupts unread.
+                    // Resume without a working dir hint; the handler resolves
+                    // it from the resumed session itself.
+                    match agent.try_lock() {
+                        Ok(agent_guard) => agent_guard.working_dir().map(str::to_string),
+                        Err(_) => None,
+                    }
                 };
                 current_client_instance_id = client_instance_id.clone();
                 {
@@ -2124,9 +2208,24 @@ pub(super) async fn handle_client(
             }
 
             Request::PersistSession { id } => {
-                // Wait for the lock instead of rejecting: this runs at an idle
-                // turn boundary and must not fail spuriously.
-                let result = agent.lock().await.persist_session_now();
+                // Never wait for the agent lock here: this actor owns the
+                // socket, and blocking would leave an interrupt (Escape,
+                // Alt+B) unread until the running turn ends. A busy agent is
+                // rejected instead, and the client retries at the turn
+                // boundary.
+                let result = match agent.try_lock() {
+                    Ok(mut agent_guard) => agent_guard.persist_session_now(),
+                    Err(_) => {
+                        send_agent_busy_error(
+                            id,
+                            "persist_session",
+                            &client_session_id,
+                            client_is_processing,
+                            &client_event_tx,
+                        );
+                        continue;
+                    }
+                };
                 let _ = client_event_tx.send(match result {
                     Ok(()) => ServerEvent::Done { id },
                     Err(error) => ServerEvent::Error {
@@ -2411,7 +2510,11 @@ pub(super) async fn handle_client(
                             // processing state, task ownership, fanout, cancel,
                             // failover, completion and disconnected continuation.
                             if provisional_session {
-                                agent.lock().await.activate_concurrency_tracking();
+                                // Never wait for the agent lock here: this
+                                // actor owns the socket.
+                                if let Ok(mut agent_guard) = agent.try_lock() {
+                                    agent_guard.activate_concurrency_tracking();
+                                }
                                 provisional_session = false;
                             }
                             if !client_is_processing {
@@ -3586,9 +3689,37 @@ async fn start_processing_message(
         return;
     }
 
+    // Whether this member reports back to a parent decides the inline output
+    // tap. Read it before taking the agent guard: the report-back edge does
+    // not change during the turn, and the guard must be taken only once.
+    let owned_worker = swarm
+        .members
+        .read()
+        .await
+        .get(client_session_id)
+        .is_some_and(|member| member.report_back_to_session_id.is_some());
+
     // Serialize recovery acceptance with the agent lock across connections.
     // A stale History frame may submit the same reminder after its first turn.
-    let mut agent_guard = agent.lock().await;
+    //
+    // The connection actor owns this socket: blocking here would stop it from
+    // reading the next request, so an interrupt (Escape, Alt+B) written by the
+    // client would sit unread in the socket buffer for the whole turn and the
+    // session would never see it. A busy agent must be rejected, never awaited.
+    let mut agent_guard = match agent.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Use the exact busy string the client matches on: it re-queues the
+            // follow-up instead of dropping it (see the client's
+            // "Already processing a message" recovery path).
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "Already processing a message".to_string(),
+                retry_after_secs: None,
+            });
+            return;
+        }
+    };
     let turn_lease = match agent_guard.claim_server_turn() {
         Ok(lease) => lease,
         Err(error) => {
@@ -3639,6 +3770,15 @@ async fn start_processing_message(
             client_session_id, id, error
         ));
     }
+    // Capture the report window and the soft-interrupt queue from the guard
+    // we already hold. Locking the agent a second time here would stall this
+    // actor on another connection's turn and leave interrupts unread, and it
+    // would re-open the window this fix closes.
+    if owned_worker {
+        agent_guard.set_inline_output_tap(true);
+    }
+    let start_message_index = agent_guard.message_count();
+    let pending_queue = agent_guard.soft_interrupt_queue();
     drop(agent_guard);
 
     *state.client_is_processing = true;
@@ -3657,22 +3797,6 @@ async fn start_processing_message(
     )
     .await;
 
-    let owned_worker = swarm
-        .members
-        .read()
-        .await
-        .get(client_session_id)
-        .is_some_and(|member| member.report_back_to_session_id.is_some());
-    let (start_message_index, pending_queue) = {
-        let mut agent_guard = agent.lock().await;
-        if owned_worker {
-            agent_guard.set_inline_output_tap(true);
-        }
-        (
-            agent_guard.message_count(),
-            agent_guard.soft_interrupt_queue(),
-        )
-    };
     let agent = Arc::clone(agent);
     let report_agent = Arc::clone(&agent);
     let events = super::state::TurnEventChannel::new(
