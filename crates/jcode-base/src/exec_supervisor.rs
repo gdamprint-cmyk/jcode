@@ -207,6 +207,83 @@ pub fn wait_for_client_exit(target: &SupervisorTarget) -> SupervisorExit {
 mod tests {
     use super::*;
 
+    /// Set the chain depth for the duration of a test.
+    ///
+    /// The environment is process-global, so the tests that touch it must not
+    /// run in parallel with each other. `crate::env::set_var` is the project's
+    /// own wrapper, which keeps the same guarantee the rest of the test suite
+    /// relies on.
+    struct DepthGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl DepthGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os(SUPERVISOR_DEPTH_ENV);
+            crate::env::set_var(SUPERVISOR_DEPTH_ENV, value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => crate::env::set_var(SUPERVISOR_DEPTH_ENV, value),
+                None => crate::env::remove_var(SUPERVISOR_DEPTH_ENV),
+            }
+        }
+    }
+
+    /// The depth decides whether a process may supervise. The head of the
+    /// chain (the client the pane shell launched) may; a successor may not.
+    ///
+    /// This is the rule that keeps the exec chain from piling up supervisors
+    /// behind the pane shell's wait: a successor's exit does not wake the
+    /// shell, because the shell waits for the head of the chain.
+    #[test]
+    fn only_the_head_of_the_chain_may_supervise() {
+        let _guard = DepthGuard::set("0");
+        assert_eq!(supervisor_depth(), 0);
+        assert!(
+            should_supervise(),
+            "the client the pane shell launched must be able to supervise"
+        );
+
+        let _guard = DepthGuard::set("1");
+        assert_eq!(supervisor_depth(), 1);
+        assert!(
+            !should_supervise(),
+            "a successor must not supervise: its exit does not gate the shell's wait"
+        );
+
+        let _guard = DepthGuard::set("2");
+        assert!(
+            !should_supervise(),
+            "a successor of a successor must not supervise either"
+        );
+    }
+
+    /// A malformed depth must not grant supervision rights.
+    ///
+    /// An unparsable value falls back to depth 0, which is the head of the
+    /// chain. That is the safe direction: the supervisor then holds the pane
+    /// shell until the console really has no client left, instead of exiting
+    /// early and letting the shell take the input.
+    #[test]
+    fn a_malformed_depth_is_read_as_the_head_of_the_chain() {
+        let _guard = DepthGuard::set("not-a-number");
+        assert_eq!(supervisor_depth(), 0);
+        assert!(should_supervise());
+    }
+
+    /// A missing depth variable means a fresh client, which may supervise.
+    #[test]
+    fn a_missing_depth_is_the_head_of_the_chain() {
+        let _guard = DepthGuard::set("0");
+        crate::env::remove_var(SUPERVISOR_DEPTH_ENV);
+        assert_eq!(supervisor_depth(), 0);
+    }
+
     #[test]
     fn successor_depth_counts_up_from_the_current_depth() {
         assert_eq!(successor_depth(), supervisor_depth() + 1);
