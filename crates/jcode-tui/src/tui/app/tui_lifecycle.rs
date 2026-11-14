@@ -1256,6 +1256,16 @@ impl App {
     pub fn set_ambient_mode(&mut self, system_prompt: String, initial_message: String) {
         self.ambient_system_prompt = Some(system_prompt);
         crate::tool::ambient::register_ambient_session(self.session.id.clone());
+        // A visible ambient cycle runs as its own top-level TUI session: it has
+        // no parent and it is not a debug session, so the presence layer would
+        // classify it as a user-visible session. It is not one - it is the
+        // carrier that performs Harbor's landing apply, and the Harbor gate
+        // blocks a reload from any session that is not marked internal.
+        // The headless carrier gets this for free because it calls
+        // `Agent::set_debug(true)` (crates/jcode-app-core/src/ambient/runner.rs),
+        // which lands in `sync_internal_presence_flag`; this path needs the
+        // marker written explicitly.
+        crate::storage::set_session_internal(&self.session.id, true);
         self.queued_messages.push(initial_message);
         self.is_processing = true;
         self.status = ProcessingStatus::Sending;
