@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+﻿use sha2::{Digest, Sha256};
 use std::io;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -608,20 +608,62 @@ impl io::Write for SyncStream {
     }
 }
 
+/// Decide whether a failed pipe probe still proves a server is present.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+///   "If the CreateNamedPipe function was not successfully called on the server
+///    prior to this operation, a pipe will not exist and CreateFile will fail
+///    with ERROR_FILE_NOT_FOUND."
+/// reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-client
+///   "If the pipe exists but all of its instances are busy, CreateFile returns
+///    INVALID_HANDLE_VALUE and the GetLastError function returns
+///    ERROR_PIPE_BUSY."
+/// reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
+///   "when a client calls the CreateFile or CallNamedPipe function to connect
+///    to the client end of a named pipe, the system performs an access check
+///    before granting access to the client."
+///
+/// So the only error that means "no server" is ERROR_FILE_NOT_FOUND. Every
+/// other failure means the endpoint is there and something else went wrong.
+fn probe_error_means_endpoint_present(code: Option<i32>) -> bool {
+    let Some(code) = code else {
+        return false;
+    };
+    code == windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32
+        // The pipe instance EXISTS but this caller may not open it.
+        //
+        // MEASURED 2026-11-14 on this host: a Scheduled Task registered with
+        // `-RunLevel Limited` opens the live daemon's pipe and gets
+        // ERROR_ACCESS_DENIED (err=5), because Windows Mandatory Integrity
+        // Control denies the lower-integrity process access to the
+        // higher-integrity daemon's pipe. The old code mapped every error
+        // other than ERROR_PIPE_BUSY to "no listener", so the Harbor carrier
+        // logged "No running jcode server found" 12/12 times while the daemon
+        // was alive and serving sessions.
+        //
+        // Access denied means the endpoint is PRESENT. Reporting it as absent
+        // made a permission problem indistinguishable from a dead daemon.
+        // Treating it as present matches the Unix side, where `is_socket_path`
+        // is just "the path exists", and it is the safe direction for every
+        // caller: a client tries to connect and gets its own honest error
+        // instead of spawning a duplicate daemon against a live one.
+        || code == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32
+}
+
 pub fn is_socket_path(path: &Path) -> bool {
     let pipe_name = path_to_pipe_name(path);
     match probe_pipe(&pipe_name) {
         Ok(_) => true,
-        Err(error)
-            if error.raw_os_error()
-                == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
-        {
+        Err(error) => {
             // Every published instance being occupied proves that a server is
             // listening. Do not report the endpoint as absent and race a second
             // daemon against it merely because another client connected first.
-            true
+            if probe_error_means_endpoint_present(error.raw_os_error()) {
+                true
+            } else {
+                false
+            }
         }
-        Err(_) => false,
     }
 }
 
@@ -892,6 +934,57 @@ mod tests {
         assert!(
             is_socket_path(&path),
             "a busy named pipe must still be recognized as a live server endpoint"
+        );
+    }
+
+    /// A probe that fails on ACCESS DENIED must NOT report the endpoint absent.
+    ///
+    /// MEASURED 2026-11-14: a `-RunLevel Limited` Scheduled Task probing a live
+    /// daemon's pipe got ERROR_ACCESS_DENIED, and the probe reported "no
+    /// listener" for 12/12 attempts while the daemon was alive and serving.
+    /// The endpoint was present the whole time; only the caller's rights were
+    /// insufficient.
+    ///
+    /// The mapping is pinned directly, so the test holds regardless of the
+    /// integrity level the test runner happens to execute at.
+    #[test]
+    fn an_access_denied_pipe_is_not_reported_as_absent() {
+        let access_denied = windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32;
+        let file_not_found = windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32;
+        let pipe_busy = windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32;
+
+        assert!(
+            probe_error_means_endpoint_present(Some(access_denied)),
+            "ACCESS_DENIED proves the pipe EXISTS; it must not read as absent"
+        );
+        assert!(
+            probe_error_means_endpoint_present(Some(pipe_busy)),
+            "PIPE_BUSY proves a server is listening"
+        );
+        assert!(
+            !probe_error_means_endpoint_present(Some(file_not_found)),
+            "FILE_NOT_FOUND is the only error that means the pipe is absent"
+        );
+        assert!(
+            !probe_error_means_endpoint_present(None),
+            "an error with no OS code carries no proof of presence"
+        );
+    }
+
+    /// A pipe with no server behind it must still be reported as absent.
+    ///
+    /// This is the negative control for the test above: it proves the mapping
+    /// did not simply start reporting every probe as present.
+    #[test]
+    fn a_pipe_with_no_server_is_reported_as_absent() {
+        let path = std::env::temp_dir().join(format!(
+            "jcode-absent-pipe-probe-{}-{}.sock",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(
+            !is_socket_path(&path),
+            "a pipe with no server must be reported as absent"
         );
     }
 }
