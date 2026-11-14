@@ -1,3 +1,10 @@
+﻿// reference: https://datatracker.ietf.org/doc/rfc9110/ - RFC 9110 Section 6.4
+//   (Content): a message body may carry several parts, and a recipient parses
+//   the body into the parts it needs rather than treating the whole body as
+//   one opaque value. This module's reload-recovery continuation travels as
+//   one such part of a hidden reminder.
+// reference: crates/jcode-base/src/message/notifications.rs:497-498 - the
+//   in-repo pattern for reading a `\n\n`-separated reminder as sections.
 use crate::tool::selfdev::ReloadRecoveryDirective;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -284,11 +291,53 @@ pub(super) fn pending_directive_for_session(
     Ok(Some(directive))
 }
 
+/// Decide whether a hidden reminder CONTAINS the stored continuation.
+///
+/// reference: crates/jcode-base/src/message/notifications.rs:497-498 - the
+///   existing in-repo pattern for reading a reminder that is a `\n\n`-separated
+///   list of sections (`normalized.split("\n\n")`). This module's continuation
+///   travels through the same hidden-reminder channel, so it uses the same
+///   section format.
+/// reference: https://datatracker.ietf.org/doc/rfc9110/ - RFC 9110 Section 6.4
+///   (Content): a message body may carry several parts, and a recipient parses
+///   the body into the parts it needs rather than treating the whole body as
+///   one opaque value. The continuation is one such part.
+///
+/// The continuation is one SECTION of a hidden reminder, never the whole
+/// reminder body:
+///
+///   - the client joins queued reminders with `\n\n`
+///     (crates/jcode-tui/src/tui/app/remote.rs:446-447, and again at
+///     remote.rs:1731 and input.rs:4236);
+///   - the server itself appends the plan-declaration reminder the same way
+///     (crates/jcode-app-core/src/server/client_lifecycle.rs:1177-1182).
+///
+/// MEASURED 2026-11-14 on this host: a session's continuation stayed `pending`
+/// while the reload trace recorded
+/// `intent_delivery_mismatch expected_chars=202 received_chars=492` - the
+/// continuation WAS sent, but glued to another reminder, so a strict equality
+/// check rejected it and the intent was never marked delivered.
+///
+/// A SECTION match, not a substring match: a substring match would let an
+/// unrelated reminder that merely CONTAINS the continuation text count as
+/// delivery, which is the same false positive the strict check was avoiding.
+fn reminder_contains_continuation(reminder: &str, continuation: &str) -> bool {
+    if reminder == continuation {
+        return true;
+    }
+    if continuation.is_empty() {
+        return false;
+    }
+    reminder
+        .split("\n\n")
+        .any(|section| section.trim() == continuation.trim())
+}
+
 /// Compare only hidden reminders, never ordinary prompt content.
 pub(super) fn is_delivered_continuation(session_id: &str, reminder: &str) -> Result<bool> {
     Ok(peek_for_session(session_id)?.is_some_and(|record| {
         record.status == ReloadRecoveryStatus::Delivered
-            && record.directive.continuation_message == reminder
+            && reminder_contains_continuation(reminder, &record.directive.continuation_message)
     }))
 }
 
@@ -316,7 +365,8 @@ pub(super) fn mark_delivered_if_matching_continuation(
         return Ok(false);
     }
 
-    if record.directive.continuation_message != continuation_message {
+    if !reminder_contains_continuation(continuation_message, &record.directive.continuation_message)
+    {
         super::reload_trace::record_value(
             &record.reload_id,
             "intent_delivery_mismatch",
@@ -549,6 +599,72 @@ mod tests {
         );
         assert!(is_delivered_continuation(session_id, continuation)?);
         assert!(!is_delivered_continuation(session_id, "ordinary reminder")?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_continuation_glued_to_another_reminder_is_still_delivered() -> Result<()> {
+        let _lock = crate::storage::lock_test_env();
+        let _home = IsolatedHome::new();
+
+        let session_id = "session-glued";
+        let continuation = "Your session was interrupted by a server reload.";
+        persist_intent(
+            "reload-glued",
+            session_id,
+            ReloadRecoveryRole::InterruptedPeer,
+            directive(continuation),
+            "glued continuation test",
+        )?;
+
+        // MEASURED 2026-11-14: the client joins queued reminders with a blank
+        // line, so the continuation arrives glued to another reminder. The
+        // reload trace recorded expected_chars=202 received_chars=492 for that
+        // case, and the intent stayed pending forever.
+        let glued = format!("some other reminder\n\n{continuation}\n\nand a third one");
+        assert!(
+            mark_delivered_if_matching_continuation(session_id, &glued, "server-a")?,
+            "a continuation glued to other reminders must still be accepted"
+        );
+        assert!(!has_pending_for_session(session_id));
+        assert!(is_delivered_continuation(session_id, &glued)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_reminder_that_only_contains_the_continuation_is_not_delivery() -> Result<()> {
+        let _lock = crate::storage::lock_test_env();
+        let _home = IsolatedHome::new();
+
+        let session_id = "session-substring";
+        let continuation = "Your session was interrupted by a server reload.";
+        persist_intent(
+            "reload-substring",
+            session_id,
+            ReloadRecoveryRole::InterruptedPeer,
+            directive(continuation),
+            "substring test",
+        )?;
+
+        // The negative control for the section match: a reminder that merely
+        // CONTAINS the continuation text, without it being a section of its
+        // own, must NOT count as delivery. A plain substring match would
+        // wrongly accept this.
+        let embedded = format!("prefix text mentioning {continuation} in passing");
+        assert!(
+            !mark_delivered_if_matching_continuation(session_id, &embedded, "server-a")?,
+            "a reminder that merely contains the continuation must not consume the intent"
+        );
+        assert!(
+            has_pending_for_session(session_id),
+            "the intent must stay pending after a non-matching reminder"
+        );
+
+        // An unrelated reminder must not consume it either.
+        assert!(
+            !mark_delivered_if_matching_continuation(session_id, "some other message", "server-b")?
+        );
+        assert!(has_pending_for_session(session_id));
         Ok(())
     }
 
