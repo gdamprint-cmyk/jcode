@@ -17,11 +17,12 @@ pub use landing::{
     LandingTransaction, activate_client_channels, activate_clients_after_verified_daemon,
     advance_landing, begin_landing, clear_landing_transaction, daemon_identity_matches_version,
     daemon_identity_path, daemon_identity_proves_version, daemon_runs_version,
-    decide_landing_recovery, is_valid_version_label, land_version, landing_journal_path,
-    landing_lock_path, load_landing_transaction, log_landing_step, prepare_shared_server,
-    publish_daemon_identity, read_daemon_identity, record_handoff_requested, recover_landing,
-    recover_landing_locked, rollback_landing, save_landing_transaction, stage_build, version_commit,
-    wait_for_daemon_identity,
+    decide_landing_recovery, guard_landing_target_is_not_a_downgrade, is_valid_version_label,
+    land_version, landing_journal_path, landing_lock_path, load_landing_transaction,
+    log_landing_step, prepare_shared_server, publish_daemon_identity, read_daemon_identity,
+    record_handoff_requested, recover_landing, recover_landing_locked, rollback_landing,
+    save_landing_transaction, stage_build, version_build_time, version_commit,
+    wait_for_daemon_identity, would_downgrade,
 };
 pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,

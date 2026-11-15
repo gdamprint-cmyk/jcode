@@ -2276,15 +2276,26 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
 /// build, and the daemon channel is restored. This is what makes "the client
 /// channel and the daemon can never disagree" true rather than aspirational.
 pub async fn run_server_land_command(version: Option<&str>, emit_json: bool) -> Result<()> {
+    // An EXPLICIT version is a deliberate rollback and is never guarded: a
+    // human who names a version wants that exact build even when it is older.
+    //
+    // The AUTOMATIC target (the staged build) IS guarded, because
+    // `staged-version` is written by every build, is never cleared, and is
+    // protected from being garbage-collected. A stale staged label would
+    // therefore move the whole ecosystem BACKWARD, silently.
     let version = match version {
         Some(version) => version.to_string(),
-        None => crate::build::read_staged_version()?
-            .or(crate::build::read_current_version()?)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No staged build is available; run a build first, or pass an installed VERSION explicitly"
-                )
-            })?,
+        None => {
+            let target = crate::build::read_staged_version()?
+                .or(crate::build::read_current_version()?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No staged build is available; run a build first, or pass an installed VERSION explicitly"
+                    )
+                })?;
+            crate::build::guard_landing_target_is_not_a_downgrade(&target)?;
+            target
+        }
     };
 
     // The session owns the single-writer lock and the journal for the whole
@@ -2301,6 +2312,20 @@ pub async fn run_server_land_command(version: Option<&str>, emit_json: bool) -> 
 
     let outcome = async {
         session.prepare()?;
+
+        // With no daemon running there is nothing to hand off and nothing to
+        // prove: the next daemon starts from the `shared-server` channel that
+        // `prepare` just pointed at the target, so the client channels may
+        // follow it directly. Waiting for a daemon identity here would burn
+        // the whole timeout and then roll back a transaction that had nothing
+        // to prove.
+        if !crate::server::has_live_listener(&crate::server::socket_path()).await {
+            crate::build::log_landing_step(
+                "no daemon is running; activating the client channels directly",
+            );
+            return Ok(session.activate_clients_without_daemon()?);
+        }
+
         session.record_handoff()?;
 
         // `--force` is deliberate: the daemon's own "am I already the newest?"

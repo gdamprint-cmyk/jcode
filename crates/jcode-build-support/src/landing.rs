@@ -269,6 +269,84 @@ pub fn version_commit(version: &str) -> &str {
     version.split('-').next().unwrap_or(version).trim()
 }
 
+/// The build time of an installed version, read from its immutable binary.
+///
+/// MEASURED 2026-11-15 on this host: `builds/current/jcode.exe` and
+/// `builds/versions/cec14bfbb-dirty-cc06d2aa916f/jcode.exe` share the mtime
+/// 2026-11-14T20:18:56.907044, which is exactly the `build_time` the binary
+/// reports in `version --json`. So the mtime of an immutable version binary IS
+/// its build time, and two builds are comparable by it.
+///
+/// reference: crates/jcode-build-support/src/platform_support.rs (read
+/// 2026-11-15) - `atomic_symlink_swap` on Windows COPIES the version binary
+/// over the channel path, and the copy keeps the source's mtime. That is why
+/// the CHANNEL's mtime is also the build's time, and why the build time can be
+/// read from either place.
+pub fn version_build_time(version: &str) -> Result<Option<std::time::SystemTime>> {
+    if !is_valid_version_label(version) {
+        anyhow::bail!("Invalid installed version label: {version:?}");
+    }
+    let path = crate::version_binary_path(version)?;
+    let payload = crate::resolve_binary_payload(&path);
+    Ok(std::fs::metadata(&payload)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok()))
+}
+
+/// Whether landing `candidate` would move the ecosystem BACKWARD from `live`.
+///
+/// The comparison is by build time, because the labels themselves are not
+/// ordered: a self-dev label is `<commit>-dirty-<fingerprint>`, and two labels
+/// can name the same commit with different fingerprints.
+///
+/// An UNVERIFIABLE build (no binary on disk, no readable mtime) is never
+/// treated as a downgrade: the guard must not block a landing it cannot judge.
+pub fn would_downgrade(candidate: &str, live: &str) -> Result<bool> {
+    if candidate == live {
+        return Ok(false);
+    }
+    let (Some(candidate_time), Some(live_time)) =
+        (version_build_time(candidate)?, version_build_time(live)?)
+    else {
+        return Ok(false);
+    };
+    Ok(candidate_time < live_time)
+}
+
+/// Refuse a landing that would DOWNGRADE the ecosystem.
+///
+/// This guards the AUTOMATIC target selection. An EXPLICIT version stays a
+/// deliberate rollback, because a human who names a version wants that exact
+/// build even when it is older.
+///
+/// The reason the guard exists: `staged-version` is written by every build and
+/// is never cleared, and the version GC protects it from being pruned
+/// (`protected_versions` in crates/jcode-build-support/src/version_gc.rs reads
+/// `read_staged_version()`). So a stale staged label survives indefinitely.
+/// Landing it automatically would move the whole ecosystem back to an older
+/// build - the exact split the landing transaction exists to prevent, reached
+/// by the other direction.
+pub fn guard_landing_target_is_not_a_downgrade(candidate: &str) -> Result<()> {
+    let mut checked: Vec<String> = Vec::new();
+    for live in [crate::read_shared_server_version()?, crate::read_current_version()?] {
+        let Some(live) = live else {
+            continue;
+        };
+        if live == candidate || checked.contains(&live) {
+            continue;
+        }
+        checked.push(live.clone());
+        if would_downgrade(candidate, &live)? {
+            anyhow::bail!(
+                "Refusing to land {candidate}: the live build {live} is NEWER, so landing it \
+                 would downgrade the whole ecosystem. Pass the version explicitly \
+                 (`jcode server land {candidate}`) if a rollback is really intended."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether a daemon identity proves the daemon runs `version`.
 ///
 /// The comparison is by COMMIT, not by the full label: a dirty self-dev
@@ -520,6 +598,31 @@ impl LandingSession {
         clear_landing_transaction()?;
         log_landing_step(&format!("landed {target}"));
 
+        Ok(LandingOutcome::Landed {
+            target_version: target,
+            previous_current_version: self.transaction.previous_current_version.clone(),
+            previous_shared_server_version: self.transaction.previous_shared_server_version.clone(),
+        })
+    }
+
+    /// Move the client channels WITHOUT a daemon handoff.
+    ///
+    /// This is the landing's answer to "no daemon is running". There is nothing
+    /// to hand off, so there is nothing to prove: the next daemon starts from
+    /// the `shared-server` channel that `prepare` already pointed at the
+    /// target, and the client channels may follow it.
+    ///
+    /// Waiting for a daemon identity here would be wrong: with no daemon
+    /// running, no identity can ever appear, so the landing would wait for its
+    /// whole timeout and then roll back a transaction that had nothing to
+    /// prove.
+    pub fn activate_clients_without_daemon(&mut self) -> Result<LandingOutcome> {
+        let target = self.transaction.target_version.clone();
+        activate_client_channels(&mut self.transaction, &target)?;
+        clear_landing_transaction()?;
+        log_landing_step(&format!(
+            "landed {target} (no daemon was running; the next daemon starts from the shared-server channel)"
+        ));
         Ok(LandingOutcome::Landed {
             target_version: target,
             previous_current_version: self.transaction.previous_current_version.clone(),

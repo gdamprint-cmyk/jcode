@@ -353,3 +353,117 @@ fn the_staged_build_is_the_landing_target_not_the_current_channel() {
         );
     });
 }
+
+/// Install a fake version whose binary carries a given build time.
+///
+/// The downgrade guard compares builds by their build time, which the landing
+/// reads from the immutable version binary's mtime. So a test has to be able
+/// to give two fake versions different times.
+fn install_fake_version_at(version: &str, build_time: std::time::SystemTime) {
+    let path = version_binary_path(version).expect("version path");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+    std::fs::write(&path, b"fake binary").expect("write binary");
+    // The mtime is set explicitly, because the guard's whole ordering rests on
+    // it. A filesystem with coarse timestamp granularity would make two
+    // versions written in the same second indistinguishable, so the test
+    // spaces them a full day apart.
+    //
+    // reference: https://doc.rust-lang.org/std/fs/fn.File.html#method.set_times
+    // (read 2026-11-15) - `File::set_times` "changes the access and modification
+    // times of a file" and takes a `FileTimes`, which is the stdlib way to set
+    // an mtime without pulling in an extra dependency.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open binary");
+    file.set_times(std::fs::FileTimes::new().set_modified(build_time))
+        .expect("set mtime");
+}
+
+#[test]
+fn a_stale_staged_build_is_refused_as_a_downgrade() {
+    with_temp_jcode_home(|| {
+        let now = std::time::SystemTime::now();
+        let older = now - std::time::Duration::from_secs(86_400);
+        let newer = now;
+
+        install_fake_version_at("aaa1111-dirty-2222", older);
+        install_fake_version_at("bbb2222-dirty-3333", newer);
+
+        // The ecosystem already runs the NEWER build.
+        update_current_symlink("bbb2222-dirty-3333").expect("current");
+        update_shared_server_symlink("bbb2222-dirty-3333").expect("shared");
+
+        // The staged marker still names the OLDER build (it is never cleared).
+        write_staged_version("aaa1111-dirty-2222").expect("stage");
+
+        // Landing the stale staged build would move the whole ecosystem back.
+        assert!(
+            would_downgrade("aaa1111-dirty-2222", "bbb2222-dirty-3333").expect("compare"),
+            "the older build must be recognised as a downgrade"
+        );
+        let error = guard_landing_target_is_not_a_downgrade("aaa1111-dirty-2222")
+            .expect_err("a downgrade must be refused");
+        assert!(
+            error.to_string().contains("Refusing to land"),
+            "unexpected error: {error}"
+        );
+    });
+}
+
+#[test]
+fn a_newer_staged_build_is_not_a_downgrade() {
+    with_temp_jcode_home(|| {
+        let now = std::time::SystemTime::now();
+        let older = now - std::time::Duration::from_secs(86_400);
+        let newer = now;
+
+        install_fake_version_at("aaa1111-dirty-2222", older);
+        install_fake_version_at("bbb2222-dirty-3333", newer);
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+        write_staged_version("bbb2222-dirty-3333").expect("stage");
+
+        assert!(
+            !would_downgrade("bbb2222-dirty-3333", "aaa1111-dirty-2222").expect("compare"),
+            "the newer build must not be a downgrade"
+        );
+        guard_landing_target_is_not_a_downgrade("bbb2222-dirty-3333")
+            .expect("a forward landing must be allowed");
+    });
+}
+
+#[test]
+fn the_live_build_is_never_a_downgrade_of_itself() {
+    with_temp_jcode_home(|| {
+        let now = std::time::SystemTime::now();
+        install_fake_version_at("aaa1111-dirty-2222", now);
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        assert!(!would_downgrade("aaa1111-dirty-2222", "aaa1111-dirty-2222").expect("compare"));
+        guard_landing_target_is_not_a_downgrade("aaa1111-dirty-2222")
+            .expect("landing the live build must be allowed");
+    });
+}
+
+#[test]
+fn an_unverifiable_build_is_never_treated_as_a_downgrade() {
+    with_temp_jcode_home(|| {
+        let now = std::time::SystemTime::now();
+        install_fake_version_at("aaa1111-dirty-2222", now);
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        // The candidate has no binary on disk, so its build time cannot be
+        // read. An unjudgeable candidate must NOT be blocked: the guard must
+        // never refuse a landing it cannot actually prove is a downgrade.
+        assert!(
+            !would_downgrade("ccc3333-dirty-4444", "aaa1111-dirty-2222").expect("compare"),
+            "an unreadable build time must not be judged a downgrade"
+        );
+        guard_landing_target_is_not_a_downgrade("ccc3333-dirty-4444")
+            .expect("an unverifiable candidate must be allowed through");
+    });
+}
