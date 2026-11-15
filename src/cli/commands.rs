@@ -2259,6 +2259,136 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
     Ok(())
 }
 
+/// Compile the current source state and STAGE it for landing.
+///
+/// This is the deterministic BUILD half of the build/landing split: it
+/// compiles the tree, installs the immutable versioned binary and records it
+/// in `staged-version`. It moves NO channel - the landing owns that - so a
+/// scheduled carrier can run it without touching the live ecosystem.
+///
+/// The exit code is the executor's contract:
+/// 0 = staged (or already up to date), 75 (EX_TEMPFAIL) = the tree moved
+/// during the compile, so the caller re-runs it against the CURRENT source
+/// state, 1 = the build genuinely failed.
+///
+/// A superseded build is NOT a broken build, so it must never look like one.
+pub fn run_server_build_command(emit_json: bool) -> Result<()> {
+    let repo_dir = crate::build::get_repo_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No jcode checkout found; set JCODE_REPO_DIR or run from the repository"
+        )
+    })?;
+
+    let outcome = crate::build::run_deterministic_build(&repo_dir)?;
+
+    #[derive(Serialize)]
+    struct ServerBuildReport {
+        status: &'static str,
+        version: Option<String>,
+        fingerprint: Option<String>,
+        current_fingerprint: Option<String>,
+        /// The failure reason, for the callers that read `error`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        detail: String,
+    }
+
+    let report = match &outcome {
+        crate::build::DeterministicBuildOutcome::Staged {
+            version,
+            fingerprint,
+            versioned_path,
+        } => ServerBuildReport {
+            status: "staged",
+            version: Some(version.clone()),
+            fingerprint: Some(fingerprint.clone()),
+            current_fingerprint: Some(fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "Build staged as {version} at {}; the landing owns the channels and has not been applied yet.",
+                versioned_path.display()
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::UpToDate {
+            version,
+            fingerprint,
+        } => ServerBuildReport {
+            status: "up_to_date",
+            version: Some(version.clone()),
+            fingerprint: Some(fingerprint.clone()),
+            current_fingerprint: Some(fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "The current source state is already staged as {version}; nothing to build."
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Superseded {
+            expected_fingerprint,
+            current_fingerprint,
+            reason,
+        } => ServerBuildReport {
+            status: "superseded",
+            version: None,
+            fingerprint: Some(expected_fingerprint.clone()),
+            current_fingerprint: Some(current_fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "Build superseded: the source tree moved during the compile (expected {expected_fingerprint}, now {current_fingerprint}) and nothing was published. Re-run it against the current tree. {reason}"
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Failed { reason } => ServerBuildReport {
+            status: "failed",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!("Build failed: {reason}"),
+        },
+        crate::build::DeterministicBuildOutcome::Locked { reason } => ServerBuildReport {
+            status: "locked",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!(
+                "Build could not replace the target binary: it is held open by a running session. The holder was NOT killed. {reason}"
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Busy { reason } => ServerBuildReport {
+            status: "busy",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!("Build skipped: {reason}"),
+        },
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.detail);
+    }
+
+    match report.status {
+        "staged" | "up_to_date" => Ok(()),
+        // Exit 75 (EX_TEMPFAIL) is the executor's contract for "run me
+        // again": the caller re-runs the build against the current tree. It is
+        // NOT a failure, so it must not look like one.
+        //
+        // `busy` shares it, because a busy build ALSO did not produce a
+        // staged binary: another build holds this worktree's lock, and the
+        // carrier has to try again once that build finishes. Exiting 0 there
+        // would tell the carrier "success" for a build that never happened.
+        "superseded" | "busy" => std::process::exit(75),
+        // Exit 69 (EX_UNAVAILABLE) is the contract for a locked target binary:
+        // the code may compile, but the compiler could not replace the running
+        // image. It is not a drift (75) and not a broken build (1).
+        "locked" => std::process::exit(69),
+        _ => anyhow::bail!("{}", report.detail),
+    }
+}
+
 /// Land an installed build onto the WHOLE ecosystem as one crash-safe
 /// transaction.
 ///

@@ -192,6 +192,29 @@ fn server_promote_parses_default_and_explicit_version() {
 }
 
 #[test]
+fn server_build_parses_the_json_flag() {
+    // The deterministic build takes no version argument: it always builds the
+    // CURRENT tree, and the carrier owns the retry decision.
+    let default = Args::try_parse_from(["jcode", "server", "build", "--json"])
+        .expect("server build should parse");
+    assert!(matches!(
+        default.command,
+        Some(Command::Server {
+            action: ServerCommand::Build { json: true }
+        })
+    ));
+
+    let plain = Args::try_parse_from(["jcode", "server", "build"])
+        .expect("server build without --json should parse");
+    assert!(matches!(
+        plain.command,
+        Some(Command::Server {
+            action: ServerCommand::Build { json: false }
+        })
+    ));
+}
+
+#[test]
 fn server_land_parses_default_and_explicit_version() {
     // The landing defaults to the STAGED build (the newest built, not yet
     // landed), and accepts an explicit installed version label.
