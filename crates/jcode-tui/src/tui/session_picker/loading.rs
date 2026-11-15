@@ -3156,3 +3156,7 @@ pub(crate) fn load_external_cli_sessions_grouped(
 #[cfg(test)]
 #[path = "loading_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "live_visibility_test.rs"]
+mod live_visibility_test;
