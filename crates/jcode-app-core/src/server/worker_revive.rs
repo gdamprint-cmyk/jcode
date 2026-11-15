@@ -7,6 +7,9 @@
 //! "no live agent" and the only way forward was spawning a replacement, which
 //! throws away the worker's transcript. This module rebuilds the agent on
 //! demand from the persisted session so the coordinator can simply resume it.
+//!
+//! reference: ~/.jcode/research/2026-11-15-tv3-session-recovery.md (diagnosis of the
+//! forced `is_debug = true` that hid a user session from the session picker)
 
 use super::{
     SessionAgents, SessionInterruptQueues, SwarmMember, register_background_tool_signal,
@@ -35,6 +38,31 @@ static CONTEXT: OnceLock<WorkerReviveContext> = OnceLock::new();
 pub(super) fn register_context(context: WorkerReviveContext) {
     let _ = CONTEXT.set(context);
 }
+
+/// Build the agent that backs a revived worker.
+///
+/// The debug flag is the session's own, persisted when the session was
+/// created. A headless worker is created with `is_debug = true`
+/// (`server::headless::create_headless_session`), so it stays hidden from the
+/// session picker. A user session whose TUI client died is persisted with
+/// `is_debug = false`: the server registers it as a headless swarm member, and
+/// forcing the flag here used to reclassify it as a test session, which
+/// silently removed it from the session list (debug sessions are hidden unless
+/// the user toggles test sessions on).
+fn build_revived_agent(
+    provider: Arc<dyn Provider>,
+    registry: crate::tool::Registry,
+    session: crate::session::Session,
+) -> Agent {
+    let is_debug = session.is_debug;
+    let mut agent = Agent::new_with_session(provider, registry, session, None);
+    agent.set_debug(is_debug);
+    agent
+}
+
+#[cfg(test)]
+#[path = "worker_revive_tests.rs"]
+mod tests;
 
 /// Return the live agent for `session_id`, restoring it from disk when it is a
 /// headless swarm member whose agent is not loaded. Returns `None` when the
@@ -86,8 +114,7 @@ pub(super) async fn live_or_revived_agent(
                     session.working_dir.as_ref().map(std::path::PathBuf::from),
                 )
                 .await;
-            let mut agent = Agent::new_with_session(provider, registry, session, None);
-            agent.set_debug(true);
+            let mut agent = build_revived_agent(provider, registry, session);
             if matches!(
                 crate::config::config().agents.swarm_spawn_mode,
                 crate::config::SwarmSpawnMode::Inline
