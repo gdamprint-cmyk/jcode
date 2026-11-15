@@ -764,6 +764,16 @@ pub(super) async fn execute_debug_command(
             manifest.canary_status = Some(crate::build::CanaryStatus::Passed);
             let _ = manifest.save();
         }
+        // The canary channel is a CLIENT-side channel too: it is the fallback a
+        // self-dev session resolves when no `current` channel exists. Point it
+        // at the landed build, so every channel names the same build. This runs
+        // only AFTER a successful landing, so a rolled-back landing leaves the
+        // canary channel untouched together with the other client channels.
+        if let Err(error) = crate::build::update_canary_symlink(&hash) {
+            crate::logging::warn(&format!(
+                "debug reload: could not point the canary channel at {hash}: {error:#}"
+            ));
+        }
 
         let stdout = String::from_utf8_lossy(&outcome.stdout);
         return Ok(format!(
