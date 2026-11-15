@@ -10,6 +10,15 @@ use super::*;
 
 const TV3_SESSION_ID: &str = "session_zebra_1794712810026_670cb896b3d06096";
 
+/// The two other sessions an earlier draft of the research document named as
+/// "affected". Both were reported as hidden, which a hand-rolled script got
+/// wrong because it read the journal entries in reverse order. The production
+/// loader and the production resume path are the decisive instruments here.
+const ALSO_CHECKED_SESSION_IDS: &[&str] = &[
+    "session_shrimp_1794689551271_157a06d4a4702a23",
+    "session_sauropod_1794690463272_386ad27d1bb2fbcb",
+];
+
 #[test]
 #[ignore = "live diagnostic of this host's session directory"]
 fn live_picker_lists_the_tv3_session() {
@@ -76,4 +85,61 @@ fn live_picker_lists_the_tv3_session() {
         "resuming TV-3 would re-hide it: Session::load is_debug=true"
     );
     println!("live resume: TV-3 session resumes with is_debug=false");
+}
+
+/// Same instrument as above, applied to every session the research document
+/// names as affected. A session counts as visible when the production loader
+/// reports `is_debug == false`, and it must stay visible when resumed.
+#[test]
+#[ignore = "live diagnostic of this host's session directory"]
+fn live_picker_lists_every_affected_session() {
+    let home = crate::storage::jcode_dir().expect("jcode home");
+    let sessions_dir = home.join("sessions");
+    assert!(
+        sessions_dir.exists(),
+        "live sessions dir missing: {}",
+        sessions_dir.display()
+    );
+
+    let sessions = super::super::loading::load_sessions().expect("load live sessions");
+    println!("live picker (all): total_sessions={}", sessions.len());
+
+    let mut ids: Vec<&str> = vec![TV3_SESSION_ID];
+    ids.extend_from_slice(ALSO_CHECKED_SESSION_IDS);
+
+    for id in ids {
+        if !sessions_dir.join(format!("{id}.json")).exists() {
+            println!("live picker (all): {id} is absent on this host, skipping");
+            continue;
+        }
+
+        // The production loader: this is the value the picker filters on.
+        let hit = sessions.iter().find(|s| s.id == id);
+        let picker_is_debug = hit.map(|s| s.is_debug);
+        println!(
+            "live picker (all): {id} present={} is_debug={:?}",
+            hit.is_some(),
+            picker_is_debug,
+        );
+
+        // The production resume path: what an agent would inherit.
+        let loaded = crate::session::Session::load(id).expect("load session");
+        println!(
+            "live resume (all): {id} is_debug={} messages={} status={:?}",
+            loaded.is_debug,
+            loaded.messages.len(),
+            loaded.status,
+        );
+
+        assert!(
+            picker_is_debug == Some(false),
+            "{id} is hidden from the picker: loader is_debug={:?}",
+            picker_is_debug,
+        );
+        assert!(
+            !loaded.is_debug,
+            "resuming {id} would re-hide it: Session::load is_debug=true",
+        );
+        println!("live picker (all): {id} is VISIBLE and resumes VISIBLE (is_debug=false)");
+    }
 }
