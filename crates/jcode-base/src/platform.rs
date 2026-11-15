@@ -565,6 +565,12 @@ pub fn replace_process_reparented(cmd: &mut std::process::Command) -> std::io::E
     #[cfg(windows)]
     {
         let successor_name = crate::exec_supervisor::program_name(cmd.get_program());
+        // From this moment the successor owns the pane, so this process must
+        // stop speaking for the pane. Otherwise the supervisor's own agent
+        // state report would carry a newer sequence number than the live
+        // successor's and would make the pane look finished while the
+        // successor is still working.
+        crate::exec_supervisor::mark_pane_handed_off();
         match crate::platform_reparent::spawn_reparented(cmd) {
             Ok(pid) => {
                 crate::logging::info(&format!(
@@ -578,7 +584,12 @@ pub fn replace_process_reparented(cmd: &mut std::process::Command) -> std::io::E
                 ));
                 match spawn_replacement_process(cmd) {
                     Ok(child) => supervise_replacement(child.id(), successor_name),
-                    Err(e) => e,
+                    Err(e) => {
+                        // No successor exists, so this process keeps the pane and
+                        // must keep reporting its state.
+                        crate::exec_supervisor::clear_pane_handoff();
+                        e
+                    }
                 }
             }
         }

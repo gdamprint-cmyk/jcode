@@ -43,6 +43,7 @@
 //! * It never releases the pane while an agent is alive: the pane still hosts
 //!   a client, so the pane must stay occupied.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Environment variable that carries the exec-chain depth to the successor.
@@ -71,6 +72,50 @@ pub const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// How often the supervisor polls for the successor's state.
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether this process already handed its pane over to a successor.
+///
+/// The outgoing client stays alive as the exec supervisor, so it lives next to
+/// its successor in the same pane. Both processes report their agent state to
+/// the terminal multiplexer, and the multiplexer accepts a report whose
+/// sequence number is higher than the one it saw last. The supervisor's report
+/// therefore arrives with a fresh number and overrules the live successor: the
+/// pane flips from "working" to "idle", which the multiplexer reports as a
+/// finished session even though the successor is still running.
+///
+/// The handover is recorded once, and everything that speaks for the pane (the
+/// agent-state reporter) stops speaking for a process that has already handed
+/// the pane over.
+///
+/// reference: https://herdr.dev/docs/add-herdr-support/ ("Only release when the
+/// user actually quits"; the pane belongs to the agent that owns it)
+static PANE_HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Record that this process handed its pane over to a successor.
+///
+/// Called right before the successor is spawned. From that moment the
+/// successor owns the pane's agent state, and this process must not report
+/// anything about it any more.
+pub fn mark_pane_handed_off() {
+    PANE_HANDED_OFF.store(true, Ordering::SeqCst);
+}
+
+/// Undo [`mark_pane_handed_off`].
+///
+/// Used when the successor could not be spawned: this process keeps the pane
+/// and must keep reporting its state.
+pub fn clear_pane_handoff() {
+    PANE_HANDED_OFF.store(false, Ordering::SeqCst);
+}
+
+/// Whether this process already handed its pane over to a successor.
+///
+/// A process that handed the pane over must not report the pane's agent state
+/// any more: its report would carry a newer sequence number than the live
+/// successor's and would make the pane look finished.
+pub fn pane_handed_off() -> bool {
+    PANE_HANDED_OFF.load(Ordering::SeqCst)
+}
 
 /// The exec-chain depth of this process.
 ///
@@ -322,5 +367,28 @@ mod tests {
     #[test]
     fn supervisor_exit_variants_are_distinct() {
         assert_ne!(SupervisorExit::ClientGone, SupervisorExit::TimedOut);
+    }
+
+    /// The handover flag gates the agent-state reporter.
+    ///
+    /// The outgoing client stays alive as the exec supervisor next to its
+    /// successor, and both report their agent state to the terminal
+    /// multiplexer. The supervisor's report would carry a newer sequence
+    /// number than the live successor's, so the multiplexer would take it and
+    /// make the pane look finished while the successor is still working.
+    ///
+    /// reference: https://herdr.dev/docs/add-herdr-support/ ("Herdr ignores
+    /// reports whose number is not higher than the last one it accepted, so
+    /// late or out-of-order reports can't overwrite newer state").
+    #[test]
+    fn the_handover_flag_gates_the_reporter() {
+        clear_pane_handoff();
+        assert!(!pane_handed_off());
+        mark_pane_handed_off();
+        assert!(pane_handed_off());
+        // The flag is undone when the successor could not be spawned: this
+        // process keeps the pane and must keep reporting it.
+        clear_pane_handoff();
+        assert!(!pane_handed_off());
     }
 }
