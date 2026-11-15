@@ -2372,10 +2372,15 @@ pub fn run_server_build_command(emit_json: bool) -> Result<()> {
 
     match report.status {
         "staged" | "up_to_date" => Ok(()),
-        // Exit 75 (EX_TEMPFAIL) is the executor's contract for a drift: the
-        // caller re-runs the build against the current tree. It is NOT a
-        // failure, so it must not look like one.
-        "superseded" => std::process::exit(75),
+        // Exit 75 (EX_TEMPFAIL) is the executor's contract for "run me
+        // again": the caller re-runs the build against the current tree. It is
+        // NOT a failure, so it must not look like one.
+        //
+        // `busy` shares it, because a busy build ALSO did not produce a
+        // staged binary: another build holds this worktree's lock, and the
+        // carrier has to try again once that build finishes. Exiting 0 there
+        // would tell the carrier "success" for a build that never happened.
+        "superseded" | "busy" => std::process::exit(75),
         // Exit 69 (EX_UNAVAILABLE) is the contract for a locked target binary:
         // the code may compile, but the compiler could not replace the running
         // image. It is not a drift (75) and not a broken build (1).
