@@ -691,6 +691,25 @@ pub(crate) enum ServerCommand {
         json: bool,
     },
 
+    /// Compile the current source state and STAGE it for landing.
+    ///
+    /// This is the deterministic half of the build/landing split: it compiles
+    /// the tree, installs the immutable versioned binary and records it in
+    /// `staged-version`. It moves NO channel - the landing owns that - so it
+    /// is safe to run from a scheduled carrier.
+    ///
+    /// Exit codes are the executor's contract: 0 when the build is staged (or
+    /// already up to date), 75 (EX_TEMPFAIL) when the tree moved during the
+    /// compile and the build was superseded, 1 when the build failed.
+    ///
+    /// A superseded build is NOT a broken build: the caller re-runs it against
+    /// the CURRENT source state.
+    Build {
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Land an installed build onto the whole ecosystem as one transaction.
     ///
     /// This is the crash-safe boundary: it moves the daemon channel, hands the

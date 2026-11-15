@@ -288,6 +288,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             ServerCommand::Promote { version, json } => {
                 commands::run_server_promote_command(version.as_deref(), json)?;
             }
+            ServerCommand::Build { json } => {
+                commands::run_server_build_command(json)?;
+            }
             ServerCommand::Land { version, json } => {
                 commands::run_server_land_command(version.as_deref(), json).await?;
             }

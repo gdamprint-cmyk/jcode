@@ -5,6 +5,9 @@
 // moves happen only inside the landing transaction
 // (crates/jcode-build-support/src/landing.rs, whose provenance is declared
 // there).
+mod binary_lock;
+mod build_lock;
+mod deterministic_build;
 mod landing;
 mod paths;
 mod platform_support;
@@ -12,6 +15,12 @@ mod source_state;
 mod storage_helpers;
 mod version_gc;
 
+pub use binary_lock::{is_locked, prepare_binary_for_overwrite, rename_binary_aside};
+pub use build_lock::{BuildLockGuard, build_lock_path};
+pub use deterministic_build::{
+    DeterministicBuildOutcome, current_buildable_source, run_deterministic_build,
+    run_staging_build_with,
+};
 pub use landing::{
     DaemonIdentity, LandingLock, LandingOutcome, LandingPhase, LandingRecovery, LandingSession,
     LandingTransaction, activate_client_channels, activate_clients_after_verified_daemon,
@@ -459,7 +468,24 @@ fn validate_dev_binary_matches_source(
     binary: &Path,
     source: &SourceState,
 ) -> Result<()> {
-    let report = read_binary_version_report(binary)?;
+    validate_dev_binary_matches_source_with(repo_dir, binary, source, read_binary_version_report)
+}
+
+/// The source check with the binary version report injected.
+///
+/// `report_for` reads the version report of a built binary. It is injected so
+/// the staging contract can be tested without a real executable; the real
+/// caller always uses [`read_binary_version_report`].
+fn validate_dev_binary_matches_source_with<F>(
+    repo_dir: &Path,
+    binary: &Path,
+    source: &SourceState,
+    report_for: F,
+) -> Result<()>
+where
+    F: Fn(&Path) -> Result<BinaryVersionReport>,
+{
+    let report = report_for(binary)?;
     if report.version.as_deref().unwrap_or_default().is_empty() {
         anyhow::bail!(
             "Binary smoke test for {} returned JSON without a version field",
@@ -761,16 +787,32 @@ pub fn stage_local_current_build_for_source(
     repo_dir: &Path,
     source: &SourceState,
 ) -> Result<PublishedBuild> {
+    stage_local_current_build_for_source_with(repo_dir, source, read_binary_version_report)
+}
+
+/// The staging step with the binary smoke test injected.
+///
+/// `report_for` reads the version report of a built binary. It is injected so
+/// the staging contract can be tested without a real executable; the real
+/// caller always uses [`read_binary_version_report`].
+pub fn stage_local_current_build_for_source_with<F>(
+    repo_dir: &Path,
+    source: &SourceState,
+    report_for: F,
+) -> Result<PublishedBuild>
+where
+    F: Fn(&Path) -> Result<BinaryVersionReport>,
+{
     let binary = find_dev_binary(repo_dir)
         .ok_or_else(|| anyhow::anyhow!("Binary not found in target/selfdev or target/release"))?;
     if !binary.exists() {
         anyhow::bail!("Binary not found at {:?}", binary);
     }
 
-    validate_dev_binary_matches_source(repo_dir, &binary, source)?;
+    validate_dev_binary_matches_source_with(repo_dir, &binary, source, &report_for)?;
     let previous_current_version = read_current_version()?;
     let versioned_path = install_binary_at_version(&binary, &source.version_label)?;
-    let installed_report = read_binary_version_report(&versioned_path)?;
+    let installed_report = report_for(&versioned_path)?;
     if installed_report
         .version
         .as_deref()
@@ -1029,6 +1071,7 @@ pub fn update_canary_symlink(hash: &str) -> Result<()> {
 /// `JCODE_HOME` is process-global, so two modules with two different mutexes
 /// would race: one test would change the home under the other, and the
 /// other's channel assertions would read the wrong directory.
+#[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     ENV_LOCK
@@ -1039,5 +1082,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod landing_tests;
+#[cfg(test)]
+mod deterministic_build_tests;
 #[cfg(test)]
 mod tests;
