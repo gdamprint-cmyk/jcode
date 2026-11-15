@@ -353,13 +353,212 @@ pub fn guard_landing_target_is_not_a_downgrade(candidate: &str) -> Result<()> {
 /// label carries a fingerprint of the working tree, and the daemon's embedded
 /// hash is the plain commit. Comparing the full labels would reject every
 /// legitimate self-dev landing.
+///
+/// Two label shapes are supported:
+///
+/// - a BUILD label (`<hash>`, `<hash>-dirty-<fingerprint>`, `main-<hash>`):
+///   the hash-shaped part of the label is compared with the daemon's embedded
+///   git hash;
+/// - a RELEASE label (a semver, e.g. `1.2.3` or `1.0.0-preview.7`): a release
+///   label carries no commit, so the semver the daemon REPORTS
+///   (`v1.2.3 (abc1234)`) is compared instead. A dev build of the same semver
+///   reports `v1.2.3-dev (...)`, which does not match a release label.
+///
+/// reference: https://docs.rs/semver/latest/semver/ (read 2026-11-15) - the
+/// SemVer spec shape is `MAJOR.MINOR.PATCH` with an optional `-prerelease`
+/// and `+build`; this function parses the same shape by hand, because the
+/// build-support crate deliberately has no semver dependency.
 pub fn daemon_identity_matches_version(identity: &DaemonIdentity, version: &str) -> bool {
-    let commit = version_commit(version);
     let hash = identity.git_hash.trim();
-    !commit.is_empty()
-        && !hash.is_empty()
-        && hash != "unknown"
-        && (hash == commit || commit.starts_with(hash) || hash.starts_with(commit))
+    if !hash.is_empty() && hash != "unknown" {
+        for candidate in version_commit_candidates(version) {
+            if hash == candidate || candidate.starts_with(hash) || hash.starts_with(&candidate) {
+                return true;
+            }
+        }
+    }
+
+    match (
+        release_semver_of(version),
+        release_semver_of(&identity.version),
+    ) {
+        (Some(label), Some(reported)) => label == reported,
+        _ => false,
+    }
+}
+
+/// The hash-shaped parts a version label can name.
+///
+/// A self-dev label is `<short-hash>` or `<short-hash>-dirty-<fingerprint>`, a
+/// main-channel label is `main-<short-hash>`, and a release label is a semver.
+/// The daemon's identity carries the git hash of the RUNNING binary, so a
+/// hash-shaped part of the label is what can be compared with it.
+fn version_commit_candidates(version: &str) -> Vec<String> {
+    version
+        .split('-')
+        .filter(|part| part.len() >= 7 && part.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|part| part.to_string())
+        .collect()
+}
+
+/// The semver a version string names, if it names one.
+///
+/// `v1.2.3 (abc1234)` -> `1.2.3`, `1.2.3-preview.7` -> `1.2.3-preview.7`,
+/// `abc1234-dirty-deadbeef` -> `None`.
+fn release_semver_of(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let core = trimmed
+        .split([' ', '(', ')'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if core.is_empty() || !core.contains('.') {
+        return None;
+    }
+    if !core.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(core.to_string())
+}
+
+/// Whether a version label names a RELEASE build (a semver).
+///
+/// `1.2.3` and `1.0.0-preview.7` are release labels; `abc1234-dirty-deadbeef`,
+/// `main-abc1234` and `v1.2.3-dev` are not.
+pub fn is_release_version_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let core = trimmed
+        .split([' ', '(', ')'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    let Some(major) = core.split('.').next() else {
+        return false;
+    };
+    !major.is_empty() && major.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether a version label names a MAIN-channel build (`main-<hash>`).
+pub fn is_main_channel_label(label: &str) -> bool {
+    label.trim().starts_with("main-")
+}
+
+/// Whether the daemon channel is deliberately PINNED to a self-dev build.
+///
+/// A pin is the marker of a build that was promoted onto the `shared-server`
+/// channel on purpose (a self-dev build the user wants to keep running). A
+/// release or main-channel label is a channel build, not a pin: those are
+/// expected to move with every update.
+///
+/// This is the ONE decision the update path makes about a pin, and it is
+/// explicit rather than a warning: an update that would replace a pinned
+/// self-dev daemon REFUSES to move any channel, so the pin is preserved and
+/// the ecosystem is never split. A local `/rebuild` landing is a different
+/// case: the user is asking for that exact local build, so it lands over the
+/// pin atomically (the whole ecosystem moves together).
+pub fn shared_server_is_pinned_to_selfdev() -> Result<bool> {
+    let Some(shared) = crate::read_shared_server_version()? else {
+        return Ok(false);
+    };
+    let shared = shared.trim();
+    if shared.is_empty() {
+        return Ok(false);
+    }
+    Ok(!is_release_version_label(shared) && !is_main_channel_label(shared))
+}
+
+/// The JSON report the `server land --json` command prints.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LandingReport {
+    pub version: String,
+    pub landed: bool,
+    #[serde(default)]
+    pub previous_current_version: Option<String>,
+    #[serde(default)]
+    pub previous_shared_server_version: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Build the command that lands `target_version`.
+///
+/// The TARGET's own immutable versioned binary runs the landing, not the
+/// launcher and not the caller's binary: only the target binary knows the
+/// `land` subcommand, and the launcher may still be an older build that
+/// predates it.
+///
+/// The version is passed EXPLICITLY: `jcode server land` without a version
+/// lands the STAGED build, which is not necessarily the build the caller
+/// installed (the staged marker is never cleared, so it can be stale).
+pub fn landing_command(target_version: &str) -> Result<std::process::Command> {
+    if !is_valid_version_label(target_version) {
+        anyhow::bail!("Invalid installed version label: {target_version:?}");
+    }
+    let binary = crate::version_binary_path(target_version)?;
+    if !binary.exists() {
+        anyhow::bail!("Version binary not found at {:?}", binary);
+    }
+    let mut command = std::process::Command::new(binary);
+    command.arg("server").arg("land").arg(target_version).arg("--json");
+    Ok(command)
+}
+
+/// Land an already-installed version by running the target's own binary.
+///
+/// This is the child-process form of the landing: the child takes the
+/// single-writer lock, journals the transaction, moves the daemon channel,
+/// hands the daemon off, PROVES the daemon runs the target, and only then
+/// moves the client channels. A caller that used this never moves a channel
+/// itself, so the daemon and the clients can never disagree.
+///
+/// The returned outcome is the child's own report: a rolled-back landing is
+/// reported as `RolledBack` (and as an error), never as a success.
+pub fn land_installed_version(target_version: &str) -> Result<LandingOutcome> {
+    let mut command = landing_command(target_version)?;
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let report = parse_landing_report(&stdout);
+
+    match report {
+        Some(report) if report.landed => Ok(LandingOutcome::Landed {
+            target_version: report.version,
+            previous_current_version: report.previous_current_version,
+            previous_shared_server_version: report.previous_shared_server_version,
+        }),
+        Some(report) => Ok(LandingOutcome::RolledBack {
+            target_version: report.version,
+            reason: if report.detail.is_empty() {
+                format!("the landing child exited with {}", output.status)
+            } else {
+                report.detail
+            },
+        }),
+        None => Ok(LandingOutcome::RolledBack {
+            target_version: target_version.to_string(),
+            reason: format!(
+                "the landing child produced no report (status {}): {}{}",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            ),
+        }),
+    }
+}
+
+/// Parse the landing report out of the child's stdout.
+///
+/// The child prints the report as JSON, but a warning printed before it (for
+/// example a recovery notice) would make the whole stdout unparseable, so the
+/// first JSON object in the output is used.
+fn parse_landing_report(stdout: &str) -> Option<LandingReport> {
+    if let Ok(report) = serde_json::from_str::<LandingReport>(stdout) {
+        return Some(report);
+    }
+    let start = stdout.find('{')?;
+    serde_json::from_str::<LandingReport>(&stdout[start..]).ok()
 }
 
 /// Whether the daemon identity proves the daemon runs `version` AND is
@@ -383,6 +582,102 @@ pub fn daemon_identity_proves_version(
     match handoff_requested_at {
         Some(requested_at) => identity.started_at >= requested_at,
         None => true,
+    }
+}
+
+/// The decision an update makes BEFORE it touches any channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseLandingPlan {
+    /// The update may land: the daemon channel is not pinned to a self-dev
+    /// build, so the whole ecosystem moves onto the new version atomically.
+    Land { version: String },
+    /// The daemon channel is PINNED to a self-dev build, so the update is
+    /// REFUSED. No channel moves, the installed build stays staged, and the
+    /// pin is preserved.
+    RefusedPinned {
+        version: String,
+        pinned_version: String,
+    },
+}
+
+/// Decide whether an update may land `version`.
+///
+/// The pin is the ONE explicit decision the update path makes about a
+/// deliberately promoted self-dev daemon:
+///
+/// - a RELEASE update REFUSES to replace a pinned self-dev daemon. The pin
+///   exists to keep that build running, and a release update must not silently
+///   destroy it. The release stays installed and staged, so
+///   `jcode server land <version>` can land it explicitly later.
+/// - the MAIN channel (a development channel of the very source tree the user
+///   develops) is allowed to land over the pin, because the landing moves the
+///   daemon AND the clients together: there is no split either way.
+///
+/// The caller passes the override explicitly, so the decision is testable and
+/// not a hidden side effect.
+pub fn plan_release_landing(version: &str) -> Result<ReleaseLandingPlan> {
+    if !is_valid_version_label(version) {
+        anyhow::bail!("Invalid installed version label: {version:?}");
+    }
+    if shared_server_is_pinned_to_selfdev()? {
+        let pinned = crate::read_shared_server_version()?.unwrap_or_default();
+        return Ok(ReleaseLandingPlan::RefusedPinned {
+            version: version.to_string(),
+            pinned_version: pinned,
+        });
+    }
+    Ok(ReleaseLandingPlan::Land {
+        version: version.to_string(),
+    })
+}
+
+/// Land an already-installed version and move the `stable` channel after it.
+///
+/// This is the ONLY place an update may move a channel, and it does so only
+/// after the landing transaction SUCCEEDED:
+///
+/// - a REFUSED pin moves nothing at all, and the lander is never called;
+/// - a ROLLED-BACK landing moves nothing at all (the transaction restored
+///   the daemon channel itself);
+/// - a LANDED transaction moved the daemon channel, the running daemon and
+///   the client channels as ONE transaction, and only then is `stable`
+///   advanced to the same version.
+///
+/// The lander is injected so the decision is testable without a running
+/// daemon, and so the production path can use the target binary's own
+/// `server land` child process.
+pub fn land_release_version(
+    version: &str,
+    allow_pin_override: bool,
+    land: &mut dyn FnMut(&str) -> Result<LandingOutcome>,
+) -> Result<LandingOutcome> {
+    let plan = plan_release_landing(version)?;
+    if let ReleaseLandingPlan::RefusedPinned {
+        version,
+        pinned_version,
+    } = &plan
+        && !allow_pin_override
+    {
+        anyhow::bail!(
+            "Refusing to land {version}: the daemon channel is pinned to the self-dev build \
+             {pinned_version}. The update was installed but no channel was moved. Land it \
+             explicitly with `jcode server land {version}` if the pin should be replaced."
+        );
+    }
+
+    let outcome = land(version)?;
+    match &outcome {
+        LandingOutcome::Landed { .. } => {
+            // The ecosystem runs the new version now, so the fallback channel
+            // may follow it. Doing this AFTER the landing is what keeps a
+            // failed landing from leaving `stable` on a build the daemon does
+            // not run.
+            crate::update_stable_symlink(version)?;
+            Ok(outcome)
+        }
+        LandingOutcome::RolledBack { reason, .. } => {
+            anyhow::bail!("Landing {version} failed and was rolled back: {reason}")
+        }
     }
 }
 

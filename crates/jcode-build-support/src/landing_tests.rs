@@ -565,6 +565,237 @@ fn the_live_build_is_never_a_downgrade_of_itself() {
 }
 
 #[test]
+fn a_release_label_is_matched_by_the_semver_the_daemon_reports() {
+    // A release label carries no commit, so the daemon's REPORTED version is
+    // what proves it runs the release.
+    let identity = DaemonIdentity {
+        pid: 4242,
+        exe: PathBuf::from("/fake/jcode"),
+        git_hash: "abc1234".to_string(),
+        version: "v1.2.3 (abc1234)".to_string(),
+        started_at: Utc::now(),
+    };
+    assert!(daemon_identity_matches_version(&identity, "1.2.3"));
+    assert!(!daemon_identity_matches_version(&identity, "1.2.4"));
+}
+
+#[test]
+fn a_dev_build_does_not_prove_a_release_label() {
+    // The dev build of the same semver reports `-dev`, so it is NOT the
+    // release: accepting it would let a dev daemon pass as a landed release.
+    let identity = DaemonIdentity {
+        pid: 4242,
+        exe: PathBuf::from("/fake/jcode"),
+        git_hash: "abc1234".to_string(),
+        version: "v1.2.3-dev (abc1234)".to_string(),
+        started_at: Utc::now(),
+    };
+    assert!(!daemon_identity_matches_version(&identity, "1.2.3"));
+}
+
+#[test]
+fn release_and_main_labels_are_recognized() {
+    assert!(is_release_version_label("1.2.3"));
+    assert!(is_release_version_label("v1.0.0-preview.7"));
+    assert!(!is_release_version_label("abc1234-dirty-deadbeef"));
+    assert!(!is_release_version_label("main-abc1234"));
+
+    assert!(is_main_channel_label("main-abc1234"));
+    assert!(!is_main_channel_label("1.2.3"));
+}
+
+#[test]
+fn a_pinned_selfdev_daemon_refuses_the_release_landing_and_moves_nothing() {
+    with_temp_jcode_home(|| {
+        install_fake_version("aaa1111-dirty-2222");
+        install_fake_version("1.2.3");
+
+        // The daemon channel is deliberately pinned to a self-dev build.
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+        update_stable_symlink("aaa1111-dirty-2222").expect("stable");
+
+        let plan = plan_release_landing("1.2.3").expect("plan");
+        assert!(
+            matches!(
+                plan,
+                ReleaseLandingPlan::RefusedPinned {
+                    ref version,
+                    ref pinned_version
+                } if version == "1.2.3" && pinned_version == "aaa1111-dirty-2222"
+            ),
+            "a pinned self-dev daemon must refuse the release landing, got {plan:?}"
+        );
+
+        // The lander must NOT even be called.
+        let mut called = false;
+        let error = land_release_version("1.2.3", false, &mut |_version| {
+            called = true;
+            Ok(LandingOutcome::Landed {
+                target_version: "1.2.3".to_string(),
+                previous_current_version: None,
+                previous_shared_server_version: None,
+            })
+        })
+        .expect_err("a pinned daemon must refuse the landing");
+        assert!(!called, "the lander must not run when the pin refuses");
+        assert!(
+            error.to_string().contains("pinned"),
+            "unexpected error: {error}"
+        );
+
+        // NOTHING moved: the daemon channel, the client channel and the
+        // stable channel all still name the pinned build.
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "a refused landing must not move the daemon channel"
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "a refused landing must not move the client channel"
+        );
+        assert_eq!(
+            read_stable_version().expect("read stable").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "a refused landing must not move the stable channel"
+        );
+    });
+}
+
+#[test]
+fn an_unpinned_daemon_lands_the_release_and_moves_both_channel_families() {
+    with_temp_jcode_home(|| {
+        install_fake_version("1.2.3");
+        install_fake_version("1.1.0");
+        install_fake_version("aaa1111-dirty-2222");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("1.1.0").expect("shared");
+        update_stable_symlink("1.1.0").expect("stable");
+
+        let plan = plan_release_landing("1.2.3").expect("plan");
+        assert!(
+            matches!(plan, ReleaseLandingPlan::Land { .. }),
+            "a release-pinned daemon channel must allow the landing, got {plan:?}"
+        );
+
+        let mut landed = None;
+        land_release_version("1.2.3", false, &mut |version| {
+            // The lander stands in for the landing transaction: it moves the
+            // daemon channel, then the client channels, as one unit.
+            update_shared_server_symlink(version).expect("shared");
+            update_current_symlink(version).expect("current");
+            landed = Some(version.to_string());
+            Ok(LandingOutcome::Landed {
+                target_version: version.to_string(),
+                previous_current_version: None,
+                previous_shared_server_version: None,
+            })
+        })
+        .expect("landing succeeds");
+
+        assert_eq!(landed.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("1.2.3"),
+            "the daemon channel must name the landed release"
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("1.2.3"),
+            "the client channel must name the landed release"
+        );
+        assert_eq!(
+            read_stable_version().expect("read stable").as_deref(),
+            Some("1.2.3"),
+            "the stable channel must follow the landed release"
+        );
+    });
+}
+
+#[test]
+fn a_rolled_back_landing_leaves_every_channel_on_the_previous_version() {
+    with_temp_jcode_home(|| {
+        install_fake_version("1.2.3");
+        install_fake_version("1.1.0");
+        install_fake_version("aaa1111-dirty-2222");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("1.1.0").expect("shared");
+        update_stable_symlink("1.1.0").expect("stable");
+
+        let error = land_release_version("1.2.3", false, &mut |_version| {
+            // The landing rolled itself back: the daemon channel was restored
+            // by the transaction, and the client channels never moved.
+            Ok(LandingOutcome::RolledBack {
+                target_version: "1.2.3".to_string(),
+                reason: "the daemon did not come up".to_string(),
+            })
+        })
+        .expect_err("a rolled-back landing is a failure");
+
+        assert!(
+            error.to_string().contains("rolled back"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("1.1.0"),
+            "a rolled-back landing must leave the daemon channel alone"
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "a rolled-back landing must leave the client channel alone"
+        );
+        assert_eq!(
+            read_stable_version().expect("read stable").as_deref(),
+            Some("1.1.0"),
+            "a rolled-back landing must not advance the stable channel"
+        );
+    });
+}
+
+#[test]
+fn the_pin_override_lets_the_main_channel_land_over_a_pinned_daemon() {
+    with_temp_jcode_home(|| {
+        install_fake_version("main-abc1234");
+        install_fake_version("aaa1111-dirty-2222");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        // The main channel is the development channel of the source tree the
+        // user develops, so it MAY land over the pin - atomically, so there is
+        // no split either way.
+        let mut landed = false;
+        land_release_version("main-abc1234", true, &mut |version| {
+            landed = true;
+            update_shared_server_symlink(version).expect("shared");
+            update_current_symlink(version).expect("current");
+            Ok(LandingOutcome::Landed {
+                target_version: version.to_string(),
+                previous_current_version: None,
+                previous_shared_server_version: None,
+            })
+        })
+        .expect("the main channel lands over the pin");
+
+        assert!(landed, "the main channel must land over a pinned daemon");
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("main-abc1234")
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("main-abc1234")
+        );
+    });
+}
+
+#[test]
 fn an_unverifiable_build_is_never_treated_as_a_downgrade() {
     with_temp_jcode_home(|| {
         let now = std::time::SystemTime::now();

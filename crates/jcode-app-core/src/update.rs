@@ -1,3 +1,10 @@
+// reference: in-repo prior art - crates/jcode-build-support/src/landing.rs
+// (read 2026-11-15), the crash-safe landing transaction (journal, single-writer
+// lock, daemon handoff, daemon proof, client activation last), and
+// crates/jcode-app-core/src/server/debug_command_exec.rs (read 2026-11-15), the
+// debug reload that lands a build by running the TARGET's own versioned binary
+// as `server land <version> --json`. The update paths here use the same
+// mechanism instead of moving the channels inline.
 use crate::build;
 use crate::storage;
 use anyhow::{Context, Result};
@@ -365,18 +372,23 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     let channel_version = format!("main-{}", latest_sha);
     build::install_binary_at_version(&path, &channel_version)
         .context("Failed to install built binary")?;
-    // Carry the long-lived daemon's reload target forward too, but only when it
-    // was tracking stable. A deliberately-promoted self-dev shared-server build
-    // is left untouched so the update never silently wipes it out.
-    if let Err(error) = build::advance_shared_server_if_tracking_stable(&channel_version) {
-        crate::logging::warn(&format!(
-            "update: failed to advance shared-server channel to {}: {}",
-            channel_version, error
-        ));
-    }
-    build::update_stable_symlink(&channel_version)?;
-    build::update_current_symlink(&channel_version)?;
-    build::update_launcher_symlink_to_current()?;
+
+    // LAND the build as ONE transaction. The main channel is a development
+    // channel of the very source tree the user develops, so it may land over a
+    // pinned self-dev daemon: the landing moves the daemon channel AND the
+    // client channels together, so there is no split either way.
+    //
+    // The landing is run by the TARGET's own versioned binary
+    // (`server land <version> --json`), exactly like the debug reload path:
+    // the child journals the transaction, hands the daemon off, PROVES the
+    // daemon runs the target and only then moves the client channels. This
+    // path never moves a channel itself.
+    let outcome = build::land_release_version(&channel_version, true, &mut |version| {
+        build::land_installed_version(version)
+    })?;
+    crate::logging::info(&format!(
+        "Main channel: landed {channel_version} ({outcome:?})"
+    ));
 
     metadata.installed_version = Some(channel_version.clone());
     metadata.installed_from = Some("source".to_string());
@@ -1090,15 +1102,28 @@ pub fn download_and_install_blocking_with_progress(
     // Termux's glibc loader (mirrors scripts/install.sh). Fail before advancing
     // any channel symlinks so we never switch to a binary that cannot exec.
     patch_termux_interpreter_if_needed(&versioned_path)?;
-    if let Err(error) = build::advance_shared_server_if_tracking_stable(version) {
-        crate::logging::warn(&format!(
-            "update: failed to advance shared-server channel to {}: {}",
-            version, error
-        ));
-    }
-    build::update_stable_symlink(version)?;
-    build::update_current_symlink(version)?;
-    build::update_launcher_symlink_to_current()?;
+
+    // LAND the release as ONE transaction, instead of moving the daemon
+    // channel, the `stable` channel, the `current` channel and the launcher
+    // as four independent filesystem operations.
+    //
+    // That old sequence was the defect: a crash between "the daemon channel
+    // moved" and "the client channels moved" left the daemon on the new
+    // release and every client on the old one, permanently. The landing
+    // transaction journals the whole thing, hands the daemon off, PROVES the
+    // daemon runs the new release, and only then moves the client channels.
+    //
+    // The landing is run by the TARGET's own versioned binary
+    // (`server land <version> --json`), so this path never moves a channel
+    // itself.
+    //
+    // A pinned self-dev daemon is REFUSED here (the pin exists to keep that
+    // build running): the release stays installed, no channel moves, and the
+    // user can land it explicitly with `jcode server land <version>`.
+    let outcome = build::land_release_version(version, false, &mut |version| {
+        build::land_installed_version(version)
+    })?;
+    crate::logging::info(&format!("update: landed {version} ({outcome:?})"));
 
     metadata.installed_version = Some(release.tag_name.clone());
     metadata.installed_from = Some(asset.browser_download_url.clone());

@@ -13,16 +13,18 @@ mod storage_helpers;
 mod version_gc;
 
 pub use landing::{
-    DaemonIdentity, LandingLock, LandingOutcome, LandingPhase, LandingRecovery, LandingSession,
-    LandingTransaction, activate_client_channels, activate_clients_after_verified_daemon,
-    advance_landing, begin_landing, clear_landing_transaction, daemon_identity_matches_version,
-    daemon_identity_path, daemon_identity_proves_version, daemon_runs_version,
-    decide_landing_recovery, guard_landing_target_is_not_a_downgrade, is_valid_version_label,
-    land_version, landing_journal_path, landing_lock_path, load_landing_transaction,
-    log_landing_step, prepare_shared_server, publish_daemon_identity, read_daemon_identity,
-    record_handoff_requested, recover_landing, recover_landing_locked, rollback_landing,
-    save_landing_transaction, stage_build, version_build_time, version_commit,
-    wait_for_daemon_identity, would_downgrade,
+    DaemonIdentity, LandingLock, LandingOutcome, LandingPhase, LandingRecovery, LandingReport,
+    LandingSession, LandingTransaction, ReleaseLandingPlan, activate_client_channels,
+    activate_clients_after_verified_daemon, advance_landing, begin_landing,
+    clear_landing_transaction, daemon_identity_matches_version, daemon_identity_path,
+    daemon_identity_proves_version, daemon_runs_version, decide_landing_recovery,
+    guard_landing_target_is_not_a_downgrade, is_main_channel_label,
+    is_release_version_label, is_valid_version_label, land_installed_version, land_release_version,
+    land_version, landing_command, landing_journal_path, landing_lock_path,
+    load_landing_transaction, log_landing_step, plan_release_landing, prepare_shared_server,
+    publish_daemon_identity, read_daemon_identity, record_handoff_requested, recover_landing,
+    recover_landing_locked, rollback_landing, save_landing_transaction, shared_server_is_pinned_to_selfdev,
+    stage_build, version_build_time, version_commit, wait_for_daemon_identity, would_downgrade,
 };
 pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,
@@ -991,8 +993,20 @@ fn shared_server_binary_is_strictly_older_than(
     }
 }
 
-/// Install release binary into immutable versions, promote it to stable, and also make it the
-/// active current/launcher build.
+/// Install the local release binary into the immutable versions directory and
+/// LAND it onto the whole ecosystem as ONE transaction, while keeping `stable`
+/// untouched until the landing succeeded.
+///
+/// The previous implementation moved the `stable`, `current`, `shared-server`
+/// and launcher channels inline, in the OPPOSITE order from the release
+/// update path. Two independent sequences moving the same channels is exactly
+/// how a daemon/client split was produced: a crash between the daemon channel
+/// move and the client channel move left the daemon on the new build and the
+/// clients on the old one, with no journal to recover from.
+///
+/// The landing transaction fixes both: it moves the daemon channel, hands the
+/// daemon off, PROVES the daemon runs the target, and only then moves the
+/// client channels - as one journaled unit that recovers on its own.
 pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     let source = release_binary_path(repo_dir);
     if !source.exists() {
@@ -1002,10 +1016,15 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     let version = repo_build_version(repo_dir)?;
 
     let versioned = install_binary_at_version(&source, &version)?;
-    update_stable_symlink(&version)?;
-    update_current_symlink(&version)?;
-    update_shared_server_symlink(&version)?;
-    update_launcher_symlink_to_current()?;
+
+    // The landing is run by the TARGET's own versioned binary, so the channel
+    // moves happen inside the transaction and never in this process.
+    match land_installed_version(&version)? {
+        LandingOutcome::Landed { .. } => {}
+        LandingOutcome::RolledBack { reason, .. } => {
+            anyhow::bail!("Landing {version} failed and was rolled back: {reason}");
+        }
+    }
 
     Ok(versioned)
 }
