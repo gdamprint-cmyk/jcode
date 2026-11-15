@@ -1,3 +1,15 @@
+// reference: crates/jcode-app-core/src/server/debug_command_exec.rs:737-741 (read
+// 2026-11-15) - the debug `reload`'s child-process atomic landing, which is the
+// same mechanism this self-dev reload adopts: the TARGET's versioned binary runs
+// `<binary> server land <version> --json`, because the process that would wait for
+// the new daemon's identity is killed by its own reload.
+// reference: https://doc.rust-lang.org/std/process/struct.Command.html#method.output
+// (read 2026-11-15) - "Executes the command as a child process, waiting for it to
+// finish and collecting all of its output"; "Note that this method does not
+// return an error if the child runs and then exits unsuccessfully ... it still
+// returns Ok, and the outcome is reflected in the ExitStatus stored in the
+// returned Output". That is why the exit code must be read from
+// `outcome.status.success()`, not from a `?` on `output()`.
 use super::*;
 pub use jcode_selfdev_types::ReloadRecoveryDirective;
 
@@ -367,9 +379,68 @@ impl SelfDevTool {
             manifest.save()?;
         }
 
-        if !test_mode && let Err(error) = build::update_shared_server_symlink(&hash) {
-            let _ = build::rollback_pending_activation_for_session(session_id);
-            return Err(error);
+        // LAND the staged build as ONE crash-safe transaction through a CHILD
+        // process, instead of moving the daemon channel here and hoping the
+        // client channels follow later.
+        //
+        // The half-landing this replaces moved `shared-server` and wrote no
+        // journal, so a crash between that move and the client activation left
+        // the daemon channel AHEAD of `current` with nothing startup recovery
+        // could read: recovery reads only the landing journal.
+        //
+        // The process that would wait for the new daemon's identity and then
+        // move the client channels is THIS daemon, which the landing replaces -
+        // the same structural problem the debug `reload` had. A child process
+        // survives the exec and completes the transaction: journal, daemon
+        // channel, handoff, PROOF the daemon runs the target, then the client
+        // channels. A crash at any point leaves a journal the next daemon
+        // resolves at startup.
+        //
+        // `pending_activation` stays a NON-crash-safe record: its only readers
+        // are this reload's own error branches, the status display and the GC
+        // guard. The journal is what makes the state resolvable.
+        if !test_mode {
+            let published = published.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "published build metadata was missing after stage_local_current_build_for_source"
+                )
+            })?;
+            // The handoff is signalled from HERE, before the landing starts.
+            // The child transaction cannot signal it: the CLI's landing
+            // resolves the exec target from the shared-server channel and then
+            // waits for the daemon to publish an identity that proves it runs
+            // the target. Signalling only inside the tool (after the landing
+            // returned) would deadlock the landing until its whole identity
+            // timeout expired.
+            //
+            // `prefer_selfdev_binary=true` is the same choice the reload made
+            // before the split: the daemon must exec into this freshly staged
+            // build, not merely the newest binary on disk.
+            server::send_reload_signal(hash.clone(), Some(session_id.to_string()), true);
+            let mut landing = Self::landing_command(&published.versioned_path, &hash);
+            let outcome = tokio::task::spawn_blocking(move || landing.output())
+                .await
+                .map_err(|error| anyhow::anyhow!("landing task failed: {error:#}"))?
+                .map_err(|error| anyhow::anyhow!("landing process failed to run: {error}"))?;
+
+            if !outcome.status.success() {
+                // The landing rolled itself back, so the client channels stay
+                // on the previous build and the daemon channel is restored.
+                // Nothing here needs a rollback call: the transaction owns it.
+                let stdout = String::from_utf8_lossy(&outcome.stdout);
+                let stderr = String::from_utf8_lossy(&outcome.stderr);
+                let _ = build::rollback_pending_activation_for_session(session_id);
+                let mut manifest = build::BuildManifest::load()?;
+                manifest.canary_status = Some(build::CanaryStatus::Failed);
+                manifest.save()?;
+                return Err(anyhow::anyhow!(
+                    "Landing build {} failed and was rolled back ({}): {}{}",
+                    hash,
+                    outcome.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
         }
 
         // Save reload context for continuation after restart
@@ -386,14 +457,14 @@ impl SelfDevTool {
         ));
         if let Err(e) = reload_ctx.save() {
             crate::logging::error(&format!("Failed to save reload context: {}", e));
-            if !test_mode {
-                let _ = build::rollback_pending_activation_for_session(session_id);
-            }
             return Err(e);
         }
         crate::logging::info("Reload context saved successfully");
 
-        // Signal the server via in-process channel (replaces filesystem-based rebuild-signal)
+        // Signal the server via in-process channel (replaces filesystem-based rebuild-signal).
+        // In production the landing above already drove this signal; re-sending
+        // here keeps the test-session path (which skips the landing) on the same
+        // ack contract as before.
         let request_id =
             server::send_reload_signal(hash.clone(), Some(session_id.to_string()), true);
         crate::logging::info(&format!(
@@ -406,9 +477,6 @@ impl SelfDevTool {
         let ack = server::wait_for_reload_ack(&request_id, timeout)
             .await
             .map_err(|error| {
-                if !test_mode {
-                    let _ = build::rollback_pending_activation_for_session(session_id);
-                }
                 anyhow::anyhow!(
                     "Timed out waiting for the server to begin reload after {}s: {}. The reload signal may not have been picked up; check that the connected server is running a build with unified self-dev reload support and try restarting the shared server.",
                     timeout.as_secs(),
@@ -434,19 +502,19 @@ impl SelfDevTool {
                 }
                 match server::await_reload_handoff(&server::socket_path(), timeout).await {
                     server::ReloadWaitStatus::Ready => {
-                        // The daemon took the socket. Now PROVE it runs the
-                        // target, and only then move the client channels.
+                        // The daemon took the socket. The client channels were
+                        // already moved by the child landing, which PROVED this
+                        // daemon runs the target before moving them; re-derive
+                        // that proof from the daemon's published identity.
                         //
-                        // Readiness is not proof: the socket can be taken by a
-                        // daemon that is still on the old build. The identity
-                        // is the proof, and the client channels follow it.
+                        // Readiness alone is not proof: the socket can be
+                        // taken by a daemon that is still on the old build.
                         let identity = build::activate_clients_after_verified_daemon(
                             &hash,
                             None,
                             timeout,
                         )
                         .map_err(|error| {
-                            let _ = build::rollback_pending_activation_for_session(session_id);
                             anyhow::anyhow!(
                                 "The replacement server took the socket for build {}, but it does not report running that build: {error:#}",
                                 ack.hash
@@ -459,7 +527,6 @@ impl SelfDevTool {
                         )))
                     }
                     server::ReloadWaitStatus::Failed(detail) => {
-                        let _ = build::rollback_pending_activation_for_session(session_id);
                         Err(anyhow::anyhow!(
                             "Reload was acknowledged for build {}, but the replacement server failed before becoming ready on {}: {}; recent_state={}",
                             ack.hash,
@@ -469,7 +536,6 @@ impl SelfDevTool {
                         ))
                     }
                     server::ReloadWaitStatus::Idle | server::ReloadWaitStatus::Waiting { .. } => {
-                        let _ = build::rollback_pending_activation_for_session(session_id);
                         Err(anyhow::anyhow!(
                             "Reload was acknowledged for build {}, but readiness could not be confirmed within {}s.",
                             ack.hash,
@@ -492,6 +558,30 @@ impl SelfDevTool {
                 )))
             }
         }
+    }
+}
+
+impl SelfDevTool {
+    /// Build the command that performs the atomic landing for a self-dev
+    /// reload.
+    ///
+    /// The TARGET's own versioned binary runs the landing, not the launcher and
+    /// not this process: only the target binary knows the `land` subcommand, and
+    /// this process is about to be replaced by the very landing it starts. The
+    /// version is passed EXPLICITLY so the transaction lands the build this
+    /// reload staged, not whatever `staged-version` happens to name.
+    fn landing_command(versioned_binary: &Path, version: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(versioned_binary);
+        command.arg("server").arg("land").arg(version).arg("--json");
+        command
+    }
+
+    #[cfg(test)]
+    pub(crate) fn landing_command_for_tests(
+        versioned_binary: &Path,
+        version: &str,
+    ) -> std::process::Command {
+        Self::landing_command(versioned_binary, version)
     }
 }
 

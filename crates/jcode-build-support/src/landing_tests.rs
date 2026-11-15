@@ -257,6 +257,122 @@ fn recovery_completes_forward_when_the_daemon_already_runs_the_target() {
     });
 }
 
+/// The self-dev reload moves its channels through the landing transaction, so
+/// a crash leaves a journal the next daemon can resolve.
+///
+/// This drives the REAL step functions the child landing runs (`begin_landing`
+/// -> `prepare_shared_server`), then inspects the on-disk order: the journal
+/// must exist BEFORE the daemon channel moved (otherwise a crash between them is
+/// unrecoverable), and it must be gone after the client channels are activated.
+#[test]
+fn the_selfdev_reload_journals_before_moving_the_daemon_channel() {
+    with_temp_jcode_home(|| {
+        install_fake_version("aaa1111-dirty-2222");
+        install_fake_version("bbb2222-dirty-3333");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        // begin_landing writes the journal. Nothing has moved yet.
+        let mut transaction = begin_landing("bbb2222-dirty-3333", None).expect("begin");
+        assert_eq!(
+            load_landing_transaction().expect("load").as_ref(),
+            Some(&transaction),
+            "the journal must exist before any channel moves"
+        );
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "beginning the landing must not move the daemon channel"
+        );
+
+        // prepare_shared_server is the FIRST channel move. It must leave the
+        // journal naming the new phase, so recovery knows what to undo.
+        prepare_shared_server(&mut transaction, "bbb2222-dirty-3333").expect("prepare");
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("bbb2222-dirty-3333")
+        );
+        let journal = load_landing_transaction().expect("load").expect("journal survives prepare");
+        assert!(journal.shared_server_moved());
+        assert!(!journal.clients_moved());
+
+        // A crash here is recoverable: the journal exists, so the next daemon
+        // start resolves forward or backward instead of finding a bare split.
+        assert!(landing_journal_path().expect("path").exists());
+
+        // Success clears the journal AFTER the client channels moved.
+        record_handoff_requested(&mut transaction).expect("handoff");
+        advance_landing(&mut transaction, LandingPhase::DaemonVerified, "verified").expect("advance");
+        activate_client_channels(&mut transaction, "bbb2222-dirty-3333").expect("activate");
+        clear_landing_transaction().expect("clear");
+        assert!(load_landing_transaction().expect("load").is_none());
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("bbb2222-dirty-3333")
+        );
+    });
+}
+
+/// When the daemon identity cannot be proven, the client channels must NOT
+/// move: a daemon that does not run the target must never drag `current` and
+/// the launcher onto the target.
+#[test]
+fn the_client_channels_do_not_move_without_a_proven_daemon() {
+    with_temp_jcode_home(|| {
+        install_fake_version("aaa1111-dirty-2222");
+        install_fake_version("bbb2222-dirty-3333");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        let mut transaction = begin_landing("bbb2222-dirty-3333", None).expect("begin");
+        prepare_shared_server(&mut transaction, "bbb2222-dirty-3333").expect("prepare");
+        record_handoff_requested(&mut transaction).expect("handoff");
+
+        // The handoff "succeeded" but the daemon publishes an identity for a
+        // DIFFERENT build - exactly the case a reload command's exit code
+        // cannot detect.
+        publish_identity("ccc3333", Utc::now());
+
+        // This is the wait the CLI landing performs; it must fail.
+        let error = wait_for_daemon_identity(
+            "bbb2222-dirty-3333",
+            transaction.handoff_requested_at,
+            std::time::Duration::from_millis(400),
+        )
+        .expect_err("an unproven daemon must never satisfy the wait");
+        assert!(
+            error.to_string().contains("did not report running"),
+            "unexpected error: {error}"
+        );
+
+        // The client channels were never touched by the failed wait.
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "a failed landing must leave the client on the old version"
+        );
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("bbb2222-dirty-3333"),
+            "the daemon channel stays moved until rollback runs"
+        );
+
+        // Rollback restores it, using the same journal the crash path reads.
+        rollback_landing(&transaction).expect("rollback");
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("aaa1111-dirty-2222")
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("aaa1111-dirty-2222")
+        );
+        assert!(load_landing_transaction().expect("load").is_none());
+    });
+}
+
 #[test]
 fn a_second_landing_cannot_start_while_one_holds_the_lock() {
     with_temp_jcode_home(|| {

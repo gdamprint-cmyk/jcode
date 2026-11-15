@@ -1065,6 +1065,37 @@ mod tests {
         );
     }
 
+    /// The self-dev reload must land the build ATOMICALLY through the TARGET's
+    /// own versioned binary, the same shape the debug reload uses.
+    ///
+    /// A bare channel move (the old half-landing) writes no journal, and startup
+    /// recovery reads only the landing journal - so the command MUST be the
+    /// atomic landing (`server land <version>`), not a promote+reload pair and
+    /// not the launcher.
+    #[test]
+    fn selfdev_reload_lands_atomically_through_the_target_binary() {
+        let binary =
+            std::path::PathBuf::from("/tmp/builds/versions/abc123-dirty-def456/jcode.exe");
+        let command = crate::tool::selfdev::SelfDevTool::landing_command_for_tests(
+            &binary,
+            "abc123-dirty-def456",
+        );
+        assert_eq!(
+            command.get_program(),
+            binary.as_os_str(),
+            "the landing must run the TARGET's versioned binary"
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["server", "land", "abc123-dirty-def456", "--json"],
+            "the selfdev reload must run the atomic landing"
+        );
+    }
+
     #[tokio::test]
     async fn debug_cancel_does_not_wait_for_busy_agent_lock() {
         let provider: Arc<dyn Provider> = Arc::new(TestProvider);
