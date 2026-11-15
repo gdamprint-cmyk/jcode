@@ -1550,6 +1550,19 @@ async fn run_ambient_visible() -> Result<()> {
         )
     })?;
 
+    // Report this process's PID before doing anything else. The ambient
+    // runner uses it to tell "the TUI started and then exited" apart from
+    // "the TUI never started", which is the difference between a closed
+    // window and a terminal that opened a window without running jcode.
+    //
+    // reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+    if let Err(error) = VisibleCycleContext::write_start(std::process::id()) {
+        eprintln!(
+            "Ambient visible: could not record the start marker ({}); the runner may wait for the timeout.",
+            error
+        );
+    }
+
     let (provider, registry) = super::provider_init::init_provider_and_registry(
         &super::provider_init::ProviderChoice::Auto,
         None,

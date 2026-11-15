@@ -263,6 +263,94 @@ async fn unsupported_visible_launch_falls_back_to_headless() {
     assert_visible_launch_error_falls_back(std::io::ErrorKind::Unsupported).await;
 }
 
+/// A terminal that opens but never runs `jcode ambient run-visible` must not
+/// block the cycle until the full timeout: the runner has to notice that the
+/// TUI never reported itself and fall back to headless.
+///
+/// reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+#[tokio::test]
+async fn visible_launch_without_a_starting_tui_falls_back_to_headless() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingTestProvider::default());
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+
+    let result = runner
+        .run_cycle_with_visible_launcher_and_timeouts(
+            &provider,
+            true,
+            || Ok(()),
+            Duration::from_millis(200),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a TUI that never starts should continue as a headless cycle");
+
+    assert!(
+        result.conversation.is_some(),
+        "headless fallback should capture an agent conversation"
+    );
+    assert!(
+        result.summary.contains("forced end after 2 attempts"),
+        "headless fallback should return the headless agent result"
+    );
+}
+
+/// A visible cycle whose TUI exits without writing a result is over: the
+/// runner must not wait for the timeout.
+#[tokio::test]
+async fn visible_cycle_ends_when_the_reported_tui_process_is_gone() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    use crate::ambient::VisibleCycleContext;
+
+    // Use a real exited process, not a made-up PID: on Unix, `kill(0, 0)`
+    // signals the caller's whole process group, so PID 0 would be reported as
+    // running and would make this test meaningless.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a short-lived process");
+    let dead_pid = child.id();
+    let _ = child.wait();
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingTestProvider::default());
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+
+    let result = runner
+        .run_cycle_with_visible_launcher_and_timeouts(
+            &provider,
+            true,
+            // The launcher stands in for the terminal: the TUI reports its PID
+            // as soon as it starts. The runner clears any stale marker before
+            // launching, so the marker has to be written from here.
+            || {
+                VisibleCycleContext::write_start(dead_pid).expect("write start marker");
+                Ok(())
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a closed visible window should not fail the cycle");
+
+    assert!(
+        result.summary.contains("user closed window"),
+        "a TUI that exited without a result should end the cycle, got: {}",
+        result.summary
+    );
+    assert!(
+        VisibleCycleContext::read_start().is_none(),
+        "the start marker should be cleared when the cycle ends"
+    );
+}
+
 #[tokio::test]
 async fn missing_visible_launcher_falls_back_to_headless() {
     assert_visible_launch_error_falls_back(std::io::ErrorKind::NotFound).await;

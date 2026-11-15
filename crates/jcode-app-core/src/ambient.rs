@@ -79,6 +79,60 @@ impl VisibleCycleContext {
             .join("ambient")
             .join("cycle_result.json"))
     }
+
+    /// Path of the start marker written by the visible TUI process.
+    pub fn start_path() -> Result<PathBuf> {
+        Ok(storage::jcode_dir()?
+            .join("ambient")
+            .join("cycle_started.json"))
+    }
+
+    /// Record that the visible TUI process is up.
+    ///
+    /// The result file alone cannot separate three states:
+    /// - the TUI wrote `cycle_result.json` -> the cycle result is available;
+    /// - the TUI started, then exited without writing a result -> the user
+    ///   closed the window;
+    /// - the TUI never started -> the terminal opened, but
+    ///   `jcode ambient run-visible` failed to launch.
+    ///
+    /// Only the PID makes the second and third states observable before the
+    /// result file appears.
+    pub fn write_start(pid: u32) -> Result<()> {
+        let path = Self::start_path()?;
+        if let Some(parent) = path.parent() {
+            storage::ensure_dir(parent)?;
+        }
+        storage::write_json(
+            &path,
+            &VisibleCycleStart {
+                pid,
+                started_at: chrono::Utc::now(),
+            },
+        )
+    }
+
+    /// Read the start marker, if the visible TUI process reported itself.
+    pub fn read_start() -> Option<VisibleCycleStart> {
+        let path = Self::start_path().ok()?;
+        storage::read_json(&path).ok()
+    }
+
+    /// Remove a stale start marker.
+    pub fn clear_start() {
+        if let Ok(path) = Self::start_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Start marker written by the visible TUI process once it is running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisibleCycleStart {
+    /// PID of the visible TUI process.
+    pub pid: u32,
+    /// When the TUI process started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Ambient mode status
