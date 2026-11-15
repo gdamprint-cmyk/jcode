@@ -1019,12 +1019,14 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
 
     // The landing is run by the TARGET's own versioned binary, so the channel
     // moves happen inside the transaction and never in this process.
-    match land_installed_version(&version)? {
-        LandingOutcome::Landed { .. } => {}
-        LandingOutcome::RolledBack { reason, .. } => {
-            anyhow::bail!("Landing {version} failed and was rolled back: {reason}");
-        }
-    }
+    //
+    // The pin is overridden here on purpose: a local `/rebuild` is the user
+    // asking for THIS exact local build, so it lands over a pinned self-dev
+    // daemon - atomically, so the ecosystem moves together and there is no
+    // split either way.
+    land_release_version(&version, true, &mut |version| {
+        land_installed_version(version)
+    })?;
 
     Ok(versioned)
 }

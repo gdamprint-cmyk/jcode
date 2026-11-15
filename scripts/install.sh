@@ -13,6 +13,7 @@ INSTALL_VERSION="unknown"
 tmpdir=""
 
 info() { printf '\033[1;34m%s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33mwarning: %s\033[0m\n' "$*" >&2; }
 err()  { printf '\033[1;31merror: %s\033[0m\n' "$*" >&2; exit 1; }
 
 valid_release_tag() {
@@ -312,23 +313,69 @@ if [ "$IS_TERMUX" = true ] && [ "$IS_WINDOWS" = false ]; then
   fi
 fi
 
-if [ "$IS_WINDOWS" = true ]; then
-  cp -f "$dest_version_dir/$bin_name" "$stable_dir/$bin_name"
-  printf '%s\n' "$version" > "$builds_dir/stable-version"
-  cp -f "$stable_dir/$bin_name" "$launcher_path"
+# The installed binary lives at its immutable versioned location
+# (`builds/versions/<version>/jcode`). Channels are NOT moved here.
+#
+# The channels are moved by the LANDING TRANSACTION, which the versioned binary
+# itself runs (`server land <version> --json`): it journals the transaction,
+# moves the daemon channel, hands the daemon off, PROVES the daemon runs the
+# target, and only then moves the client channels (`current` and the launcher).
+# The previous installer wrote `stable` and the launcher and then reloaded the
+# daemon as three independent steps, which is how a daemon/client split was
+# produced.
+#
+# A binary that predates the `land` subcommand cannot run the transaction, so
+# the legacy sequence is used for it - and ONLY for it.
+supports_landing=false
+if "$dest_version_dir/$bin_name" server land --help >/dev/null 2>&1; then
+  supports_landing=true
+fi
+
+# A daemon channel PINNED to a self-dev build is a deliberate choice: that
+# build is meant to keep running. A release install must not silently destroy
+# it, and it must never move a client channel while leaving the daemon pinned.
+# So the pin is an EXPLICIT REFUSAL: the release stays installed at its
+# versioned path, no channel moves, and the user lands it by hand if they want
+# the pin replaced.
+pinned_version=""
+if [ -f "$builds_dir/shared-server-version" ]; then
+  pinned_version=$(head -n 1 "$builds_dir/shared-server-version" 2>/dev/null | tr -d '\r' || true)
+fi
+case "$pinned_version" in
+  ''|[0-9]*|main-*) is_pinned=false ;;
+  *) is_pinned=true ;;
+esac
+
+if [ "$is_pinned" = true ]; then
+  err "The daemon channel is pinned to the self-dev build $pinned_version. jcode $version was installed at $dest_version_dir/$bin_name but NO channel was moved, and the pin was preserved. Run \"$dest_version_dir/$bin_name\" server land $version explicitly if you want to replace the pin."
+fi
+
+if [ "$supports_landing" = true ]; then
+  info "Landing $version onto the whole ecosystem as one transaction..."
+  if ! "$dest_version_dir/$bin_name" server land "$version" --json >/dev/null 2>&1; then
+    err "Landing $version failed. The installed build stays at $dest_version_dir/$bin_name and no channel was moved; retry with \"$dest_version_dir/$bin_name\" server land $version."
+  fi
+  info "Landed $version: the daemon and every client now run it."
 else
-  ln -sfn "$dest_version_dir/$bin_name" "$stable_dir/$bin_name"
-  printf '%s\n' "$version" > "$builds_dir/stable-version"
-  if [ "$IS_TERMUX" = true ]; then
-    rm -f "$launcher_path"
-    cat > "$launcher_path" <<EOF
+  warn "This build predates the atomic landing transaction; falling back to the legacy channel move."
+  if [ "$IS_WINDOWS" = true ]; then
+    cp -f "$dest_version_dir/$bin_name" "$stable_dir/$bin_name"
+    printf '%s\n' "$version" > "$builds_dir/stable-version"
+    cp -f "$stable_dir/$bin_name" "$launcher_path"
+  else
+    ln -sfn "$dest_version_dir/$bin_name" "$stable_dir/$bin_name"
+    printf '%s\n' "$version" > "$builds_dir/stable-version"
+    if [ "$IS_TERMUX" = true ]; then
+      rm -f "$launcher_path"
+      cat > "$launcher_path" <<EOF
 #!/usr/bin/env bash
 unset LD_PRELOAD
 exec "$stable_dir/$bin_name" "\$@"
 EOF
-    chmod +x "$launcher_path"
-  else
-    ln -sfn "$stable_dir/$bin_name" "$launcher_path"
+      chmod +x "$launcher_path"
+    else
+      ln -sfn "$stable_dir/$bin_name" "$launcher_path"
+    fi
   fi
 fi
 
@@ -352,15 +399,13 @@ Darwin|Linux)
   ;;
 esac
 
-# Retire any background server still running the old binary so the freshly
-# installed version is picked up without the user having to kill a daemon by
-# hand (issue #291). We use the graceful `server reload` path, which hands live
-# headless/swarm sessions to a newly-exec'd server instead of dropping them, and
-# only reloads when the running server is genuinely older than what we just
-# installed (so a newer/dev daemon is never downgraded). This is best-effort:
-# it must never fail the install, and it is skipped when no server is running.
+# The daemon handoff already happened inside the landing transaction, so no
+# separate `server reload` is issued here: a reload would be a second,
+# unjournaled channel move (issue #291). It is still issued for a legacy build
+# that could not run the transaction. Best-effort: it must never fail the
+# install, and it is skipped when no server is running.
 INSTALL_STAGE="server_reload"
-if [ "${JCODE_SKIP_SERVER_RELOAD:-}" != "1" ]; then
+if [ "${JCODE_SKIP_SERVER_RELOAD:-}" != "1" ] && [ "$supports_landing" != true ]; then
   reload_bin="$launcher_path"
   [ -x "$reload_bin" ] || reload_bin="$stable_dir/$bin_name"
   if [ -x "$reload_bin" ]; then
