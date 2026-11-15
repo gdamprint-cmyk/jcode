@@ -1,5 +1,76 @@
 use super::*;
 
+// reference: no prior art, local jcode source; derived from crates/jcode-tui/src/tui/session_picker/loading.rs:1519-1568 and crates/jcode-base/src/session/persistence.rs:188-207
+//
+// The picker hides a session when its EFFECTIVE `is_debug` is true, and the
+// effective value is the LAST parsable journal entry's `meta.is_debug`
+// (loading.rs:1546 overwrites it on every line). These tests pin that merge
+// rule with a NEGATIVE CONTROL, so a loader that stopped reading the flag
+// could not still pass.
+#[test]
+fn load_session_summary_merges_debug_is_last_journal_entry_wins() {
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    // A snapshot is valid SessionSummary only with the non-defaulted
+    // timestamps (loading.rs:1179-1180).
+    fn snapshot_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","created_at":"1970-01-01T00:00:00Z","updated_at":"1970-01-01T00:00:00Z","is_debug":false,"messages":[]}}"#
+        )
+    }
+
+    // Case 1: the journal's LAST entry says false -> the summary is false
+    // even though the snapshot says false and an earlier entry said true.
+    {
+        let snapshot = temp.path().join("session_case1.json");
+        let journal = temp.path().join("session_case1.journal.jsonl");
+        std::fs::write(&snapshot, snapshot_json("negctl_case1").as_bytes()).expect("write snapshot");
+        std::fs::write(
+            &journal,
+            concat!(
+                r#"{"meta":{"is_debug":true,"updated_at":"1970-01-01T00:00:00Z"}}"#,
+                "\n",
+                r#"{"meta":{"is_debug":false,"updated_at":"1970-01-01T00:00:01Z"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write journal");
+
+        let summary = load_session_summary(&snapshot).expect("load summary");
+        assert!(
+            !summary.is_debug,
+            "the last journal entry (is_debug=false) must win over the earlier true"
+        );
+    }
+
+    // Negative control: the journal's LAST entry says true -> the summary
+    // MUST be true. Without this case a loader that ignored the journal's
+    // flag entirely would report the snapshot's false and pass case 1
+    // vacuously.
+    {
+        let snapshot = temp.path().join("session_case2.json");
+        let journal = temp.path().join("session_case2.journal.jsonl");
+        std::fs::write(&snapshot, snapshot_json("negctl_case2").as_bytes()).expect("write snapshot");
+        std::fs::write(
+            &journal,
+            concat!(
+                r#"{"meta":{"is_debug":false,"updated_at":"1970-01-01T00:00:00Z"}}"#,
+                "\n",
+                r#"{"meta":{"is_debug":true,"updated_at":"1970-01-01T00:00:01Z"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write journal");
+
+        let summary = load_session_summary(&snapshot).expect("load summary");
+        assert!(
+            summary.is_debug,
+            "negative control: the last journal entry (is_debug=true) must win, \
+             otherwise case 1 passes vacuously"
+        );
+    }
+}
+
 #[test]
 fn preview_loading_preserves_live_tool_duration_metadata() {
     let mut session = Session::create_with_id("preview_metadata".into(), None, None);
