@@ -384,7 +384,17 @@ export -f cargo
                             &repo_dir,
                             &source_after_build,
                         )?;
-                        let published = build::publish_local_current_build_for_source(
+                        // A BUILD only STAGES: it installs the immutable
+                        // versioned binary and records it as the landing
+                        // target. It does NOT move `current` or the launcher.
+                        //
+                        // Moving the client channels at build time is what
+                        // opened the desync window: a new client would attach
+                        // to a daemon still running the previous build. The
+                        // channels now move only inside a landing
+                        // transaction, after the daemon has been proven to run
+                        // the target.
+                        let published = build::stage_local_current_build_for_source(
                             &repo_dir,
                             &source_after_build,
                         )?;
@@ -395,7 +405,9 @@ export -f cargo
                         })?;
                         request.published_version = Some(published.version.clone());
                         request.validated = true;
-                        request.last_progress = Some("published and smoke-tested".to_string());
+                        request.last_progress = Some(
+                            "staged and smoke-tested (not yet landed)".to_string(),
+                        );
                         request.save()?;
                         result
                     }

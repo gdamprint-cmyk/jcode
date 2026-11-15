@@ -1,11 +1,10 @@
 use super::*;
 
 fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    ENV_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    // The lock is shared with the other test module: `JCODE_HOME` is
+    // process-global, so two independent mutexes would let one module change
+    // the home under the other.
+    super::test_env_lock()
 }
 
 fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {

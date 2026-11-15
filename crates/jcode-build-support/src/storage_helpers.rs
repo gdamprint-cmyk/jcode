@@ -1,3 +1,8 @@
+// reference: in-repo prior art - `read_current_version` /
+// `read_shared_server_version` in this same file (the marker-file pattern:
+// one file per channel under `builds_dir()`, holding the channel's version
+// label, written when the channel moves). `staged_version_file` follows that
+// exact pattern for the staging marker.
 use super::{MigrationContext, binary_name};
 use anyhow::Result;
 use jcode_storage as storage;
@@ -90,6 +95,21 @@ pub fn shared_server_version_file() -> Result<PathBuf> {
     Ok(builds_dir()?.join("shared-server-version"))
 }
 
+/// Get path to the staged version file (the newest BUILT build).
+///
+/// The staged marker is what makes a BUILD staging-only. A build installs
+/// its immutable versioned binary and records the label here; it does NOT
+/// touch the `current` channel or the launcher. The landing then moves every
+/// channel onto the staged build in one transaction, so a client can never
+/// attach to a daemon running a different build.
+///
+/// Before this marker existed, the `current` channel doubled as "the newest
+/// build" and "the build the clients run", and those two are different
+/// things: the first is a build output, the second is a release decision.
+pub fn staged_version_file() -> Result<PathBuf> {
+    Ok(builds_dir()?.join("staged-version"))
+}
+
 /// Save migration context before switching to canary
 pub fn save_migration_context(ctx: &MigrationContext) -> Result<()> {
     let path = migration_context_path(&ctx.session_id)?;
@@ -150,6 +170,33 @@ pub fn read_current_version() -> Result<Option<String>> {
 /// Read the current shared-server version.
 pub fn read_shared_server_version() -> Result<Option<String>> {
     let path = shared_server_version_file()?;
+    if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        let hash = content.trim();
+        if hash.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hash.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Record the version a BUILD produced, without moving any channel.
+///
+/// This is the staging half of the landing split. The build's output becomes
+/// the landing's TARGET, but it does not become the build the clients run:
+/// that happens only when the landing commits.
+pub fn write_staged_version(version: &str) -> Result<()> {
+    let path = staged_version_file()?;
+    std::fs::write(path, version)?;
+    Ok(())
+}
+
+/// Read the version of the newest STAGED build, if any.
+pub fn read_staged_version() -> Result<Option<String>> {
+    let path = staged_version_file()?;
     if path.exists() {
         let content = std::fs::read_to_string(path)?;
         let hash = content.trim();

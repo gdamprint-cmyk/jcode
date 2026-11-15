@@ -1,5 +1,11 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+// reference: in-repo prior art - `run_server_promote_command` and
+// `run_server_reload_command` in this same file (the two half-steps of the
+// landing transaction), plus `crates/jcode-build-support/src/landing.rs`
+// (the transaction itself, with its own provenance declared there). The
+// landing command composes those two existing half-steps into the single
+// crash-safe boundary they were missing.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -2249,6 +2255,125 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", report.detail);
+    }
+    Ok(())
+}
+
+/// Land an installed build onto the WHOLE ecosystem as one crash-safe
+/// transaction.
+///
+/// The transaction (implemented in `jcode_build_support::landing`) is:
+///
+/// 1. journal the transaction,
+/// 2. point the DAEMON channel at the target,
+/// 3. hand the running daemon off to the target,
+/// 4. PROVE the daemon runs the target (its published identity),
+/// 5. move the CLIENT channels (`current` + launcher) onto the target,
+/// 6. commit.
+///
+/// The client channels move LAST and only after the daemon has been proven
+/// to run the target. A failed handoff therefore leaves clients on the old
+/// build, and the daemon channel is restored. This is what makes "the client
+/// channel and the daemon can never disagree" true rather than aspirational.
+pub async fn run_server_land_command(version: Option<&str>, emit_json: bool) -> Result<()> {
+    let version = match version {
+        Some(version) => version.to_string(),
+        None => crate::build::read_staged_version()?
+            .or(crate::build::read_current_version()?)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No staged build is available; run a build first, or pass an installed VERSION explicitly"
+                )
+            })?,
+    };
+
+    // The session owns the single-writer lock and the journal for the whole
+    // transaction. The handoff is the ONE async step: it asks the running
+    // daemon to exec into the target that `prepare` just pointed the daemon
+    // channel at.
+    //
+    // reference: https://doc.rust-lang.org/std/future/trait.Future.html (read
+    // 2026-11-15) - "A future represents an asynchronous computation,
+    // commonly obtained by use of `async`"; an `async` block is a future that
+    // is polled to completion, so the block below is what carries the
+    // `.await` over the daemon handoff.
+    let mut session = crate::build::LandingSession::begin(&version, None)?;
+
+    let outcome = async {
+        session.prepare()?;
+        session.record_handoff()?;
+
+        // `--force` is deliberate: the daemon's own "am I already the newest?"
+        // probe compares the candidate's mtime against a snapshot PINNED at
+        // server start, so it can answer "no update" while the channel names
+        // a different build. The daemon's own guard still refuses to exec into
+        // itself or into an older binary, so forcing cannot downgrade it.
+        run_server_reload_command_to(true, false, &mut std::io::sink()).await?;
+
+        session.verify_and_activate(std::time::Duration::from_secs(120))
+    }
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A failed landing rolls back what it moved and leaves the client
+            // channels on the old version.
+            let reason = format!("{error:#}");
+            let _ = session.rollback();
+            crate::build::LandingOutcome::RolledBack {
+                target_version: version.clone(),
+                reason,
+            }
+        }
+    };
+
+    #[derive(Serialize)]
+    struct ServerLandReport {
+        version: String,
+        landed: bool,
+        previous_current_version: Option<String>,
+        previous_shared_server_version: Option<String>,
+        detail: String,
+    }
+
+    let report = match &outcome {
+        crate::build::LandingOutcome::Landed {
+            target_version,
+            previous_current_version,
+            previous_shared_server_version,
+        } => ServerLandReport {
+            version: target_version.clone(),
+            landed: true,
+            previous_current_version: previous_current_version.clone(),
+            previous_shared_server_version: previous_shared_server_version.clone(),
+            detail: format!("Landed {target_version}: the daemon and every client now run it."),
+        },
+        crate::build::LandingOutcome::RolledBack {
+            target_version,
+            reason,
+        } => ServerLandReport {
+            version: target_version.clone(),
+            landed: false,
+            previous_current_version: None,
+            previous_shared_server_version: None,
+            detail: format!(
+                "Landing {target_version} FAILED and was rolled back; the client channels stay on the previous version. Reason: {reason}"
+            ),
+        },
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.detail);
+    }
+
+    // A rolled-back landing is a FAILURE, and the exit code must say so: a
+    // caller that only checks the exit status must not mistake a failed
+    // landing for a successful one.
+    if !report.landed {
+        anyhow::bail!("{}", report.detail);
     }
     Ok(())
 }

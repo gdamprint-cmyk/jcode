@@ -7,7 +7,7 @@
 
 use crate::{
     BuildManifest, builds_dir, read_current_version, read_shared_server_version,
-    read_stable_version,
+    read_stable_version, read_staged_version,
 };
 use anyhow::Result;
 use std::collections::HashSet;
@@ -49,6 +49,10 @@ fn protected_versions() -> HashSet<String> {
         read_current_version(),
         read_stable_version(),
         read_shared_server_version(),
+        // The STAGED build is the landing's target. It is not on any channel
+        // yet, so without this it would be the first version the GC removes -
+        // and the landing would then have nothing to land.
+        read_staged_version(),
     ]
     .into_iter()
     .flatten()

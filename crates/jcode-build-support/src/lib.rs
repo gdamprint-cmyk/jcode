@@ -1,9 +1,28 @@
+// reference: in-repo prior art - `publish_local_current_build_for_source` in
+// this same file (the build-time publish: validate, install the immutable
+// versioned binary, smoke-test it, move the channels). The staging variant
+// keeps the first three steps and drops the channel moves, so the channel
+// moves happen only inside the landing transaction
+// (crates/jcode-build-support/src/landing.rs, whose provenance is declared
+// there).
+mod landing;
 mod paths;
 mod platform_support;
 mod source_state;
 mod storage_helpers;
 mod version_gc;
 
+pub use landing::{
+    DaemonIdentity, LandingLock, LandingOutcome, LandingPhase, LandingRecovery, LandingSession,
+    LandingTransaction, activate_client_channels, activate_clients_after_verified_daemon,
+    advance_landing, begin_landing, clear_landing_transaction, daemon_identity_matches_version,
+    daemon_identity_path, daemon_identity_proves_version, daemon_runs_version,
+    decide_landing_recovery, is_valid_version_label, land_version, landing_journal_path,
+    landing_lock_path, load_landing_transaction, log_landing_step, prepare_shared_server,
+    publish_daemon_identity, read_daemon_identity, record_handoff_requested, recover_landing,
+    recover_landing_locked, rollback_landing, save_landing_transaction, stage_build, version_commit,
+    wait_for_daemon_identity,
+};
 pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,
     current_binary_build_time_string, current_binary_built_at, find_dev_binary,
@@ -22,9 +41,9 @@ pub use storage_helpers::{
     build_log_path, build_progress_path, builds_dir, canary_binary_path, clear_build_progress,
     clear_migration_context, current_binary_path, current_version_file, load_migration_context,
     manifest_path, migration_context_path, read_build_progress, read_current_version,
-    read_shared_server_version, read_stable_version, save_migration_context,
+    read_shared_server_version, read_stable_version, read_staged_version, save_migration_context,
     shared_server_binary_path, shared_server_version_file, stable_binary_path, stable_version_file,
-    version_binary_path, write_build_progress,
+    staged_version_file, version_binary_path, write_build_progress, write_staged_version,
 };
 pub use version_gc::{
     DEFAULT_KEEP_RECENT_VERSIONS, KEEP_VERSIONS_ENV, VersionPruneReport, prune_old_versions,
@@ -720,6 +739,68 @@ pub fn publish_local_current_build_for_source(
     })
 }
 
+/// STAGE a build: install the immutable versioned binary and record it as
+/// the landing target, WITHOUT moving any channel.
+///
+/// This is the build-time half of the landing split. It does exactly what a
+/// build is allowed to do:
+///
+/// - install the immutable binary under `builds/versions/<label>/`,
+/// - smoke-test that binary,
+/// - record the label as the STAGED version, the landing's target.
+///
+/// It does NOT move `current`, the launcher, or `shared-server`. Those move
+/// only inside a landing transaction, where the daemon is handed off and
+/// PROVEN to run the target before the client channels follow.
+///
+/// Why the split matters: while the build moved `current` and the launcher
+/// but the daemon was still on the old build, any new client attached to an
+/// older daemon. That window is what this function removes.
+pub fn stage_local_current_build_for_source(
+    repo_dir: &Path,
+    source: &SourceState,
+) -> Result<PublishedBuild> {
+    let binary = find_dev_binary(repo_dir)
+        .ok_or_else(|| anyhow::anyhow!("Binary not found in target/selfdev or target/release"))?;
+    if !binary.exists() {
+        anyhow::bail!("Binary not found at {:?}", binary);
+    }
+
+    validate_dev_binary_matches_source(repo_dir, &binary, source)?;
+    let previous_current_version = read_current_version()?;
+    let versioned_path = install_binary_at_version(&binary, &source.version_label)?;
+    let installed_report = read_binary_version_report(&versioned_path)?;
+    if installed_report
+        .version
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        anyhow::bail!(
+            "Binary smoke test for {} returned JSON without a version field",
+            versioned_path.display()
+        );
+    }
+    validate_binary_version_matches_source_report(&installed_report, &versioned_path, source)?;
+
+    // The staged marker is written LAST: it is the promise that the build is
+    // complete and installable, so it must not exist before the binary is
+    // verified.
+    write_staged_version(&source.version_label)?;
+
+    // The channel links are the CURRENT channel's links, unchanged by this
+    // build. They are reported so a caller can see where the clients still
+    // point.
+    Ok(PublishedBuild {
+        version: source.version_label.clone(),
+        source_fingerprint: source.fingerprint.clone(),
+        versioned_path,
+        current_link: current_binary_path()?,
+        launcher_link: launcher_binary_path()?,
+        previous_current_version,
+    })
+}
+
 /// Install the local release binary into immutable versions and make it the active `current`
 /// build + launcher, while keeping `stable` untouched.
 pub fn publish_local_current_build(repo_dir: &std::path::Path) -> Result<PathBuf> {
@@ -940,5 +1021,22 @@ pub fn update_canary_symlink(hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// The process-wide lock guarding `JCODE_HOME` in tests.
+///
+/// It lives in the crate root, not in a test module, because BOTH
+/// `tests.rs` and `landing_tests.rs` redirect `JCODE_HOME` into a temp dir.
+/// `JCODE_HOME` is process-global, so two modules with two different mutexes
+/// would race: one test would change the home under the other, and the
+/// other's channel assertions would read the wrong directory.
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod landing_tests;
 #[cfg(test)]
 mod tests;

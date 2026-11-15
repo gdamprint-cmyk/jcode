@@ -325,10 +325,13 @@ impl SelfDevTool {
         };
         let hash = source.version_label.clone();
         let version_before = jcode_build_meta::version().to_string();
+        // STAGE only: the build installs the immutable binary and records the
+        // landing target. The client channels move in the landing
+        // transaction, after the daemon is proven to run this build.
         let published = if test_mode {
             None
         } else {
-            Some(build::publish_local_current_build_for_source(
+            Some(build::stage_local_current_build_for_source(
                 &repo_dir, &source,
             )?)
         };
@@ -431,10 +434,28 @@ impl SelfDevTool {
                 }
                 match server::await_reload_handoff(&server::socket_path(), timeout).await {
                     server::ReloadWaitStatus::Ready => {
+                        // The daemon took the socket. Now PROVE it runs the
+                        // target, and only then move the client channels.
+                        //
+                        // Readiness is not proof: the socket can be taken by a
+                        // daemon that is still on the old build. The identity
+                        // is the proof, and the client channels follow it.
+                        let identity = build::activate_clients_after_verified_daemon(
+                            &hash,
+                            None,
+                            timeout,
+                        )
+                        .map_err(|error| {
+                            let _ = build::rollback_pending_activation_for_session(session_id);
+                            anyhow::anyhow!(
+                                "The replacement server took the socket for build {}, but it does not report running that build: {error:#}",
+                                ack.hash
+                            )
+                        })?;
                         let _ = build::complete_pending_activation_for_session(session_id);
                         Ok(ToolOutput::new(format!(
-                            "Reload completed successfully for build {}. Server reported ready.",
-                            ack.hash
+                            "Reload completed successfully for build {}. Server reported ready and runs that build (pid {}).",
+                            ack.hash, identity.pid
                         )))
                     }
                     server::ReloadWaitStatus::Failed(detail) => {

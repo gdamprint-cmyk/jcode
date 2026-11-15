@@ -691,6 +691,26 @@ pub(crate) enum ServerCommand {
         json: bool,
     },
 
+    /// Land an installed build onto the whole ecosystem as one transaction.
+    ///
+    /// This is the crash-safe boundary: it moves the daemon channel, hands the
+    /// running daemon off to the target, PROVES the daemon really runs the
+    /// target, and only then moves the client channels (`current` and the
+    /// launcher) onto it. A build never moves a channel, so a client can
+    /// never attach to a daemon running a different build.
+    ///
+    /// If the handoff fails, the client channels stay on the old build and the
+    /// daemon channel is restored. A crash mid-transaction is resolved at the
+    /// next daemon startup.
+    Land {
+        /// Installed version to land (defaults to the current channel)
+        version: Option<String>,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Gracefully reload the running background server onto the newest binary.
     ///
     /// This is the preferred way to pick up an upgrade: the daemon hands its

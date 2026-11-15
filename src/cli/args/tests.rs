@@ -192,6 +192,35 @@ fn server_promote_parses_default_and_explicit_version() {
 }
 
 #[test]
+fn server_land_parses_default_and_explicit_version() {
+    // The landing defaults to the STAGED build (the newest built, not yet
+    // landed), and accepts an explicit installed version label.
+    let current = Args::try_parse_from(["jcode", "server", "land", "--json"])
+        .expect("server land should default to the staged build");
+    assert!(matches!(
+        current.command,
+        Some(Command::Server {
+            action: ServerCommand::Land {
+                version: None,
+                json: true,
+            }
+        })
+    ));
+
+    let explicit = Args::try_parse_from(["jcode", "server", "land", "abc1234-dirty-deadbeef"])
+        .expect("server land should accept an installed version label");
+    assert!(matches!(
+        explicit.command,
+        Some(Command::Server {
+            action: ServerCommand::Land {
+                version: Some(ref version),
+                json: false,
+            }
+        }) if version == "abc1234-dirty-deadbeef"
+    ));
+}
+
+#[test]
 fn telemetry_subcommands_parse() {
     let status = Args::try_parse_from(["jcode", "telemetry", "status", "--json"])
         .expect("telemetry status should parse");

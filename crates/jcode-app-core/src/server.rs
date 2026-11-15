@@ -47,6 +47,7 @@ pub use group_transfer::{GroupTransferBundle, GroupTransferSelection, GroupTrans
 pub use swarm_persistence::{PersistedSwarmMember, PersistedSwarmState, PersistedVersionedPlan};
 mod idle_hibernation;
 mod jade_relay;
+mod landing_identity;
 mod lifecycle;
 mod live_status;
 mod live_turn;
@@ -2588,6 +2589,16 @@ impl Server {
             self.identity.display_name(),
             self.identity.version
         ));
+
+        // Announce which build this daemon runs, and resolve any landing
+        // transaction a previous daemon left unfinished.
+        //
+        // This runs AFTER the listener is bound but BEFORE the accept loops
+        // start, so a client that connects right after this point talks to a
+        // daemon whose identity is already published: the landing can then
+        // prove what runs, instead of trusting a reload command's exit code.
+        landing_identity::publish_identity_and_recover();
+
         crate::logging::info(&format!("Server listening on {:?}", self.socket_path));
         crate::logging::info(&format!("Debug socket on {:?}", self.debug_socket_path));
 
