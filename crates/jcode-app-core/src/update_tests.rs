@@ -2,6 +2,80 @@ use super::*;
 use jcode_update_core::parse_sha256sums;
 use sha2::{Digest, Sha256};
 
+/// The `.tar.gz` release path must leave a durable publication proof.
+///
+/// This branch of the updater installs `builds/versions/<version>/` DIRECTLY:
+/// it never goes through `install_binary_at_version`, so before the fix it
+/// left NO row in the append-only ledger. That is the path the real release
+/// artifacts use, and a publication with no proof becomes invisible once the
+/// version GC removes the directory.
+///
+/// reference: crates/jcode-build-support/src/lib.rs:378
+/// `install_binary_at_version` - the sibling path that records its row
+/// automatically.
+/// reference: crates/jcode-build-support/src/publication_ledger_tests.rs:141
+/// `installing_a_version_records_a_publication` - the ledger test for that
+/// sibling path, and the pattern this test follows.
+#[test]
+fn the_tarball_release_path_records_a_publication() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    // JCODE_HOME redirects BOTH the builds dir and the ledger
+    // (crates/jcode-build-support/src/storage_helpers.rs:23
+    // `resolve_builds_dir`), so the test never touches the real ledger.
+    unsafe { std::env::set_var("JCODE_HOME", &home) };
+
+    // Build a real .tar.gz archive containing a jcode binary.
+    let mut tar_bytes = Vec::new();
+    {
+        let encoder = flate2::write::GzEncoder::new(&mut tar_bytes, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let payload = b"not a real binary, but a real file";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "jcode", &payload[..])
+            .expect("append jcode to the archive");
+        builder.into_inner().expect("finish the archive").finish().expect("gzip");
+    }
+
+    let extract_dir = temp.path().join("extract");
+    let installed = install_tarball_release(&tar_bytes, "9.9.9-test", &extract_dir)
+        .expect("the tarball release must install");
+
+    assert!(
+        installed.exists(),
+        "the release binary must be installed at {installed:?}"
+    );
+    let versions = home.join("builds").join("versions").join("9.9.9-test");
+    assert!(
+        versions.exists(),
+        "the version directory must exist: {versions:?}"
+    );
+
+    // The durable proof: the ledger must name this version.
+    let ledger = home.join("builds").join("published-versions.jsonl");
+    assert!(
+        ledger.exists(),
+        "the tarball path must write the durable publication ledger: {ledger:?}"
+    );
+    let contents = std::fs::read_to_string(&ledger).expect("read the ledger");
+    assert!(
+        contents.contains("9.9.9-test"),
+        "the ledger must name the installed version, got: {contents}"
+    );
+    assert!(
+        build::published_versions_from_ledger().contains(&"9.9.9-test".to_string()),
+        "the ledger reader must see the tarball publication"
+    );
+
+    unsafe { std::env::remove_var("JCODE_HOME") };
+}
+
 #[test]
 fn test_version_is_newer() {
     assert!(version_is_newer("0.1.3", "0.1.2"));

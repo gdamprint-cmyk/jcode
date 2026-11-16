@@ -969,6 +969,117 @@ fn log_download_retry_short(attempt: usize, downloaded: u64, total: u64) {
     ));
 }
 
+/// Install a `.tar.gz` release archive into `builds/versions/<version>/`.
+///
+/// This branch of the updater installs the release DIRECTLY: it creates
+/// `builds/versions/<version>/` and copies the binary in, so it never goes
+/// through `install_binary_at_version` and would leave NO durable publication
+/// proof. The publication is therefore recorded in the append-only ledger
+/// explicitly, or the tarball release path - the one the real release
+/// artifacts use - stays unprovable once the version GC removes the directory.
+///
+/// Returns the path of the installed binary.
+///
+/// reference: crates/jcode-build-support/src/lib.rs:378
+/// `install_binary_at_version` - the sibling path that DOES record its row
+/// automatically, and the reason this branch has to record its own.
+/// reference: crates/jcode-build-support/src/lib.rs:251 `record_publication`.
+/// reference: https://docs.rs/tar/latest/tar/struct.Archive.html (read
+/// 2026-11-16) - `Archive::entries` "Construct an iterator over the entries
+/// in this archive" and the note that "entries are processed out of sequence
+/// ... the contents read for each entry may be corrupted"; `Entry::unpack`
+/// extracts one entry to the given path.
+fn install_tarball_release(bytes: &[u8], version: &str, extract_dir: &Path) -> Result<PathBuf> {
+    let cursor = std::io::Cursor::new(bytes);
+    let gz = flate2::read::GzDecoder::new(cursor);
+    let mut archive = tar::Archive::new(gz);
+    if extract_dir.exists() {
+        let _ = fs::remove_dir_all(extract_dir);
+    }
+    fs::create_dir_all(extract_dir).context("Failed to create archive extraction dir")?;
+    let mut extracted_binary: Option<PathBuf> = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.into_owned();
+        if entry_path.components().count() != 1 {
+            continue;
+        }
+        let file_name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if file_name.is_empty() || file_name.ends_with(".tar.gz") {
+            continue;
+        }
+        let dest = extract_dir.join(&file_name);
+        entry.unpack(&dest)?;
+        if file_name.starts_with("jcode") && !file_name.ends_with(".bin") {
+            extracted_binary = Some(dest);
+        }
+    }
+    let Some(extracted_binary) = extracted_binary else {
+        anyhow::bail!("Could not find jcode binary inside tar.gz archive");
+    };
+    crate::platform::set_permissions_executable(&extracted_binary)?;
+
+    let dest_dir = build::builds_dir()?.join("versions").join(version);
+    fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
+    let mut installed_files = Vec::new();
+    for entry in fs::read_dir(extract_dir).context("Failed to read extracted archive")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        let dest_name = if name_string == get_asset_name()
+            || name_string == format!("{}.exe", get_asset_name())
+        {
+            build::binary_name().to_string()
+        } else {
+            name_string.to_string()
+        };
+        let dest = dest_dir.join(dest_name);
+        if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+        fs::copy(entry.path(), &dest)
+            .with_context(|| format!("Failed to install {}", dest.display()))?;
+        if dest
+            .file_name()
+            .is_some_and(|name| name == build::binary_name())
+            || dest.extension().is_some_and(|ext| ext == "bin")
+        {
+            crate::platform::set_permissions_executable(&dest)?;
+        }
+        installed_files.push(dest);
+    }
+    // Give every installed file the same mtime. The wrapper script and the
+    // `.bin` payload otherwise land with whatever sub-second skew the copy
+    // loop produced, and any code comparing binary freshness by mtime then
+    // sees two "different age" files for one logical install.
+    let install_stamp = SystemTime::now();
+    for path in &installed_files {
+        if let Ok(file) = fs::File::options().write(true).open(path) {
+            let _ = file.set_modified(install_stamp);
+        }
+    }
+    let _ = fs::remove_dir_all(extract_dir);
+
+    if let Err(err) = build::record_publication(&build::PublicationRecord {
+        version: version.to_string(),
+        source_fingerprint: String::new(),
+        published_at: chrono::Utc::now(),
+        validated: false,
+    }) {
+        eprintln!(
+            "warning: could not record the installation of {version} in the durable ledger: {err}"
+        );
+    }
+
+    Ok(dest_dir.join(build::binary_name()))
+}
+
 pub fn download_and_install_blocking_with_progress(
     release: &GitHubRelease,
     mut on_progress: impl FnMut(DownloadProgress),
@@ -1005,102 +1116,11 @@ pub fn download_and_install_blocking_with_progress(
 
     let mut installed_version_dir: Option<PathBuf> = None;
     if asset.name.ends_with(".tar.gz") {
-        let cursor = std::io::Cursor::new(&bytes);
-        let gz = flate2::read::GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(gz);
-        let extract_dir = temp_path.with_extension("extract");
-        if extract_dir.exists() {
-            let _ = fs::remove_dir_all(&extract_dir);
-        }
-        fs::create_dir_all(&extract_dir).context("Failed to create archive extraction dir")?;
-        let mut extracted_binary: Option<PathBuf> = None;
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.into_owned();
-            if entry_path.components().count() != 1 {
-                continue;
-            }
-            let file_name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if file_name.is_empty() || file_name.ends_with(".tar.gz") {
-                continue;
-            }
-            let dest = extract_dir.join(&file_name);
-            entry.unpack(&dest)?;
-            if file_name.starts_with("jcode") && !file_name.ends_with(".bin") {
-                extracted_binary = Some(dest);
-            }
-        }
-        let Some(extracted_binary) = extracted_binary else {
-            anyhow::bail!("Could not find jcode binary inside tar.gz archive");
-        };
-        crate::platform::set_permissions_executable(&extracted_binary)?;
-
-        let version = release.tag_name.trim_start_matches('v');
-        let dest_dir = build::builds_dir()?.join("versions").join(version);
-        fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
-        let mut installed_files = Vec::new();
-        for entry in fs::read_dir(&extract_dir).context("Failed to read extracted archive")? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_string = name.to_string_lossy();
-            let dest_name = if name_string == get_asset_name()
-                || name_string == format!("{}.exe", get_asset_name())
-            {
-                build::binary_name().to_string()
-            } else {
-                name_string.to_string()
-            };
-            let dest = dest_dir.join(dest_name);
-            if dest.exists() {
-                fs::remove_file(&dest)?;
-            }
-            fs::copy(entry.path(), &dest)
-                .with_context(|| format!("Failed to install {}", dest.display()))?;
-            if dest
-                .file_name()
-                .is_some_and(|name| name == build::binary_name())
-                || dest.extension().is_some_and(|ext| ext == "bin")
-            {
-                crate::platform::set_permissions_executable(&dest)?;
-            }
-            installed_files.push(dest);
-        }
-        // Give every installed file the same mtime. The wrapper script and the
-        // `.bin` payload otherwise land with whatever sub-second skew the copy
-        // loop produced, and any code comparing binary freshness by mtime then
-        // sees two "different age" files for one logical install.
-        let install_stamp = SystemTime::now();
-        for path in &installed_files {
-            if let Ok(file) = fs::File::options().write(true).open(path) {
-                let _ = file.set_modified(install_stamp);
-            }
-        }
-        let _ = fs::remove_dir_all(&extract_dir);
-        installed_version_dir = Some(dest_dir.join(build::binary_name()));
-
-        // This branch installs the release DIRECTLY: it creates
-        // `builds/versions/<version>/` and copies the binary in, so it never
-        // goes through `install_binary_at_version` and would leave NO durable
-        // publication proof. Record the installation in the append-only ledger
-        // explicitly, or the tarball release path - the one the real release
-        // artifacts use - stays unprovable once the version GC removes the
-        // directory.
-        if let Err(err) = build::record_publication(&build::PublicationRecord {
-            version: version.to_string(),
-            source_fingerprint: String::new(),
-            published_at: chrono::Utc::now(),
-            validated: false,
-        }) {
-            eprintln!(
-                "warning: could not record the installation of {version} in the durable ledger: {err}"
-            );
-        }
+        installed_version_dir = Some(install_tarball_release(
+            &bytes,
+            release.tag_name.trim_start_matches('v'),
+            &temp_path.with_extension("extract"),
+        )?);
     } else {
         fs::write(&temp_path, &bytes).context("Failed to write temp file")?;
     }

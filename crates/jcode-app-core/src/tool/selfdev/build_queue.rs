@@ -85,11 +85,83 @@ export -f cargo
         }
     }
 
+    /// Move a LOCKED self-dev binary aside so the compile can replace it.
+    ///
+    /// Returns the path the binary was moved to, or `None` when nothing was
+    /// locked. The holder is NEVER killed: renaming is the only operation used.
+    ///
+    /// This is the same helper `run_deterministic_build` uses
+    /// (crates/jcode-build-support/src/deterministic_build.rs:127); the
+    /// self-dev build path is the one that was missing it, and it is the path
+    /// every self-dev session uses.
+    ///
+    /// reference: crates/jcode-build-support/src/binary_lock.rs:58
+    pub(super) fn quarantine_locked_selfdev_binary(repo_dir: &Path) -> Option<std::path::PathBuf> {
+        let binary = build::selfdev_binary_path(repo_dir);
+        match build::prepare_binary_for_overwrite(&binary) {
+            Ok(Some(aside)) => Some(aside),
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!(
+                    "warning: could not move the locked self-dev binary {} aside: {err}",
+                    binary.display()
+                );
+                None
+            }
+        }
+    }
+
     async fn stream_build_command(
         repo_dir: PathBuf,
         command: SelfDevBuildCommand,
         output_path: PathBuf,
     ) -> Result<TaskResult> {
+        // THE SELF-LOCK. The binary that runs `selfdev build` is usually the
+        // binary cargo must REPLACE: a self-dev session lives at
+        // `target/selfdev/jcode.exe`, and the compile writes a fresh file to
+        // that same path. MEASURED 2026-11-16 on this host: a live
+        // `jcode.exe self-dev --resume` session holds a Windows handle on
+        // `target/selfdev/jcode.exe`, so cargo's `remove_file` fails with
+        // "failed to remove file ..." / "Отказано в доступе. (os error 5)"
+        // (access denied) and the build dies with exit 101.
+        //
+        // Windows semantics, from the PRIMARY SOURCE:
+        //   * DeleteFileA fails when the file has other handles open for
+        //     normal I/O unless `FILE_SHARE_DELETE` was specified when those
+        //     handles were opened. A running image is opened exactly that
+        //     way, so DELETE fails with ERROR_ACCESS_DENIED - which is what
+        //     cargo hits.
+        //     reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilea
+        //   * `fs::rename` on Windows is `MoveFileExW` (with a
+        //     `SetFileInformationByHandle` fallback), and renaming needs only
+        //     "delete permission on the file, or delete child permission in
+        //     the parent directory" - so the RENAME of a running image
+        //     SUCCEEDS and the open handle follows the renamed file.
+        //     reference: https://doc.rust-lang.org/std/fs/fn.rename.html
+        //
+        // The rename is the only operation used, so the holder is NEVER
+        // killed: the running sessions stay alive on the renamed image and
+        // cargo writes a fresh binary at the original path.
+        //
+        // reference: crates/jcode-build-support/src/binary_lock.rs:58
+        // `prepare_binary_for_overwrite`. The SAME helper is already used by
+        // `run_deterministic_build`
+        // (crates/jcode-build-support/src/deterministic_build.rs:127) and by
+        // the Harbor bootstrap (~/.jcode/harbor/harbor_build.py:613
+        // `quarantine_locked_binary`); the self-dev build path was the one
+        // that missed it, and it is the path every self-dev session uses.
+        //
+        // Only the SELFDEV profile output is quarantined: that is the exact
+        // file this build command writes
+        // (`cargo build --profile selfdev -p jcode --bin jcode`), and
+        // `prepare_binary_for_overwrite` is a no-op when the file is absent.
+        if let Some(aside) = Self::quarantine_locked_selfdev_binary(&repo_dir) {
+            eprintln!(
+                "note: the running self-dev binary was locked; it was moved aside to {} so the compile could replace it",
+                aside.display()
+            );
+        }
+
         let mut cmd = tokio::process::Command::new(&command.program);
         cmd.args(&command.args)
             .envs(command.env.iter().cloned())

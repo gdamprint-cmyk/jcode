@@ -35,6 +35,7 @@ pub use jcode_build_support::{
     read_daemon_identity, read_shared_server_version, read_stable_version,
     read_staged_version, recover_landing, recover_landing_locked, record_handoff_requested,
     record_publication, release_binary_path, rename_binary_aside, repair_stale_shared_server_channel,
+    published_versions_from_ledger, validated_versions_from_ledger,
     repo_build_version, repo_scope_key,
     resolve_binary_payload, rollback_landing, rollback_pending_activation_for_session,
     run_deterministic_build, run_selfdev_build, run_staging_build_with,

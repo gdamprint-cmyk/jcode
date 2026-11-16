@@ -1475,3 +1475,85 @@ fn selfdev_child_inherits_the_parents_debug_flag() {
         "a self-dev child must stay hidden from the session picker like its parent"
     );
 }
+
+/// A LOCKED self-dev binary must be moved aside so the compile can replace it.
+///
+/// MEASURED 2026-11-16 on this host: a live `jcode.exe self-dev --resume`
+/// session holds a Windows handle on `target/selfdev/jcode.exe`, so cargo's
+/// `remove_file` fails with "failed to remove file ... jcode.exe" /
+/// "Отказано в доступе. (os error 5)" and the build dies with exit 101.
+///
+/// The holder is NEVER killed: the binary is RENAMED, and the open handle
+/// follows the renamed file.
+///
+/// reference: crates/jcode-build-support/src/binary_lock.rs:85
+/// `a_locked_binary_is_renamed_aside_not_removed` - the prior art for this
+/// exact mechanism, in the crate that owns it.
+/// reference: crates/jcode-build-support/src/binary_lock.rs:58
+/// `prepare_binary_for_overwrite` - the helper under test.
+/// reference: ~/.jcode/harbor/_probe_running_exe.py - the measured probe that
+/// established that a RUNNING exe cannot be opened for write but CAN be
+/// renamed; the fixture below reproduces that condition with a real running
+/// process instead of a plain open handle.
+/// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilea
+/// (read 2026-11-16) - "The DeleteFile function fails if an application
+/// attempts to delete a file that has other handles open for normal I/O"
+/// unless FILE_SHARE_DELETE was specified, which is why DELETE fails and
+/// RENAME succeeds for a running image.
+///
+/// The test uses a REAL lock: a genuinely RUNNING exe holds its own image,
+/// exactly like a running session holds jcode.exe.
+#[cfg(windows)]
+#[test]
+fn a_locked_selfdev_binary_is_moved_aside_not_killed() {
+    use std::os::windows::process::CommandExt;
+
+    // CREATE_NO_WINDOW so the fixture does not flash a console window.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = temp.path();
+    let profile_dir = repo_dir.join("target").join("selfdev");
+    std::fs::create_dir_all(&profile_dir).expect("profile dir");
+    let binary = profile_dir.join(build::binary_name());
+
+    // A REAL running exe, never the real jcode binary: a copy of the system
+    // shell holds its own image exactly like a running session holds jcode.exe.
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let shell = std::path::Path::new(&system_root).join("System32").join("cmd.exe");
+    std::fs::copy(&shell, &binary).expect("copy the shell as the fixture binary");
+
+    let mut holder = std::process::Command::new(&binary)
+        .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .expect("spawn the holder");
+    // Give the holder time to map its image.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // The lock signal is a failed write-open. If this does not hold, the
+    // test would pass vacuously.
+    assert!(
+        build::is_locked(&binary),
+        "the running fixture binary must be locked for this test to mean anything"
+    );
+
+    let aside = SelfDevTool::quarantine_locked_selfdev_binary(repo_dir)
+        .expect("a locked binary must be moved aside");
+    assert!(
+        aside.exists(),
+        "the moved-aside binary must still exist: the holder is renamed, never killed"
+    );
+    assert!(
+        !binary.exists(),
+        "the original path must be free so the compile can write a fresh binary"
+    );
+
+    // The holder is still alive: renaming must not have killed it.
+    assert!(
+        holder.try_wait().expect("holder status").is_none(),
+        "the process holding the binary must still be running"
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
