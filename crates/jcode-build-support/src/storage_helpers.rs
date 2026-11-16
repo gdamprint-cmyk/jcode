@@ -61,14 +61,23 @@ pub fn manifest_path() -> Result<PathBuf> {
 /// their ONLY publication proof and the acceptance checker reported 8 failures
 /// for fixes that were demonstrably live.
 ///
-/// This ledger is the durable proof that a version label was published. It is
-/// appended at the SINGLE point where a version is published
-/// (`stage_local_current_build_for_source_with`), so every publishing path -
-/// the session build request, the debug `reload`, and the self-dev `reload` -
+/// This ledger is the durable proof that a version label was installed. It is
+/// appended at the SINGLE point where a version directory is created
+/// (`install_binary_at_version`), so every publishing path that goes through
+/// that function - the session build request, the debug `reload`, the self-dev
+/// `reload`, `/rebuild`, the release updater and `landing::stage_build` -
 /// leaves a record. The session build request additionally writes a
 /// build-request record, but the two reload paths did not, which left one
 /// published version (`ac6859a22-dirty-a2b2105c06c0`) provable only by its
 /// garbage-collectible directory.
+///
+/// The tarball release path (`crates/jcode-app-core/src/update.rs`) installs
+/// the binary DIRECTLY, without going through `install_binary_at_version`, so
+/// it records its row explicitly.
+///
+/// A row without `validated: true` proves INSTALLATION only: the ledger row is
+/// written before the post-install smoke test and hash check. The staging path
+/// appends a second, validated row once those pass.
 ///
 /// reference: in-repo prior art - the marker-file pattern of
 /// `read_current_version` in this same file, and the append-only semantics of

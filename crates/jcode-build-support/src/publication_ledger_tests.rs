@@ -41,12 +41,14 @@ fn publication_ledger_keeps_every_version() {
             version: "aaaa1111-dirty-000000000000".to_string(),
             source_fingerprint: "fp-one".to_string(),
             published_at: Utc::now(),
+            validated: true,
         })
         .expect("record first publication");
         record_publication(&PublicationRecord {
             version: "bbbb2222-dirty-111111111111".to_string(),
             source_fingerprint: "fp-two".to_string(),
             published_at: Utc::now(),
+            validated: true,
         })
         .expect("record second publication");
 
@@ -76,6 +78,7 @@ fn publication_ledger_skips_malformed_lines() {
             version: "cccc3333-dirty-222222222222".to_string(),
             source_fingerprint: "fp-three".to_string(),
             published_at: Utc::now(),
+            validated: true,
         })
         .expect("record publication");
 
@@ -223,6 +226,49 @@ fn the_ledger_records_the_fingerprint_of_the_installed_build() {
         assert!(
             !content.contains("aaaaaaaaaaaaaaaa"),
             "a stale sidecar's fingerprint must never be recorded: {content}"
+        );
+    });
+}
+
+/// A ledger row written at INSTALL time proves installation, NOT publication:
+/// the smoke test and the hash check run after the install. The strong reader
+/// must therefore require `validated: true`.
+///
+/// This is the guard against a build whose post-install validation FAILED
+/// being asserted forever as published.
+#[test]
+fn the_validated_ledger_reader_excludes_install_only_rows() {
+    with_temp_jcode_home(|| {
+        record_publication(&PublicationRecord {
+            version: "1111aaaa-dirty-000000000000".to_string(),
+            source_fingerprint: "fp-install".to_string(),
+            published_at: Utc::now(),
+            validated: false,
+        })
+        .expect("record install");
+        record_publication(&PublicationRecord {
+            version: "2222bbbb-dirty-111111111111".to_string(),
+            source_fingerprint: "fp-validated".to_string(),
+            published_at: Utc::now(),
+            validated: true,
+        })
+        .expect("record validated publication");
+
+        let all = published_versions_from_ledger();
+        assert!(
+            all.contains(&"1111aaaa-dirty-000000000000".to_string())
+                && all.contains(&"2222bbbb-dirty-111111111111".to_string()),
+            "the full reader must see both rows: {all:?}"
+        );
+
+        let validated = validated_versions_from_ledger();
+        assert!(
+            !validated.contains(&"1111aaaa-dirty-000000000000".to_string()),
+            "an install-only row must NOT count as a validated publication: {validated:?}"
+        );
+        assert!(
+            validated.contains(&"2222bbbb-dirty-111111111111".to_string()),
+            "a validated row must count: {validated:?}"
         );
     });
 }

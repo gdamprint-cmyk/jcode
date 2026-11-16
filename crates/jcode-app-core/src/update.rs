@@ -1083,6 +1083,24 @@ pub fn download_and_install_blocking_with_progress(
         }
         let _ = fs::remove_dir_all(&extract_dir);
         installed_version_dir = Some(dest_dir.join(build::binary_name()));
+
+        // This branch installs the release DIRECTLY: it creates
+        // `builds/versions/<version>/` and copies the binary in, so it never
+        // goes through `install_binary_at_version` and would leave NO durable
+        // publication proof. Record the installation in the append-only ledger
+        // explicitly, or the tarball release path - the one the real release
+        // artifacts use - stays unprovable once the version GC removes the
+        // directory.
+        if let Err(err) = build::record_publication(&build::PublicationRecord {
+            version: version.to_string(),
+            source_fingerprint: String::new(),
+            published_at: chrono::Utc::now(),
+            validated: false,
+        }) {
+            eprintln!(
+                "warning: could not record the installation of {version} in the durable ledger: {err}"
+            );
+        }
     } else {
         fs::write(&temp_path, &bytes).context("Failed to write temp file")?;
     }

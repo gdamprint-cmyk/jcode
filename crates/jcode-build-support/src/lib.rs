@@ -214,6 +214,19 @@ pub struct PublicationRecord {
     pub source_fingerprint: String,
     /// When the publication happened.
     pub published_at: chrono::DateTime<Utc>,
+    /// Whether the installed binary was VALIDATED against its source.
+    ///
+    /// The ledger row is written when the binary is INSTALLED, which is BEFORE
+    /// the post-install smoke test and the hash check
+    /// (`stage_local_current_build_for_source_with`: install at :972, smoke
+    /// test at :973, hash check at :985). A row without this flag therefore
+    /// proves INSTALLATION, not PUBLICATION.
+    ///
+    /// A validated row is appended after the checks pass. Consumers that need
+    /// the strong proof must require it; consumers that accept "this label was
+    /// installed" may accept either.
+    #[serde(default)]
+    pub validated: bool,
 }
 
 /// Append a publication to the durable ledger.
@@ -260,6 +273,23 @@ pub fn record_publication(record: &PublicationRecord) -> Result<()> {
 /// truncated final line (a crash mid-write) must not make the whole ledger
 /// unreadable.
 pub fn published_versions_from_ledger() -> Vec<String> {
+    ledger_labels(|record| true)
+}
+
+/// The version labels in the ledger whose row was VALIDATED.
+///
+/// A ledger row is written when the binary is INSTALLED, which happens before
+/// the post-install smoke test and the hash check. Only a row with
+/// `validated: true` proves that the binary was verified against its source.
+///
+/// This is the STRONG proof, matching what the build-request records enforce
+/// (a record counts only when `validated` is true). Use this when a false
+/// positive is worse than a false negative.
+pub fn validated_versions_from_ledger() -> Vec<String> {
+    ledger_labels(|record| record.validated)
+}
+
+fn ledger_labels(keep: impl Fn(&PublicationRecord) -> bool) -> Vec<String> {
     let Ok(path) = publication_ledger_path() else {
         return Vec::new();
     };
@@ -275,7 +305,7 @@ pub fn published_versions_from_ledger() -> Vec<String> {
         let Ok(record) = serde_json::from_str::<PublicationRecord>(line) else {
             continue;
         };
-        if !record.version.is_empty() {
+        if !record.version.is_empty() && keep(&record) {
             labels.push(record.version);
         }
     }
@@ -367,12 +397,17 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
     }
     crate::platform_support::set_permissions_executable(&dest)?;
 
-    // Record the publication in the DURABLE ledger.
+    // Record the INSTALLATION in the DURABLE ledger.
     //
     // The version is PUBLISHED once its immutable binary is installed and
     // executable: from that moment on the label names an installable
     // artifact, and every other record of it (the manifest history, the
     // build-request records) is lossy.
+    //
+    // This row records an INSTALLATION, not yet a validated publication: the
+    // smoke test and the hash check run AFTER this point. The staging path
+    // appends a second row with `validated: true` once they pass, so a
+    // consumer that needs the strong proof can require that flag.
     //
     // A failure to record MUST NOT fail the installation: the binary is
     // already installed and executable at this point, and losing the build
@@ -382,6 +417,7 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
         version: version.to_string(),
         source_fingerprint: publication_fingerprint_for(source, version),
         published_at: Utc::now(),
+        validated: false,
     }) {
         eprintln!(
             "warning: could not record the publication of {version} in the durable ledger: {err}"
@@ -989,11 +1025,27 @@ where
     // verified.
     write_staged_version(&source.version_label)?;
 
-    // The durable publication ledger is written by `install_binary_at_version`
-    // above - the single point where a version directory is created. It is
-    // deliberately NOT written again here: the ledger is append-only, and a
-    // second row for the same version would be a duplicate record of one
-    // publication.
+    // The INSTALLATION row of the durable ledger was written by
+    // `install_binary_at_version` above - the single point where a version
+    // directory is created. It records that the label names an installable
+    // artifact, but it was written BEFORE the smoke test and the hash check
+    // that just passed.
+    //
+    // Append the VALIDATED row now: a consumer that needs the strong proof
+    // ("this label names a binary that was verified against its source")
+    // requires a row with `validated: true`. The install row stays in place:
+    // the ledger is append-only, and both rows describe one installation.
+    if let Err(err) = record_publication(&PublicationRecord {
+        version: source.version_label.clone(),
+        source_fingerprint: source.fingerprint.clone(),
+        published_at: Utc::now(),
+        validated: true,
+    }) {
+        eprintln!(
+            "warning: could not record the validated publication of {} in the durable ledger: {err}",
+            source.version_label
+        );
+    }
 
     // The channel links are the CURRENT channel's links, unchanged by this
     // build. They are reported so a caller can see where the clients still
