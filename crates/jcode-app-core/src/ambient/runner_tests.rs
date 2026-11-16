@@ -1,3 +1,11 @@
+// reference: no prior art, searched the web for an upstream jcode implementation of
+// the ambient scheduled-task spawn (websearch "jcode rust ambient runner
+// spawn_session_for_scheduled_item session is_debug github 1jehuang" returned
+// unrelated store-locator pages, no upstream source found). The behaviour under
+// test is this repository's own: every ambient parent session is created with
+// set_debug(true) (crates/jcode-app-core/src/ambient/runner.rs) and the session
+// picker hides a session by its own debug flag
+// (crates/jcode-tui/src/tui/session_picker/filter.rs).
 use super::{AmbientRunnerHandle, ambient_allowed};
 use crate::ambient::{AmbientState, AmbientStatus, Priority, ScheduleTarget, ScheduledItem};
 use crate::config::Config;
@@ -416,6 +424,63 @@ async fn spawn_target_creates_one_child_session_and_runs_task() {
                 .content_preview()
                 .contains("Spawned session handled task.")
     }));
+}
+
+/// A scheduled child spawned from an UNLOADABLE parent must still be a debug
+/// session.
+///
+/// Every ambient parent is created with `set_debug(true)`
+/// (`ambient/runner.rs`, `run_cycle_with_visible_launcher_and_timeouts`), and
+/// the picker hides a session by its OWN debug flag
+/// (`crates/jcode-tui/src/tui/session_picker/filter.rs`). The fallback child
+/// therefore must not keep the `Session::create` default of `false`, or an
+/// ambient worker lands in the user's visible session list.
+#[tokio::test]
+async fn spawn_target_with_unloadable_parent_creates_a_hidden_child() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    // Pin the flag OFF: `Session::create` copies JCODE_TEST_SESSION into
+    // is_debug (session.rs:848), so with the flag on the fallback child would
+    // be a debug session anyway and the test could not tell the fix apart from
+    // the bug.
+    let _no_test_session = EnvVarGuard::unset("JCODE_TEST_SESSION");
+
+    let provider = StreamingTestProvider::default();
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Handled the task.".to_string()),
+        StreamEvent::MessageEnd { stop_reason: None },
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
+    let item = ScheduledItem {
+        id: "sched_spawn_missing_parent".to_string(),
+        scheduled_for: chrono::Utc::now(),
+        context: "Follow up later".to_string(),
+        priority: Priority::Normal,
+        target: ScheduleTarget::Spawn {
+            parent_session_id: "session_does_not_exist_ambient".to_string(),
+        },
+        created_by_session: "session_does_not_exist_ambient".to_string(),
+        created_at: chrono::Utc::now(),
+        working_dir: Some(temp.path().display().to_string()),
+        task_description: Some("Follow up later".to_string()),
+        relevant_files: vec!["src/lib.rs".to_string()],
+        git_branch: None,
+        additional_context: None,
+    };
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    let child_session_id = runner
+        .spawn_session_for_scheduled_item(&provider, &item, "session_does_not_exist_ambient")
+        .await
+        .expect("spawned scheduled task should succeed even without the parent");
+
+    let child = Session::load(&child_session_id).expect("load spawned child session");
+    assert!(
+        child.is_debug,
+        "an ambient child of a debug parent must stay hidden from the session picker"
+    );
 }
 
 /// A stopped ambient loop must be revivable without restarting the process.

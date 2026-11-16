@@ -592,6 +592,14 @@ impl AmbientRunnerHandle {
                     ),
                 );
                 child.working_dir = item.working_dir.clone();
+                // The parent could not be loaded, so its flag cannot be copied.
+                // Every ambient parent is a debug session (the ambient agent is
+                // created with set_debug(true)), and the picker hides a session
+                // by its OWN flag
+                // (crates/jcode-tui/src/tui/session_picker/filter.rs). Leaving
+                // the child at the Session::create default (false) would put an
+                // ambient worker into the user's visible session list.
+                child.is_debug = true;
                 child
             }
         };

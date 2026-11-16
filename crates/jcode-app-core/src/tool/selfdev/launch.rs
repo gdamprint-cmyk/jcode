@@ -1,15 +1,25 @@
+// reference: no prior art, searched the web for an upstream jcode implementation of the
+// self-dev session clone (websearch "jcode rust enter_selfdev_session is_debug github
+// 1jehuang" returned unrelated store-locator pages, no upstream source found). The
+// behaviour under test is this repository's own: the session picker hides a session by
+// its OWN debug flag (crates/jcode-tui/src/tui/session_picker/filter.rs) and
+// Session::create seeds is_debug from JCODE_TEST_SESSION
+// (crates/jcode-base/src/session.rs:848).
 use super::*;
 
-pub fn enter_selfdev_session(
-    parent_session_id: Option<&str>,
-    working_dir: Option<&Path>,
-) -> Result<SelfDevLaunchResult> {
-    let repo_dir = SelfDevTool::resolve_repo_dir(working_dir).ok_or_else(|| {
-        anyhow::anyhow!("Could not find the jcode repository to enter self-dev mode")
-    })?;
-
+/// Build the self-dev session, cloning the parent's context when it loads.
+///
+/// Returns the session and whether the parent's context was inherited. The
+/// child's debug flag follows the parent's: the session picker hides a session
+/// by its OWN debug flag
+/// (`crates/jcode-tui/src/tui/session_picker/filter.rs`), so a child that does
+/// not inherit the flag reappears in the user's session list even though its
+/// parent is a hidden self-dev session. Measured 2026-11-16 on this host:
+/// `session_maple_...` was visible while its parent `session_tulip_...` was
+/// hidden.
+pub(super) fn build_selfdev_session(parent_session_id: Option<&str>) -> (session::Session, bool) {
     let mut inherited_context = false;
-    let mut session = if let Some(parent_session_id) = parent_session_id {
+    let session = if let Some(parent_session_id) = parent_session_id {
         match session::Session::load(parent_session_id) {
             Ok(parent) => {
                 let mut child = session::Session::create(
@@ -27,6 +37,7 @@ pub fn enter_selfdev_session(
                 child.autojudge_enabled = parent.autojudge_enabled;
                 child.memory_injections = parent.memory_injections.clone();
                 child.replay_events = parent.replay_events.clone();
+                child.is_debug = parent.is_debug;
                 inherited_context = true;
                 child
             }
@@ -41,6 +52,18 @@ pub fn enter_selfdev_session(
     } else {
         session::Session::create(None, Some("Self-development session".to_string()))
     };
+    (session, inherited_context)
+}
+
+pub fn enter_selfdev_session(
+    parent_session_id: Option<&str>,
+    working_dir: Option<&Path>,
+) -> Result<SelfDevLaunchResult> {
+    let repo_dir = SelfDevTool::resolve_repo_dir(working_dir).ok_or_else(|| {
+        anyhow::anyhow!("Could not find the jcode repository to enter self-dev mode")
+    })?;
+
+    let (mut session, inherited_context) = build_selfdev_session(parent_session_id);
     session.set_canary("self-dev");
     session.working_dir = Some(repo_dir.display().to_string());
     session.status = session::SessionStatus::Closed;

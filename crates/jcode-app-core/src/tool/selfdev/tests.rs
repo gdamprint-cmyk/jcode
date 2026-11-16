@@ -1437,3 +1437,41 @@ fn reconcile_keeps_running_request_not_yet_registered_in_live_task_map() {
 
 #[path = "repo_resolver_tests.rs"]
 mod repo_resolver;
+
+/// A self-dev child session must inherit the parent's debug flag.
+///
+/// The session picker hides a session by its OWN debug flag
+/// (`crates/jcode-tui/src/tui/session_picker/filter.rs`), so a child that
+/// leaves the flag at the `Session::create` default shows up in the user's
+/// session list even though its parent is a hidden self-dev session.
+/// Measured 2026-11-16 on this host: `session_maple_...` was visible while its
+/// parent `session_tulip_...` was hidden.
+#[test]
+fn selfdev_child_inherits_the_parents_debug_flag() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    // Pin the flag OFF: `Session::create` copies JCODE_TEST_SESSION into
+    // is_debug (session.rs:848), so with the flag on every child would be a
+    // debug session and the test could not tell the fix apart from the bug.
+    let _no_test_session = EnvVarGuard::remove("JCODE_TEST_SESSION");
+
+    let mut parent = crate::session::Session::create_with_id(
+        "session_parent_selfdev_debug".to_string(),
+        None,
+        Some("Parent".to_string()),
+    );
+    parent.is_debug = true;
+    parent.save().expect("save parent session");
+
+    let (child, inherited_context) = launch::build_selfdev_session(Some(&parent.id));
+
+    assert!(
+        inherited_context,
+        "the parent session should have been cloned"
+    );
+    assert!(
+        child.is_debug,
+        "a self-dev child must stay hidden from the session picker like its parent"
+    );
+}
