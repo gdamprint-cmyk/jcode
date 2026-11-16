@@ -458,21 +458,16 @@ impl BuildRequest {
     }
 }
 
-struct BuildLockGuard {
-    file: Option<std::fs::File>,
-    path: PathBuf,
-}
-
 type SelfDevBuildCommand = build::SelfDevBuildCommand;
 
-impl Drop for BuildLockGuard {
-    fn drop(&mut self) {
-        // Windows does not allow deleting an open lock file. Close the handle
-        // before unlinking so self-dev builds do not leave a permanent lock.
-        self.file.take();
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+/// The build lock guard.
+///
+/// The lock itself lives in the shared build-support crate, which records the
+/// lock's owner and breaks a lock whose owner is gone.
+///
+/// reference: crates/jcode-build-support/src/build_lock.rs:62-71 (read
+/// 2026-11-16)
+type BuildLockGuard = build::BuildLockGuard;
 
 #[derive(Default)]
 pub struct SelfDevTool;
@@ -774,47 +769,32 @@ impl SelfDevTool {
         build::selfdev_build_command_for_target(repo_dir, target)
     }
 
+    /// The lock file for a worktree scope.
+    ///
+    /// The path is the one the shared build-support crate uses
+    /// (`<jcode home>/selfdev-build-locks/<worktree scope>.lock`), so the
+    /// session-driven build and the deterministic executor contend for ONE
+    /// lock instead of two.
+    ///
+    /// reference: crates/jcode-build-support/src/build_lock.rs:54-60 (read
+    /// 2026-11-16)
     fn build_lock_path(worktree_scope: &str) -> Result<PathBuf> {
-        let dir = storage::jcode_dir()?.join("selfdev-build-locks");
-        storage::ensure_dir(&dir)?;
-        Ok(dir.join(format!("{}.lock", worktree_scope)))
+        build::build_lock_path(worktree_scope)
     }
 
-    #[cfg(unix)]
+    /// Take the build lock for a worktree scope.
+    ///
+    /// The lock itself lives in the shared build-support crate, which knows
+    /// how to break a lock whose owner is gone. MEASURED 2026-11-16: the
+    /// duplicate implementation that lived here had NO stale break, so a
+    /// build killed by the reload that a landing performs left its lock file
+    /// behind and every later build for that scope waited forever (observed:
+    /// a lock file aged 136.5 minutes with no owning process).
+    ///
+    /// reference: crates/jcode-build-support/src/build_lock.rs:87-120 (read
+    /// 2026-11-16) - `try_acquire_path`.
     fn try_acquire_build_lock(worktree_scope: &str) -> Result<Option<BuildLockGuard>> {
-        use std::fs::OpenOptions;
-        use std::os::fd::AsRawFd;
-
-        let path = Self::build_lock_path(worktree_scope)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if ret == 0 {
-            Ok(Some(BuildLockGuard {
-                file: Some(file),
-                path,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn try_acquire_build_lock(worktree_scope: &str) -> Result<Option<BuildLockGuard>> {
-        use std::fs::OpenOptions;
-
-        let path = Self::build_lock_path(worktree_scope)?;
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(file) => Ok(Some(BuildLockGuard {
-                file: Some(file),
-                path,
-            })),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+        Ok(build::BuildLockGuard::try_acquire(worktree_scope)?)
     }
 
     fn load_session_labels(session_id: &str) -> (Option<String>, Option<String>) {
