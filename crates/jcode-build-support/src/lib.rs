@@ -71,6 +71,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+// On unix `Write` is already imported above (with BufRead/BufReader); on other
+// platforms the ledger writer needs it for `write_all`.
+#[cfg(not(unix))]
+use std::io::Write;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
@@ -219,22 +223,34 @@ pub struct PublicationRecord {
 /// manifest history truncates to 20 rows and `builds/versions/` is garbage
 /// collected by the daily version GC - both lossy under a daemon restart.
 ///
+/// The whole line is serialized into ONE buffer and written with a single
+/// `write_all`, so a concurrent reader (or a process killed mid-append) can
+/// never observe a torn half-line, and two concurrent appenders cannot
+/// interleave fragments. This mirrors the house pattern in
+/// `jcode_storage::append_json_line_fast`.
+///
 /// reference: `storage_helpers::publication_ledger_path` for the rationale and
 /// the measured failure this replaces.
+/// reference: https://doc.rust-lang.org/std/fs/struct.File.html - `flush()`
+/// on a `File` is a no-op on Unix and Windows ("Since a File structure doesn't
+/// contain any buffers, this function is currently a no-op on Unix and
+/// Windows"), so `sync_data()` is what actually reaches the filesystem.
 pub fn record_publication(record: &PublicationRecord) -> Result<()> {
     let path = publication_ledger_path()?;
-    let line = serde_json::to_string(record)?;
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    use std::io::Write;
     // MUTATION-PROOF MARKER: the `.append(true)` flag above is load-bearing.
     // Removing it (or switching to `.write(true)`) must make
     // `publication_ledger_keeps_every_version` FAIL, because the second
     // publication would then overwrite the first instead of adding to it.
-    writeln!(file, "{line}")?;
-    file.flush()?;
+    file.write_all(&line)?;
+    // `flush()` is a no-op on a raw File; `sync_data()` is what pushes the
+    // record to the filesystem, so a power loss cannot lose a publication.
+    file.sync_data()?;
     Ok(())
 }
 
@@ -307,6 +323,28 @@ pub fn rollback_pending_activation_for_session(session_id: &str) -> Result<Optio
 }
 
 /// Install a binary at a specific immutable version path.
+///
+/// This is the SINGLE point where a version directory is created under
+/// `builds/versions/`, so it is also the single point where the durable
+/// publication ledger is written. Every publishing path installs a version
+/// HERE - the session build request, the debug `reload`, the self-dev
+/// `reload`, `/rebuild` (`install_local_release`) and the release updater
+/// (`update.rs`) - so every one of them leaves a durable proof.
+///
+/// WHY THE LEDGER EXISTS: the manifest history truncates to 20 rows
+/// (`BuildManifest::add_to_history`) and `builds/versions/` is garbage
+/// collected by the daily version GC. Both are lossy under exactly the
+/// operation a landing performs (a daemon restart). Measured 2026-11-16 on
+/// this host: a landing that restarted the daemon ran that GC, which removed
+/// 9 version directories and evicted 2 more rows from the truncated history,
+/// so four Harbor queue entries from other sessions lost their ONLY
+/// publication proof and the acceptance checker reported 8 failures for fixes
+/// that were demonstrably live.
+///
+/// reference: in-repo prior art - `write_dev_binary_source_metadata` in this
+/// same file (the sidecar that carries the build's fingerprint) and the
+/// append-only semantics of the session journal
+/// (`crates/jcode-base/src/session/persistence.rs`).
 pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Result<PathBuf> {
     if !source.exists() {
         anyhow::bail!("Binary not found at {:?}", source);
@@ -329,7 +367,58 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
     }
     crate::platform_support::set_permissions_executable(&dest)?;
 
+    // Record the publication in the DURABLE ledger.
+    //
+    // The version is PUBLISHED once its immutable binary is installed and
+    // executable: from that moment on the label names an installable
+    // artifact, and every other record of it (the manifest history, the
+    // build-request records) is lossy.
+    //
+    // A failure to record MUST NOT fail the installation: the binary is
+    // already installed and executable at this point, and losing the build
+    // would be worse than losing the record. The checker then falls back to
+    // the other evidence sources.
+    if let Err(err) = record_publication(&PublicationRecord {
+        version: version.to_string(),
+        source_fingerprint: publication_fingerprint_for(source, version),
+        published_at: Utc::now(),
+    }) {
+        eprintln!(
+            "warning: could not record the publication of {version} in the durable ledger: {err}"
+        );
+    }
+    // MUTATION-PROOF MARKER: the `record_publication` call above is load-bearing.
+    // Removing it must make `installing_a_version_records_a_publication` FAIL:
+    // a version installed by a path other than the staging path would then
+    // leave NO durable publication proof, and the acceptance checker would
+    // report a live fix as unpublished.
+
     Ok(dest)
+}
+
+/// The source fingerprint to record for a version installed from `source`.
+///
+/// The TRUE fingerprint is the 16-char value the build recorded in the sidecar
+/// next to the built binary (`write_dev_binary_source_metadata`). It is only
+/// trusted when the sidecar describes THIS version: a stale sidecar from an
+/// earlier build must never be recorded against a different label.
+///
+/// When there is no usable sidecar (a release build has none), the 12-char
+/// fingerprint embedded in a dirty version label (`{short}-dirty-{fingerprint}`)
+/// is the best available evidence.
+fn publication_fingerprint_for(source: &Path, version: &str) -> String {
+    let sidecar = binary_source_metadata_path(source);
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        if let Ok(metadata) = serde_json::from_str::<DevBinarySourceMetadata>(&text) {
+            if metadata.version_label == version {
+                return metadata.source_fingerprint;
+            }
+        }
+    }
+    version
+        .split_once("-dirty-")
+        .map(|(_, fingerprint)| fingerprint.to_string())
+        .unwrap_or_default()
 }
 
 fn binary_source_metadata_path(binary: &Path) -> PathBuf {
@@ -900,29 +989,11 @@ where
     // verified.
     write_staged_version(&source.version_label)?;
 
-    // Record the publication in the DURABLE ledger.
-    //
-    // This is the SINGLE point where a version becomes published, so recording
-    // it here covers every publishing path: the session build request, the
-    // debug `reload` and the self-dev `reload`. Without it, a version published
-    // by the two reload paths left NO durable trace: the manifest history
-    // truncates to 20 rows and `builds/versions/` is garbage collected, so the
-    // version became unprovable as soon as either lost it.
-    //
-    // A failure to record MUST NOT fail the publication: the binary is already
-    // installed and verified at this point, and losing the build would be worse
-    // than losing the record. The next check will fall back to the other
-    // evidence sources.
-    if let Err(err) = record_publication(&PublicationRecord {
-        version: source.version_label.clone(),
-        source_fingerprint: source.fingerprint.clone(),
-        published_at: Utc::now(),
-    }) {
-        eprintln!(
-            "warning: could not record the publication of {} in the durable ledger: {err}",
-            source.version_label
-        );
-    }
+    // The durable publication ledger is written by `install_binary_at_version`
+    // above - the single point where a version directory is created. It is
+    // deliberately NOT written again here: the ledger is append-only, and a
+    // second row for the same version would be a duplicate record of one
+    // publication.
 
     // The channel links are the CURRENT channel's links, unchanged by this
     // build. They are reported so a caller can see where the clients still

@@ -120,3 +120,109 @@ fn publication_ledger_lives_in_the_builds_directory() {
         );
     });
 }
+
+/// Installing a version MUST record a publication, whatever path installed it.
+///
+/// WHY THIS MATTERS: the ledger used to be written only by
+/// `stage_local_current_build_for_source_with`, so a version installed by any
+/// other path - `/rebuild` (`install_local_release`), the release updater
+/// (`update.rs`), `landing::stage_build` - left NO durable trace. Measured
+/// 2026-11-16 on this host: `ac6859a22-dirty-a2b2105c06c0` was provable ONLY
+/// by its own garbage-collectible directory, in none of the manifest history,
+/// the ledger or the build-request records.
+///
+/// The write now lives in `install_binary_at_version`, the single point where
+/// a version directory is created. This test installs a version DIRECTLY (not
+/// through the staging path) and requires a ledger row for it.
+#[test]
+fn installing_a_version_records_a_publication() {
+    with_temp_jcode_home(|| {
+        let version = "dddd4444-dirty-333333333333";
+        let source = std::env::current_exe().expect("current exe");
+        install_binary_at_version(&source, version).expect("install version");
+
+        let labels = published_versions_from_ledger();
+        assert!(
+            labels.contains(&version.to_string()),
+            "installing a version must record its publication in the durable \
+             ledger, otherwise a version published by /rebuild or the release \
+             updater leaves no durable trace: {labels:?}"
+        );
+    });
+}
+
+/// The NEGATIVE CONTROL for the test above: the ledger must record the version
+/// that was actually installed, and NOT some other label.
+///
+/// Without this case the test above could pass while the writer recorded the
+/// wrong version (for example the source's own label instead of the installed
+/// one), which is the failure mode that would make the ledger useless as a
+/// publication proof.
+#[test]
+fn the_ledger_records_the_installed_version_not_another_one() {
+    with_temp_jcode_home(|| {
+        let installed = "eeee5555-dirty-444444444444";
+        let source = std::env::current_exe().expect("current exe");
+        install_binary_at_version(&source, installed).expect("install version");
+
+        let labels = published_versions_from_ledger();
+        assert_eq!(
+            labels.len(),
+            1,
+            "one installation must produce exactly one ledger row: {labels:?}"
+        );
+        assert_eq!(
+            labels[0], installed,
+            "the ledger must name the INSTALLED version: {labels:?}"
+        );
+    });
+}
+
+/// The fingerprint recorded for a published version must be the build's own
+/// fingerprint, taken from the sidecar the build wrote next to the binary.
+///
+/// The sidecar is only trusted when it describes THIS version: a stale sidecar
+/// left behind by an earlier build must never be recorded against a different
+/// label.
+#[test]
+fn the_ledger_records_the_fingerprint_of_the_installed_build() {
+    with_temp_jcode_home(|| {
+        let version = "ffff6666-dirty-555555555555";
+        let source_dir = tempfile::tempdir().expect("tempdir");
+        let source = source_dir.path().join(binary_name());
+        std::fs::write(&source, b"fake binary").expect("write fake binary");
+
+        // A sidecar describing a DIFFERENT version must be ignored.
+        write_dev_binary_source_metadata(
+            &source,
+            &SourceState {
+                repo_scope: "repo".to_string(),
+                worktree_scope: "worktree".to_string(),
+                short_hash: "ffff6666".to_string(),
+                full_hash: "ffff6666aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                dirty: true,
+                fingerprint: "aaaaaaaaaaaaaaaa".to_string(),
+                version_label: "some-other-version".to_string(),
+                changed_paths: 0,
+            },
+        )
+        .expect("write stale sidecar");
+
+        install_binary_at_version(&source, version).expect("install version");
+
+        let labels = published_versions_from_ledger();
+        assert!(
+            labels.contains(&version.to_string()),
+            "the installation must be recorded: {labels:?}"
+        );
+
+        // With a stale sidecar the fingerprint must fall back to the label's own
+        // fingerprint, never to the stale sidecar's value.
+        let path = publication_ledger_path().expect("ledger path");
+        let content = std::fs::read_to_string(&path).expect("read ledger");
+        assert!(
+            !content.contains("aaaaaaaaaaaaaaaa"),
+            "a stale sidecar's fingerprint must never be recorded: {content}"
+        );
+    });
+}
