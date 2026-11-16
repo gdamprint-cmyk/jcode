@@ -278,6 +278,90 @@ mod tests {
         );
     }
 
+    /// The REAL second-quarantine failure: the destination is already a
+    /// RUNNING IMAGE.
+    ///
+    /// MEASURED 2026-11-16 on this host, the real failure was:
+    ///
+    /// ```text
+    /// rename ok=False win32=5   (ERROR_ACCESS_DENIED)
+    /// source still there (quarantine FAILED): True
+    /// holder still alive: True
+    /// ```
+    ///
+    /// The destination of the second rename was the file the FIRST quarantine
+    /// had moved aside - and that file was a running image, because the
+    /// sessions that ran the old binary kept running it. Renaming ONTO a
+    /// running image fails with ERROR_ACCESS_DENIED, and
+    /// `MOVEFILE_REPLACE_EXISTING` cannot help: a running image cannot be
+    /// replaced at all.
+    ///
+    /// The test below reproduces that EXACT state: a real running exe sits at
+    /// the destination the second rename would choose. It fails on the OLD
+    /// code (the destination collides) and passes on the new one (the
+    /// destination name carries a process-wide sequence).
+    ///
+    /// The fixture is a REAL running exe: a copy of the system shell, never
+    /// the real jcode binary.
+    #[cfg(windows)]
+    #[test]
+    fn a_second_quarantine_survives_a_running_image_at_the_destination() {
+        use std::os::windows::process::CommandExt;
+
+        // CREATE_NO_WINDOW so the fixture does not flash a console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("jcode.exe");
+        let system_root =
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let shell = std::path::Path::new(&system_root).join("System32").join("cmd.exe");
+        std::fs::copy(&shell, &binary).expect("copy the shell as the fixture binary");
+
+        let mut holder = std::process::Command::new(&binary)
+            .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn the holder");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // The FIRST quarantine moves the running image aside. The renamed
+        // file KEEPS the running image: the handle follows the file.
+        let first = rename_binary_aside(&binary).expect("first quarantine");
+        assert!(!binary.exists(), "the original path must be free for cargo");
+        assert!(first.exists(), "the first quarantine must leave the binary behind");
+        assert!(
+            holder.try_wait().expect("holder status").is_none(),
+            "the process holding the binary must still be running: renaming, never killing"
+        );
+
+        // A new build put a fresh binary at the original path.
+        std::fs::write(&binary, b"second build").expect("write");
+
+        // The SECOND quarantine must NOT land on the first destination: that
+        // destination is a running image and cannot be replaced.
+        let second = rename_binary_aside(&binary).expect("second quarantine");
+        assert!(
+            second != first,
+            "the second quarantine must land on a DIFFERENT name, otherwise it collides \
+             with the running image the first quarantine left behind"
+        );
+        assert!(!binary.exists(), "the original path must be free for cargo");
+        assert!(second.exists(), "the second quarantine must leave the binary behind");
+        assert_eq!(
+            std::fs::read(&second).expect("read second"),
+            b"second build",
+            "the second quarantine must move the NEW binary, not the old one"
+        );
+        assert!(
+            holder.try_wait().expect("holder status").is_none(),
+            "the holder must still be running after BOTH quarantines"
+        );
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
     /// The NEGATIVE CONTROL for the test above: an UNLOCKED binary must NOT
     /// be reported as locked. Without it, a detector that always returns true
     /// would make the locked test pass vacuously.
