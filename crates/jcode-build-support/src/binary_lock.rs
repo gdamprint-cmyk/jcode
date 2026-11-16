@@ -18,15 +18,44 @@ use std::path::{Path, PathBuf};
 /// On Windows a running executable denies write access, so a failed write-open
 /// is the lock signal. On Unix an executable can be written while it runs, so
 /// there is nothing to handle.
+///
+/// MEASURED 2026-11-16 on this host with a REAL running exe (a copy of
+/// `cmd.exe`, compiled and run as a Rust program - not inferred):
+///
+/// ```text
+/// write-open FAILED
+///   kind(): Uncategorized
+///   raw_os_error(): Some(32)
+///   display: ... (os error 32)
+/// ```
+///
+/// The raw code is 32 = ERROR_SHARING_VIOLATION, and the Rust `ErrorKind` is
+/// `Uncategorized` - NOT `PermissionDenied`. The previous check accepted only
+/// `PermissionDenied` or raw code 5, so it reported "not locked" for a binary
+/// that a live session was holding, and the quarantine never ran. The
+/// `Uncategorized` kind is the reason: Rust's Windows error mapping does not
+/// give sharing violations a dedicated kind.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499
+/// - ERROR_SHARING_VIOLATION (32): "The process cannot access the file
+/// because it is being used by another process."
+/// reference: https://doc.rust-lang.org/std/io/enum.ErrorKind.html - the
+/// error kinds and their Windows mapping.
 pub fn is_locked(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
     match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(_) => false,
-        // ERROR_ACCESS_DENIED (5) is what Windows returns for a running image.
         Err(err) => {
-            err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5)
+            err.kind() == std::io::ErrorKind::PermissionDenied
+                // ERROR_ACCESS_DENIED (5): the file itself is not writable.
+                || err.raw_os_error() == Some(5)
+                // ERROR_SHARING_VIOLATION (32): another process holds it open
+                // without FILE_SHARE_WRITE. This is the code Windows returns
+                // for a RUNNING IMAGE, and it is what cargo's `remove_file`
+                // hits. MEASURED, see the doc comment above.
+                || err.raw_os_error() == Some(32)
         }
     }
 }
@@ -94,6 +123,79 @@ mod tests {
             std::fs::read(&aside).expect("read aside"),
             b"binary",
             "renaming must not change the bytes"
+        );
+    }
+
+    /// A RUNNING image must be detected as locked.
+    ///
+    /// MEASURED 2026-11-16 on this host: a write-open on a running image
+    /// fails with raw os error 32 (ERROR_SHARING_VIOLATION) and the Rust
+    /// `ErrorKind` is `Uncategorized` - NOT `PermissionDenied`. The detector
+    /// used to accept only `PermissionDenied` or raw code 5, so it reported
+    /// "not locked" for a binary a live session was holding, and the quarantine
+    /// never ran. That is why `cargo` could not replace the binary.
+    ///
+    /// The fixture is a REAL running exe: a copy of the system shell, never
+    /// the real jcode binary.
+    ///
+    /// reference: ~/.jcode/harbor/_probe_running_exe.py - the measured probe
+    /// that established that a RUNNING exe cannot be opened for write but CAN
+    /// be renamed.
+    /// reference: https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499
+    /// - ERROR_SHARING_VIOLATION (32).
+    #[cfg(windows)]
+    #[test]
+    fn a_running_image_is_detected_as_locked() {
+        use std::os::windows::process::CommandExt;
+
+        // CREATE_NO_WINDOW so the fixture does not flash a console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("jcode.exe");
+        let system_root =
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let shell = std::path::Path::new(&system_root).join("System32").join("cmd.exe");
+        std::fs::copy(&shell, &binary).expect("copy the shell as the fixture binary");
+
+        let mut holder = std::process::Command::new(&binary)
+            .args(["/c", "ping -n 30 127.0.0.1 > nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn the holder");
+        // Give the holder time to map its image.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        assert!(
+            is_locked(&binary),
+            "a RUNNING image must be detected as locked, otherwise the quarantine never runs"
+        );
+        let aside = prepare_binary_for_overwrite(&binary)
+            .expect("prepare")
+            .expect("a locked binary must be moved aside");
+        assert!(!binary.exists(), "the original path must be free for cargo");
+        assert!(aside.exists(), "the binary must survive, renamed aside");
+        assert!(
+            holder.try_wait().expect("holder status").is_none(),
+            "the process holding the binary must still be running: renaming, never killing"
+        );
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// The NEGATIVE CONTROL for the test above: an UNLOCKED binary must NOT
+    /// be reported as locked. Without it, a detector that always returns true
+    /// would make the locked test pass vacuously.
+    #[cfg(windows)]
+    #[test]
+    fn an_unlocked_binary_is_not_reported_as_locked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("jcode.exe");
+        std::fs::write(&binary, b"binary").expect("write");
+        assert!(
+            !is_locked(&binary),
+            "a plain file must not be reported as locked"
         );
     }
 

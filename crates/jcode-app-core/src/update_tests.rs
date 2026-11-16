@@ -27,7 +27,11 @@ fn the_tarball_release_path_records_a_publication() {
     // `resolve_builds_dir`), so the test never touches the real ledger.
     unsafe { std::env::set_var("JCODE_HOME", &home) };
 
-    // Build a real .tar.gz archive containing a jcode binary.
+    // Build a real .tar.gz archive containing the release asset. The asset
+    // name must match `get_asset_name()` (crates/jcode-update-core/src/lib.rs:141
+    // - "jcode-windows-x86_64.exe" on Windows), because the installer renames
+    // the asset to `jcode.exe` only when the name matches.
+    let asset_name = get_asset_name();
     let mut tar_bytes = Vec::new();
     {
         let encoder = flate2::write::GzEncoder::new(&mut tar_bytes, flate2::Compression::default());
@@ -38,8 +42,8 @@ fn the_tarball_release_path_records_a_publication() {
         header.set_mode(0o755);
         header.set_cksum();
         builder
-            .append_data(&mut header, "jcode", &payload[..])
-            .expect("append jcode to the archive");
+            .append_data(&mut header, asset_name, &payload[..])
+            .expect("append the asset to the archive");
         builder.into_inner().expect("finish the archive").finish().expect("gzip");
     }
 

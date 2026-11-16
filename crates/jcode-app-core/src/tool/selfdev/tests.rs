@@ -1491,6 +1491,9 @@ fn selfdev_child_inherits_the_parents_debug_flag() {
 /// exact mechanism, in the crate that owns it.
 /// reference: crates/jcode-build-support/src/binary_lock.rs:58
 /// `prepare_binary_for_overwrite` - the helper under test.
+/// reference: crates/jcode-build-support/src/binary_lock.rs:21 `is_locked` -
+/// the detector, whose error-code gap (ERROR_SHARING_VIOLATION) was found by
+/// this test and fixed there.
 /// reference: ~/.jcode/harbor/_probe_running_exe.py - the measured probe that
 /// established that a RUNNING exe cannot be opened for write but CAN be
 /// renamed; the fixture below reproduces that condition with a real running
