@@ -95,6 +95,33 @@ impl Tool for WebFetchTool {
 
         let status = response.status();
         if !status.is_success() {
+            // A 404 is an EXPECTED outcome of checking a URL, not a tool
+            // failure: RFC 9110 §404 defines it as "the origin server did not
+            // find a current representation for the target resource". The
+            // measured pattern was the agent repeating the same dead URL, so
+            // the message says what to do instead of repeating the same
+            // request.
+            //
+            // MEASURED 2026-11-16: 25 occurrences, several of them the SAME
+            // URL three times in a row.
+            // reference: C:\Users\WorkShop1\.jcode\research\2026-11-16-error-classes\error-classes-research.md
+            //   (class D)
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(anyhow::anyhow!(
+                    "URL not found (404 Not Found): {}\n\
+                     The link may have moved or been removed - search for the current \
+                     URL or an archived copy instead of repeating this request.",
+                    params.url
+                ));
+            }
+            if status == reqwest::StatusCode::GONE {
+                return Err(anyhow::anyhow!(
+                    "URL is gone (410 Gone): {}\n\
+                     This resource was removed permanently; search for a replacement \
+                     instead of repeating this request.",
+                    params.url
+                ));
+            }
             return Err(anyhow::anyhow!("HTTP error: {}", status));
         }
 

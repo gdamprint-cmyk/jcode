@@ -58,6 +58,24 @@ const WRITE_TOOLS: [&str; 6] = [
     "write_file",
 ];
 
+/// Directory segments that mean "working area", not "product".
+///
+/// MEASURED 2026-11-16 on this host: this gate blocked a one-off MEASUREMENT
+/// probe written by an agent, and it had no exemption at all, while the python
+/// `research_required.py` gate DID have one - so the two disagreed about the
+/// same file. The rules now live in one module (`decisions/triviality.py`) that
+/// both python gates import, and this file mirrors it.
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py
+const TRIVIAL_DIR_SEGMENTS: [&str; 13] = [
+    "scratch", "scratchpad", "tmp", "temp", "research", "probe", "probes",
+    "sandbox", "playground", "out", "output", "artifacts", "artifact",
+];
+
+/// Directory segments that mean "this is a test".
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py
+const TEST_DIR_SEGMENTS: [&str; 6] =
+    ["test", "tests", "testing", "__tests__", "spec", "specs"];
+
 /// Extensions that are SOURCE for this gate. Mirrors the python gate's
 /// `SOURCE_EXT`.
 // reference: ~/.jcode/decisions/reference_first.py - `SOURCE_EXT`.
@@ -168,6 +186,183 @@ fn target_path(payload: &Value) -> &str {
     ""
 }
 
+/// The path segments of a path, split on both separators.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether the file is a TEST file, by name or by directory.
+///
+/// A test asserts about code that already exists, so its provenance IS the
+/// module under test: there is nothing to look up.
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py - `is_test_path`.
+fn is_test_path(path: &str) -> bool {
+    let segments = path_segments(path);
+    let Some(name) = segments.last() else {
+        return false;
+    };
+    let stem = name.split('.').next().unwrap_or(name);
+    // The Python rule this mirrors is:
+    //   ^test_ | _test$ | ^tests?$ | _tests?$ | \.test\. | _spec\. | ^spec_ | ^conftest
+    // So the shape is a PREFIX or a SUFFIX, never a free token: "mod_tests" is
+    // a test file, "test_thing" is a test file, "thing_spec" is a test file,
+    // and "specs" or "mytest" are NOT.
+    //
+    // MEASURED 2026-11-16: the first version compared the whole stem, so
+    // "mod_tests.rs" was NOT recognised as a test. The isolated compile check
+    // caught it. A later version split on `_` and over-matched: "specs.rs"
+    // became a test file in Rust but not in Python.
+    let is_test = |token: &str| {
+        token == "test"
+            || token == "tests"
+            || token == "testing"
+            || token == "conftest"
+    };
+    if is_test(stem) {
+        return true;
+    }
+    if stem.starts_with("test_")
+        || stem.starts_with("spec_")
+        || stem.starts_with("conftest")
+    {
+        return true;
+    }
+    for suffix in ["_test", "_tests", "_spec"] {
+        if stem.ends_with(suffix) {
+            return true;
+        }
+    }
+    // ".test." anywhere in the name.
+    if name.contains(".test.") {
+        return true;
+    }
+    segments[..segments.len().saturating_sub(1)]
+        .iter()
+        .any(|segment| TEST_DIR_SEGMENTS.contains(&segment.as_str()))
+}
+
+/// Whether the path says "working area" rather than "product tree".
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py - `is_trivial_path`.
+fn is_trivial_path(path: &str) -> bool {
+    let segments = path_segments(path);
+    if segments.is_empty() {
+        return false;
+    }
+    if segments[..segments.len() - 1]
+        .iter()
+        .any(|segment| TRIVIAL_DIR_SEGMENTS.contains(&segment.as_str()))
+    {
+        return true;
+    }
+    let name = segments.last().cloned().unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or(&name).to_string();
+    // The python rule matches the probe words as SEPARATE tokens, separated by
+    // `.`, `_` or `-`. Mirror that: a whole token must be one of the words.
+    const PROBE_WORDS: [&str; 24] = [
+        "probe", "probes", "measure", "measurement", "check", "checker", "audit",
+        "verify", "validation", "scratch", "tmp", "temp", "scratchpad", "dump",
+        "diag", "diagnostic", "inspect", "inspector", "sniff", "count", "scan",
+        "sampler", "bench", "benchmark",
+    ];
+    stem
+        .split(['.', '_', '-'])
+        .any(|token| PROBE_WORDS.contains(&token))
+}
+
+/// Whether the content has the SHAPE of a measurement rather than of a module.
+///
+/// The python rule: no module docstring, no typed signatures, no typed
+/// exports, and at least half of the body lines are calls.
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py - `is_trivial_shape`.
+fn is_trivial_shape(text: &str) -> bool {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = stripped
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    // A module docstring marks a real module.
+    let first = lines[0].trim_start();
+    if first.starts_with("//!")
+        || first.starts_with("///")
+        || first.starts_with("/**")
+        || first.starts_with("/*")
+        || (first.starts_with('#') && !first.starts_with("#!"))
+        || (first.starts_with('"') && first.len() > 2)
+        || (first.starts_with('\'') && first.len() > 2)
+    {
+        return false;
+    }
+    let mut typed_signature = false;
+    let mut typed_export = false;
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("fn(")
+            || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("func ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("export ")
+            || trimmed.starts_with("type ")
+            || trimmed.starts_with("interface ")
+            || trimmed.starts_with("class ")
+        {
+            typed_signature = true;
+        }
+        if trimmed.starts_with("export ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("impl ")
+        {
+            typed_export = true;
+        }
+    }
+    if typed_signature || typed_export {
+        return false;
+    }
+    // At least half of the non-definition, non-import body lines are calls.
+    let mut body = 0usize;
+    let mut calls = 0usize;
+    for line in &lines {
+        let trimmed = line.trim_start();
+        let is_definition = trimmed.starts_with("def ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("func ");
+        let is_import = trimmed.starts_with("import ") || trimmed.starts_with("from ");
+        if is_definition || is_import {
+            continue;
+        }
+        body += 1;
+        if trimmed.contains('(') {
+            calls += 1;
+        }
+    }
+    body > 0 && calls * 2 >= body
+}
+
+/// Whether this write is exempt from the research requirement.
+///
+/// MEASURED 2026-11-16: without this, the gate refused a one-off measurement
+/// probe - a script whose correctness comes from reading the host, not from the
+/// internet - and it had no way to exempt a test file either. The python gates
+/// already exempted both; this file now agrees with them.
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py
+fn is_trivial(path: &str, text: &str) -> bool {
+    is_test_path(path) || is_trivial_path(path) || is_trivial_shape(text)
+}
+
 /// The text this tool call would introduce. Only the NEW side of an edit.
 // reference: ~/.jcode/decisions/reference_first.py - `_payload_text`.
 fn payload_text(payload: &Value) -> String {
@@ -269,6 +464,12 @@ pub fn should_require_research(
         return None;
     }
     if !is_substantial(&text, config.min_bytes, config.min_lines) {
+        return None;
+    }
+    // A probe, a measurement, a test, or a one-off helper is exempt: its
+    // correctness comes from reading the host, not from the internet.
+    // reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py
+    if is_trivial(&path, &text) {
         return None;
     }
     if research_lookup_occurred(session_id) {

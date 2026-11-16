@@ -337,3 +337,125 @@ fn disabled_gate_allows_everything() {
         vec!["websearch", "webfetch", "web_search", "web_extract"]
     );
 }
+
+/// A probe, a measurement, a test, or a one-off helper is EXEMPT from the
+/// research requirement, with no lookup on record.
+///
+/// MEASURED 2026-11-16: this gate refused a one-off measurement probe written
+/// by an agent, and it had no exemption at all, while the python
+/// `research_required.py` gate did - so the two disagreed about the same file.
+/// The rules now live in `decisions/triviality.py`, which both python gates
+/// import, and this file mirrors them.
+/// reference: C:\Users\WorkShop1\.jcode\decisions\triviality.py
+#[test]
+fn trivial_writes_are_exempt_without_a_lookup() {
+    let session = "research-gate-trivial";
+    reset(session);
+
+    // A probe under a working directory.
+    let probe = json!({
+        "file_path": "C:\\Users\\WorkShop1\\.jcode\\scratch\\probe_state.py",
+        "content": probe_content(),
+    });
+    assert!(
+        research_gate::should_require_research("write", &probe, session).is_none(),
+        "a probe under a working directory must be exempt"
+    );
+
+    // A probe NAMED as a probe, even under a product tree.
+    let named = json!({
+        "file_path": "C:\\repo\\crates\\x\\probe_thing.py",
+        "content": probe_content(),
+    });
+    assert!(
+        research_gate::should_require_research("write", &named, session).is_none(),
+        "a probe named as a probe must be exempt"
+    );
+
+    // A TEST file: its provenance is the module under test.
+    let test = json!({
+        "file_path": "C:\\repo\\crates\\x\\mod_tests.rs",
+        "content": substantial_content(),
+    });
+    assert!(
+        research_gate::should_require_research("write", &test, session).is_none(),
+        "a test file must be exempt"
+    );
+
+    // A test file under a tests/ directory.
+    let under_tests = json!({
+        "file_path": "C:\\repo\\tests\\thing.rs",
+        "content": substantial_content(),
+    });
+    assert!(
+        research_gate::should_require_research("write", &under_tests, session).is_none(),
+        "a file under tests/ must be exempt"
+    );
+
+    // A PRODUCT module with the same shape is NOT exempt: the shape test must
+    // not swallow real modules.
+    let product = json!({
+        "file_path": "C:\\repo\\crates\\x\\mod.rs",
+        "content": product_content(),
+    });
+    assert!(
+        research_gate::should_require_research("write", &product, session).is_some(),
+        "a product module must still need a lookup"
+    );
+
+    // The test-name shapes the Python rule recognises, and the near-misses it
+    // does NOT.
+    //
+    // MEASURED 2026-11-16: the first Rust version compared the whole stem, so
+    // "mod_tests.rs" was not a test; a later version split on `_` and
+    // over-matched, so "specs.rs" WAS a test in Rust and not in Python. The
+    // two implementations are hand-mirrored, so they drift - and this is the
+    // case list that makes the drift visible.
+    for (name, is_test) in [
+        ("mod_tests.rs", true),
+        ("tests.rs", true),
+        ("test_thing.rs", true),
+        ("thing_spec.rs", true),
+        ("mod_test.rs", true),
+        ("conftest.rs", true),
+        ("thing.test.rs", true),
+        ("mytest.rs", false),
+        ("specs.rs", false),
+        ("contest.rs", false),
+        ("manifest.rs", false),
+    ] {
+        let payload = json!({
+            "file_path": format!("C:\\repo\\crates\\x\\{name}"),
+            "content": substantial_content(),
+        });
+        let blocked = research_gate::should_require_research("write", &payload, session).is_some();
+        assert_eq!(
+            blocked, !is_test,
+            "{name}: expected {}",
+            if is_test { "exempt" } else { "gated" }
+        );
+    }
+
+    reset(session);
+}
+
+/// A product module: a module docstring and typed signatures.
+fn product_content() -> String {
+    let mut out = String::from("//! The module docstring makes this a real module.\n");
+    out.push_str("use std::sync::Arc;\n\n");
+    out.push_str("/// A typed public surface.\n");
+    out.push_str("pub struct Config {\n    pub name: String,\n}\n\n");
+    for i in 0..90 {
+        out.push_str(&format!("pub fn helper_{i}(value: u32) -> u32 {{ value + {i} }}\n"));
+    }
+    out
+}
+
+/// A measurement script: no module docstring, no typed signatures, mostly calls.
+fn probe_content() -> String {
+    let mut out = String::from("import os\nimport sys\n\n");
+    for i in 0..90 {
+        out.push_str(&format!("    print('probe line {i}')\n"));
+    }
+    out
+}

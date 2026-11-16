@@ -187,7 +187,27 @@ impl Tool for ReadTool {
         }
 
         // Read file
-        let content = tokio::fs::read_to_string(&path).await?;
+        //
+        // MEASURED 2026-11-16: 57 failures of "stream did not contain valid
+        // UTF-8" on this host, and the message named NEITHER the file nor a
+        // way forward - the agent had to guess which file it was reading. The
+        // fix is the message, not a new decoding dependency: the strict UTF-8
+        // behaviour is what the standard specifies, so the content is not
+        // silently corrupted; it is named and explained instead.
+        //
+        // reference: C:\Users\WorkShop1\.jcode\research\2026-11-16-error-classes\error-classes-research.md
+        //   (class C: `encoding_rs` is already in the tree at Cargo.lock:1980
+        //    and supports windows-1251, so a decoding fallback is available if
+        //    the content itself is ever needed - the message is the cheap
+        //    first step)
+        let content = tokio::fs::read_to_string(&path).await.map_err(|err| {
+            anyhow::anyhow!(
+                "File is not valid UTF-8: {} ({err})\n\
+                 This file's encoding is not UTF-8 (cp1251/UTF-16 are common on \
+                 this host). Use a tool that reads bytes, or convert it first.",
+                params.file_path
+            )
+        })?;
 
         // Single-pass: count lines while building output
         let mut output = String::with_capacity(range.limit.min(2000) * 80);

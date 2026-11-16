@@ -598,10 +598,24 @@ fn validate_membership(fields: &serde_json::Map<String, Value>) -> Result<()> {
                     .as_u64()
                     .is_some_and(|phase| phase > 0 && phase <= u32::MAX as u64)
                 {
-                    bail!("phase must be a positive integer");
+                    // The message names the field, the value it got and the
+                    // rule it broke. The old text named only the rule, so the
+                    // agent had to guess which of its two membership fields
+                    // was wrong.
+                    //
+                    // MEASURED 2026-11-16: ~436 failures of this class on
+                    // this host, every one of them a schema complaint about
+                    // the agent's own call.
+                    // reference: C:\Users\WorkShop1\.jcode\research\2026-11-16-error-classes\error-classes-research.md
+                    //   (class A: thiserror's "print expected AND found",
+                    //    validator's "error keyed by field name")
+                    bail!(
+                        "phase must be a positive integer, got {value:?} (expected 1..={})",
+                        u32::MAX
+                    );
                 }
             } else if !value.as_str().is_some_and(|lane| !lane.trim().is_empty()) {
-                bail!("lane must be a nonempty string");
+                bail!("lane must be a nonempty string, got {value:?}");
             }
         }
     }
@@ -628,21 +642,31 @@ fn flatten_phases(input: &mut Value) -> Result<()> {
     let mut phase_ids = std::collections::HashSet::new();
     let mut item_ids = std::collections::HashSet::new();
     let mut todos = Vec::new();
-    for phase in phases {
+    for (phase_index, phase) in phases.iter().enumerate() {
         let phase = phase
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("phase must be an object"))?;
-        if phase
+        if let Some(key) = phase
             .keys()
-            .any(|key| !["phase", "lanes"].contains(&key.as_str()))
+            .find(|key| !["phase", "lanes"].contains(&key.as_str()))
         {
-            bail!("unexpected phase field");
+            bail!(
+                "unexpected phase field {key:?} at phases[{phase_index}] \
+                 (allowed keys: \"phase\", \"lanes\")"
+            );
         }
         let number = phase
             .get("phase")
             .and_then(Value::as_u64)
             .filter(|n| *n > 0 && *n <= u32::MAX as u64)
-            .ok_or_else(|| anyhow::anyhow!("phase must be a positive integer"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "phase must be a positive integer, got {:?} at phases[{phase_index}].phase \
+                     (expected 1..={})",
+                    phase.get("phase"),
+                    u32::MAX
+                )
+            })?;
         if !phase_ids.insert(number) {
             bail!("duplicate phase {number}");
         }
@@ -652,22 +676,30 @@ fn flatten_phases(input: &mut Value) -> Result<()> {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow::anyhow!("phase needs nonempty lanes"))?;
         let mut lane_ids = std::collections::HashSet::new();
-        for lane in lanes {
+        for (lane_index, lane) in lanes.iter().enumerate() {
             let lane = lane
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("lane must be an object"))?;
-            if lane
+            if let Some(key) = lane
                 .keys()
-                .any(|key| !["lane", "items", "after"].contains(&key.as_str()))
+                .find(|key| !["lane", "items", "after"].contains(&key.as_str()))
             {
-                bail!("unexpected lane field");
+                bail!(
+                    "unexpected lane field {key:?} at phases[{phase_index}].lanes[{lane_index}] \
+                     (allowed keys: \"lane\", \"items\", \"after\")"
+                );
             }
             let name = lane
                 .get("lane")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("lane must be a nonempty string"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "lane must be a nonempty string, got {:?} at phases[{phase_index}].lanes[{lane_index}].lane",
+                        lane.get("lane")
+                    )
+                })?;
             if !lane_ids.insert(name) {
                 bail!("duplicate lane {name:?}");
             }
@@ -676,16 +708,19 @@ fn flatten_phases(input: &mut Value) -> Result<()> {
                 .and_then(Value::as_array)
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("lane needs nonempty items"))?;
-            for item in items {
+            for (item_index, item) in items.iter().enumerate() {
                 let mut item = item
                     .as_object()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("item must be an object"))?;
-                if ["phase", "lane", "stage", "group", "wave", "lane_after"]
+                if let Some(key) = ["phase", "lane", "stage", "group", "wave", "lane_after"]
                     .iter()
-                    .any(|key| item.contains_key(*key))
+                    .find(|key| item.contains_key(*key))
                 {
-                    bail!("hierarchical items must not own phase/lane/stage/group membership");
+                    bail!(
+                        "hierarchical items must not own {key:?} \
+                         (at phases[{phase_index}].lanes[{lane_index}].items[{item_index}])"
+                    );
                 }
                 let id = item
                     .get("id")
