@@ -45,6 +45,38 @@ pub fn manifest_path() -> Result<PathBuf> {
     Ok(builds_dir()?.join("manifest.json"))
 }
 
+/// Get path to the APPEND-ONLY publication ledger.
+///
+/// The ledger records every version that was PUBLISHED, one JSON object per
+/// line, and is never truncated or garbage collected.
+///
+/// WHY IT EXISTS: the manifest history truncates to 20 rows
+/// (`BuildManifest::add_to_history`) and `builds/versions/` is garbage
+/// collected by the daily version GC
+/// (`crates/jcode-build-support/src/version_gc.rs`). Both are lossy under
+/// exactly the operation a landing performs (a daemon restart). Measured
+/// 2026-11-16 on this host: a landing that restarted the daemon ran that GC,
+/// which removed 9 version directories and evicted 2 more rows from the
+/// truncated history, so four Harbor queue entries from other sessions lost
+/// their ONLY publication proof and the acceptance checker reported 8 failures
+/// for fixes that were demonstrably live.
+///
+/// This ledger is the durable proof that a version label was published. It is
+/// appended at the SINGLE point where a version is published
+/// (`stage_local_current_build_for_source_with`), so every publishing path -
+/// the session build request, the debug `reload`, and the self-dev `reload` -
+/// leaves a record. The session build request additionally writes a
+/// build-request record, but the two reload paths did not, which left one
+/// published version (`ac6859a22-dirty-a2b2105c06c0`) provable only by its
+/// garbage-collectible directory.
+///
+/// reference: in-repo prior art - the marker-file pattern of
+/// `read_current_version` in this same file, and the append-only semantics of
+/// the session journal (`crates/jcode-base/src/session/persistence.rs`).
+pub fn publication_ledger_path() -> Result<PathBuf> {
+    Ok(builds_dir()?.join("published-versions.jsonl"))
+}
+
 /// Get path to a specific version's binary
 pub fn version_binary_path(hash: &str) -> Result<PathBuf> {
     Ok(builds_dir()?

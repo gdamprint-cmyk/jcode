@@ -52,10 +52,11 @@ pub use source_state::{
 pub use storage_helpers::{
     build_log_path, build_progress_path, builds_dir, canary_binary_path, clear_build_progress,
     clear_migration_context, current_binary_path, current_version_file, load_migration_context,
-    manifest_path, migration_context_path, read_build_progress, read_current_version,
-    read_shared_server_version, read_stable_version, read_staged_version, save_migration_context,
-    shared_server_binary_path, shared_server_version_file, stable_binary_path, stable_version_file,
-    staged_version_file, version_binary_path, write_build_progress, write_staged_version,
+    manifest_path, migration_context_path, publication_ledger_path, read_build_progress,
+    read_current_version, read_shared_server_version, read_stable_version, read_staged_version,
+    save_migration_context, shared_server_binary_path, shared_server_version_file,
+    stable_binary_path, stable_version_file, staged_version_file, version_binary_path,
+    write_build_progress, write_staged_version,
 };
 pub use version_gc::{
     DEFAULT_KEEP_RECENT_VERSIONS, KEEP_VERSIONS_ENV, VersionPruneReport, prune_old_versions,
@@ -197,6 +198,72 @@ impl BuildManifest {
         self.history.truncate(20);
         self.save()
     }
+}
+
+/// One row of the append-only publication ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationRecord {
+    /// The version label that was published.
+    pub version: String,
+    /// The source fingerprint the version was built from.
+    #[serde(default)]
+    pub source_fingerprint: String,
+    /// When the publication happened.
+    pub published_at: chrono::DateTime<Utc>,
+}
+
+/// Append a publication to the durable ledger.
+///
+/// The ledger is APPEND-ONLY and never truncated: one JSON object per line.
+/// It is the durable proof that a version label was published, because the
+/// manifest history truncates to 20 rows and `builds/versions/` is garbage
+/// collected by the daily version GC - both lossy under a daemon restart.
+///
+/// reference: `storage_helpers::publication_ledger_path` for the rationale and
+/// the measured failure this replaces.
+pub fn record_publication(record: &PublicationRecord) -> Result<()> {
+    let path = publication_ledger_path()?;
+    let line = serde_json::to_string(record)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    use std::io::Write;
+    // MUTATION-PROOF MARKER: the `.append(true)` flag above is load-bearing.
+    // Removing it (or switching to `.write(true)`) must make
+    // `publication_ledger_keeps_every_version` FAIL, because the second
+    // publication would then overwrite the first instead of adding to it.
+    writeln!(file, "{line}")?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Every version label recorded in the durable publication ledger.
+///
+/// A malformed line is SKIPPED, not fatal: the ledger is append-only and a
+/// truncated final line (a crash mid-write) must not make the whole ledger
+/// unreadable.
+pub fn published_versions_from_ledger() -> Vec<String> {
+    let Ok(path) = publication_ledger_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<PublicationRecord>(line) else {
+            continue;
+        };
+        if !record.version.is_empty() {
+            labels.push(record.version);
+        }
+    }
+    labels
 }
 
 pub fn complete_pending_activation_for_session(session_id: &str) -> Result<Option<String>> {
@@ -833,6 +900,30 @@ where
     // verified.
     write_staged_version(&source.version_label)?;
 
+    // Record the publication in the DURABLE ledger.
+    //
+    // This is the SINGLE point where a version becomes published, so recording
+    // it here covers every publishing path: the session build request, the
+    // debug `reload` and the self-dev `reload`. Without it, a version published
+    // by the two reload paths left NO durable trace: the manifest history
+    // truncates to 20 rows and `builds/versions/` is garbage collected, so the
+    // version became unprovable as soon as either lost it.
+    //
+    // A failure to record MUST NOT fail the publication: the binary is already
+    // installed and verified at this point, and losing the build would be worse
+    // than losing the record. The next check will fall back to the other
+    // evidence sources.
+    if let Err(err) = record_publication(&PublicationRecord {
+        version: source.version_label.clone(),
+        source_fingerprint: source.fingerprint.clone(),
+        published_at: Utc::now(),
+    }) {
+        eprintln!(
+            "warning: could not record the publication of {} in the durable ledger: {err}",
+            source.version_label
+        );
+    }
+
     // The channel links are the CURRENT channel's links, unchanged by this
     // build. They are reported so a caller can see where the clients still
     // point.
@@ -1105,5 +1196,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod landing_tests;
 #[cfg(test)]
 mod deterministic_build_tests;
+#[cfg(test)]
+mod publication_ledger_tests;
 #[cfg(test)]
 mod tests;
