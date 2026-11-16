@@ -188,6 +188,21 @@ fn lock_owner(path: &Path) -> Option<u32> {
 ///
 /// On Windows the file's existence IS the lock, so this is the only thing
 /// that keeps a killed build from wedging its scope forever.
+///
+/// A LIVE owner's lock is NEVER broken, however old it is. MEASURED 2026-11-16
+/// (independent review): the age valve that used to apply to a live owner
+/// let the Rust side break a lock the Harbor executor keeps, and breaking a
+/// live owner's lock starts a SECOND cargo build into the same artifact
+/// directory - the exact harm the lock exists to prevent. The dead-owner check
+/// is what closes the real wedge: a build killed by a landing reload has a
+/// dead pid, and its lock is broken at once.
+///
+/// The age rule therefore applies only to a lock with NO readable owner (an
+/// empty file, or a lock written before the pid was recorded), where there is
+/// no liveness to consult.
+///
+/// reference: crates/jcode-build-support/src/landing.rs:1341-1362 (read
+/// 2026-11-16) - the same Win32 liveness check.
 #[cfg(not(unix))]
 fn break_stale_lock(path: &Path) -> bool {
     if let Some(pid) = lock_owner(path) {
@@ -195,13 +210,12 @@ fn break_stale_lock(path: &Path) -> bool {
             // Our own lock: never break it.
             return false;
         }
-        if process_is_alive(pid) && !lock_is_older_than(path, STALE_LOCK_AGE) {
-            // The owner is still running and has not held the lock for
-            // longer than the stale window: never break its lock.
+        if process_is_alive(pid) {
+            // The owner is still running: never break its lock, not even when
+            // it has been sitting there for longer than the stale window.
             return false;
         }
-        // Either the owner is gone, or it has held the lock for longer than
-        // the stale window, which is the safety valve for a hung build.
+        // The owner is provably gone: the lock is abandoned.
         return std::fs::remove_file(path).is_ok();
     }
     // No readable owner (an empty file, or a lock written by an older
@@ -278,10 +292,30 @@ mod tests {
     /// A process id the operating system will never assign, so the liveness
     /// check must report it as dead.
     ///
-    /// Windows allocates process ids in multiples of four, so this odd value
-    /// cannot name a live process.
+    /// The value exceeds the SIGNED 32-bit range that the Win32 process-id
+    /// space uses, so `OpenProcess` on it cannot succeed: no process can carry
+    /// this id, and the liveness check reports it as dead.
     #[cfg(windows)]
     const DEAD_OWNER_PID: u32 = u32::MAX - 1;
+
+    /// A live process id that is NOT this process.
+    ///
+    /// MEASURED 2026-11-16: the "live owner" tests used to write THIS
+    /// process's own pid into the lock file. The self-pid guard in
+    /// `break_stale_lock` then returned false BEFORE the liveness check was
+    /// ever consulted, so those tests passed even when the age valve for a
+    /// live owner was restored - they were vacuous for the rule they claimed
+    /// to pin. A foreign live pid is what actually exercises the liveness
+    /// branch.
+    #[cfg(windows)]
+    fn spawn_live_foreign_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a live foreign process")
+    }
 
     #[test]
     fn a_lock_is_exclusive_and_released_on_drop() {
@@ -342,33 +376,114 @@ mod tests {
 
     /// The negative control for the check above: a lock whose owner is alive
     /// is NEVER broken, however long it has been sitting.
+    ///
+    /// The owner is a FOREIGN live process, so the self-pid guard cannot be
+    /// what keeps the lock.
     #[cfg(windows)]
     #[test]
     fn a_lock_whose_owner_is_alive_is_not_broken() {
         let dir = tempfile::tempdir().expect("temp lock dir");
         let path = dir.path().join("scope.lock");
-        std::fs::write(&path, std::process::id().to_string()).expect("write live lock");
+        let mut owner = spawn_live_foreign_process();
+        let owner_pid = owner.id();
+        assert!(
+            process_is_alive(owner_pid),
+            "the spawned owner must really be alive, or the test proves nothing"
+        );
+        std::fs::write(&path, owner_pid.to_string()).expect("write live lock");
         assert!(
             BuildLockGuard::try_acquire_path(&path)
                 .expect("acquire")
                 .is_none(),
             "a lock held by a live owner must never be broken"
         );
+        let _ = owner.kill();
     }
 
     /// The negative control for the age rule: a live owner's lock that is
     /// YET younger than the stale window is never broken either.
+    ///
+    /// MEASURED 2026-11-16 (independent review): this test and
+    /// `a_lock_whose_owner_is_alive_is_not_broken` were IDENTICAL - both wrote
+    /// a fresh lock with the current pid - so neither distinguished the age
+    /// rule from the self-pid guard, and BOTH passed even with the age valve
+    /// restored. They also proved nothing about a live owner other than
+    /// ourselves. The owner here is a FOREIGN live process, so the liveness
+    /// branch is the one under test.
     #[cfg(windows)]
     #[test]
     fn a_young_lock_held_by_a_live_owner_is_not_broken() {
         let dir = tempfile::tempdir().expect("temp lock dir");
         let path = dir.path().join("scope.lock");
-        std::fs::write(&path, std::process::id().to_string()).expect("write live lock");
+        let mut owner = spawn_live_foreign_process();
+        let owner_pid = owner.id();
+        assert!(
+            process_is_alive(owner_pid),
+            "the spawned owner must really be alive, or the test proves nothing"
+        );
+        std::fs::write(&path, owner_pid.to_string()).expect("write live lock");
         assert!(
             BuildLockGuard::try_acquire_path(&path)
                 .expect("acquire")
                 .is_none(),
             "a fresh lock held by a live owner must never be broken"
+        );
+        let _ = owner.kill();
+    }
+
+    /// The control that the two tests above could not express: a live owner's
+    /// lock that is OLDER than the stale window is still never broken.
+    ///
+    /// MEASURED 2026-11-16 (independent review): the age rule used to apply
+    /// to a live owner, so this file WAS broken after 6h - while the Harbor
+    /// executor kept it. The two sides disagreed, and breaking a live owner's
+    /// lock starts a second cargo build into the same artifact directory.
+    /// This test is the control that pins the agreed rule: a live owner keeps
+    /// its lock, at any age.
+    #[cfg(windows)]
+    #[test]
+    fn an_aged_lock_held_by_a_live_owner_is_not_broken() {
+        let dir = tempfile::tempdir().expect("temp lock dir");
+        let path = dir.path().join("scope.lock");
+        let mut owner = spawn_live_foreign_process();
+        let owner_pid = owner.id();
+        assert!(
+            process_is_alive(owner_pid),
+            "the spawned owner must really be alive, or the test proves nothing"
+        );
+        std::fs::write(&path, owner_pid.to_string()).expect("write live lock");
+        // Age the lock well past the stale window.
+        let old = SystemTime::now() - STALE_LOCK_AGE - Duration::from_secs(60);
+        set_file_mtime(&path, old);
+        assert!(
+            BuildLockGuard::try_acquire_path(&path)
+                .expect("acquire")
+                .is_none(),
+            "a lock held by a live owner must never be broken, however old it is"
+        );
+        let _ = owner.kill();
+    }
+
+    /// Our OWN lock is never broken, even when it is older than the stale
+    /// window.
+    ///
+    /// MEASURED 2026-11-16: the self-pid guard is what makes this true. With
+    /// the age valve in front of the liveness check, an old lock of our own
+    /// was broken, and the process that owns it does not know it lost the
+    /// lock.
+    #[cfg(windows)]
+    #[test]
+    fn our_own_aged_lock_is_not_broken() {
+        let dir = tempfile::tempdir().expect("temp lock dir");
+        let path = dir.path().join("scope.lock");
+        std::fs::write(&path, std::process::id().to_string()).expect("write own lock");
+        let old = SystemTime::now() - STALE_LOCK_AGE - Duration::from_secs(60);
+        set_file_mtime(&path, old);
+        assert!(
+            BuildLockGuard::try_acquire_path(&path)
+                .expect("acquire")
+                .is_none(),
+            "our own lock must never be broken, however old it is"
         );
     }
 
@@ -389,6 +504,25 @@ mod tests {
             "the lock file must name its owner"
         );
         drop(guard);
+    }
+
+    /// A lock whose owner is gone is broken IMMEDIATELY, without waiting for
+    /// the stale window. MEASURED 2026-11-16: the real wedge was a lock file
+    /// aged 136.5 minutes whose owner was provably dead; the age rule alone
+    /// would have kept it for 6 hours.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_owners_lock_is_broken_before_the_stale_window() {
+        let dir = tempfile::tempdir().expect("temp lock dir");
+        let path = dir.path().join("scope.lock");
+        std::fs::write(&path, DEAD_OWNER_PID.to_string()).expect("write dead lock");
+        // The lock is FRESH: only the dead owner can justify breaking it.
+        assert!(
+            BuildLockGuard::try_acquire_path(&path)
+                .expect("acquire")
+                .is_some(),
+            "a fresh lock whose owner is gone must still be broken"
+        );
     }
 
     fn set_file_mtime(path: &std::path::Path, time: SystemTime) {
