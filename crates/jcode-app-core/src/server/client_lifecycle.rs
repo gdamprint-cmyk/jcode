@@ -295,11 +295,28 @@ pub(super) async fn handle_client(
     soft_interrupt_queues: SessionInterruptQueues,
     await_members_runtime: AwaitMembersRuntime,
     swarm_mutation_runtime: SwarmMutationRuntime,
+    client_instance_sessions: super::client_instance_sessions::ClientInstanceSessions,
 ) -> Result<()> {
     let handler_start = Instant::now();
-    let (reader, writer) = stream.into_split();
+    let (reader, writer_half) = {
+        // TEMPORARY PROBE (do not commit): env-gated, so the default path is
+        // byte-identical. BLOCK_PROBE=1 makes the READ half hold its mutex
+        // across a blocking sleep, reproducing the native stack exactly:
+        // the runtime worker parks in a sync-lock wait while the writer is
+        // stuck in NtWriteFile.
+        if std::env::var_os("JCODE_BLOCK_PROBE").is_some() {
+            stream.into_split_probe()
+        } else {
+            stream.into_split()
+        }
+    };
     let mut reader = BufReader::new(reader);
-    let writer = Arc::new(Mutex::new(writer));
+    // ONE task owns the write half for the whole life of the connection. Two
+    // tasks writing the same half can lose the write-ready wakeup, because
+    // tokio keeps a single writer waker slot per IO resource.
+    // The task ends when every sender is dropped, which happens when the
+    // connection is torn down (`drop(writer)` below).
+    let (writer, _writer_handle) = super::client_writer_task::spawn_client_writer(writer_half);
     let mut line = String::new();
 
     let mut initial_request = loop {
@@ -1418,6 +1435,15 @@ pub(super) async fn handle_client(
                     &soft_interrupt_queues,
                 )
                 .await;
+                // `Clear` replaces the session in place. The client instance is
+                // still the same client, so its binding must follow the new
+                // session or the next reconnect would reattach the old one.
+                super::client_instance_sessions::bind_client_instance(
+                    &client_instance_sessions,
+                    current_client_instance_id.as_deref(),
+                    &client_session_id,
+                )
+                .await;
             }
 
             Request::Rewind { id, message_index } => {
@@ -1680,6 +1706,60 @@ pub(super) async fn handle_client(
                         info.terminal_env = active_terminal_env.clone();
                     }
                 }
+                let target_session_id = match target_session_id {
+                    Some(target) => Some(target),
+                    None => {
+                        // A reconnecting client whose `SessionId` frame was never
+                        // dispatched re-subscribes with `target_session_id: None`.
+                        // The client instance id IS stable across those
+                        // reconnects, so resolve the session this client already
+                        // owns and reattach instead of minting a new one. Every
+                        // new session registers its own MCP child set, so
+                        // minting one per reconnect is what turned a dropped
+                        // connection into hundreds of processes.
+                        //
+                        // Only a LIVE session is reused: a session whose runtime
+                        // was reclaimed must not be resurrected, because the
+                        // client would then attach to a transcript that no longer
+                        // matches its view.
+                        let candidate =
+                            super::client_instance_sessions::lookup_client_instance_session(
+                                &client_instance_sessions,
+                                client_instance_id.as_deref(),
+                            )
+                            .await;
+                        match candidate {
+                            Some(candidate)
+                                if crate::session::session_exists(&candidate)
+                                    || sessions.read().await.contains_key(&candidate) =>
+                            {
+                                crate::logging::info(&format!(
+                                    "RECONNECT_REATTACH client_instance_id={} session={}",
+                                    client_instance_id.as_deref().unwrap_or("none"),
+                                    candidate
+                                ));
+                                Some(candidate)
+                            }
+                            Some(stale) => {
+                                // The session is gone. Drop the stale binding so
+                                // the next reconnect does not keep probing it.
+                                crate::logging::info(&format!(
+                                    "RECONNECT_REATTACH_SKIPPED client_instance_id={} session={} reason=session_gone",
+                                    client_instance_id.as_deref().unwrap_or("none"),
+                                    stale
+                                ));
+                                super::client_instance_sessions::forget_client_instance(
+                                    &client_instance_sessions,
+                                    client_instance_id.as_deref(),
+                                    &stale,
+                                )
+                                .await;
+                                None
+                            }
+                            None => None,
+                        }
+                    }
+                };
                 if let Some(target_session_id) = target_session_id {
                     // A brand-new desktop panel has no transcript on disk until
                     // its first prompt. Its creator connection can detach before
@@ -1856,6 +1936,15 @@ pub(super) async fn handle_client(
                 super::client_session::apply_or_defer_desktop_response_capability(
                     &agent,
                     supports_user_response,
+                )
+                .await;
+                // Bind this client instance to the session it now owns, so a
+                // reconnect that lost the `SessionId` frame can reattach
+                // instead of minting a new session.
+                super::client_instance_sessions::bind_client_instance(
+                    &client_instance_sessions,
+                    client_instance_id.as_deref(),
+                    &client_session_id,
                 )
                 .await;
                 client_subscribed = true;
@@ -4386,6 +4475,10 @@ pub(super) async fn process_reserved_message_streaming_mpsc_with_display_role(
 #[cfg(test)]
 #[path = "client_lifecycle_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_instance_sessions_tests.rs"]
+mod client_instance_sessions_tests;
 
 #[cfg(test)]
 #[path = "client_target_attach_tests.rs"]

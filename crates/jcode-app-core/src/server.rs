@@ -13,6 +13,7 @@ mod client_comm_context;
 mod client_comm_message;
 mod client_comm_swarms;
 mod client_disconnect_cleanup;
+mod client_instance_sessions;
 mod client_lifecycle;
 mod client_lifecycle_logging;
 mod client_lightweight_control;
@@ -774,6 +775,13 @@ pub struct Server {
     await_members_runtime: AwaitMembersRuntime,
     /// Persisted dedupe registry for mutating swarm coordinator operations.
     swarm_mutation_runtime: SwarmMutationRuntime,
+    /// `client_instance_id` -> the session that instance is bound to.
+    ///
+    /// A reconnecting client whose `SessionId` frame was never dispatched
+    /// re-subscribes with `target_session_id: None`. Without this mapping the
+    /// server mints a new session per reconnect, and every new session
+    /// registers its own MCP child set.
+    client_instance_sessions: client_instance_sessions::ClientInstanceSessions,
 }
 
 impl Server {
@@ -860,6 +868,7 @@ impl Server {
             soft_interrupt_queues: Arc::new(RwLock::new(HashMap::new())),
             await_members_runtime: AwaitMembersRuntime::default(),
             swarm_mutation_runtime: SwarmMutationRuntime::default(),
+            client_instance_sessions: client_instance_sessions::new_client_instance_sessions(),
         }
     }
 

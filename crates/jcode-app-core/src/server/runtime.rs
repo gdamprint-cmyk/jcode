@@ -115,6 +115,7 @@ pub(super) struct ServerRuntime {
     soft_interrupt_queues: SessionInterruptQueues,
     await_members_runtime: AwaitMembersRuntime,
     swarm_mutation_runtime: SwarmMutationRuntime,
+    client_instance_sessions: crate::server::client_instance_sessions::ClientInstanceSessions,
     tasks: Arc<RuntimeTaskScope>,
 }
 
@@ -148,6 +149,7 @@ impl ServerRuntime {
             soft_interrupt_queues: Arc::clone(&server.soft_interrupt_queues),
             await_members_runtime: server.await_members_runtime.clone(),
             swarm_mutation_runtime: server.swarm_mutation_runtime.clone(),
+            client_instance_sessions: Arc::clone(&server.client_instance_sessions),
             tasks: Arc::new(RuntimeTaskScope::default()),
         }
     }
@@ -369,6 +371,7 @@ impl ServerRuntime {
                     Arc::clone(&self.soft_interrupt_queues),
                     self.await_members_runtime.clone(),
                     self.swarm_mutation_runtime.clone(),
+                    Arc::clone(&self.client_instance_sessions),
                 )
                 .await
             };

@@ -105,6 +105,7 @@ async fn system_prompt_socket_creation_attach_resume_fork_and_no_leaking() {
             soft_interrupt_queues.clone(),
             AwaitMembersRuntime::default(),
             SwarmMutationRuntime::default(),
+            crate::server::client_instance_sessions::new_client_instance_sessions(),
         ));
         (server_task, client_stream)
     };

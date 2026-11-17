@@ -428,11 +428,18 @@ impl RemoteConnection {
         // Subscribe to events
         let subscribe_start = Instant::now();
         let (working_dir, selfdev) = super::subscribe_metadata(remote_working_dir);
-        let resume_target = resume_session
-            .filter(|session_id| {
-                super::is_ssh_remote() || crate::session::session_exists(session_id)
-            })
-            .map(|session_id| session_id.to_string());
+        // Never drop the resume target because its session file is missing.
+        //
+        // MEASURED 2026-11-17: this filter used a FILE check
+        // (`crate::session::session_exists`). A session created moments ago has
+        // not written a snapshot yet, so a fresh session's id was silently
+        // discarded and the Subscribe went out with `target_session_id: None`.
+        //
+        // The server accepts exactly this case (a persisted session OR a live
+        // runtime) and now resolves a missing target from the client's own
+        // `client_instance_id` binding, so dropping the target here only made
+        // the client lose work it could keep.
+        let resume_target = resume_session.map(|session_id| session_id.to_string());
         conn.send_request(Request::Subscribe {
             system_prompt: None,
             supports_pdf_panels: false,

@@ -190,19 +190,20 @@ async fn sdk_socket_workflow_inner(
             event_counter.clone(),
             swarm_event_tx.clone(),
             "jcode-test".to_string(),
-            "🧪".to_string(),
+            "рџ§Є".to_string(),
             mcp_pool.clone(),
             shutdown_signals.clone(),
             soft_interrupt_queues.clone(),
             AwaitMembersRuntime::default(),
             SwarmMutationRuntime::default(),
+            crate::server::client_instance_sessions::new_client_instance_sessions(),
         ));
         (server_task, client_stream)
     };
     let (server_task, client_stream) = connect();
 
     let (client_reader, mut client_writer) = client_stream.into_split();
-    let mut client_reader = BufReader::new(client_reader);
+    let mut client_reader = DaemonEvents::new(BufReader::new(client_reader));
 
     async fn send(writer: &mut crate::transport::WriteHalf, value: serde_json::Value) {
         writer

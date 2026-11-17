@@ -2129,6 +2129,7 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
         soft_interrupt_queues,
         AwaitMembersRuntime::default(),
         SwarmMutationRuntime::default(),
+        crate::server::client_instance_sessions::new_client_instance_sessions(),
     ));
 
     let (client_reader, mut client_writer) = client_stream.into_split();

@@ -67,6 +67,7 @@ async fn queued_message_stuck_idle_soft_interrupt_without_client_id_is_acknowled
         soft_interrupt_queues.clone(),
         AwaitMembersRuntime::default(),
         SwarmMutationRuntime::default(),
+        crate::server::client_instance_sessions::new_client_instance_sessions(),
     ));
     let (client_reader, mut client_writer) = client_stream.into_split();
     let mut client_reader = BufReader::new(client_reader);
