@@ -1,3 +1,8 @@
+// reference: no prior art, searched upstream 1jehuang/jcode master
+//   crates/jcode-app-core/src/server/swarm_persistence.rs (fetched 2026-11-16) -
+//   upstream `recover_member_status` has the same "no headless process survives
+//   a restart" rule and marks an idle headless worker dead, so upstream has no
+//   restore-the-idle-worker mechanism to copy.
 use super::{SwarmMember, SwarmTaskProgress, VersionedPlan};
 use crate::protocol::ServerEvent;
 use crate::storage;
@@ -96,8 +101,13 @@ pub(super) struct LoadedSwarmRuntimeState {
     pub swarms_by_id: HashMap<String, HashSet<String>>,
 }
 
-/// Recovery note on an idle headless worker that a server restart stopped.
-/// No headless process survives a restart (issue #1651).
+/// Recovery note on an idle headless worker that a server restart stopped and
+/// that cannot be restored (its session file is gone).
+///
+/// No headless process survives a restart (issue #1651), but a headless
+/// worker whose session file still exists IS restorable: `worker_revive`
+/// rebuilds its agent from disk on demand. So this note marks only the
+/// genuinely unrecoverable case.
 pub(super) const IDLE_WORKER_NOT_RESTORED_NOTE: &str =
     "idle worker not restored after server restart";
 /// Suffix appended only after the owner's model-facing interrupt was accepted.
@@ -380,6 +390,7 @@ fn recover_member_status(
     status: SwarmLifecycleStatus,
     detail: Option<String>,
     is_headless: bool,
+    session_id: &str,
 ) -> (SwarmLifecycleStatus, Option<String>) {
     if status == SwarmLifecycleStatus::Running {
         return (
@@ -394,6 +405,19 @@ fn recover_member_status(
     // that can never enter terminal-member GC. This previously resurrected
     // hundreds of detached historical clients as ready on every reload.
     if status == SwarmLifecycleStatus::Ready {
+        // A headless worker IS restorable: `worker_revive::live_or_revived_agent`
+        // rebuilds its agent from the persisted session on demand, and
+        // `comm_control::task_agent_session` already hands work to a revived
+        // worker. Marking it dead here made the server tell its owner "spawn a
+        // replacement", which threw away a usable worker and its transcript.
+        //
+        // MEASURED 2026-11-16: 29 such notices in one day; every one of them
+        // asked a coordinator to re-spawn a worker that was still on disk.
+        //
+        // Only a worker whose session file is GONE is genuinely unrestorable.
+        if is_headless && crate::session::session_exists(session_id) {
+            return (SwarmLifecycleStatus::Ready, detail);
+        }
         return (
             SwarmLifecycleStatus::Stopped,
             append_recovery_detail(
@@ -443,7 +467,12 @@ pub(super) fn from_persisted_member(
     let original_status = record.status.as_str();
     let was_terminal_before_recovery =
         super::swarm::member_status_is_terminal(original_status.as_ref());
-    let (status, detail) = recover_member_status(record.status, record.detail, record.is_headless);
+    let (status, detail) = recover_member_status(
+        record.status,
+        record.detail,
+        record.is_headless,
+        &record.session_id,
+    );
     let status_text = status.as_str();
     let terminal_since_unix_ms = super::swarm::member_status_is_terminal(status_text.as_ref())
         .then(|| {

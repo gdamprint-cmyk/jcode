@@ -961,6 +961,7 @@ pub(super) async fn handle_client(
                 Some(id),
                 Some(request_decoded_at),
                 Some(&sessions),
+                &soft_interrupt_queues,
             )
             .await;
             crate::logging::info(&format!(
@@ -1248,6 +1249,7 @@ pub(super) async fn handle_client(
                     Some(id),
                     Some(request_decoded_at),
                     Some(&sessions),
+                    &soft_interrupt_queues,
                 )
                 .await;
                 if !client_is_processing {
@@ -3910,6 +3912,7 @@ async fn cancel_processing_message(
     request_id: Option<u64>,
     request_decoded_at: Option<Instant>,
     sessions: Option<&super::SessionAgents>,
+    soft_interrupt_queues: &super::SessionInterruptQueues,
 ) {
     // Capture before cancellation releases the reservation. Modern clients
     // reject unscoped terminal events to protect newer turns from stale ones.
@@ -3937,18 +3940,22 @@ async fn cancel_processing_message(
         .as_deref()
         .unwrap_or(session_control.session_id.as_str())
         .to_string();
-    // Stopping a session also stops the workers it spawned. This runs first
-    // and on every path, including the idle one: a coordinator waiting on
-    // `await_members` has no running turn of its own while its workers do.
-    super::swarm::cancel_spawned_descendant_turns(
-        &session_control.session_id,
-        swarm.members,
-        swarm.swarms_by_id,
-        Some(swarm.event_history),
-        Some(swarm.event_counter),
-        Some(swarm.event_tx),
-    )
-    .await;
+    // Interrupting the coordinator stops ONLY the coordinator's own turn. Its
+    // workers keep running: they get a soft wrap-up notice, finish the step
+    // they are on and report back, so their in-flight work survives.
+    //
+    // MEASURED 2026-11-16: the previous cascade fired the hard turn-cancel
+    // signal of every descendant (11 events/day, 1-7 workers each) and threw
+    // their work away. The explicit hard kill is `swarm stop`.
+    if let Some(sessions) = sessions {
+        super::swarm::notify_spawned_descendants_of_interrupt(
+            &session_control.session_id,
+            swarm.members,
+            sessions,
+            soft_interrupt_queues,
+        )
+        .await;
+    }
     crate::logging::info(&format!(
         "SERVER_INTERRUPT_CANCEL_RECEIVED request_id={:?} session={} control_session={} client_processing={} message_id={:?} has_task={} decoded_age_ms={:?}",
         request_id,

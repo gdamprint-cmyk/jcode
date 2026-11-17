@@ -198,9 +198,12 @@ async fn startup_recovery_honors_pending_intent_for_stopped_worker() -> Result<(
         ],
     );
     let server = Server::new(provider);
+    // The worker's session file exists, so it is RESTORABLE: it loads as
+    // `ready`, not as a dead `stopped` record. The pending recovery intent is
+    // what makes the startup pass resume it, and that path is unchanged.
     assert_eq!(
         server.swarm_state.members.read().await[&worker.id].status,
-        "stopped"
+        "ready"
     );
     server.recover_headless_sessions_on_startup().await;
     timeout(Duration::from_secs(5), async {

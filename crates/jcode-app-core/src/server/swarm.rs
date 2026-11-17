@@ -1,3 +1,8 @@
+// reference: no prior art, searched upstream 1jehuang/jcode master
+//   crates/jcode-app-core/src/server/swarm.rs (fetched 2026-11-16) - upstream
+//   still has `cancel_spawned_descendant_turns` firing the hard turn-cancel
+//   signal of every descendant, so there is no upstream "soft interrupt the
+//   descendants" mechanism to copy.
 use super::state::{MAX_EVENT_HISTORY, fanout_session_event};
 use super::{SwarmEvent, SwarmEventType, SwarmMember, SwarmState, VersionedPlan};
 use super::{persist_swarm_state_for, remove_persisted_swarm_state_for};
@@ -101,59 +106,77 @@ pub(super) fn swarm_descendants(
     descendants
 }
 
-/// Stop the running turns of every worker `session_id` spawned (workers run
-/// their own server-side turns, so cancelling only the coordinator left them
-/// spending tokens). Idle workers are left alone. Returns the stopped ids.
-pub(super) async fn cancel_spawned_descendant_turns(
+/// Tell the workers `session_id` spawned that their coordinator was
+/// interrupted, WITHOUT killing their turns.
+///
+/// MEASURED 2026-11-16: the previous implementation fired the hard turn-cancel
+/// signal of every descendant and set its member status to `stopped`. 11 such
+/// cascade events in one day killed 1-7 running workers each, throwing away
+/// their in-flight work. Interrupting the coordinator must stop only the
+/// coordinator's own turn; the workers keep running and report back when they
+/// finish, so the coordinator can pick their results up on its next turn.
+///
+/// The explicit hard kill remains `swarm stop` (`handle_comm_stop`), which
+/// removes the member and closes its agent.
+///
+/// Returns the ids of the descendants that were notified.
+pub(super) async fn notify_spawned_descendants_of_interrupt(
     session_id: &str,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
-    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    event_history: Option<&Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>>,
-    event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
-    swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
+    sessions: &super::SessionAgents,
+    soft_interrupt_queues: &super::SessionInterruptQueues,
 ) -> Vec<String> {
     let descendants = swarm_descendants(&*swarm_members.read().await, session_id);
-    let mut stopped = Vec::new();
+    let mut notified = Vec::new();
     for descendant in descendants {
-        let signals = crate::turn_cancel_registry::active_turn_signals(&descendant);
-        if signals.is_empty() {
+        if crate::turn_cancel_registry::active_turn_signals(&descendant).is_empty() {
+            // No live turn: the worker is idle. Nothing to interrupt.
             continue;
         }
-        for signal in &signals {
-            signal.fire();
-        }
-        // Workers usually have no attached client; the status update below
-        // is what the coordinator's swarm view shows.
+        // A soft interrupt is injected into the worker's running turn at its
+        // next tool boundary, so the worker finishes the step it is on and
+        // then reads the notice. Its turn is NOT cancelled.
+        let message = format!(
+            "Your coordinator {session_id} was interrupted. Finish the step you are on, \
+             then wrap up and report your result back to {session_id}. Do not start new work."
+        );
+        let delivered = super::state::queue_soft_interrupt_for_session(
+            &descendant,
+            message.clone(),
+            false,
+            jcode_agent_runtime::SoftInterruptSource::System,
+            soft_interrupt_queues,
+            sessions,
+        )
+        .await;
+        // The worker has no attached client; the notification below is what the
+        // coordinator's swarm view shows.
         fanout_session_event(
             swarm_members,
             &descendant,
-            ServerEvent::TurnStopped {
-                reason: crate::protocol::TurnStopReason::Interrupted,
-                message: format!("Stopped because its coordinator {session_id} was interrupted."),
-                provider_stop_reason: None,
+            ServerEvent::Notification {
+                from_session: session_id.to_string(),
+                from_name: None,
+                notification_type: NotificationType::Message {
+                    scope: Some("swarm".to_string()),
+                    channel: None,
+                    tldr: Some("coordinator interrupted".to_string()),
+                },
+                message,
             },
         )
         .await;
-        update_member_status(
-            &descendant,
-            "stopped",
-            Some("coordinator interrupted".to_string()),
-            swarm_members,
-            swarms_by_id,
-            event_history,
-            event_counter,
-            swarm_event_tx,
-        )
-        .await;
-        stopped.push(descendant);
+        if delivered {
+            notified.push(descendant);
+        }
     }
-    if !stopped.is_empty() {
-        let names = stopped.join(",");
+    if !notified.is_empty() {
+        let names = notified.join(",");
         crate::logging::info(&format!(
-            "SWARM_CASCADE_CANCEL coordinator={session_id} stopped={names}"
+            "SWARM_INTERRUPT_NOTICE coordinator={session_id} notified={names}"
         ));
     }
-    stopped
+    notified
 }
 
 #[cfg(test)]

@@ -11,6 +11,13 @@ use futures::stream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// The cancel path only needs the interrupt queues to tell spawned workers
+/// that their coordinator was interrupted. These tests have no swarm members,
+/// so an empty registry is enough.
+fn empty_interrupt_queues() -> super::super::SessionInterruptQueues {
+    std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
 #[test]
 fn identity_transport_negotiation_preserves_legacy_payload_shape() {
     let identity = crate::protocol::TurnIdentity {
@@ -516,6 +523,7 @@ async fn cancel_without_local_task_still_signals_session_control() {
         Some(99),
         None,
         None,
+        &empty_interrupt_queues(),
     )
     .await;
 
@@ -591,6 +599,7 @@ async fn deferred_cancel_reset_does_not_erase_newer_cancel() {
             Some(request_id),
             None,
             None,
+            &empty_interrupt_queues(),
         )
         .await;
     };
@@ -765,6 +774,7 @@ fn cancel_aborts_detached_streaming_turn_with_stale_stop_signal() -> anyhow::Res
             Some(1),
             None,
             None,
+            &empty_interrupt_queues(),
         )
         .await;
 
@@ -853,6 +863,7 @@ fn idle_cancel_does_not_arm_the_signal_for_the_next_turn() -> anyhow::Result<()>
             Some(1),
             None,
             None,
+            &empty_interrupt_queues(),
         )
         .await;
 

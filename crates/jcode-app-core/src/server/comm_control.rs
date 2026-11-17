@@ -1562,6 +1562,43 @@ async fn handle_comm_assign_task_with_mode(
             .values()
             .any(|connection| connection.session_id == target_session)
     };
+    let target_is_headless = {
+        let members = swarm_members.read().await;
+        members
+            .get(&target_session)
+            .is_some_and(|member| member.is_headless)
+    };
+    if !target_has_client && target_agent.is_none() && target_is_headless {
+        // The assignment is already recorded in the plan, but no agent can run
+        // it: the worker has no live client and its agent could not be revived
+        // from disk. Leaving the member `queued` would strand the task
+        // forever, because the staleness sweep only requeues assignments whose
+        // assignee reached a DEAD status. Mark it failed so that sweep salvages
+        // the task back to `queued` and it is re-dispatched.
+        //
+        // MEASURED 2026-11-16: a reload restores idle headless workers as
+        // `ready`, which makes them auto-pickable again. A headless worker
+        // whose session file turned out to be unreadable must not swallow a
+        // task.
+        //
+        // Only headless workers are marked failed. A detached USER session is
+        // not revived from disk (it re-attaches with its own client), so it
+        // must stay `queued` and wait for its owner to come back.
+        update_member_status(
+            &target_session,
+            "failed",
+            Some("worker could not be revived to run the assigned task".to_string()),
+            swarm_members,
+            swarms_by_id,
+            Some(event_history),
+            Some(event_counter),
+            Some(swarm_event_tx),
+        )
+        .await;
+        crate::logging::warn(&format!(
+            "Assigned task {selected_task_id} to {target_session}, but the worker has no live agent and could not be revived"
+        ));
+    }
     if !target_has_client && let Some(agent_arc) = target_agent {
         let target_session_for_run = target_session.clone();
         let swarm_members_for_run = Arc::clone(swarm_members);
