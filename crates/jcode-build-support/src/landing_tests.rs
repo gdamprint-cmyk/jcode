@@ -257,6 +257,58 @@ fn recovery_completes_forward_when_the_daemon_already_runs_the_target() {
     });
 }
 
+/// A transaction that crashed BEFORE the handoff was requested must roll
+/// back, even when the daemon's identity names the target's commit.
+///
+/// MEASURED 2026-11-17: the git hash cannot make this call. The source
+/// fingerprint that separates two builds of one commit lives only in the
+/// version label, never in the binary and never in the identity, so a commit
+/// match is not evidence that the daemon runs the target.
+///
+/// Without a handoff timestamp there is no way to tell the new daemon's
+/// identity from the old daemon's leftover file, so the recovery must not
+/// complete the landing forward.
+#[test]
+fn recovery_rolls_back_when_the_handoff_was_never_requested() {
+    with_temp_jcode_home(|| {
+        install_fake_version("aaa1111-dirty-2222");
+        install_fake_version("bbb2222-dirty-3333");
+
+        update_current_symlink("aaa1111-dirty-2222").expect("current");
+        update_shared_server_symlink("aaa1111-dirty-2222").expect("shared");
+
+        // A crash AFTER the daemon channel moved but BEFORE the handoff was
+        // requested: the journal still carries no handoff timestamp.
+        let mut transaction = begin_landing("bbb2222-dirty-3333", None).expect("begin");
+        prepare_shared_server(&mut transaction, "bbb2222-dirty-3333").expect("prepare");
+        assert!(
+            transaction.handoff_requested_at.is_none(),
+            "the handoff must not be recorded yet"
+        );
+
+        // The identity names the TARGET's commit - the match the old code
+        // accepted on its own. It is still not proof.
+        publish_identity("bbb2222", Utc::now());
+
+        let recovery = recover_landing().expect("recover").expect("a recovery happened");
+        assert!(
+            matches!(recovery, LandingRecovery::RollBack { .. }),
+            "an unproven daemon must never complete the landing forward, got {recovery:?}"
+        );
+        assert_eq!(
+            read_shared_server_version().expect("read shared").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "recovery must restore the daemon channel"
+        );
+        assert_eq!(
+            read_current_version().expect("read current").as_deref(),
+            Some("aaa1111-dirty-2222"),
+            "the client channels must stay on the old version"
+        );
+        assert!(load_landing_transaction().expect("load").is_none());
+    });
+}
+
 /// The self-dev reload moves its channels through the landing transaction, so
 /// a crash leaves a journal the next daemon can resolve.
 ///

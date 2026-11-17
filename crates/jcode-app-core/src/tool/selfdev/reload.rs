@@ -379,6 +379,20 @@ impl SelfDevTool {
             manifest.save()?;
         }
 
+        // The floor for the daemon-identity freshness proof.
+        //
+        // MEASURED 2026-11-17: the daemon publishes its identity EXACTLY ONCE,
+        // at startup (crates/jcode-app-core/src/server.rs:2601). So an identity
+        // whose `started_at` is older than this moment describes the OLD
+        // daemon, and an identity newer than it describes the daemon this
+        // reload produced. The floor is captured BEFORE the reload signal is
+        // sent, so it is strictly older than the new daemon's publication.
+        //
+        // It is captured here rather than at the activation call because the
+        // activation happens AFTER the new daemon is up, and a floor taken
+        // then would accept the old daemon's identity.
+        let reload_handoff_floor = chrono::Utc::now();
+
         // LAND the staged build as ONE crash-safe transaction through a CHILD
         // process, instead of moving the daemon channel here and hoping the
         // client channels follow later.
@@ -509,9 +523,15 @@ impl SelfDevTool {
                         //
                         // Readiness alone is not proof: the socket can be
                         // taken by a daemon that is still on the old build.
+                        //
+                        // The freshness floor is the moment BEFORE this reload
+                        // was requested. The daemon publishes its identity once,
+                        // at startup, so an identity older than the floor is the
+                        // old daemon's - the case where the reload was refused
+                        // (no exec target) and the old build kept serving.
                         let identity = build::activate_clients_after_verified_daemon(
                             &hash,
-                            None,
+                            Some(reload_handoff_floor),
                             timeout,
                         )
                         .map_err(|error| {

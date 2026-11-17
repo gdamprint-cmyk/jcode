@@ -571,6 +571,19 @@ fn parse_landing_report(stdout: &str) -> Option<LandingReport> {
 ///
 /// Returns `false` when no identity has been published: an unverifiable
 /// daemon must never be treated as a verified one.
+///
+/// MEASURED 2026-11-17: `None` is NOT a weaker proof, it is NO proof at all.
+/// A transaction that crashed before `record_handoff_requested` carries
+/// `handoff_requested_at: None` (landing.rs:1026), and this function used to
+/// accept the identity on the git-hash match alone. The git hash cannot
+/// distinguish two builds of the SAME commit - the source fingerprint that
+/// does distinguish them lives only in the version LABEL, never in the binary
+/// and never in the identity - so a stale identity published by an older
+/// daemon of the same commit was accepted as proof that the target runs.
+///
+/// The honest verdict for "no handoff timestamp" is "unprovable", not
+/// "probably fine": the landing rolls back in that case, which is the safe
+/// direction. A rollback is recoverable; a desynced ecosystem is not.
 pub fn daemon_identity_proves_version(
     identity: &DaemonIdentity,
     version: &str,
@@ -581,7 +594,9 @@ pub fn daemon_identity_proves_version(
     }
     match handoff_requested_at {
         Some(requested_at) => identity.started_at >= requested_at,
-        None => true,
+        // No handoff timestamp means no way to tell "the daemon re-exec'd onto
+        // the target" from "the old daemon's identity file is still on disk".
+        None => false,
     }
 }
 
@@ -1457,6 +1472,23 @@ mod tests {
             "abc1234-dirty-deadbeef",
             Some(handoff)
         ));
+    }
+
+    /// A transaction that crashed BEFORE the handoff was recorded carries no
+    /// timestamp, so there is no way to tell the new daemon's identity from
+    /// the old daemon's leftover file. The proof must REFUSE, not assume.
+    ///
+    /// MEASURED 2026-11-17: the git hash cannot make the distinction either.
+    /// The source fingerprint that separates two builds of one commit lives
+    /// only in the version label, never in the binary and never in the
+    /// identity, so a commit match is NOT evidence that the target runs.
+    #[test]
+    fn an_identity_without_a_handoff_timestamp_never_proves_the_target() {
+        let identity = identity("abc1234", Utc::now());
+        assert!(
+            !daemon_identity_proves_version(&identity, "abc1234-dirty-deadbeef", None),
+            "without a handoff timestamp the identity proves nothing"
+        );
     }
 
     #[test]
