@@ -29,12 +29,16 @@ use std::sync::atomic::AtomicU32;
 static QUARANTINE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 /// The exact format of a quarantine file name, produced by
-/// `rename_binary_aside`.
+/// `rename_binary_aside`: `{binary_name}.locked-{pid}-{sequence}`.
 ///
 /// Both the pre-fix form `{binary_name}.locked-{pid}` (no sequence) and the
-/// post-fix form `{binary_name}.locked-{pid}-{sequence}` (with sequence)
-/// are produced over time; the reclamation below matches BOTH.
-pub const QUARANTINE_FORMAT: &str = "{binary_name}.locked-{pid}-{sequence}";
+/// post-fix form (with sequence) are produced over time; the reclamation below
+/// matches BOTH.
+///
+/// MEASURED 2026-11-17: a `QUARANTINE_FORMAT` constant used to sit here with no
+/// reader anywhere in the tree while `rename_binary_aside` built the name from
+/// its own literal, so the two could drift silently. It was removed; the format
+/// lives in this doc comment and in the single producing literal.
 
 /// Keep the most recent N quarantine files; reclaim everything older.
 pub const KEEP_RECENT_QUARANTINES: usize = 3;

@@ -574,7 +574,8 @@ fn parse_landing_report(stdout: &str) -> Option<LandingReport> {
 ///
 /// MEASURED 2026-11-17: `None` is NOT a weaker proof, it is NO proof at all.
 /// A transaction that crashed before `record_handoff_requested` carries
-/// `handoff_requested_at: None` (landing.rs:1026), and this function used to
+/// `handoff_requested_at: None` (initialised at landing.rs:1041, stamped at
+/// landing.rs:1086-1093), and this function used to
 /// accept the identity on the git-hash match alone. The git hash cannot
 /// distinguish two builds of the SAME commit - the source fingerprint that
 /// does distinguish them lives only in the version LABEL, never in the binary
