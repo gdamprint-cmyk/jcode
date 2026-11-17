@@ -223,17 +223,49 @@ pub fn prune_old_versions_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::fs;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Set a DIRECTORY's mtime explicitly.
+    ///
+    /// The GC orders version directories by the DIRECTORY's mtime, so the
+    /// fixture must move the directory's own timestamp, not the binary's.
+    ///
+    /// On Unix a directory can be opened read-only and `futimens` still sets
+    /// its timestamps. On Windows a directory cannot be opened at all without
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, and `set_modified` then needs a handle
+    /// with write access - a plain `File::open` returns ERROR_ACCESS_DENIED.
+    ///
+    /// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    /// (read 2026-11-17) - `FILE_FLAG_BACKUP_SEMANTICS` is the documented way
+    /// to open a directory as a file handle; verified on this host by a probe
+    /// that opened a temp directory and moved its mtime back by one day.
+    fn set_dir_mtime(path: &Path, mtime: SystemTime) {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(path)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("set dir mtime");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("set dir mtime");
+        }
+    }
 
     fn make_version(dir: &Path, name: &str, age: Duration) {
         let version = dir.join(name);
         fs::create_dir_all(&version).unwrap();
         fs::write(version.join("jcode"), b"bin").unwrap();
-        File::open(&version)
-            .and_then(|file| file.set_modified(SystemTime::now() - age))
-            .unwrap();
+        set_dir_mtime(&version, SystemTime::now() - age);
     }
 
     #[test]

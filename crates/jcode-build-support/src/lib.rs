@@ -67,6 +67,31 @@ use anyhow::Result;
 use chrono::Utc;
 use jcode_storage as storage;
 use serde::{Deserialize, Serialize};
+
+/// Whether two binaries are the SAME FILE BY CONTENT.
+///
+/// Comparing canonical paths is not portable: on Unix a channel entry is a
+/// symlink into `versions/<v>/`, so both paths canonicalize to the same file.
+/// On Windows the channel entry is a COPY (Windows keeps a running executable
+/// open, so `platform_support::atomic_symlink_swap` copies and renames aside
+/// instead of symlinking), so the two paths are DIFFERENT files with the SAME
+/// content.
+///
+/// The question the callers actually ask is "does this channel serve that
+/// version", which is a statement about content, not about path identity.
+///
+/// reference: https://docs.rs/rustc-std-workspace-std/latest/std/fs/index.html
+/// (read 2026-11-16) - `std::fs::read` "Reads the entire contents of a file
+/// into a bytes vector"; `canonicalize` "Returns the canonical, absolute form
+/// of a path with all intermediate components normalized and symbolic links
+/// resolved", which is exactly why it cannot equate a Windows copy with the
+/// file it was copied from.
+pub fn same_binary_content(left: &Path, right: &Path) -> bool {
+    match (std::fs::read(left), std::fs::read(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

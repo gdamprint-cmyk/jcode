@@ -202,9 +202,13 @@ fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
 
     let candidate = client_update_candidate(true).expect("expected selfdev candidate");
     assert_eq!(candidate.1, "current");
-    assert_eq!(
-        std::fs::canonicalize(candidate.0).expect("canonical candidate"),
-        std::fs::canonicalize(version_binary).expect("canonical version binary")
+    // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+    // reference: https://docs.rs/rustc-std-workspace-std/latest/std/fs/index.html
+    // (read 2026-11-16) - `canonicalize` resolves symlinks, so it cannot
+    // equate a Windows copy with the file it was copied from.
+    assert!(
+        same_binary_content(&candidate.0, &version_binary),
+        "the current channel must serve the installed version binary"
     );
 
     if let Some(prev_home) = prev_home {
@@ -238,9 +242,10 @@ fn update_launcher_symlink_stays_inside_sandbox_home() {
             .join("bin")
             .join(binary_name());
         assert_eq!(launcher, expected_launcher);
-        assert_eq!(
-            std::fs::canonicalize(&launcher).expect("canonical launcher"),
-            std::fs::canonicalize(version_binary).expect("canonical version binary")
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&launcher, &version_binary),
+            "the launcher must serve the installed version binary"
         );
     });
 }
@@ -400,10 +405,11 @@ fn shared_server_candidate_prefers_approved_channel_over_current() {
         let candidate =
             shared_server_update_candidate(true).expect("expected shared-server candidate");
         assert_eq!(candidate.1, "shared-server");
-        let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
-        let approved = std::fs::canonicalize(version_binary_path(approved_version).unwrap())
-            .expect("canonical approved");
-        assert_eq!(selected, approved);
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&candidate.0, &version_binary_path(approved_version).unwrap()),
+            "the shared-server channel must serve the approved version binary"
+        );
     });
 }
 
@@ -423,10 +429,11 @@ fn normal_shared_server_candidate_repairs_stale_shared_channel_to_stable() {
         let candidate =
             shared_server_update_candidate(false).expect("expected stable shared-server candidate");
         assert_eq!(candidate.1, "stable");
-        let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
-        let installed = std::fs::canonicalize(version_binary_path(installed_version).unwrap())
-            .expect("canonical installed");
-        assert_eq!(selected, installed);
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&candidate.0, &version_binary_path(installed_version).unwrap()),
+            "the stable shared-server channel must serve the installed version binary"
+        );
     });
 }
 
@@ -607,13 +614,16 @@ fn simulate_stable_update_channel_swap(new_version: &str) {
 /// `server_update_candidate` in the server, which both go through
 /// `shared_server_update_candidate(false)`.
 fn daemon_reload_target_version() -> Option<String> {
-    let (candidate, _label) = shared_server_update_candidate(false)?;
-    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-    // versions/<version>/jcode -> <version>
-    canonical
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+    // The reload target is the version the daemon WOULD reload INTO, which is
+    // the version of the candidate that `shared_server_update_candidate(false)`
+    // selects - not the version the shared-server channel currently holds.
+    // Those differ exactly in the case this test pins: after `/update` the
+    // shared-server channel stays pinned to the old self-dev build while the
+    // selected candidate is the freshly installed release.
+    //
+    // `candidate_version` resolves the version through the CHANNEL MARKER of
+    // the selected candidate, which names the version on both platforms.
+    candidate_version(shared_server_update_candidate(false))
 }
 
 /// Reproduces the user-reported "/update gives the new client but a stale
@@ -698,8 +708,44 @@ fn update_advances_daemon_reload_target_when_shared_server_tracks_stable() {
     });
 }
 
+/// The version a channel candidate points at, resolved PLATFORM-NEUTRALLY.
+///
+/// The candidate comes with a LABEL naming the channel it was taken from
+/// ("shared-server", "stable" or "current"), and every one of those channels
+/// has a MARKER FILE naming the version it currently serves. The marker is
+/// written by the same machinery that moves the channel, so it names the
+/// version on BOTH platforms.
+///
+/// Reading the canonicalized path's PARENT instead only works on Unix: there
+/// the channel entry is a symlink into `versions/<v>/`. On Windows the channel
+/// entry is a COPY (`platform_support.rs` copies the file because Windows keeps
+/// a running executable open), so the parent is the channel directory name,
+/// not a version.
 fn candidate_version(candidate: Option<(PathBuf, &'static str)>) -> Option<String> {
-    let (candidate, _label) = candidate?;
+    let (candidate, label) = candidate?;
+    let marker = match label {
+        "shared-server" => read_shared_server_version(),
+        "stable" => read_stable_version(),
+        // The "current" label is ALSO used for the `current_exe()` fallback,
+        // which is not a channel at all. Only the real channel may be read
+        // from the marker; the fallback falls through to the path shape.
+        "current" => {
+            let channel = current_binary_path().ok();
+            match channel {
+                Some(channel) if channel == candidate => read_current_version(),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    };
+    if let Ok(Some(version)) = marker {
+        let version = version.trim().to_string();
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    // No usable marker (a channel that was moved without a marker write):
+    // fall back to the path shape, which is exact on Unix.
     let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
     canonical
         .parent()

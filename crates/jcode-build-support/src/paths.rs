@@ -1,7 +1,7 @@
 use super::{
     SelfDevBuildCommand, SelfDevBuildTarget, canary_binary_path, current_binary_path,
     read_current_version, read_shared_server_version, read_stable_version,
-    shared_server_binary_path, stable_binary_path,
+    same_binary_content, shared_server_binary_path, stable_binary_path,
 };
 use anyhow::Result;
 // reference: scripts/dev_cargo.sh (export_git_build_metadata) - the Unix wrapper that
@@ -851,6 +851,10 @@ mod tests {
         );
     }
 
+    // Unix-only behaviour: on Windows the build runs cargo directly (see
+    // `windows_cargo_args_build_the_tui_for_all`), so there is no wrapper and
+    // no bash. The assertion below only holds where the wrapper exists.
+    #[cfg(unix)]
     #[test]
     fn unix_selfdev_build_keeps_using_the_wrapper() {
         let repo = repo_fixture(false);
@@ -866,11 +870,14 @@ mod tests {
 
         assert_eq!(command.program, "bash");
         assert_eq!(command.args.first().map(String::as_str), Some("-lc"));
+        // `shell_escape` emits the host path with the host separator, so the
+        // wrapper path is "scripts/dev_cargo.sh" on Unix and
+        // "scripts\dev_cargo.sh" on Windows. Compare separators-agnostically.
         assert!(
             command
                 .args
                 .last()
-                .is_some_and(|arg| arg.contains("scripts/dev_cargo.sh"))
+                .is_some_and(|arg| arg.replace('\\', "/").contains("scripts/dev_cargo.sh"))
         );
     }
 
@@ -991,9 +998,23 @@ mod tests {
         std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
         #[cfg(not(unix))]
         std::fs::copy(&wrapper, &link).map(|_| ()).expect("copy");
-        assert_eq!(
-            resolve_binary_payload(&link),
-            std::fs::canonicalize(&payload).expect("canonical payload")
+        // On Unix the symlink resolves to the payload.
+        //
+        // On Windows the channel entry is a COPY (Windows keeps a running
+        // executable open, so the installer cannot symlink it - see
+        // `platform_support::atomic_symlink_swap`). A copy carries no link
+        // target, so the payload can only be found as the SIBLING of the
+        // copy: the install directory holds the wrapper and its payload
+        // together. The fixture reproduces that by placing the payload next
+        // to the copied channel entry.
+        #[cfg(not(unix))]
+        std::fs::copy(&payload, channel_dir.join("jcode-linux-x86_64.bin"))
+            .map(|_| ())
+            .expect("copy payload next to the channel copy");
+        let resolved = resolve_binary_payload(&link);
+        assert!(
+            same_binary_content(&resolved, &payload),
+            "the channel entry must resolve to the payload, got {resolved:?}"
         );
     }
 
