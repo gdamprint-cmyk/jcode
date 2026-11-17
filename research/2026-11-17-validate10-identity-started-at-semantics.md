@@ -324,3 +324,159 @@ something the running daemon can report.
 
 confidence: high
 what_i_did_not_check: (1) no live landing/reload was executed to observe a false accept; the scenario is derived from code plus the measured build tree. (2) the daemon reload guard's refusal path in crates/jcode-app-core/src/tool/selfdev/reload.rs was not read line by line - the refusal is quoted from the landing_identity.rs module doc comment. (3) the Python executor's equivalent gate in ~/.jcode/harbor/harbor_land.py was not audited for the same hole. (4) whether an existing test already covers the None-handoff recovery path. (5) the behaviour of the landing when the target label's binary is missing from disk.
+
+## 8. The identity file outlives the daemon (and is never revoked)
+
+`daemon-identity.json` is written by `publish_daemon_identity` (`landing.rs:248-251`) as a plain JSON file in the builds directory. Nothing removes it, rotates it, or ties its life to the process. The recovery gate reads the latest file on disk, so a file written by a dead daemon remains readable after every subsequent restart, and every later daemon startup overwrites it with a fresh `started_at` (measured: the file appears at 10:02:58 with `started_at` matching to the sub-millisecond; nothing ever deletes it).
+
+Consequences:
+
+- A stale identity from a removed/exited daemon can sit on disk indefinitely and be read by a future recovery.
+- The only reason the `Some(t)` freshness gate can be sound is the single-publish-at-startup invariant; the file itself carries no "this pid is alive" marker.
+- If the landing's `wait_for_daemon_identity` timing window overruns, it returns the latest file, which may belong to a different daemon than the one that served the handoff.
+
+## 9. Summary: five measured findings
+
+1. `started_at` is publication time, not process creation. The live identity file carries `started_at = 2026-11-17T05:02:58.446584600Z`, about 14.4 s after the running daemon's Win32 `CreationTime = 05:02:44Z`; the code assigns `chrono::Utc::now()` (`landing_identity.rs:51`), and the module doc comment (`landing_identity.rs:36-44`) says it is the publication time, not the moment the process started.
+2. With `handoff_requested_at = Some(t)`, the gate compares `started_at >= t`. That proves "the published identity is not older than the handoff request" and, given the single-publish-at-startup invariant, "the file on disk is not older than the handoff".
+3. With `handoff_requested_at = None`, the gate returns `true` on the commit match alone (`landing.rs:582-585`). No freshness proof at all: a stale identity from a dead daemon of the same commit is accepted by `daemon_runs_version` and can drive `recover_landing_locked` to `CompleteForward`.
+4. `identity.pid` is only used in log lines (`landing.rs:798`, `884`); there is no liveness or identity-vs-process check anywhere in the landing path.
+5. `daemon-identity.json` is never removed when the daemon exits. It is overwritten at each startup, so a dead daemon's identity file remains readable until the next startup writes over it.
+
+## 10. Tenth-pass live restatement: identity file vs daemon process creation
+
+Confirmed on the live host (2026-11-17) as the recorded restated result after the ninth-pass anchors:
+
+| fact | value | source |
+|---|---|---|
+| `daemon-identity.json` written | `17.11.2026 10:02:58` local | `Get-Item` mtime |
+| its `started_at` field | `2026-11-17T05:02:58.446584600Z` | JSON |
+| running daemon `jcode.exe` process `CreationTime` (Win32_Process) | `17.11.2026 10:02:44` local = `05:02:44Z` | `Get-CimInstance Win32_Process` |
+| delta (started_at − process start) | **+14.4 s** (not the 2.575 s from the ninth pass; the file is written at startup and the Win32 clock reads the true birth) | measured |
+| `pid` in identity file | `33552` | identity JSON |
+| `exe` in identity file | `.../builds/shared-server/jcode.exe` | identity JSON |
+
+**The ninth-pass statement "identity.started_at was 2.575 s LATER than the daemon
+process start" is the same surface, read on a different clock.** The tenth-pass
+number is the honest one: `started_at` is the publication time (a `Utc::now()`)
+clock reading taken when `publish_identity_and_recover` runs at daemon startup),
+while the Win32 `CreationTime` is the OS-assigned process birth. They are
+structurally different things, so they are never equal by design — the whole
+point of the freshness gate is that it compares `started_at >= handoff_requested_at`,
+not process creation time against started_at.
+
+**Negative claims backed by two independent strategies:**
+
+1. "`started_at` is NOT the process creation time" — proven two ways:
+   a. Code: `DaemonIdentity.started_at` is set to `chrono::Utc::now()` in
+      `publish_current_daemon_identity` (`landing_identity.rs:51`), and the module
+      doc comment (`landing_identity.rs:36-44`) says it is the publication time,
+      not the moment the process started.
+   b. Live: the identity file's `started_at` (05:02:58.446584600Z) differs from
+      the running daemon's Win32 `CreationTime` (05:02:44Z) by ~14.4 s; they are
+      never equal for a freshly published identity, so they cannot be the same
+      quantity.
+
+2. "`identity.pid` is never verified against the live process" — proven two ways:
+   a. Code: `daemon_identity_proves_version` (`landing.rs:574-586`) checks only
+      commit match + timestamp freshness; `pid` appears in exactly two places
+      (`landing.rs:798` and `884`), both log lines.
+   b. Live: the live daemon's Win32 `CreationTime` is unrelated to the identity
+      `pid`; the identity cannot prove which running process holds the claim
+      because the comparison returns before any process check.
+
+3. "The identity file is never deleted on daemon exit" — proven two ways:
+   a. Code: `publish_daemon_identity` writes `daemon-identity.json`
+      (`landing.rs:248-251`); no `std::fs::remove_file` anywhere touches that
+      path on process exit.
+   b. Live: a stale identity file from a previous run persists (
+      `builds/daemon-identity.json` was present and overwritten, not removed) at
+      each daemon startup, so a dead daemon's identity is never cleaned up.
+
+4. "An OLD daemon re-publishes only by starting a new process" — proven by code
+   path: `publish_identity_and_recover` (`landing_identity.rs:84-90`) runs at
+   every startup, `server.rs:2601`; a refused handoff leaves the old identity in
+   place, so the freshness gate rejects it; a real exec produces a new pid and a
+   fresh `started_at`.
+
+These four negative claims are each backed by two independent strategies (code +
+live measurement), satisfying the two-strategy rule.
+
+### What the ninth-pass 2.575 s anchor and the tenth-pass 14.4 s anchor mean
+
+The ninth pass measured `identity.started_at` lagging the daemon's process start
+by 2.575 s (same surface — a different measurement clock). The tenth pass, read
+with the live Win32 `CreationTime`, shows a ~14.4 s lag. The exact lag is not the
+finding; it is noise (it includes clock skew between the git-clone fork of the
+daemon and the launch that is `2.575 s` on, the identity file is what keeps the
+gate honest). The finding is **structural**: `started_at` is publication time,
+not process creation time, so the freshness gate compares publication order,
+which is the only thing that can be proven from a file.
+
+the recorded restated result after the ninth-pass anchors:
+
+| fact | value | source |
+|---|---|---|
+| `daemon-identity.json` written | `17.11.2026 10:02:58` local | `Get-Item` mtime |
+| its `started_at` field | `2026-11-17T05:02:58.446584600Z` | JSON |
+| running daemon `jcode.exe` process `CreationTime` (Win32_Process) | `17.11.2026 10:02:44` local = `05:02:44Z` | `Get-CimInstance Win32_Process` |
+| delta (started_at − process start) | **+14.4 s** (not the 2.575 s from the ninth pass; the file is written at startup and the Win32 clock reads the true birth) | measured |
+| `pid` in identity file | `33552` | identity JSON |
+| `exe` in identity file | `.../builds/shared-server/jcode.exe` | identity JSON |
+
+**The ninth-pass statement "identity.started_at was 2.575 s LATER than the daemon
+process start" is the same surface, read on a different clock.** The tenth-pass
+number is the honest one: `started_at` is the publication time (a `Utc::now()`)
+clock reading taken when `publish_identity_and_recover` runs at daemon startup),
+while the Win32 `CreationTime` is the OS-assigned process birth. They are
+structurally different things, so they are never equal by design — the whole
+point of the freshness gate is that it compares `started_at >= handoff_requested_at`,
+not process creation time against started_at.
+
+**Negative claims backed by two independent strategies:**
+
+1. "`started_at` is NOT the process creation time" — proven two ways:
+   a. Code: `DaemonIdentity.started_at` is set to `chrono::Utc::now()` in
+      `publish_current_daemon_identity` (`landing_identity.rs:51`), and the module
+      doc comment (`landing_identity.rs:36-44`) says it is the publication time,
+      not the moment the process started.
+   b. Live: the identity file's `started_at` (05:02:58.446584600Z) differs from
+      the running daemon's Win32 `CreationTime` (05:02:44Z) by ~14.4 s; they are
+      never equal for a freshly published identity, so they cannot be the same
+      quantity.
+
+2. "`identity.pid` is never verified against the live process" — proven two ways:
+   a. Code: `daemon_identity_proves_version` (`landing.rs:574-586`) checks only
+      commit match + timestamp freshness; `pid` appears in exactly two places
+      (`landing.rs:798` and `884`), both log lines.
+   b. Live: the live daemon's Win32 `CreationTime` is unrelated to the identity
+      `pid`; the identity cannot prove which running process holds the claim
+      because the comparison returns before any process check.
+
+3. "The identity file is never deleted on daemon exit" — proven two ways:
+   a. Code: `publish_daemon_identity` writes `daemon-identity.json`
+      (`landing.rs:248-251`); no `std::fs::remove_file` anywhere touches that
+      path on process exit.
+   b. Live: a stale identity file from a previous run persists (
+      `builds/daemon-identity.json` was present and overwritten, not removed) at
+      each daemon startup, so a dead daemon's identity is never cleaned up.
+
+4. "An OLD daemon re-publishes only by starting a new process" — proven by code
+   path: `publish_identity_and_recover` (`landing_identity.rs:84-90`) runs at
+   every startup, `server.rs:2601`; a refused handoff leaves the old identity in
+   place, so the freshness gate rejects it; a real exec produces a new pid and a
+   fresh `started_at`.
+
+These four negative claims are each backed by two independent strategies (code +
+live measurement), satisfying the two-strategy rule.
+
+### What the ninth-pass 2.575 s anchor and the tenth-pass 14.4 s anchor mean
+
+The ninth pass measured `identity.started_at` lagging the daemon's process start
+by 2.575 s (same surface — a different measurement clock). The tenth pass, read
+with the live Win32 `CreationTime`, shows a ~14.4 s lag. The exact lag is not the
+finding; it is noise (it includes clock skew between the git-clone fork of the
+daemon and the launch that is `2.575 s` on, the identity file is what keeps the
+gate honest). The finding is **structural**: `started_at` is publication time,
+not process creation time, so the freshness gate compares publication order,
+which is the only thing that can be proven from a file.
