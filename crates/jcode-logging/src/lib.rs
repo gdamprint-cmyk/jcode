@@ -204,9 +204,27 @@ fn context_prefix_for(ctx: &LogContext) -> String {
     }
 }
 
+// reference: Microsoft Learn Win32 WriteFile (GetLastError on failure) and CreateFileW
+// (reopen to obtain a fresh handle); ERROR_NOT_READY = 21 "The device is not ready"
+// (System Error Codes 0-499). A handle into a volume that stopped responding stays
+// failed until it is replaced, so the logger reopens instead of dropping lines.
+
 pub struct Logger {
+    /// Today's log file path, kept so a failed handle can be reopened. A file
+    /// handle into a volume that went away (USB disconnect, re-enumeration)
+    /// keeps failing until it is replaced, so the path is what lets us recover.
+    path: PathBuf,
     file: File,
 }
+
+/// How long to wait between reopen attempts after the log file write fails.
+/// The volume may be a USB disk that is spinning up or re-enumerating, so a
+/// short backoff is enough to recover without blocking the logging path for long.
+const LOG_REOPEN_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Upper bound on reopen attempts for one line. Keeps a dead volume from blocking
+/// the caller indefinitely.
+const LOG_REOPEN_ATTEMPTS: u32 = 5;
 
 fn log_dir() -> Option<PathBuf> {
     jcode_storage::logs_dir().ok()
@@ -227,17 +245,55 @@ impl Logger {
             .open(&path)
             .ok()?;
 
-        Some(Self { file })
+        Some(Self { path, file })
+    }
+
+    /// Replace the open handle after a write failed. `None` means the volume is
+    /// still unavailable and this line cannot be delivered.
+    fn reopen(&self) -> Option<File> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok()
     }
 
     fn write(&mut self, level: &str, message: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let ctx = context_prefix();
         let line = format!("[{}] [{}] {}{}\n", timestamp, level, ctx, message);
-        if let Err(err) = self.file.write_all(line.as_bytes()) {
-            eprintln!("jcode logger write failed: {err}");
+        let bytes = line.as_bytes();
+
+        match self.file.write_all(bytes) {
+            Ok(()) => {
+                self.flush();
+                return;
+            }
+            Err(err) => {
+                eprintln!("jcode logger write failed: {err}");
+            }
+        }
+
+        // The failed handle stays failed; reopen and retry the same line.
+        for attempt in 0..LOG_REOPEN_ATTEMPTS {
+            let Some(file) = self.reopen() else {
+                if attempt + 1 < LOG_REOPEN_ATTEMPTS {
+                    std::thread::sleep(LOG_REOPEN_BACKOFF);
+                }
+                continue;
+            };
+            self.file = file;
+            if let Err(err) = self.file.write_all(bytes) {
+                eprintln!("jcode logger reopen-write failed: {err}");
+                continue;
+            }
+            self.flush();
             return;
         }
+        eprintln!("jcode logger dropped line after {LOG_REOPEN_ATTEMPTS} reopen attempts");
+    }
+
+    fn flush(&mut self) {
         if let Err(err) = self.file.flush() {
             eprintln!("jcode logger flush failed: {err}");
         }
@@ -844,6 +900,51 @@ mod tests {
         assert!(old_memory.exists(), "memory-events jsonl must survive");
         assert!(old_other.exists(), "unrelated files must survive");
         assert!(subdir.is_dir(), "subdirectories must survive");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopen_replaces_a_dead_handle_and_writes_the_line() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-log-reopen-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp log dir");
+        let path = dir.join("jcode-2099-01-01.log");
+
+        // Build a Logger exactly as Logger::new does.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open log file");
+        let mut logger = Logger {
+            path: path.clone(),
+            file,
+        };
+        logger.write("INFO", "before");
+
+        // Simulate the volume fault: the cached handle is now unusable and every
+        // write on it fails, which is what ERROR_NOT_READY (21) looks like from
+        // the logger's point of view. Only a fresh open of the real path can
+        // deliver later lines.
+        let dead = File::open(&path).expect("open read-only handle as dead handle");
+        logger.file = dead; // read-only handle: writes fail
+        logger.write("WARN", "after-reopen");
+
+        let contents = fs::read_to_string(&path).expect("read log file");
+        assert!(contents.contains("before"), "first line must be present");
+        assert!(
+            contents.contains("after-reopen"),
+            "line after reopen must be written: {contents}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
