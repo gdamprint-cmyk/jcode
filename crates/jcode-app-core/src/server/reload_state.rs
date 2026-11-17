@@ -179,7 +179,31 @@ pub fn reload_process_alive(pid: u32) -> bool {
         matches!(err.raw_os_error(), Some(libc::EPERM))
     }
 
-    #[cfg(not(unix))]
+    // MEASURED 2026-11-17: this arm used to `let _ = pid; true`, so on Windows
+    // EVERY non-zero pid counted as alive - a stale or bogus reload pid could
+    // never be reported as dead, and inspect_reload_wait_status would return
+    // Waiting forever instead of Failed. Ask the OS instead. Same Win32 path as
+    // jcode-base's platform::is_process_running; the windows-sys features are
+    // already enabled for this crate (Cargo.toml:144).
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE as u32
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
