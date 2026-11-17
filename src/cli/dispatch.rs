@@ -1494,6 +1494,11 @@ async fn spawn_server_with_lifetime(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // A timed-out spawn must not leak the child. Dropping a
+        // `std::process::Child` does not terminate it, so the half-started
+        // daemon would stay alive as an orphan `jcode.exe` while the keepalive
+        // keeps producing new ones. Kill it before bailing.
+        let _ = child.kill();
         anyhow::bail!(
             "Timed out waiting for server to become ready at {} after {}ms",
             server::socket_path().display(),
@@ -1537,6 +1542,10 @@ async fn run_server_keepalive(
     let mut client: Option<server::Client> = None;
     let mut first_attempt = true;
     let mut unhealthy_server_hold_skip = false;
+    // Consecutive failed spawns drive the retry delay. A daemon that cannot
+    // start used to be retried every second forever, and every attempt
+    // leaked a child process (see the timeout path in `spawn_server`).
+    let mut failed_spawns: u32 = 0;
 
     loop {
         let delay = if first_attempt {
@@ -1545,7 +1554,8 @@ async fn run_server_keepalive(
         } else if client.is_some() {
             std::time::Duration::from_secs(30)
         } else {
-            std::time::Duration::from_secs(1)
+            // 1s, 2s, 4s ... capped at 30s.
+            std::time::Duration::from_secs((1u64 << failed_spawns.min(5)).min(30))
         };
         tokio::select! {
             _ = &mut owner_closed => return Ok(()),
@@ -1564,8 +1574,10 @@ async fn run_server_keepalive(
                 if !server::has_live_listener(&server::socket_path()).await {
                     unhealthy_server_hold_skip = false;
                     if spawn_server(provider_choice, model, provider_profile).await.is_err() {
+                        failed_spawns = failed_spawns.saturating_add(1);
                         continue;
                     }
+                    failed_spawns = 0;
                 } else if unhealthy_server_hold_skip {
                     // Give the unresponsive server one full interval with no
                     // hold so it can idle-exit before we probe it again.
