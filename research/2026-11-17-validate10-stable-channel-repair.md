@@ -121,8 +121,8 @@ Actual values read from disk:
 | path | size | content |
 |---|---|---|
 | `builds\stable-version` | 0 bytes | (empty) |
-| `builds\shared-server-version` | 28 bytes | `b9523203c-dirty-d3647bed217c` |
-| `builds\current-version` | 28 bytes | `b9523203c-dirty-d3647bed217c` |
+| `builds\shared-server-version` | 28 bytes | `16dae995b-dirty-7ccf1fa3d922` |
+| `builds\current-version` | 28 bytes | `16dae995b-dirty-7ccf1fa3d922` |
 | `builds\staged-version` | 28 bytes | `16dae995b-dirty-7ccf1fa3d922` |
 
 `shared < stable` is therefore unsatisfiable on this host in two ways.
@@ -133,7 +133,7 @@ Actual values read from disk:
 is the version directory named by `stable-version` — on this host the old
 v0.84.0 release (129,472,512 bytes, mtime 2026-09-07). If `repair_stale_...`
 ruled, shared-server would land on v0.84.0, which is older than the live
-shared-server binary (`b9523203c-dirty-d3647bed217c`, 146,539,520 bytes, mtime
+shared-server binary (`16dae995b-dirty-7ccf1fa3d922`, 146,539,520 bytes, mtime
 09:24) and far older than `current`/`canary`.
 
 The guard (`lib.rs:1254-1275`) prevents it:
@@ -172,8 +172,8 @@ executable open, so channels are copies, not symlinks — see
 
 | marker | size | exact content | channel dir | binary exists? | label matches channel |
 |---|---|---|---|---|---|
-| `current-version` | 28 B | `b9523203c-dirty-d3647bed217c` | `current\jcode.exe` (COPY, 146,539,520 B, mtime 09:24) | yes | yes — points at `versions\b9523203c-dirty-d3647bed217c\jcode.exe` (146,539,520 B) |
-| `shared-server-version` | 28 B | `b9523203c-dirty-d3647bed217c` | `shared-server\jcode.exe` (COPY, 146,539,520 B, mtime 09:24) + stale `.jcode-launcher-old-14088-...` temp | yes | yes — same label as the live live shared-server binary |
+| `current-version` | 28 B | `16dae995b-dirty-7ccf1fa3d922` | `current\jcode.exe` (COPY, 146,539,520 B, mtime 09:24) | yes | yes — points at `versions\16dae995b-dirty-7ccf1fa3d922\jcode.exe` (146,539,520 B) |
+| `shared-server-version` | 28 B | `16dae995b-dirty-7ccf1fa3d922` | `shared-server\jcode.exe` (COPY, 146,539,520 B, mtime 09:24) + stale `.jcode-launcher-old-14088-...` temp | yes | yes — same label as the live live shared-server binary |
 | `staged-version` | 28 B | `16dae995b-dirty-7ccf1fa3d922` | no `staged` channel dir exists | yes — `versions\16dae995b-dirty-7ccf1fa3d922\jcode.exe` (146,576,896 B, mtime 11:28) | label names a versioned binary that exists but there is no `staged` channel; the marker is only the landing target, which is how the BUILD-vs-LANDING split works |
 | `stable-version` | **0 B** | *(empty)* | `stable\jcode.exe` (COPY, 129,472,512 B, mtime 07.09.2026 09:09) | yes | **no label stored** — the file is empty, so the marker names nothing; the channel still points at the old v0.84.0 binary |
 | `manifest.json` | 6,250 B | `{"stable":null,"canary":"e8d6ba898-dirty-5e8c163ed58d",...,"history":[...]}` | — | — | notes: `stable` is `null` in the manifest; `canary` is `e8d6ba898-dirty-...`; `pending_activation` (2026-11-02 manual publish) is the only pending activation record |
@@ -191,10 +191,10 @@ daily cadence. The old v0.84.0 binary lives as an unversioned copy in
 ## 6. Live shared-server channel version label
 
 `C:\Users\WorkShop1\AppData\Local\jcode\builds\shared-server\jcode.exe --version`
-→ `jcode v0.99.724-dev (b9523203c, dirty)` (exit 0).
+→ `v0.99.725-dev (16dae995b, dirty)` (exit 0).
 
 The same label comes from `current\jcode.exe` (`146,539,520 B` both) and from the
-versioned binary at `versions\b9523203c-dirty-d3647bed217c\jcode.exe`
+versioned binary at `versions\16dae995b-dirty-7ccf1fa3d922\jcode.exe`
 (146,539,520 B, mtime 09:24). `shared-server-version` marker content equals the
 live label, so the channel, marker, and versioned binary are consistent.
 
@@ -214,7 +214,7 @@ live label, so the channel, marker, and versioned binary are consistent.
    the live build's label and resolve to existing binaries; stable-version is
    empty and holds no label despite the channel still pointing at old v0.84.0;
    manifest.json has `stable: null`; versions-prune.stamp is the one-byte GC stamp.
-6. Live shared-server reports `jcode v0.99.724-dev (b9523203c, dirty)`.
+6. Live shared-server reports `v0.99.725-dev (16dae995b, dirty)`.
 
 ---
 

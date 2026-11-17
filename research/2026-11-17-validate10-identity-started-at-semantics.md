@@ -415,6 +415,104 @@ which is the only thing that can be proven from a file.
 
 the recorded restated result after the ninth-pass anchors:
 
+---
+
+## The fix (commit `697daa6a9`)
+
+### What changed
+
+**1. `crates/jcode-build-support/src/landing.rs` — the `None` arm refuses.**
+
+```rust
+match handoff_requested_at {
+    Some(requested_at) => identity.started_at >= requested_at,
+    // No handoff timestamp means no way to tell "the daemon re-exec'd onto
+    // the target" from "the old daemon's identity file is still on disk".
+    None => false,
+}
+```
+
+`None => true` became `None => false`. The honest verdict for "no handoff
+timestamp" is "unprovable", not "probably fine". A landing with no handoff
+timestamp now rolls back, which is the safe direction: a rollback is
+recoverable, a desynced ecosystem is not.
+
+**2. `crates/jcode-app-core/src/tool/selfdev/reload.rs` — the live path gets a
+real freshness floor.**
+
+The self-dev reload passed `None` to the same proof
+(`activate_clients_after_verified_daemon(&hash, None, timeout)`), which lost
+the freshness check exactly where it mattered most: the live reload path. It
+now captures a floor BEFORE the reload signal is sent:
+
+```rust
+let reload_handoff_floor = chrono::Utc::now();
+```
+
+and passes `Some(reload_handoff_floor)`. The floor is captured before the
+signal, not at the activation call, because the activation happens AFTER the
+new daemon is up — a floor taken then would accept the old daemon's identity.
+
+### Why this is sound, not merely stricter
+
+The `Some(t)` arm is sound because the daemon publishes its identity EXACTLY
+ONCE, at startup (`server.rs:2601`, verified by lane E's full caller list).
+So "identity written at or after t" implies "the daemon that wrote it started
+at or after t". The `None` arm had no such anchor, and the git-hash match
+cannot substitute for one: the source fingerprint that separates two builds of
+one commit lives only in the version label, never in the binary
+(`JCODE_FINGERPRINT` → 0 matches in 0 files) and never in the identity.
+
+**Hole B is closed by the same change, structurally.** The recovery decision
+(`landing.rs:1169-1182`) does not consult the phase, which looked like a
+separate defect. But `LandingPhase::HandoffRequested` is reachable ONLY
+through `record_handoff_requested` (the only `advance_landing` call that sets
+it — verified by grep across the crate), and that function is the ONLY writer
+of `handoff_requested_at`. So the phase and the timestamp move together: a
+transaction in a phase at or after `HandoffRequested` always has a timestamp,
+and a transaction without a timestamp is always in `Begun` or
+`SharedServerPrepared` — where the daemon channel was never proven to serve
+the target. With the `None` arm refusing, that transaction rolls back.
+
+### Verification
+
+| check | result |
+|---|---|
+| `cargo test -p jcode-build-support --lib` | **124 passed, 0 failed** |
+| `cargo check -p jcode-app-core --lib` | Finished dev profile, no errors (31 pre-existing warnings) |
+| `cargo build --profile selfdev -p jcode --bin jcode` | exit 0, target `697daa6a9-dirty-00cf963d620d` |
+| new test `landing::tests::an_identity_without_a_handoff_timestamp_never_proves_the_target` | passes |
+| new test `landing_tests::recovery_rolls_back_when_the_handoff_was_never_requested` | passes — a pre-handoff crash with an identity naming the TARGET's commit now rolls back and leaves both channel families on the old version |
+| `harbor_reconcile.py --dry-run --json` | `ok: true`, `desynced: false`, `needs_build: ["fix_697daa6a9_fix_landing_"]` |
+
+The second test is the one that matters: it drives the REAL journal and the
+REAL channel helpers against a temp home, so it asserts on filesystem state,
+not on a mock. Before the fix it would have completed the landing forward.
+
+### Registered with Harbor
+
+`harbor_register.py identity-proof-freshness 697daa6a9 ...` →
+`registered: fix_697daa6a9_fix_landing_`. The self-dev BUILD for
+`697daa6a9-dirty-00cf963d620d` was queued by this session; the LANDING is
+Harbor's alone.
+
+### What this fix does NOT close
+
+- **Hole C stands.** The fingerprint is still absent from the binary and from
+  the identity, so the landing still cannot tell two builds of one commit
+  apart at the identity level. The fix makes that ambiguity resolve to a
+  ROLLBACK rather than to a false accept, which is the safe direction, but the
+  underlying inability remains.
+- The Python executor (`~/.jcode/harbor/harbor_land.py`) was not audited for
+  an equivalent hole. Its own proof is different (NTFS file index of the
+  channel file plus the daemon's create time against the promote time), so it
+  may not share this flaw — but that is unmeasured here.
+- No live landing or reload was executed to observe a false accept end to end.
+  The claim rests on the code paths plus the measured build tree.
+
+confidence: high
+what_i_did_not_check: (1) no live landing/reload was executed to observe a false accept; the scenario is derived from code plus the measured build tree. (2) the daemon reload guard's refusal path in crates/jcode-app-core/src/tool/selfdev/reload.rs was not read line by line - the refusal is quoted from the landing_identity.rs module doc comment. (3) the Python executor's equivalent gate in ~/.jcode/harbor/harbor_land.py was not audited for the same hole. (4) whether an existing test already covers the None-handoff recovery path. (5) the behaviour of the landing when the target label's binary is missing from disk.
+
 | fact | value | source |
 |---|---|---|
 | `daemon-identity.json` written | `17.11.2026 10:02:58` local | `Get-Item` mtime |
