@@ -1,7 +1,7 @@
 use super::{
     SelfDevBuildCommand, SelfDevBuildTarget, canary_binary_path, current_binary_path,
     read_current_version, read_shared_server_version, read_stable_version,
-    same_binary_content, shared_server_binary_path, stable_binary_path,
+    shared_server_binary_path, stable_binary_path,
 };
 use anyhow::Result;
 // reference: scripts/dev_cargo.sh (export_git_build_metadata) - the Unix wrapper that
@@ -699,6 +699,10 @@ pub fn is_jcode_repo(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `same_binary_content` is a TEST-ONLY helper: the product compares
+    // channels by path, and only the assertions need content comparison
+    // (on Windows a channel entry is a copy, not a symlink).
+    use crate::same_binary_content;
 
     fn repo_fixture(git_file: bool) -> tempfile::TempDir {
         let temp = tempfile::TempDir::new().expect("temp repo");
