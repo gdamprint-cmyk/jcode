@@ -413,6 +413,53 @@ gate honest). The finding is **structural**: `started_at` is publication time,
 not process creation time, so the freshness gate compares publication order,
 which is the only thing that can be proven from a file.
 
+---
+
+## The fix is LIVE (measured after the landing)
+
+Harbor reported the landing; the report was MEASURED, not trusted.
+
+| fact | measured value |
+|---|---|
+| `current-version` | `697daa6a9-dirty-00cf963d620d` |
+| `shared-server-version` | `697daa6a9-dirty-00cf963d620d` |
+| live daemon `git_hash` | `697daa6a9` |
+| live daemon `version` | `v0.99.728-dev (697daa6a9, dirty)` |
+| live daemon `pid` | `19408` |
+
+Both channel markers and the daemon's own published identity agree, so the
+client and the daemon run the build that carries the fix. The ecosystem then
+advanced on its own to `bdb5fb2a5`, whose ancestry contains `697daa6a9`
+(`bdb5fb2a5 -> 0a5722765 -> d0ab40cc3 -> 697daa6a9`), so the fix is in the
+branch, not only in one transient build.
+
+### Two test failures found while verifying, and what they are
+
+A full `cargo test -p jcode-app-core --lib` run was interrupted by a server
+reload. Two tests failed. Both were re-run IN ISOLATION, where each failed
+deterministically, so the reload is not the cause:
+
+1. `server::socket_tests::inspect_reload_wait_status_reports_failed_when_reload_pid_is_dead`
+   fails at its own precondition (`socket_tests.rs:738`, "test requires a
+   definitely-dead pid"). The test asserts `!reload_process_alive(pid + 1_000_000)`,
+   but `reload_process_alive` returns `true` UNCONDITIONALLY on non-unix
+   (`server/reload_state.rs:182-186` is `let _ = pid; true`). No pid is ever dead
+   on Windows, so the precondition cannot hold. The sibling unit test that does
+   exercise real liveness (`reload_process_alive_handles_zero_and_dead_pids`,
+   `reload_state.rs:956`) is correctly `#[cfg(unix)]`; this one is the same
+   class and needs the same gate.
+
+2. `server::swarm::tests::swarm_status_immediate_broadcasts_can_invert_on_one_member_channel`
+   fails with `left = ["ready", "running"]`, `right = ["running", "ready"]`.
+   The assertion's own message says: "if this fails with the correct order, the
+   snapshot-vs-send race may have been fixed (update the wiring audit)". The
+   observed order IS the correct order, so the test's premise no longer holds.
+
+Neither is a product defect and neither touches this fix. Both are recorded as
+findings rather than patched here: the affected files carry heavy parallel
+uncommitted work, and a test-side gate or audit update belongs to whoever owns
+that change.
+
 the recorded restated result after the ninth-pass anchors:
 
 ---
