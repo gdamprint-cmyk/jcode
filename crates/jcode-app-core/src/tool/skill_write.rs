@@ -6,8 +6,15 @@
 //! action=`create` / `patch` / `write_file` / `remove_file` / `delete`), whose
 //! frontmatter validator (`_validate_frontmatter`) and read-before-write guard
 //! (`tools/skill_manager_guards.py`) this module ports.
-//! Reference: `~/.jcode/decisions/mutation_ledger.py`, the jcode ledger this
-//! module's mutations are expected to pass through.
+//! Reference: `~/.jcode/decisions/mutation_ledger.py`, the hook ledger this
+//! module's mutations also pass through (it needs a configured hook, so it is
+//! not guaranteed to be present).
+//! Reference: `%LOCALAPPDATA%\hermes\hermes-agent\tools\skill_ledger.py`, the
+//! Hermes per-mutation audit ledger whose row shape `curator_ledger` reproduces
+//! (read 2026-11-17: `append_entry` writes id/ts/actor/action/skill/evidence/
+//! before/after, and every public write path swallows failures).
+//! reference: https://docs.rs/sha2/latest/sha2/ - `Sha256::digest(&bytes)`
+//! one-shot API (read 2026-11-17).
 //!
 //! What this adds to jcode: `skill_manage` could only READ skills
 //! (`load`, `list`, `reload`, `reload_all`, `read`). An agent could therefore
@@ -60,6 +67,147 @@ pub struct SkillWrite {
     pub old_string: Option<String>,
     /// Replacement text, for `patch`.
     pub new_string: Option<String>,
+}
+
+/// Path of the per-skill mutation ledger.
+///
+/// `~/.jcode/skills/.curator_ledger.jsonl`, the same path shape Hermes uses for
+/// `%LOCALAPPDATA%\hermes\skills\.curator_ledger.jsonl`. Overridable so the
+/// ledger can be exercised without touching the real skills tree.
+pub fn curator_ledger_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("JCODE_SKILL_LEDGER_PATH") {
+        return PathBuf::from(path);
+    }
+    if let Some(dir) = std::env::var_os("JCODE_SKILL_LEDGER_DIR") {
+        return PathBuf::from(dir).join(".curator_ledger.jsonl");
+    }
+    skills_root(None).join(".curator_ledger.jsonl")
+}
+
+/// Whether skill writes are journaled, and where.
+///
+/// `None` disables the ledger entirely; the path is what the tool passes to the
+/// write functions. Opt-in via `JCODE_SKILL_LEDGER=on` (default path) or an
+/// explicit `JCODE_SKILL_LEDGER_PATH` / `JCODE_SKILL_LEDGER_DIR`.
+///
+/// The env vars live here, not in `record_skill_mutation`, so a test can pass its
+/// own path and cargo's parallel test threads cannot cross-contaminate ledgers.
+pub fn ledger_path() -> Option<PathBuf> {
+    if std::env::var_os("JCODE_SKILL_LEDGER_PATH").is_some()
+        || std::env::var_os("JCODE_SKILL_LEDGER_DIR").is_some()
+    {
+        return Some(curator_ledger_path());
+    }
+    match std::env::var("JCODE_SKILL_LEDGER") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            if value.is_empty() || matches!(value.as_str(), "0" | "off" | "false" | "no") {
+                None
+            } else {
+                Some(curator_ledger_path())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+    };
+    hex_lower(&digest)
+}
+
+/// Lowercase hex of a digest. std-only: a digest is a byte string, and a hex
+/// crate would be a dependency added for one line.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Append one before/after entry to the skill ledger.
+///
+/// TELEMETRY, NOT A GATE: every failure is swallowed, exactly like Hermes'
+/// `append_entry`, because a ledger that can block a skill write loses work.
+/// The row is the Hermes shape: `id`, `ts`, `actor`, `action`, `skill`,
+/// `evidence`, `before`, `after`, where before/after are `{path, sha256}` lists
+/// and `sha256` is null for a file that did not exist on that side.
+pub fn record_skill_mutation(
+    ledger: Option<&Path>,
+    action: &str,
+    skill: &str,
+    path: &Path,
+    before: Option<&[u8]>,
+) {
+    // An explicit path, not an env var read here: cargo runs tests in parallel
+    // threads and they must not share this state (Rust Book, ch. 11).
+    let Some(ledger) = ledger else {
+        return;
+    };
+    let entry = serde_json::json!({
+        "id": ledger_id(),
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "actor": "agent",
+        "action": action,
+        "skill": skill,
+        "evidence": {},
+        "before": [ledger_file(path, before)],
+        "after": [ledger_file_after(path)],
+    });
+    let Some(parent) = ledger.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(line) = serde_json::to_string(&entry) else {
+        return;
+    };
+    use std::io::Write as _;
+    // Bytes, not `writeln!`: the file is opened with implicit text-mode newline
+    // translation on Windows, and a translated terminator changes the row's bytes
+    // on every append. JSONL is defined by the LF terminator.
+    let mut line = line.into_bytes();
+    line.push(b'\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger)
+    {
+        let _ = file.write_all(&line);
+    }
+}
+
+/// The `before`/`after` file manifest. `None` is a side the caller did not
+/// capture bytes for, which for `before` is a file that did not exist; it stays
+/// null rather than being filled from disk, so a `create` cannot claim a
+/// before-state it never had.
+fn ledger_file(path: &Path, bytes: Option<&[u8]>) -> serde_json::Value {
+    let sha256 = bytes.map(sha256_bytes);
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "sha256": sha256,
+    })
+}
+
+/// The `after` side always comes from the file on disk, which is what the caller
+/// wrote; a post-write hash must not be derivable from the request alone.
+fn ledger_file_after(path: &Path) -> serde_json::Value {
+    let sha256 = std::fs::read(path).ok().map(|bytes| sha256_bytes(&bytes));
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "sha256": sha256,
+    })
+}
+
+/// 12 hex chars, the same id shape Hermes' `append_entry` writes.
+fn ledger_id() -> String {
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// Outcome of a skill write.
@@ -215,7 +363,11 @@ fn apply_patch(content: &str, old_string: &str, new_string: &str) -> Result<Stri
 ///
 /// Refuses to overwrite an existing skill: overwriting is a patch's job, and
 /// silently replacing a learned procedure loses it.
-pub fn create_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutcome> {
+pub fn create_skill(
+    root: &Path,
+    request: &SkillWrite,
+    ledger: Option<&Path>,
+) -> Result<SkillWriteOutcome> {
     let name = validate_skill_name(&request.name)?;
     let content = request
         .content
@@ -233,7 +385,9 @@ pub fn create_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutco
     }
     std::fs::create_dir_all(&dir)?;
     let content = normalize_line_endings(content, resolve_line_ending(&path, None));
+    let before = std::fs::read(&path).ok();
     std::fs::write(&path, content)?;
+    record_skill_mutation(ledger, "create", &name, &path, before.as_deref());
     Ok(SkillWriteOutcome {
         path,
         summary: format!("Created skill {name:?}"),
@@ -244,7 +398,11 @@ pub fn create_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutco
 ///
 /// The patched result must still be a valid skill, so a patch that breaks the
 /// frontmatter is refused before it is written rather than after.
-pub fn patch_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutcome> {
+pub fn patch_skill(
+    root: &Path,
+    request: &SkillWrite,
+    ledger: Option<&Path>,
+) -> Result<SkillWriteOutcome> {
     let name = validate_skill_name(&request.name)?;
     let old_string = request
         .old_string
@@ -259,10 +417,12 @@ pub fn patch_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutcom
             path.display()
         )
     })?;
+    let before = current.as_bytes();
     let updated = apply_patch(&current, old_string, new_string)?;
     validate_skill_document(&name, &updated)?;
     let updated = normalize_line_endings(&updated, resolve_line_ending(&path, Some(&current)));
     std::fs::write(&path, &updated)?;
+    record_skill_mutation(ledger, "patch", &name, &path, Some(before));
     Ok(SkillWriteOutcome {
         path,
         summary: format!("Patched skill {name:?}"),
@@ -274,7 +434,11 @@ pub fn patch_skill(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutcom
 /// Support files are how a skill stays small: the SKILL.md stays a short
 /// procedure and the bulk lives in `references/`. The file must stay inside
 /// the skill directory — a support file that escapes it is a path traversal.
-pub fn write_skill_file(root: &Path, request: &SkillWrite) -> Result<SkillWriteOutcome> {
+pub fn write_skill_file(
+    root: &Path,
+    request: &SkillWrite,
+    ledger: Option<&Path>,
+) -> Result<SkillWriteOutcome> {
     let name = validate_skill_name(&request.name)?;
     let file_path = request
         .file_path
@@ -321,8 +485,10 @@ pub fn write_skill_file(root: &Path, request: &SkillWrite) -> Result<SkillWriteO
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let before = std::fs::read(&target).ok();
     let content = normalize_line_endings(content, resolve_line_ending(&target, None));
     std::fs::write(&target, content)?;
+    record_skill_mutation(ledger, "write_file", &name, &target, before.as_deref());
     Ok(SkillWriteOutcome {
         path: target,
         summary: format!("Wrote {file_path} in skill {name:?}"),
@@ -377,11 +543,11 @@ mod tests {
         let mut request = req("demo");
         request.content = Some("---\nname: demo\ndescription: A demo\n---\n\nBody\n".to_string());
 
-        let outcome = create_skill(&root, &request).expect("create");
+        let outcome = create_skill(&root, &request, None).expect("create");
         assert!(outcome.path.exists());
         assert_eq!(outcome.path.file_name().unwrap(), "SKILL.md");
 
-        let second = create_skill(&root, &request);
+        let second = create_skill(&root, &request, None);
         assert!(second.is_err(), "an existing skill must not be overwritten");
     }
 
@@ -391,12 +557,12 @@ mod tests {
         let root = temp.path().join("skills");
         let mut request = req("demo");
         request.content = Some("---\nname: demo\ndescription: A demo\n---\n\nBody\n".to_string());
-        create_skill(&root, &request).expect("create");
+        create_skill(&root, &request, None).expect("create");
 
         let mut patch = req("demo");
         patch.old_string = Some("Body".to_string());
         patch.new_string = Some("New body".to_string());
-        let outcome = patch_skill(&root, &patch).expect("patch");
+        let outcome = patch_skill(&root, &patch, None).expect("patch");
         assert!(
             std::fs::read_to_string(outcome.path)
                 .unwrap()
@@ -407,7 +573,7 @@ mod tests {
         ambiguous.old_string = Some("e".to_string());
         ambiguous.new_string = Some("E".to_string());
         assert!(
-            patch_skill(&root, &ambiguous).is_err(),
+            patch_skill(&root, &ambiguous, None).is_err(),
             "an ambiguous patch must be refused"
         );
     }
@@ -418,12 +584,12 @@ mod tests {
         let root = temp.path().join("skills");
         let mut request = req("demo");
         request.content = Some("---\nname: demo\ndescription: A demo\n---\n\nBody\n".to_string());
-        create_skill(&root, &request).expect("create");
+        create_skill(&root, &request, None).expect("create");
 
         let mut patch = req("demo");
         patch.old_string = Some("description: A demo".to_string());
         patch.new_string = Some("description:".to_string());
-        assert!(patch_skill(&root, &patch).is_err());
+        assert!(patch_skill(&root, &patch, None).is_err());
     }
 
     #[test]
@@ -432,17 +598,91 @@ mod tests {
         let root = temp.path().join("skills");
         let mut request = req("demo");
         request.content = Some("---\nname: demo\ndescription: A demo\n---\n\nBody\n".to_string());
-        create_skill(&root, &request).expect("create");
+        create_skill(&root, &request, None).expect("create");
 
         let mut support = req("demo");
         support.file_path = Some("references/detail.md".to_string());
         support.content = Some("Reference body\n".to_string());
-        let outcome = write_skill_file(&root, &support).expect("write support file");
+        let outcome = write_skill_file(&root, &support, None).expect("write support file");
         assert!(outcome.path.ends_with("references/detail.md"));
 
         let mut escaping = req("demo");
         escaping.file_path = Some("../escape.md".to_string());
         escaping.content = Some("nope\n".to_string());
-        assert!(write_skill_file(&root, &escaping).is_err());
+        assert!(write_skill_file(&root, &escaping, None).is_err());
+    }
+
+    /// The ledger is telemetry for a bad skill edit: a write that is not
+    /// recorded is an edit nobody can prove or revert.
+    #[test]
+    fn skill_writes_are_recorded_with_before_and_after_hashes() {
+        let temp = tempfile::tempdir().unwrap();
+        // The test owns its ledger path. An env var would be process-global and
+        // cargo runs tests in parallel threads, so other tests' writes would
+        // land in this file.
+        let ledger = temp.path().join("ledger.jsonl");
+        let root = temp.path().join("skills");
+
+        let mut create = req("ledger-demo");
+        create.content = Some("---\nname: ledger-demo\ndescription: A demo\n---\n\nBody\n".to_string());
+        create_skill(&root, &create, Some(&ledger)).expect("create");
+
+        let mut patch = req("ledger-demo");
+        patch.old_string = Some("Body".to_string());
+        patch.new_string = Some("Patched body".to_string());
+        patch_skill(&root, &patch, Some(&ledger)).expect("patch");
+
+        // Read the bytes back from disk, never recomputed from a literal: the
+        // writer normalizes line endings, so the on-disk bytes are the truth.
+        let skill_md = root.join("ledger-demo").join("SKILL.md");
+        let after_bytes = std::fs::read(&skill_md).unwrap();
+        let expected_after = sha256_bytes(&after_bytes);
+        let expected_before = sha256_bytes(
+            b"---\nname: ledger-demo\ndescription: A demo\n---\n\nBody\n",
+        );
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .expect("ledger written")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("valid JSONL"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one entry per skill write: {lines:?}");
+
+        let create_row = &lines[0];
+        assert_eq!(create_row["action"], "create");
+        assert_eq!(create_row["skill"], "ledger-demo");
+        assert_eq!(
+            create_row["before"][0]["sha256"], serde_json::Value::Null,
+            "a created file had no before state"
+        );
+        assert_eq!(create_row["after"][0]["sha256"], expected_before);
+        assert_eq!(create_row["after"][0]["path"], skill_md.display().to_string());
+
+        let patch_row = &lines[1];
+        assert_eq!(patch_row["action"], "patch");
+        assert_eq!(patch_row["before"][0]["sha256"], expected_before);
+        assert_eq!(patch_row["after"][0]["sha256"], expected_after);
+        assert_ne!(
+            patch_row["before"][0]["sha256"], patch_row["after"][0]["sha256"],
+            "a real patch must change the hash"
+        );
+
+        // NEGATIVE CONTROL: a second patch's before-state must equal the first
+        // patch's after-state. If the ledger hashed the post-write file for both
+        // sides, this equality would hold but the create row's before would be
+        // non-null, so the control distinguishes the two implementations.
+        let mut patch2 = req("ledger-demo");
+        patch2.old_string = Some("Patched body".to_string());
+        patch2.new_string = Some("Third body".to_string());
+        patch_skill(&root, &patch2, Some(&ledger)).expect("patch again");
+        let lines2: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines2.len(), 3);
+        assert_eq!(lines2[2]["before"][0]["sha256"], expected_after);
     }
 }
