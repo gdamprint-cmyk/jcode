@@ -34,6 +34,7 @@ mod jcode_docs;
 pub use jcode_docs::{BundledDocs, bundled_docs, register_bundled_docs};
 pub mod mcp;
 mod memory;
+pub mod memory_write_gate;
 mod name_suggestions;
 mod open;
 mod panel;

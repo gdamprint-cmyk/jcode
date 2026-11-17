@@ -48,6 +48,43 @@ impl CompactionMode {
     }
 }
 
+/// Gate for writes into memory.
+///
+/// `"off"` (default) writes immediately. `"approve"` refuses every memory
+/// write until the user explicitly approves it through the existing
+/// permission surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryWriteGate {
+    /// Write immediately (default).
+    #[default]
+    Off,
+    /// Require an explicit user approval before the write is applied.
+    Approve,
+}
+
+impl MemoryWriteGate {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Approve => "approve",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" => Some(Self::Off),
+            "approve" | "approval" | "true" | "yes" => Some(Self::Approve),
+            _ => None,
+        }
+    }
+
+    /// Whether a memory write needs an explicit user approval first.
+    pub fn requires_approval(&self) -> bool {
+        matches!(self, Self::Approve)
+    }
+}
+
 /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
 /// Ctrl+Enter performs the alternate action.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -589,6 +626,16 @@ pub struct AgentsConfig {
     /// metadata / sanity checks). Unset = inferred from the model name.
     #[serde(default)]
     pub memory_embedding_dim: Option<usize>,
+    /// Gate for writes into memory.
+    ///
+    /// `"off"` (default) writes immediately, exactly as before this setting
+    /// existed. `"approve"` refuses every memory write until the user
+    /// explicitly approves it, using the existing permission surface
+    /// (`jcode permissions`, the Telegram/email reply paths).
+    ///
+    /// The gate is opt-in so an existing config.toml keeps its behaviour.
+    #[serde(default)]
+    pub memory_write_gate: MemoryWriteGate,
     /// Maximum number of live swarm worker agents in one swarm. This is the RAM
     /// safety budget for spawning. Completed/stopped workers do not consume
     /// slots. `0` disables this configurable guard,
@@ -672,6 +719,7 @@ impl Default for AgentsConfig {
             memory_embedding_model: None,
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
+            memory_write_gate: MemoryWriteGate::default(),
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
             swarm_stall_after_secs: default_swarm_stall_after_secs(),
             swarm_stall_nudge: false,
