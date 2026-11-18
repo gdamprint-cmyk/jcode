@@ -46,6 +46,29 @@ captures/
 # never a committed baseline.
 *.out
 
+# Session/agent scratch dumps at the repo root and under research/. These are
+# command captures, log extracts and probe output written by live agent
+# sessions, not source, and they dominated the untracked listing.
+/out_*.txt
+/promote*.json
+/stash_*.txt
+/nil
+/server_help.txt
+/path_matrix_final.txt
+/probe_live_identity.ps1
+/win_diff.patch
+/t2.txt
+/t3.txt
+/test_out.txt
+/wt.txt
+/crates/jcode-tui/.cgrep/
+/research/_*.txt
+/research/cargo_*.txt
+/research/check_out.txt
+/research/cv*-reconcile-*.txt
+/research/run_tests_status.txt
+/research/test_*_out.txt
+
 # A stray zero-byte file named 746 that some earlier run left in the repo
 # root. Provenance was never established, so it is ignored rather than
 # deleted - see artifact-stray-746-provenance.md. Listed here as well as
