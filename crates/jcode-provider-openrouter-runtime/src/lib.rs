@@ -1110,6 +1110,12 @@ impl OpenRouterProvider {
                 self.profile_id.as_deref(),
                 self.send_openrouter_headers,
             )
+            // A profile that explicitly declared itself as not supporting
+            // reasoning levels still reaches the swarm sentinel: swarm is a
+            // Jcode orchestration mode, not a wire-level effort, so it must not
+            // be gated behind provider effort support. Without this,
+            // `/effort swarm` is refused before the ladder is even consulted.
+            || self.reasoning_effort_support == Some(false)
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {

@@ -584,6 +584,12 @@ impl Provider for OpenRouterProvider {
             self.send_openrouter_headers,
         ) {
             jcode_provider_core::OPENROUTER_SELECTABLE_EFFORTS.to_vec()
+        } else if self.reasoning_effort_support == Some(false) {
+            // A profile that declared itself as NOT supporting reasoning effort
+            // gets no level rungs, so the ladder cannot offer dials that do
+            // nothing. The swarm sentinel stays: it is a Jcode UI mode rather
+            // than a wire-level effort, so `/effort swarm` keeps working.
+            vec!["swarm"]
         } else {
             vec![]
         }

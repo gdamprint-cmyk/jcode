@@ -3250,8 +3250,13 @@ fn compat_profile_serving_gpt_family_model_supports_reasoning_effort() {
         ..make_custom_compatible_provider()
     };
     force_off.set_model("gpt-5.3-codex-spark").unwrap();
-    assert!(force_off.available_efforts().is_empty());
+    assert_eq!(
+        force_off.available_efforts(),
+        vec!["swarm"],
+        "a profile that opted out of effort keeps only the swarm sentinel"
+    );
     assert!(force_off.set_reasoning_effort("high").is_err());
+    force_off.set_reasoning_effort("swarm").unwrap();
 }
 
 #[test]
@@ -3290,11 +3295,19 @@ fn named_profile_supports_reasoning_effort_config_override() {
         ..make_custom_compatible_provider()
     };
     force_off.set_model("deepseek-v4-flash").unwrap();
-    assert!(force_off.available_efforts().is_empty());
+    assert_eq!(
+        force_off.available_efforts(),
+        vec!["swarm"],
+        "a profile that declared itself as not supporting effort keeps only the swarm sentinel"
+    );
     assert!(
         force_off.set_reasoning_effort("high").is_err(),
         "explicit supports_reasoning_effort=false suppresses model auto-detection"
     );
+    force_off
+        .set_reasoning_effort("swarm")
+        .expect("the swarm sentinel stays reachable on a reasoning-disabled profile");
+    assert_eq!(force_off.reasoning_effort(), Some("swarm".to_string()));
 }
 
 /// `supports_reasoning_effort = true` must put `none` on the wire.
