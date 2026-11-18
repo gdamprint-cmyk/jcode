@@ -40,6 +40,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::MemoryWriteGate;
+use crate::memory::MemoryEntry;
 
 /// The action label the permission surface shows for a memory write.
 const MEMORY_WRITE_ACTION: &str = "memory_write";
@@ -79,6 +80,29 @@ pub fn memory_write_request_id(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     )
+}
+
+/// The first 12 bytes of a sha256 digest as hex (96 bits of request id).
+fn id_prefix(hasher: sha2::Sha256) -> String {
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(12)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+/// Clip a content preview for the permission request description.
+fn truncate(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let clipped: String = trimmed.chars().take(max_chars - 1).collect();
+    format!("{clipped}…")
 }
 
 /// Whether the config asks for an approval before a memory write.
@@ -240,6 +264,169 @@ fn ensure_request_queued(
     if let crate::safety::PermissionResult::Queued { request_id } = result {
         crate::logging::info(&format!(
             "MEMORY_WRITE_GATE queued a memory write for approval: {request_id}"
+        ));
+    }
+}
+
+/// Decide whether a whole batch of memory writes may be applied.
+///
+/// This is the CLI import path: `jcode memory import` writes many entries in
+/// one command, so gating them one at a time would queue a request per entry.
+/// Instead the batch is evaluated as a unit and ONE permission request covers
+/// it, under the same contract as [`evaluate_memory_write`]:
+///
+/// - gate off, or the batch already approved -> `Allowed`
+/// - the batch explicitly refused -> `Rejected` (fail closed, nothing is written)
+/// - otherwise -> `Pending { request_id, reason }`, with the request queued for
+///   the existing permission surfaces and the batch left unwritten.
+///
+/// The batch id is deterministic over the same inputs as the per-entry ids, so
+/// approving the batch request and re-running the identical import goes
+/// through, and a different import is a different request.
+// reference: https://github.com/NousResearch/hermes-agent/blob/main/tools/write_approval.py
+//   (per-subsystem write_approval gate, allow/blocked/stage; this batch entry
+//   point applies the same contract to a multi-entry import)
+pub fn evaluate_memory_write_batch(
+    session_id: &str,
+    scope: &str,
+    entries: &[MemoryEntry],
+) -> GateOutcome {
+    if !gate_enabled() {
+        return GateOutcome::Allowed;
+    }
+
+    let batch_id = memory_write_batch_id(session_id, scope, entries);
+
+    if approval_cached(session_id, &batch_id) {
+        return GateOutcome::Allowed;
+    }
+
+    match crate::safety::permission_decision_via_file(&batch_id) {
+        Ok(Some(decision)) if decision.approved => {
+            remember_approval(session_id, &batch_id);
+            return GateOutcome::Allowed;
+        }
+        Ok(Some(decision)) => {
+            return GateOutcome::Rejected {
+                reason: decision
+                    .message
+                    .unwrap_or_else(|| "the user rejected this memory import".to_string()),
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "MEMORY_WRITE_GATE could not read the permission history: {error}"
+            ));
+        }
+    }
+
+    ensure_batch_request_queued(session_id, &batch_id, scope, entries);
+
+    let count = entries.len();
+    GateOutcome::Pending {
+        request_id: batch_id.clone(),
+        reason: format!(
+            "MEMORY-WRITE GATE: importing {count} memories into {scope} memory needs your \
+             approval. Approve it with `jcode permissions` (request id {batch_id}) or the \
+             Telegram/email reply, then repeat the same import."
+        ),
+    }
+}
+
+/// The deterministic request id for a batch memory write.
+///
+/// Same construction as [`memory_write_request_id`] (fields separated by a
+/// zero byte, sha256, first 12 bytes hex), but the content component is the
+/// concatenation of the entries' id/category/content so the id identifies the
+/// exact batch.
+pub fn memory_write_batch_id(session_id: &str, scope: &str, entries: &[MemoryEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for part in [session_id, scope] {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    // Keyed by CONTENT, not by the entry id: an import's ids are whatever the
+    // source file carried, and re-exporting the same memories can reorder or
+    // re-id them. The same batch of facts must produce the same request id so
+    // the approval is reusable. A deterministic sort makes the id independent
+    // of the order the file happened to list them in.
+    let mut fingerprint = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}\u{0}{}\u{0}",
+                entry.category,
+                entry.content.trim()
+            )
+        })
+        .collect::<Vec<_>>();
+    fingerprint.sort();
+    for part in fingerprint {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("req_memory_{}", id_prefix(hasher))
+}
+
+/// Put the batch request into the permission queue if it is not there yet.
+fn ensure_batch_request_queued(
+    session_id: &str,
+    request_id: &str,
+    scope: &str,
+    entries: &[MemoryEntry],
+) {
+    let system = crate::safety::SafetySystem::new();
+    if system
+        .pending_requests()
+        .iter()
+        .any(|req| req.id == request_id)
+    {
+        return;
+    }
+
+    let summary = entries
+        .iter()
+        .take(3)
+        .map(|entry| format!("{}: {}", entry.category, truncate(&entry.content, 60)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = entries.len().saturating_sub(3);
+    let summary = if more > 0 {
+        format!("{summary}; and {more} more")
+    } else {
+        summary
+    };
+
+    let request = crate::safety::PermissionRequest {
+        id: request_id.to_string(),
+        action: MEMORY_WRITE_ACTION.to_string(),
+        description: format!(
+            "Import {} memories into {scope} memory: {summary}",
+            entries.len()
+        ),
+        rationale:
+            "The memory write gate is enabled, so an import is not stored until you approve it."
+                .to_string(),
+        urgency: crate::safety::Urgency::Normal,
+        wait: false,
+        created_at: chrono::Utc::now(),
+        context: Some(json!({
+            "session_id": session_id,
+            "review": {
+                "summary": format!("Import {} memories into {scope} memory", entries.len()),
+                "why_permission_needed":
+                    "memory_write_gate = \"approve\" is set, so an import is only stored after you approve it.",
+                "files": Vec::<String>::new(),
+                "commands": Vec::<String>::new(),
+            },
+        })),
+    };
+
+    let result = system.request_permission(request);
+    if let crate::safety::PermissionResult::Queued { request_id } = result {
+        crate::logging::info(&format!(
+            "MEMORY_WRITE_GATE queued a memory import for approval: {request_id}"
         ));
     }
 }

@@ -1793,6 +1793,43 @@ async fn run_memory_command_for_dir(
             let content = std::fs::read_to_string(&input)?;
             let memories: Vec<memory::MemoryEntry> = serde_json::from_str(&content)?;
 
+            // Memory write gate (opt-in, default off). `import` writes many
+            // entries in one command, so it is gated as a BATCH: one permission
+            // request for the whole import, and nothing is written until the
+            // user approves it. The request id is deterministic, so repeating
+            // the identical import after the approval goes through.
+            //
+            // reference: crates/jcode-app-core/src/tool/memory_write_gate.rs
+            //   (evaluate_memory_write_batch, the batch entry point of the same
+            //   gate that covers the agent's `remember` tool call)
+            // The gate keys its approval cache by session id. A one-off CLI
+            // import has no session, so the identity is the process id: the
+            // same process (a retry in the same shell invocation) and a fresh
+            // process each get their own approval, and the durable decision
+            // still lives in the permission history.
+            let gate_session = format!("cli-import-{}", std::process::id());
+            match crate::tool::memory_write_gate::evaluate_memory_write_batch(
+                &gate_session,
+                scope.as_str(),
+                &memories,
+            ) {
+                crate::tool::memory_write_gate::GateOutcome::Allowed => {}
+                crate::tool::memory_write_gate::GateOutcome::Pending {
+                    request_id,
+                    reason,
+                } => {
+                    println!("{reason}");
+                    println!(
+                        "Nothing was imported. Re-run the same command after approving \
+                         request {request_id}."
+                    );
+                    return Ok(());
+                }
+                crate::tool::memory_write_gate::GateOutcome::Rejected { reason } => {
+                    anyhow::bail!("memory import rejected by the user: {reason}");
+                }
+            }
+
             let mut imported = 0;
             let mut skipped = 0;
 

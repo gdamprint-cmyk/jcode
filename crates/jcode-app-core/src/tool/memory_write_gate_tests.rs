@@ -272,3 +272,145 @@ fn request_id_is_deterministic_and_session_scoped() {
     assert_ne!(first, other_scope, "a scope must not share an approval");
     assert!(first.starts_with("req_memory_"), "unexpected id: {first}");
 }
+
+/// The batch id is deterministic and identifies the exact batch.
+#[test]
+fn batch_id_is_deterministic_and_batch_scoped() {
+    let entry = |content: &str| {
+        crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, content.to_string())
+    };
+
+    let first = crate::tool::memory_write_gate::memory_write_batch_id(
+        "session-a",
+        "project",
+        &[entry("one"), entry("two")],
+    );
+    let again = crate::tool::memory_write_gate::memory_write_batch_id(
+        "session-a",
+        "project",
+        &[entry("one"), entry("two")],
+    );
+    let reordered = crate::tool::memory_write_gate::memory_write_batch_id(
+        "session-a",
+        "project",
+        &[entry("two"), entry("one")],
+    );
+    let different = crate::tool::memory_write_gate::memory_write_batch_id(
+        "session-a",
+        "project",
+        &[entry("one"), entry("three")],
+    );
+    let other_session = crate::tool::memory_write_gate::memory_write_batch_id(
+        "session-b",
+        "project",
+        &[entry("one"), entry("two")],
+    );
+
+    assert_eq!(first, again, "the same batch must produce the same id");
+    assert_eq!(
+        first, reordered,
+        "the id must not depend on the order the file listed the entries"
+    );
+    assert_ne!(first, different, "a different batch must produce a different id");
+    assert_ne!(first, other_session, "a session must not share an approval");
+    assert!(first.starts_with("req_memory_"), "unexpected id: {first}");
+}
+
+/// The gate off lets an import batch through.
+#[tokio::test]
+async fn batch_gate_off_allows_the_import() {
+    let _guard = crate::storage::lock_test_env();
+    let _home = GateHome::new("off");
+    let entries = vec![crate::memory::MemoryEntry::new(
+        crate::memory::MemoryCategory::Fact,
+        "batch-off-probe".to_string(),
+    )];
+
+    let outcome = crate::tool::memory_write_gate::evaluate_memory_write_batch(
+        "batch-session",
+        "project",
+        &entries,
+    );
+    assert_eq!(outcome, crate::tool::memory_write_gate::GateOutcome::Allowed);
+}
+
+/// The gate on holds the whole batch and queues ONE request for it.
+#[tokio::test]
+async fn batch_gate_on_holds_the_batch_and_queues_one_request() {
+    let _guard = crate::storage::lock_test_env();
+    let _home = GateHome::new("approve");
+    let entries = vec![
+        crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "batch-probe-one".to_string(),
+        ),
+        crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "batch-probe-two".to_string(),
+        ),
+    ];
+
+    let outcome = crate::tool::memory_write_gate::evaluate_memory_write_batch(
+        "batch-session",
+        "project",
+        &entries,
+    );
+
+    let crate::tool::memory_write_gate::GateOutcome::Pending { reason, .. } = &outcome else {
+        panic!("a gated batch must be held: {outcome:?}");
+    };
+    assert!(
+        reason.contains("needs your approval"),
+        "the reason must say the import is held: {reason}"
+    );
+
+    let pending = crate::safety::SafetySystem::new().pending_requests();
+    assert_eq!(
+        pending
+            .iter()
+            .filter(|req| req.action == "memory_write")
+            .count(),
+        1,
+        "one import must queue exactly one request: {pending:?}"
+    );
+    assert!(
+        pending.iter().any(|req| req.description.contains("2 memories")),
+        "the request must describe the batch: {pending:?}"
+    );
+}
+
+/// After the user approves the batch, the same import goes through.
+#[tokio::test]
+async fn batch_gate_lets_the_import_through_after_approval() {
+    let _guard = crate::storage::lock_test_env();
+    let _home = GateHome::new("approve");
+    let entries = vec![crate::memory::MemoryEntry::new(
+        crate::memory::MemoryCategory::Fact,
+        "batch-approved-probe".to_string(),
+    )];
+    let session = "batch-approved-session";
+
+    let first = crate::tool::memory_write_gate::evaluate_memory_write_batch(
+        session,
+        "project",
+        &entries,
+    );
+    assert!(
+        matches!(first, crate::tool::memory_write_gate::GateOutcome::Pending { .. }),
+        "{first:?}"
+    );
+
+    let batch_id = crate::tool::memory_write_gate::memory_write_batch_id(session, "project", &entries);
+    crate::safety::record_permission_via_file(&batch_id, true, "test", None)
+        .expect("record the approval");
+
+    let second = crate::tool::memory_write_gate::evaluate_memory_write_batch(
+        session,
+        "project",
+        &entries,
+    );
+    assert_eq!(
+        second, crate::tool::memory_write_gate::GateOutcome::Allowed,
+        "the approved batch must go through"
+    );
+}
