@@ -77,10 +77,10 @@ struct IsolatedRuntimeDir {
     _temp: tempfile::TempDir,
 }
 
-struct IsolatedReloadRecoveryEnv {
+pub(super) struct IsolatedReloadRecoveryEnv {
     prev_home: Option<std::ffi::OsString>,
     prev_runtime: Option<std::ffi::OsString>,
-    _home: tempfile::TempDir,
+    pub(super) _home: tempfile::TempDir,
     _runtime: tempfile::TempDir,
 }
 
@@ -643,7 +643,7 @@ impl IsolatedRuntimeDir {
 }
 
 impl IsolatedReloadRecoveryEnv {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let home = tempfile::TempDir::new().expect("jcode home");
         let runtime = tempfile::TempDir::new().expect("runtime dir");
         let prev_home = std::env::var_os("JCODE_HOME");

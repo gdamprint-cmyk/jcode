@@ -9,6 +9,7 @@ use crate::protocol::{
 };
 use crate::provider::Provider;
 use crate::session::{Session, SessionStatus};
+use super::client_writer_task::ClientWriter;
 use crate::transport::WriteHalf;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
@@ -141,7 +142,7 @@ pub(super) async fn handle_get_state(
     client_is_processing: bool,
     pending_soft_interrupts: usize,
     sessions: &SessionAgents,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
 ) -> Result<()> {
     let session_count = {
         let sessions_guard = sessions.read().await;
@@ -175,7 +176,7 @@ pub(super) async fn handle_get_history(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -257,7 +258,7 @@ pub(super) async fn handle_get_model_catalog(
     session_id: &str,
     agent: &Arc<Mutex<Agent>>,
     provider: &Arc<dyn Provider>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
 ) -> Result<()> {
     let started = Instant::now();
     let build_started = Instant::now();
@@ -384,23 +385,18 @@ pub(super) async fn handle_get_model_catalog(
         applets: Default::default(),
     };
     let json = encode_event(&event);
+    let json_len = json.len();
     let encode_ms = encode_started.elapsed().as_millis();
     let write_started = Instant::now();
-    let mut writer_guard = writer.lock().await;
-    let writer_lock_ms = write_started.elapsed().as_millis();
-    writer_guard.write_all(json.as_bytes()).await?;
-    let write_ms = write_started
-        .elapsed()
-        .as_millis()
-        .saturating_sub(writer_lock_ms);
+    writer.send_frame(json.into_bytes())?;
+    let write_ms = write_started.elapsed().as_millis();
     crate::logging::info(&format!(
-        "[TIMING] handle_get_model_catalog: session={}, source={}, bytes={}, build={}ms, encode={}ms, writer_lock={}ms, write={}ms, total={}ms",
+        "[TIMING] handle_get_model_catalog: session={}, source={}, bytes={}, build={}ms, encode={}ms, write={}ms, total={}ms",
         session_id,
         source,
-        json.len(),
+        json_len,
         build_ms,
         encode_ms,
-        writer_lock_ms,
         write_ms,
         started.elapsed().as_millis()
     ));
@@ -411,7 +407,7 @@ pub(super) async fn handle_get_compacted_history(
     id: u64,
     session_id: &str,
     agent: &Arc<Mutex<Agent>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
     visible_messages: usize,
 ) -> Result<()> {
     let started = Instant::now();
@@ -686,7 +682,7 @@ async fn send_history_from_persisted_session(
     provider: &Arc<dyn Provider>,
     sessions: &SessionAgents,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -815,13 +811,14 @@ async fn send_history_from_persisted_session(
     };
 
     let json = encode_event(&history_event);
-    let mut writer_guard = writer.lock().await;
+    // The turn state and the history belong together: queue them as ONE
+    // frame so no other producer can interleave between them.
+    let mut frames = Vec::new();
     if supports_turn_identity && let Some(state) = history_turn_state(sessions, session_id) {
-        writer_guard
-            .write_all(encode_event(&state).as_bytes())
-            .await?;
+        frames.push(encode_event(&state).into_bytes());
     }
-    writer_guard.write_all(json.as_bytes()).await?;
+    frames.push(json.into_bytes());
+    writer.send_frames(&frames)?;
     Ok(())
 }
 
@@ -865,7 +862,7 @@ async fn send_history_with_guard(
     agent_guard: tokio::sync::MutexGuard<'_, Agent>,
     sessions: &SessionAgents,
     client_count: &Arc<RwLock<usize>>,
-    writer: &Arc<Mutex<WriteHalf>>,
+    writer: &ClientWriter,
     server_name: &str,
     server_icon: &str,
     was_interrupted: Option<bool>,
@@ -1132,20 +1129,19 @@ async fn send_history_with_guard(
     let json_len = json.len();
     let encode_ms = encode_start.elapsed().as_millis();
     let writer_lock_start = Instant::now();
-    let mut writer_guard = writer.lock().await;
-    let writer_lock_ms = writer_lock_start.elapsed().as_millis();
-    let write_start = Instant::now();
+    // The turn state and the history belong together: queue them as ONE
+    // frame so no other producer can interleave between them.
+    let mut frames = Vec::new();
     if supports_turn_identity && let Some(state) = history_turn_state(sessions, session_id) {
-        writer_guard
-            .write_all(encode_event(&state).as_bytes())
-            .await?;
+        frames.push(encode_event(&state).into_bytes());
     }
-    let result = writer_guard.write_all(json.as_bytes()).await;
-    drop(writer_guard);
+    frames.push(json.clone().into_bytes());
+    let result = writer.send_frames(&frames);
+    let writer_lock_ms = writer_lock_start.elapsed().as_millis();
     // Release the serialized payload before any further work (logging below
     // only needs the captured length).
     drop(json);
-    let write_ms = write_start.elapsed().as_millis();
+    let write_ms = writer_lock_start.elapsed().as_millis();
 
     crate::logging::info(&format!(
         "[TIMING] send_history write: session={}, bytes={}, build={}ms ({}), encode={}ms, writer_lock={}ms, write={}ms, total={}ms",
@@ -1216,16 +1212,14 @@ fn history_turn_state(sessions: &SessionAgents, session_id: &str) -> Option<Serv
     })
 }
 
-async fn write_event(writer: &Arc<Mutex<WriteHalf>>, event: &ServerEvent) -> Result<()> {
+async fn write_event(writer: &ClientWriter, event: &ServerEvent) -> Result<()> {
     // Serialize straight to bytes with the same framing as encode_event
     // (JSON body, "{}" on serialize failure, trailing newline) and drop the
     // buffer as soon as the bytes are written so the serialized copy does not
     // outlive the socket write.
     let mut buf = serde_json::to_vec(event).unwrap_or_else(|_| b"{}".to_vec());
     buf.push(b'\n');
-    let mut writer = writer.lock().await;
-    writer.write_all(&buf).await?;
-    drop(buf);
+    writer.send_frame(buf)?;
     Ok(())
 }
 

@@ -203,7 +203,7 @@ async fn sdk_socket_workflow_inner(
     let (server_task, client_stream) = connect();
 
     let (client_reader, mut client_writer) = client_stream.into_split();
-    let mut client_reader = DaemonEvents::new(BufReader::new(client_reader));
+    let mut client_reader = BufReader::new(client_reader);
 
     async fn send(writer: &mut crate::transport::WriteHalf, value: serde_json::Value) {
         writer

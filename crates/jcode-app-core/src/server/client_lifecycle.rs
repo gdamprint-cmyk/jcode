@@ -298,18 +298,7 @@ pub(super) async fn handle_client(
     client_instance_sessions: super::client_instance_sessions::ClientInstanceSessions,
 ) -> Result<()> {
     let handler_start = Instant::now();
-    let (reader, writer_half) = {
-        // TEMPORARY PROBE (do not commit): env-gated, so the default path is
-        // byte-identical. BLOCK_PROBE=1 makes the READ half hold its mutex
-        // across a blocking sleep, reproducing the native stack exactly:
-        // the runtime worker parks in a sync-lock wait while the writer is
-        // stuck in NtWriteFile.
-        if std::env::var_os("JCODE_BLOCK_PROBE").is_some() {
-            stream.into_split_probe()
-        } else {
-            stream.into_split()
-        }
-    };
+    let (reader, writer_half) = stream.into_split();
     let mut reader = BufReader::new(reader);
     // ONE task owns the write half for the whole life of the connection. Two
     // tasks writing the same half can lose the write-ready wakeup, because
@@ -351,7 +340,7 @@ pub(super) async fn handle_client(
                     let keep_connection_open = matches!(request, Request::Ping { .. });
                     handle_lightweight_control_request(
                         request,
-                        Arc::clone(&writer),
+                        writer.clone(),
                         LightweightControlContext {
                             sessions: &sessions,
                             global_session_id: &global_session_id,
@@ -583,7 +572,7 @@ pub(super) async fn handle_client(
         tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
 
     // Spawn event forwarder for this client only
-    let writer_clone = Arc::clone(&writer);
+    let writer_clone = writer.clone();
     let client_connection_id_for_events = client_connection_id.clone();
     let client_connections_for_events = Arc::clone(&client_connections);
     let event_handle = tokio::spawn(async move {
@@ -620,9 +609,7 @@ pub(super) async fn handle_client(
             let Some(event) = event_for_transport(event, supports_turn_identity) else {
                 continue;
             };
-            let json = encode_event(&event);
-            let mut w = writer_clone.lock().await;
-            if let Err(error) = w.write_all(json.as_bytes()).await {
+            if let Err(error) = writer_clone.send_event(&event) {
                 // A broken pipe here is routine (client reload/disconnect mid
                 // broadcast), so keep the line short: a full Debug dump of e.g.
                 // a SwarmStatus event prints every member and floods the log.
@@ -850,9 +837,7 @@ pub(super) async fn handle_client(
                         message: format!("Invalid request: {}", e),
                         retry_after_secs: None,
                     };
-                    let json = encode_event(&event);
-                    let mut w = writer.lock().await;
-                    if w.write_all(json.as_bytes()).await.is_err() {
+                    if writer.send_event(&event).is_err() {
                         break;
                     }
                     continue;
@@ -1055,11 +1040,9 @@ pub(super) async fn handle_client(
 
         // Send ack
         let ack = ServerEvent::Ack { id: request.id() };
-        let json = encode_event(&ack);
         {
             let ack_start = Instant::now();
-            let mut w = writer.lock().await;
-            if w.write_all(json.as_bytes()).await.is_err() {
+            if writer.send_event(&ack).is_err() {
                 if request_lifecycle_logged {
                     let mut fields =
                         server_request_lifecycle_fields(ServerRequestLifecycleFields {
@@ -1600,18 +1583,14 @@ pub(super) async fn handle_client(
 
             Request::Ping { id } => {
                 let event = super::session_connections::connection_presence_pong(id, &client_connections, &swarm_members).await;
-                let json = encode_event(&event);
-                let mut w = writer.lock().await;
-                if w.write_all(json.as_bytes()).await.is_err() {
+                if writer.send_event(&event).is_err() {
                     break;
                 }
             }
 
             Request::PrepareDisconnect { id } => {
                 drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
-                let json = encode_event(&ServerEvent::Done { id });
-                let mut w = writer.lock().await;
-                if w.write_all(json.as_bytes()).await.is_err() {
+                if writer.send_event(&ServerEvent::Done { id }).is_err() {
                     break;
                 }
             }

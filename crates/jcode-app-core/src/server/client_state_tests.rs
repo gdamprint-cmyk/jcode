@@ -189,7 +189,8 @@ fn model_prefetch_hydrates_capabilities_with_existing_model_names() {
 
             let (stream, mut peer) = crate::transport::stream_pair().unwrap();
             let (_, writer) = stream.into_split();
-            let writer = Arc::new(Mutex::new(writer));
+            let (writer, _writer_handle) =
+                crate::server::client_writer_task::spawn_test_client_writer(writer);
             handle_get_model_catalog(44, session_id, &agent, &provider, &writer)
                 .await
                 .unwrap();
@@ -442,7 +443,8 @@ async fn turn_identity_busy_history_bootstraps_active_turn_and_idle_watermark() 
     let count = Arc::new(RwLock::new(1));
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
     let (_, write_half) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write_half));
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write_half);
     let busy = agent.lock().await;
     let lease = busy.claim_server_turn().unwrap();
     let expected = lease.identity().clone();
@@ -545,7 +547,8 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
     let count = Arc::new(RwLock::new(1));
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
     let (reader, write_half) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write_half));
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write_half);
     let busy_guard = agent.lock().await;
 
     // Keep the mutex held throughout, representing either idle prefetch or a
@@ -767,7 +770,8 @@ async fn assert_history_service_tier_and_pdf_capability(
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
     let (reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(writer_a);
 
     if racing_turn {
         // Reproduce the exact decision/preparation boundary without scheduler
@@ -777,9 +781,8 @@ async fn assert_history_service_tier_and_pdf_capability(
         tokio::pin!(turn);
         assert!(futures::poll!(&mut turn).is_pending());
 
-        // Socket backpressure lets us inspect the lock lifetime after snapshot
-        // preparation, while the history request is still in flight.
-        let writer_guard = writer.lock().await;
+        // The snapshot must release the agent BEFORE the socket write, so the
+        // racing turn can take the agent while the history is still in flight.
         let history = super::send_history_with_guard(
             42,
             session_id,
@@ -798,12 +801,15 @@ async fn assert_history_service_tier_and_pdf_capability(
             None,
         );
         tokio::pin!(history);
-        assert!(futures::poll!(&mut history).is_pending());
-        let turn_guard = match futures::poll!(&mut turn) {
-            std::task::Poll::Ready(guard) => guard,
-            std::task::Poll::Pending => panic!("snapshot must release agent before socket write"),
+        let turn_guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            &mut turn,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => panic!("snapshot must release agent before socket write"),
         };
-        drop(writer_guard);
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut history)
             .await
             .expect("history must not reacquire the racing turn's lock")
