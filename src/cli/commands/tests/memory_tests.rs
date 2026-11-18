@@ -135,23 +135,17 @@ async fn memory_cli_import_is_gated_until_approved() {
     )
     .expect("write config");
     crate::config::invalidate_config_cache();
-    // This test runs FIRST in the suite (alphabetical order) and mutates two
-    // process-global pieces of state: the approval cache below and the config
-    // cache. `SavedEnv` only restores the env var, so without this reset the
-    // next test in the process inherits `gate on` and fails.
-    let gate_session = format!("cli-import-{}", std::process::id());
-    crate::tool::memory_write_gate::reset_session(&gate_session);
-    // Reset again when this test ends, so the next test in the process does not
-    // inherit this test's approval. `SavedEnv` drops BEFORE this guard, so the
-    // reset runs after JCODE_HOME is restored.
-    struct ResetGateOnDrop(String);
-    impl Drop for ResetGateOnDrop {
+    // The config cache is process-global and this test runs FIRST in the suite
+    // (alphabetical order), so it must not leak `gate on` into the next test.
+    // `SavedEnv` drops BEFORE this guard, so the reset runs after JCODE_HOME is
+    // restored.
+    struct ResetConfigOnDrop;
+    impl Drop for ResetConfigOnDrop {
         fn drop(&mut self) {
-            crate::tool::memory_write_gate::reset_session(&self.0);
             crate::config::invalidate_config_cache();
         }
     }
-    let _reset_on_drop = ResetGateOnDrop(gate_session.clone());
+    let _reset_on_drop = ResetConfigOnDrop;
 
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).expect("create project");
@@ -199,7 +193,6 @@ async fn memory_cli_import_is_gated_until_approved() {
 
 /// Approve the deterministic batch id, then the same import goes through.
     let batch_id = crate::tool::memory_write_gate::memory_write_batch_id(
-        &gate_session,
         "project",
         std::slice::from_ref(&entry),
     );
@@ -220,5 +213,31 @@ async fn memory_cli_import_is_gated_until_approved() {
             .map(|memory| memory.content.as_str()),
         Some("gated import probe"),
         "the approved import must be stored"
+    );
+
+    // A SECOND importer process must reach the SAME decision from the durable
+    // history alone. The request id is content-keyed precisely so that a fresh
+    // process (new pid, no in-memory approval cache) can find the approval made
+    // by another process; keying it by session would hold the import forever.
+    // reference: crates/jcode-app-core/src/tool/memory_write_gate.rs
+    //   (memory_write_batch_id, deliberately NOT session-scoped)
+    // reference: https://docs.stripe.com/api/idempotent_requests
+    //   (an idempotency key identifies the OPERATION, so a retry reaches the
+    //   saved result; keying it by caller/session defeats the purpose)
+    crate::config::invalidate_config_cache();
+    let second_batch_id = crate::tool::memory_write_gate::memory_write_batch_id(
+        "project",
+        std::slice::from_ref(&entry),
+    );
+    assert_eq!(
+        second_batch_id, batch_id,
+        "a second process must derive the same request id from the same content"
+    );
+    assert!(
+        matches!(
+            crate::safety::permission_decision_via_file(&second_batch_id).expect("read history"),
+            Some(decision) if decision.approved
+        ),
+        "the durable history must carry the approval for the content-keyed id"
     );
 }

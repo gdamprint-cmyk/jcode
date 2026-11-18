@@ -281,28 +281,23 @@ fn batch_id_is_deterministic_and_batch_scoped() {
     };
 
     let first = crate::tool::memory_write_gate::memory_write_batch_id(
-        "session-a",
         "project",
         &[entry("one"), entry("two")],
     );
     let again = crate::tool::memory_write_gate::memory_write_batch_id(
-        "session-a",
         "project",
         &[entry("one"), entry("two")],
     );
     let reordered = crate::tool::memory_write_gate::memory_write_batch_id(
-        "session-a",
         "project",
         &[entry("two"), entry("one")],
     );
     let different = crate::tool::memory_write_gate::memory_write_batch_id(
-        "session-a",
         "project",
         &[entry("one"), entry("three")],
     );
-    let other_session = crate::tool::memory_write_gate::memory_write_batch_id(
-        "session-b",
-        "project",
+    let other_scope = crate::tool::memory_write_gate::memory_write_batch_id(
+        "global",
         &[entry("one"), entry("two")],
     );
 
@@ -312,7 +307,10 @@ fn batch_id_is_deterministic_and_batch_scoped() {
         "the id must not depend on the order the file listed the entries"
     );
     assert_ne!(first, different, "a different batch must produce a different id");
-    assert_ne!(first, other_session, "a session must not share an approval");
+    assert_ne!(
+        first, other_scope,
+        "the same content into a different scope is a different write"
+    );
     assert!(first.starts_with("req_memory_"), "unexpected id: {first}");
 }
 
@@ -327,7 +325,6 @@ async fn batch_gate_off_allows_the_import() {
     )];
 
     let outcome = crate::tool::memory_write_gate::evaluate_memory_write_batch(
-        "batch-session",
         "project",
         &entries,
     );
@@ -351,7 +348,6 @@ async fn batch_gate_on_holds_the_batch_and_queues_one_request() {
     ];
 
     let outcome = crate::tool::memory_write_gate::evaluate_memory_write_batch(
-        "batch-session",
         "project",
         &entries,
     );
@@ -388,10 +384,8 @@ async fn batch_gate_lets_the_import_through_after_approval() {
         crate::memory::MemoryCategory::Fact,
         "batch-approved-probe".to_string(),
     )];
-    let session = "batch-approved-session";
 
     let first = crate::tool::memory_write_gate::evaluate_memory_write_batch(
-        session,
         "project",
         &entries,
     );
@@ -400,12 +394,11 @@ async fn batch_gate_lets_the_import_through_after_approval() {
         "{first:?}"
     );
 
-    let batch_id = crate::tool::memory_write_gate::memory_write_batch_id(session, "project", &entries);
+    let batch_id = crate::tool::memory_write_gate::memory_write_batch_id("project", &entries);
     crate::safety::record_permission_via_file(&batch_id, true, "test", None)
         .expect("record the approval");
 
     let second = crate::tool::memory_write_gate::evaluate_memory_write_batch(
-        session,
         "project",
         &entries,
     );

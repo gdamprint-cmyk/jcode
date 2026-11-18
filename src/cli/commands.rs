@@ -1802,14 +1802,10 @@ async fn run_memory_command_for_dir(
             // reference: crates/jcode-app-core/src/tool/memory_write_gate.rs
             //   (evaluate_memory_write_batch, the batch entry point of the same
             //   gate that covers the agent's `remember` tool call)
-            // The gate keys its approval cache by session id. A one-off CLI
-            // import has no session, so the identity is the process id: the
-            // same process (a retry in the same shell invocation) and a fresh
-            // process each get their own approval, and the durable decision
-            // still lives in the permission history.
-            let gate_session = format!("cli-import-{}", std::process::id());
+            // The gate keys the batch by its CONTENT, not by a session: an import
+            // runs in its own process and the approval comes from ANOTHER process,
+            // so a per-process key could never be matched.
             match crate::tool::memory_write_gate::evaluate_memory_write_batch(
-                &gate_session,
                 scope.as_str(),
                 &memories,
             ) {

@@ -287,7 +287,6 @@ fn ensure_request_queued(
 //   (per-subsystem write_approval gate, allow/blocked/stage; this batch entry
 //   point applies the same contract to a multi-entry import)
 pub fn evaluate_memory_write_batch(
-    session_id: &str,
     scope: &str,
     entries: &[MemoryEntry],
 ) -> GateOutcome {
@@ -295,15 +294,13 @@ pub fn evaluate_memory_write_batch(
         return GateOutcome::Allowed;
     }
 
-    let batch_id = memory_write_batch_id(session_id, scope, entries);
+    let batch_id = memory_write_batch_id(scope, entries);
 
-    if approval_cached(session_id, &batch_id) {
-        return GateOutcome::Allowed;
-    }
-
+    // A CLI import is a fresh process every time, so the approval cache (which
+    // lives in the process) is always cold here. The durable decision is the
+    // one that matters, and it is read below.
     match crate::safety::permission_decision_via_file(&batch_id) {
         Ok(Some(decision)) if decision.approved => {
-            remember_approval(session_id, &batch_id);
             return GateOutcome::Allowed;
         }
         Ok(Some(decision)) => {
@@ -321,7 +318,7 @@ pub fn evaluate_memory_write_batch(
         }
     }
 
-    ensure_batch_request_queued(session_id, &batch_id, scope, entries);
+    ensure_batch_request_queued(&batch_id, scope, entries);
 
     let count = entries.len();
     GateOutcome::Pending {
@@ -338,14 +335,21 @@ pub fn evaluate_memory_write_batch(
 ///
 /// Same construction as [`memory_write_request_id`] (fields separated by a
 /// zero byte, sha256, first 12 bytes hex), but the content component is the
-/// concatenation of the entries' id/category/content so the id identifies the
+/// concatenation of the entries' category/content so the id identifies the
 /// exact batch.
-pub fn memory_write_batch_id(session_id: &str, scope: &str, entries: &[MemoryEntry]) -> String {
+///
+/// Deliberately NOT keyed by session id, unlike the single-write id: an import
+/// runs in its own process and the approval is made by ANOTHER process
+/// (`jcode permissions`, Telegram, email). Keying by session would mint a new
+/// id per invocation, so the approval could never be found and the import would
+/// be held forever.
+// reference: https://github.com/NousResearch/hermes-agent/blob/main/tools/write_approval.py
+//   (an approved write is replayed from the staged record; the identity of a
+//   pending write must therefore be recoverable without the requester's process)
+pub fn memory_write_batch_id(scope: &str, entries: &[MemoryEntry]) -> String {
     let mut hasher = Sha256::new();
-    for part in [session_id, scope] {
-        hasher.update(part.as_bytes());
-        hasher.update([0u8]);
-    }
+    hasher.update(scope.as_bytes());
+    hasher.update([0u8]);
     // Keyed by CONTENT, not by the entry id: an import's ids are whatever the
     // source file carried, and re-exporting the same memories can reorder or
     // re-id them. The same batch of facts must produce the same request id so
@@ -371,7 +375,6 @@ pub fn memory_write_batch_id(session_id: &str, scope: &str, entries: &[MemoryEnt
 
 /// Put the batch request into the permission queue if it is not there yet.
 fn ensure_batch_request_queued(
-    session_id: &str,
     request_id: &str,
     scope: &str,
     entries: &[MemoryEntry],
@@ -412,7 +415,9 @@ fn ensure_batch_request_queued(
         wait: false,
         created_at: chrono::Utc::now(),
         context: Some(json!({
-            "session_id": session_id,
+            // The batch id is content-keyed, so it is the only stable handle on
+            // this write; there is no session for a one-shot CLI import.
+            "memory_write_request_id": request_id,
             "review": {
                 "summary": format!("Import {} memories into {scope} memory", entries.len()),
                 "why_permission_needed":
