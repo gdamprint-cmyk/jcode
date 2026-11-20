@@ -108,6 +108,7 @@ pub const GEMINI: DialectSpec = DialectSpec {
         // the `swarm` tool expresses its spawn/non-spawn branches. Nested
         // `anyOf` inside a property is fine, so only the root is widened.
         flatten_top_level_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
@@ -206,6 +207,7 @@ pub const ANTIGRAVITY_CLAUDE: DialectSpec = DialectSpec {
     supported_string_formats: &[],
     transforms: DialectTransforms {
         flatten_all_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
@@ -240,6 +242,7 @@ pub const ANTIGRAVITY_BRIDGE: DialectSpec = DialectSpec {
     supported_string_formats: &[],
     transforms: DialectTransforms {
         flatten_all_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
@@ -257,6 +260,7 @@ const DEFAULT_TRANSFORMS: DialectTransforms = DialectTransforms {
     prune_dangling_required: false,
     const_as_enum: false,
     one_of_as_any_of: false,
+    scalar_types: false,
     merge_all_of_branches: false,
     union_type_as_nullable: false,
 };

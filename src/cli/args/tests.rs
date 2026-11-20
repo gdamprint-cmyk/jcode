@@ -2,6 +2,24 @@ use super::*;
 use crate::cli::provider_init::ProviderChoice;
 
 #[test]
+fn jarvis_is_explicitly_opt_in_and_supports_resume() {
+    assert!(!Args::try_parse_from(["jcode"]).unwrap().jarvis);
+    let args = Args::try_parse_from(["jcode", "--jarvis", "--resume", "voice-session"]).unwrap();
+    assert!(args.jarvis);
+    assert_eq!(args.resume.as_deref(), Some("voice-session"));
+}
+
+#[test]
+fn continuous_jarvis_and_screen_feed_are_separate_opt_ins() {
+    let ordinary = Args::try_parse_from(["jcode"]).unwrap();
+    assert!(!ordinary.jarvis_always_on && !ordinary.jarvis_screen);
+    let voice = Args::try_parse_from(["jcode", "--jarvis-always-on"]).unwrap();
+    assert!(voice.jarvis_always_on && !voice.jarvis_screen);
+    let both = Args::try_parse_from(["jcode", "--jarvis-always-on", "--jarvis-screen"]).unwrap();
+    assert!(both.jarvis_always_on && both.jarvis_screen);
+}
+
+#[test]
 fn cloud_move_selection_defaults_to_swarm_and_independent_sessions_are_explicit() {
     let args = Args::try_parse_from(["jcode", "cloud", "move"]).unwrap();
     assert!(
@@ -628,10 +646,12 @@ fn login_no_browser_flag_parses() {
             no_validate,
             flow_id,
             cancel,
+            device_code,
         }) => {
             assert!(provider.is_none());
             assert!(account.is_none());
             assert!(no_browser);
+            assert!(!device_code);
             assert!(!print_auth_url);
             assert!(callback_url.is_none());
             assert!(auth_code.is_none());
@@ -1217,3 +1237,6 @@ fn api_stdio_accepts_alias_and_daemon_socket_but_not_api_socket() {
         );
     }
 }
+
+#[path = "tests_additional_tests.rs"]
+mod additional_cloud_lifecycle_commands_parse_their_contracts;

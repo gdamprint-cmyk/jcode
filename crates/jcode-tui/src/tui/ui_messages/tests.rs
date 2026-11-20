@@ -1,48 +1,6 @@
 use super::*;
 
 #[test]
-fn pinned_dependency_label_uses_available_width_and_palette() {
-    let task = TodoCardBackgroundTask {
-        task_id: "resume".into(),
-        label: "Resume lint validation".into(),
-        percent: Some(38.0),
-    };
-    let line = todo_dependency_progress(&[&task], 60);
-    assert!(line.to_string().contains(&task.label));
-    assert_eq!(line.spans[0].style.fg, Some(todo_meta_color()));
-    for width in 0..100 {
-        assert!(todo_dependency_progress(&[&task], width).width() <= width);
-    }
-}
-
-#[test]
-fn expanded_diff_rows_preserve_source_and_align_continuations() {
-    let source = "    let result = compute(\"界界 e\u{301}\", argument);";
-    let parsed = ParsedDiffLine {
-        kind: DiffLineKind::Add,
-        prefix: "9+ ".into(),
-        content: source.into(),
-        file_path: None,
-    };
-    let rows = expanded_diff_row(&parsed, Some("rs"), 3, 24);
-    assert!(rows.len() > 1);
-    assert!(extract_line_text(&rows[0]).starts_with("│   9 +     let"));
-    let mut reconstructed = String::new();
-    for (index, row) in rows.iter().enumerate() {
-        assert!(row.width() <= 24, "{row:?}");
-        assert_eq!(row.alignment, Some(Alignment::Left));
-        if index > 0 {
-            assert!(extract_line_text(row).starts_with("│     ↪ "));
-        }
-        for span in row.spans.iter().skip(if index == 0 { 2 } else { 1 }) {
-            reconstructed.push_str(&span.content);
-        }
-    }
-    assert_eq!(reconstructed, source);
-    assert_eq!(rows[0].spans[1].style.fg, Some(diff_add_color()));
-}
-
-#[test]
 fn expanded_diff_rows_fit_narrow_widths_and_expand_tabs() {
     let parsed = ParsedDiffLine {
         kind: DiffLineKind::Del,
@@ -985,6 +943,27 @@ fn render_background_task_failure_without_diagnostic_is_honest() {
 }
 
 #[test]
+fn selfdev_build_status_uses_one_tool_row() {
+    for (status, label) in [
+        ("running", "◌ selfdev build · running"),
+        ("↻ superseded", "↻ selfdev build · superseded"),
+    ] {
+        let msg = DisplayMessage::background_task(format!(
+            "**Background task** `bg123` · `selfdev-build` · {status} · 84.0s · exit 0\n\n```text\ncompiler output\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"bg123\"`"
+        ));
+        for width in [20, 80] {
+            let lines =
+                render_background_task_message(&msg, width, crate::config::DiffDisplayMode::Off);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].width() <= width as usize);
+            if width == 80 {
+                assert!(lines[0].to_string().contains(label));
+            }
+        }
+    }
+}
+
+#[test]
 fn render_background_task_success_is_compact_and_preserves_raw_output() {
     let msg = DisplayMessage::background_task(
         "**Background task** `bg123` · `bash` · ✓ completed · 7.1s · exit 0\n\n```text\nline 1\nline 2\nline 3\nline 4\nline 5\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"bg123\"`",
@@ -1292,7 +1271,7 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
         content: "Connect account".into(),
         status: "in_progress".into(),
         waiting_on: vec!["build".into()],
-        completely_blocked: Some(crate::todo::TodoCompleteBlocker {
+        requires_user_auth: Some(crate::todo::TodoUserAuth {
             reason: "Only you can authorize\nthis account ✋".into(),
         }),
         ..Default::default()
@@ -1311,7 +1290,7 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
         let row = render_todo_item_line_with_background(&todo, &[], &tasks, "", width);
         assert!(row.width() <= width, "{width}: {row:?}");
     }
-    todo.completely_blocked = None;
+    todo.requires_user_auth = None;
     assert!(
         render_todo_item_line_with_background(&todo, &[], &tasks, "", 240)
             .to_string()
@@ -1321,11 +1300,11 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
     assert!(
         !render_todo_card_item_line(&todo, "", 240)
             .to_string()
-            .contains("Completely blocked")
+            .contains("Needs your login")
     );
     for status in ["completed", "cancelled"] {
         todo.status = status.into();
-        todo.completely_blocked = Some(crate::todo::TodoCompleteBlocker {
+        todo.requires_user_auth = Some(crate::todo::TodoUserAuth {
             reason: "Only you".into(),
         });
         assert!(
@@ -1337,28 +1316,26 @@ fn complete_blocker_row_precedes_background_clock_and_preserves_reason() {
 }
 
 #[test]
-fn complete_blocker_detail_displays_reason_without_user_action_framing() {
+fn user_auth_detail_names_the_authorization_and_flattens_the_reason() {
     let todo = crate::todo::TodoItem {
-        completely_blocked: Some(crate::todo::TodoCompleteBlocker {
-            reason: "No way forward.".into(),
+        requires_user_auth: Some(crate::todo::TodoUserAuth {
+            reason: "Log in to the\ndeploy dashboard".into(),
         }),
         ..Default::default()
     };
     assert_eq!(
         todo_complete_blocker_detail(&todo),
-        "Completely blocked: No way forward."
+        "Needs your login: Log in to the deploy dashboard"
     );
 }
 
 #[test]
-fn external_blocker_todo_row_shows_reason_deadline_and_never_wraps() {
+fn waiting_todo_row_shows_its_reason_and_never_wraps() {
     let mut todo = crate::todo::TodoItem {
         content: "Acceptance".into(),
         status: "pending".into(),
-        external_blocker: Some(crate::todo::TodoExternalBlocker {
-            reason: "Frozen source awaiting coordinator".into(),
-            review_at: chrono::Utc::now() + chrono::Duration::hours(1),
-        }),
+        waiting_on: vec!["bench".into()],
+        waiting_reason: Some("Benchmark rerun in progress".into()),
         ..Default::default()
     };
     let wide = extract_line_text(&render_todo_item_line_with_background(
@@ -1369,25 +1346,30 @@ fn external_blocker_todo_row_shows_reason_deadline_and_never_wraps() {
         160,
     ));
     assert!(
-        wide.contains("blocked: Frozen source awaiting coordinator"),
+        wide.contains("waiting: Benchmark rerun in progress"),
         "{wide}"
     );
-    assert!(wide.contains("review ") && wide.contains("UTC"));
+    assert!(!wide.contains('⊘') && !wide.contains("blocked"), "{wide}");
     for width in 0..160 {
         let line = render_todo_item_line_with_background(&todo, &[], &[], "", width);
         assert!(extract_line_text(&line).width() <= width);
     }
-    todo.external_blocker.as_mut().unwrap().review_at =
-        chrono::Utc::now() - chrono::Duration::seconds(1);
-    let expired = extract_line_text(&render_todo_item_line_with_background(
-        &todo,
-        &[],
-        &[],
-        "",
-        160,
-    ));
-    assert!(expired.contains("review due"));
-    assert_eq!(todo.status, "pending");
+    // The reason belongs to the wait: no IDs or a finished todo, no note.
+    for (ids, status) in [
+        (vec![], "pending"),
+        (vec!["bench".to_string()], "completed"),
+    ] {
+        todo.waiting_on = ids;
+        todo.status = status.into();
+        let text = extract_line_text(&render_todo_item_line_with_background(
+            &todo,
+            &[],
+            &[],
+            "",
+            160,
+        ));
+        assert!(!text.contains("waiting:"), "{text}");
+    }
 }
 
 #[test]
@@ -1457,6 +1439,7 @@ fn render_todos_message_shows_grouped_card_with_status_glyphs() {
     fn todo(id: &str, content: &str, status: &str, group: Option<&str>) -> crate::todo::TodoItem {
         crate::todo::TodoItem {
             lane_after: None,
+            lane_owner: None,
             id: id.to_string(),
             content: content.to_string(),
             status: status.to_string(),
@@ -1466,8 +1449,8 @@ fn render_todos_message_shows_grouped_card_with_status_glyphs() {
             completion_confidence: (status == "completed")
                 .then_some(crate::todo::ConfidenceState::from_legacy_score(95)),
             confidence_history: Vec::new(),
-            external_blocker: None,
-            completely_blocked: None,
+            waiting_reason: None,
+            requires_user_auth: None,
             waiting_on: Vec::new(),
             blocked_by: Vec::new(),
             assigned_to: None,
@@ -1541,6 +1524,7 @@ fn render_todos_message_shows_grouped_card_with_status_glyphs() {
 fn render_todos_message_shows_goal_scores_without_verbose_feedback() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         stage: None,
         details: None,
         id: "1".to_string(),
@@ -1550,8 +1534,8 @@ fn render_todos_message_shows_goal_scores_without_verbose_feedback() {
         group: Some("todo rendering".to_string()),
         confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
         completion_confidence: None,
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
             crate::todo::ConfidenceState::from_legacy_score(80),
@@ -1605,6 +1589,7 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
     let long_text = "This deliberately long assessment detail should not consume several rows in a narrow terminal window";
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Keep the task visible".to_string(),
         status: "in_progress".to_string(),
@@ -1613,8 +1598,8 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
         confidence: None,
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1692,6 +1677,7 @@ fn render_todos_message_shows_user_intention_when_understanding_is_unclear() {
 fn render_todos_message_uses_readable_semantic_colors() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Tune the palette".to_string(),
         status: "in_progress".to_string(),
@@ -1700,8 +1686,8 @@ fn render_todos_message_uses_readable_semantic_colors() {
         confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1882,6 +1868,7 @@ fn render_todos_message_color_codes_every_intent_state() {
 fn render_todos_message_collapses_passing_quality_gates() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Verify the result".to_string(),
         status: "completed".to_string(),
@@ -1890,8 +1877,8 @@ fn render_todos_message_collapses_passing_quality_gates() {
         confidence: None,
         completion_confidence: Some(crate::todo::ConfidenceState::Validated),
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1938,6 +1925,7 @@ fn render_todos_message_collapses_passing_quality_gates() {
 fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Render the card".to_string(),
         status: "in_progress".to_string(),
@@ -1946,8 +1934,8 @@ fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
         confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -1983,6 +1971,7 @@ fn render_todos_message_wraps_goal_scores_at_narrow_widths() {
 fn render_todos_message_packs_multiple_goal_gates_per_row() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         id: "1".to_string(),
         content: "Render the card".to_string(),
         status: "in_progress".to_string(),
@@ -1991,8 +1980,8 @@ fn render_todos_message_packs_multiple_goal_gates_per_row() {
         confidence: Some(crate::todo::ConfidenceState::from_legacy_score(85)),
         completion_confidence: None,
         confidence_history: Vec::new(),
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
@@ -2054,6 +2043,7 @@ fn render_todos_message_bad_payload_falls_back_to_system() {
 fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
     let todos = vec![crate::todo::TodoItem {
         lane_after: None,
+        lane_owner: None,
         stage: None,
         details: None,
         id: "render".to_string(),
@@ -2063,8 +2053,8 @@ fn render_todo_tool_result_uses_borderless_card_with_goal_scores() {
         group: Some("todo rendering".to_string()),
         confidence: Some(crate::todo::ConfidenceState::from_legacy_score(92)),
         completion_confidence: None,
-        external_blocker: None,
-        completely_blocked: None,
+        waiting_reason: None,
+        requires_user_auth: None,
         waiting_on: Vec::new(),
         confidence_history: vec![
             crate::todo::ConfidenceState::from_legacy_score(85),
@@ -3002,14 +2992,14 @@ fn render_swarm_message_collapsed_shows_tldr_and_expand_badge_only() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plain.contains("fixed the flaky test"), "{plain}");
-    assert!(plain.contains(super::SWARM_EXPAND_BADGE), "{plain}");
+    assert!(!plain.contains("fixed the flaky test"), "{plain}");
+    assert!(plain.contains("tok"), "{plain}");
     let preview = lines
         .iter()
         .flat_map(|line| &line.spans)
-        .find(|span| span.content.contains("fixed the flaky test"))
-        .expect("DM preview span");
-    assert_eq!(preview.style.fg, Some(rgb(130, 130, 140)));
+        .find(|span| span.content.contains("tok"))
+        .expect("DM token count span");
+    assert_eq!(preview.style.fg, Some(rgb(118, 118, 118)));
     assert!(
         !plain.contains("race in the setup helper"),
         "collapsed card must hide the full body: {plain}"
@@ -3592,3 +3582,9 @@ mod discovery_cards;
 
 #[path = "tool_render_tests.rs"]
 mod tool_render;
+
+#[path = "provider_card_tests.rs"]
+mod provider_card_tests;
+
+#[path = "tests_additional_tests.rs"]
+mod additional_pinned_dependency_label_uses_available_width_and_palette;

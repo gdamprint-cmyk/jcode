@@ -1,4 +1,9 @@
 use super::*;
+#[path = "ui_viewport_todo_margins.rs"]
+mod todo_margins;
+pub(crate) use todo_margins::compute_visible_margins;
+pub(crate) use todo_margins::pinned_todo_band_lines_for_payload;
+
 use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
@@ -217,85 +222,6 @@ pub(crate) fn copy_badge_reserved_width(
     reserved
 }
 
-pub(crate) fn compute_visible_margins(
-    lines: &[Line],
-    visible_user_indices: &[usize],
-    area: Rect,
-    centered: bool,
-) -> info_widget::Margins {
-    let visible_height = area.height as usize;
-    let mut visible_user_cursor = 0usize;
-
-    let mut right_widths = Vec::with_capacity(visible_height);
-    let mut left_widths = Vec::with_capacity(visible_height);
-
-    for row in 0..visible_height {
-        while visible_user_cursor < visible_user_indices.len()
-            && visible_user_indices[visible_user_cursor] < row
-        {
-            visible_user_cursor += 1;
-        }
-        let is_user_line = visible_user_cursor < visible_user_indices.len()
-            && visible_user_indices[visible_user_cursor] == row;
-
-        if row < lines.len() {
-            let mut used = lines[row].width().min(area.width as usize) as u16;
-            if is_user_line && area.width > 0 {
-                used = used.saturating_add(1).min(area.width);
-            }
-
-            // Compute the true free space on each side from the line's *rendered*
-            // alignment. This matters even in left-aligned mode: the header lines
-            // (`server:`/`client:`/model/version, auth status, mcp list, changelog
-            // box, etc.) are always centered regardless of mode, so a centered line
-            // of width `used` leaves only ~half the slack on the right. Reporting
-            // the full `area.width - used` here would let a right-side info widget
-            // overlap the centered header text.
-            let total_margin = area.width.saturating_sub(used);
-            let default_alignment = if centered {
-                Alignment::Center
-            } else {
-                Alignment::Left
-            };
-            let effective_alignment = lines[row].alignment.unwrap_or(default_alignment);
-            let (left_margin, right_margin) = match effective_alignment {
-                Alignment::Left => (0, total_margin),
-                Alignment::Center => {
-                    let left = total_margin / 2;
-                    let right = total_margin.saturating_sub(left);
-                    (left, right)
-                }
-                Alignment::Right => (total_margin, 0),
-            };
-
-            if centered {
-                left_widths.push(left_margin);
-                right_widths.push(right_margin);
-            } else {
-                // Left-aligned mode never places left-side widgets (content is
-                // flush-left), so the left gap is reported as 0; the right gap
-                // still respects per-line alignment so widgets clear the header.
-                left_widths.push(0);
-                right_widths.push(right_margin);
-            }
-        } else if centered {
-            let half = area.width / 2;
-            left_widths.push(half);
-            right_widths.push(area.width.saturating_sub(half));
-        } else {
-            left_widths.push(0);
-            right_widths.push(area.width);
-        }
-    }
-
-    info_widget::Margins {
-        right_widths,
-        left_widths,
-        centered,
-        ..Default::default()
-    }
-}
-
 pub(crate) fn reserve_copy_badge_margins(
     margins: &mut info_widget::Margins,
     scroll: usize,
@@ -352,6 +278,7 @@ pub(super) fn draw_messages(
     // the sticky previous-prompt preview, including at the top of the transcript.
     let (pinned_todo_band, pinned_todo_more_line) =
         pinned_todo_band_lines(app, text_render_area.width, render_area.height);
+    let pinned_todo_band_rows = pinned_todo_band.len() as u16;
     let max_scroll = compute_max_scroll_with_prompt_preview(
         total_lines,
         wrapped_user_prompt_starts,
@@ -428,6 +355,12 @@ pub(super) fn draw_messages(
         0u16
     };
     let pinned_todo_lines = pinned_todo_band.len() as u16;
+    publish_pinned_todo_scroll((pinned_todo_band_rows > 0).then(|| Rect {
+        x: text_render_area.x,
+        y: render_area.y.saturating_add(prompt_preview_lines),
+        width: text_render_area.width,
+        height: pinned_todo_band_rows,
+    }));
     set_pinned_todo_more_area(pinned_todo_more_line.map(|line| {
         Rect {
             x: text_render_area.x,
@@ -1359,24 +1292,7 @@ pub(super) fn draw_messages(
 mod viewport_margins;
 pub(super) use viewport_margins::{INFO_WIDGET_LOOKAHEAD_ROWS, windowed_min};
 
-/// Passive worker status lives in the todo lanes. The focused swarm panel
-/// remains available for keyboard navigation and its transcript controls.
-pub(crate) fn pinned_todos_show_workers(app: &dyn TuiState, width: u16) -> bool {
-    crate::config::config().display.pin_todos
-        && app.pinned_todos_payload().is_some()
-        && app.inline_swarm_gallery_active()
-        && !app.inline_swarm_members().is_empty()
-        && !pinned_todo_band_lines_for_payload(
-            app.pinned_todos_payload(),
-            app.pinned_todos_expanded(),
-            app.diff_mode(),
-            width,
-            3,
-        )
-        .0
-        .is_empty()
-}
-
+/// Worker activity and progress live in the pinned todo lanes.
 pub(crate) fn pinned_todo_band_lines(
     app: &dyn TuiState,
     width: u16,
@@ -1417,74 +1333,73 @@ pub(crate) fn pinned_todo_band_lines(
     (lines, more)
 }
 
-/// Pinned todo band for an arbitrary todo payload. Shared by the live chat
-/// viewport and the `/resume` preview so both render the band identically.
-pub(crate) fn pinned_todo_band_lines_for_payload(
-    payload: Option<&str>,
-    expanded: bool,
-    diff_mode: crate::config::DiffDisplayMode,
-    width: u16,
-    viewport_height: u16,
-) -> (Vec<Line<'static>>, Option<usize>) {
-    if width < 16 || viewport_height < 3 {
-        return (Vec::new(), None);
-    }
+static PINNED_TODO_SCROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PINNED_TODO_MAX_SCROLL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Max scroll computed by the most recent band build. Only the live viewport
+/// render publishes it, since layout probes build bands at other heights.
+static PINNED_TODO_LAST_MAX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static PINNED_TODO_BAND_AREA: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
-    let card_lines = if crate::config::config().display.pin_todos {
-        payload
-            .map(|payload| {
-                // Distinct title keeps the line cache from sharing entries with
-                // the width-capped inline transcript card.
-                let mut msg = crate::tui::DisplayMessage::todos(payload.to_string());
-                msg.title = Some("Pinned todos".to_string());
-                super::messages::get_cached_message_lines(
-                    &msg,
-                    width,
-                    diff_mode,
-                    super::messages::render_pinned_todos_message,
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if card_lines.is_empty() {
-        return (Vec::new(), None);
-    }
-    let mut card_lines = card_lines;
-    super::messages::animate_lane_spinners(&mut card_lines);
+fn pinned_todo_scroll() -> usize {
+    PINNED_TODO_SCROLL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-    // Band budget: about a third of the viewport.
-    let budget = ((viewport_height as usize) / 3).clamp(2, 12);
-    let content_budget = budget.max(2);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let has_more = card_lines.len() > content_budget && !expanded;
-    let mut more_line = None;
-    if has_more {
-        let shown = content_budget.saturating_sub(1);
-        let hidden = card_lines.len() - shown;
-        lines.extend(card_lines.into_iter().take(shown));
-        more_line = Some(lines.len());
-        lines.push(Line::from(Span::styled(
-            format!("  … +{} more (todo)", hidden),
-            Style::default().fg(dim_color()),
-        )));
-    } else {
-        if expanded {
-            more_line = Some(lines.len());
-            lines.push(Line::from(Span::styled(
-                "  ▴ Collapse todos",
-                Style::default().fg(dim_color()),
-            )));
-        }
-        lines.extend(card_lines);
+fn publish_pinned_todo_scroll(band_area: Option<Rect>) {
+    if super::secondary_render_active() {
+        return;
     }
-    (lines, more_line)
+    let max = PINNED_TODO_LAST_MAX.load(std::sync::atomic::Ordering::Relaxed);
+    PINNED_TODO_MAX_SCROLL.store(max, std::sync::atomic::Ordering::Relaxed);
+    if pinned_todo_scroll() > max {
+        PINNED_TODO_SCROLL.store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+    set_pinned_todo_band_area(band_area);
+}
+
+#[cfg(test)]
+pub(crate) fn publish_pinned_todo_scroll_for_test() {
+    publish_pinned_todo_scroll(None);
+}
+
+/// Scroll the expanded pinned todo band. Returns true when the offset changed.
+pub(crate) fn scroll_pinned_todos(delta: isize) -> bool {
+    let max = PINNED_TODO_MAX_SCROLL.load(std::sync::atomic::Ordering::Relaxed);
+    let current = pinned_todo_scroll();
+    let next = current.saturating_add_signed(delta).min(max);
+    PINNED_TODO_SCROLL.store(next, std::sync::atomic::Ordering::Relaxed);
+    next != current
+}
+
+pub(crate) fn reset_pinned_todo_scroll() {
+    PINNED_TODO_SCROLL.store(0, std::sync::atomic::Ordering::Relaxed);
+    PINNED_TODO_MAX_SCROLL.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn set_pinned_todo_band_area(area: Option<Rect>) {
+    if super::secondary_render_active() {
+        return;
+    }
+    if let Ok(mut current) = PINNED_TODO_BAND_AREA.lock() {
+        *current = area;
+    }
+}
+
+/// Screen rect of the pinned todo band, when it is scrollable (expanded with overflow).
+pub(crate) fn pinned_todo_scroll_area() -> Option<Rect> {
+    if PINNED_TODO_MAX_SCROLL.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    PINNED_TODO_BAND_AREA.lock().ok().and_then(|area| *area)
 }
 
 static PINNED_TODO_MORE_AREA: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
 
 fn set_pinned_todo_more_area(area: Option<Rect>) {
+    if super::secondary_render_active() {
+        return;
+    }
     if let Ok(mut current) = PINNED_TODO_MORE_AREA.lock() {
         *current = area;
     }
@@ -1501,196 +1416,15 @@ pub(crate) fn pinned_todo_more_area() -> Option<Rect> {
 
 /// The same previous-prompt band for live sessions and resume previews. Work on
 /// bounded head/tail graphemes instead of allocating every character in a prompt.
-pub(crate) fn prompt_preview_lines(
-    number: usize,
-    text: &str,
-    width: u16,
-    align: ratatui::layout::Alignment,
-) -> Vec<Line<'static>> {
-    use unicode_segmentation::UnicodeSegmentation;
-    let text = text.trim().replace('\n', " ");
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let number = number.to_string();
-    let prefix = number.len() + 2;
-    let content_width = usize::from(width).saturating_sub(prefix + 2);
-    let style = Style::default().dim().bg(user_bg());
-    let mut lines = Vec::with_capacity(2);
-    let long = UnicodeWidthStr::width(text.as_str()) > content_width;
-    let (head, tail) = if long {
-        let budget = usize::from(width.saturating_sub(1)).saturating_sub(prefix + 4);
-        let mut used = 0;
-        let head: String = text
-            .graphemes(true)
-            .take_while(|g| {
-                used += UnicodeWidthStr::width(*g);
-                used <= budget
-            })
-            .collect();
-        used = 0;
-        let tail: Vec<_> = text
-            .graphemes(true)
-            .rev()
-            .take_while(|g| {
-                used += UnicodeWidthStr::width(*g);
-                used <= budget
-            })
-            .collect();
-        (
-            format!("{} ...", head.trim_end()),
-            Some(format!(
-                "... {}",
-                tail.into_iter().rev().collect::<String>().trim_start()
-            )),
-        )
-    } else {
-        (text, None)
-    };
-    lines.push(
-        Line::from(vec![
-            Span::styled(number, style.fg(dim_color())),
-            Span::styled("› ", style.fg(user_color())),
-            Span::styled(head, style.fg(user_text())),
-        ])
-        .alignment(align),
-    );
-    if let Some(tail) = tail {
-        lines.push(
-            Line::from(vec![
-                Span::styled(" ".repeat(prefix), style),
-                Span::styled(tail, style.fg(user_text())),
-            ])
-            .alignment(align),
-        );
-    }
-    lines
-        .into_iter()
-        .map(|line| {
-            let mut clipped = super::truncate_line_with_ellipsis_to_width(
-                &line,
-                usize::from(width.saturating_sub(1)),
-            );
-            clipped.alignment = Some(align);
-            clipped
-        })
-        .collect()
-}
-
-fn compute_prompt_preview_line_count(
-    wrapped_user_prompt_starts: &[usize],
-    user_prompt_texts: &[String],
-    scroll: usize,
-    area_width: u16,
-    prompt_number_offset: usize,
-) -> u16 {
-    if prompt_history_expanded() {
-        return expanded_prompt_preview_items(
-            wrapped_user_prompt_starts,
-            user_prompt_texts,
-            scroll,
-            prompt_number_offset,
-        )
-        .len() as u16;
-    }
-    let last_offscreen = lower_bound(wrapped_user_prompt_starts, scroll).checked_sub(1);
-    let Some(prompt_order) = last_offscreen else {
-        return 0;
-    };
-    let Some(prompt_text) = user_prompt_texts.get(prompt_order) else {
-        return 0;
-    };
-    let prompt_text = prompt_text.trim();
-    if prompt_text.is_empty() {
-        return 0;
-    }
-    let num_str = format!("{}", prompt_number_offset + prompt_order + 1);
-    let prefix_len = num_str.len() + 2;
-    let content_width = area_width.saturating_sub(prefix_len as u16 + 2) as usize;
-    let text_flat = prompt_text.replace('\n', " ");
-    let display_width = UnicodeWidthStr::width(text_flat.as_str());
-    if display_width > content_width { 2 } else { 1 }
-}
-
-/// Number of previous prompts shown when the expanded prompt history (Alt+E) is on.
-const EXPANDED_PROMPT_PREVIEW_COUNT: usize = 6;
-
-static PROMPT_HISTORY_EXPANDED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn prompt_history_expanded() -> bool {
-    PROMPT_HISTORY_EXPANDED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Toggle the expanded previous-prompt band. Returns the new state.
-pub(crate) fn toggle_prompt_history_expanded() -> bool {
-    !PROMPT_HISTORY_EXPANDED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Last few offscreen prompts, oldest first, as `(number, flattened text)`.
-fn expanded_prompt_preview_items(
-    wrapped_user_prompt_starts: &[usize],
-    user_prompt_texts: &[String],
-    scroll: usize,
-    prompt_number_offset: usize,
-) -> Vec<(String, String)> {
-    let offscreen = lower_bound(wrapped_user_prompt_starts, scroll).min(user_prompt_texts.len());
-    let mut items: Vec<(String, String)> = (0..offscreen)
-        .rev()
-        .filter_map(|idx| {
-            let text = user_prompt_texts[idx].trim();
-            (!text.is_empty()).then(|| {
-                (
-                    format!("{}", prompt_number_offset + idx + 1),
-                    text.split_whitespace().collect::<Vec<_>>().join(" "),
-                )
-            })
-        })
-        .take(EXPANDED_PROMPT_PREVIEW_COUNT)
-        .collect();
-    items.reverse();
-    items
-}
-
-fn compute_max_scroll_with_prompt_preview(
-    total_lines: usize,
-    wrapped_user_prompt_starts: &[usize],
-    user_prompt_texts: &[String],
-    area: Rect,
-    pinned_todo_lines: u16,
-    prompt_number_offset: usize,
-) -> usize {
-    let mut max_scroll =
-        total_lines.saturating_sub(area.height.saturating_sub(pinned_todo_lines) as usize);
-    let preview_enabled = crate::config::config().display.prompt_preview;
-    if max_scroll == 0 || (!preview_enabled && pinned_todo_lines == 0) {
-        return max_scroll;
-    }
-
-    for _ in 0..4 {
-        let prompt_preview_lines = if preview_enabled {
-            compute_prompt_preview_line_count(
-                wrapped_user_prompt_starts,
-                user_prompt_texts,
-                max_scroll,
-                area.width,
-                prompt_number_offset,
-            )
-        } else {
-            0
-        };
-        let content_height =
-            area.height
-                .saturating_sub(prompt_preview_lines + pinned_todo_lines) as usize;
-        let adjusted = total_lines.saturating_sub(content_height);
-        if adjusted == max_scroll {
-            break;
-        }
-        max_scroll = adjusted;
-    }
-
-    max_scroll
-}
+#[path = "ui_viewport/prompt_preview.rs"]
+mod prompt_preview;
+pub(crate) use prompt_preview::EXPANDED_PROMPT_PREVIEW_COUNT;
+use prompt_preview::compute_max_scroll_with_prompt_preview;
+use prompt_preview::compute_prompt_preview_line_count;
+use prompt_preview::expanded_prompt_preview_items;
+pub(crate) use prompt_preview::prompt_history_expanded;
+pub(crate) use prompt_preview::prompt_preview_lines;
+pub(crate) use prompt_preview::toggle_prompt_history_expanded;
 
 #[cfg(test)]
 #[path = "ui_viewport_tests.rs"]

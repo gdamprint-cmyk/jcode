@@ -8,6 +8,7 @@ use super::client_comm::{
 };
 use super::client_comm_swarms::{handle_comm_list_swarms, handle_comm_set_swarm_label};
 use super::client_writer::write_direct_event;
+use super::client_writer_task::ClientWriter;
 use super::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
 use super::comm_control::{
     handle_comm_assign_next, handle_comm_assign_role, handle_comm_assign_task,
@@ -245,7 +246,7 @@ pub(super) struct LightweightControlContext<'a> {
 
 pub(super) async fn handle_lightweight_control_request(
     request: Request,
-    writer: Arc<Mutex<crate::transport::WriteHalf>>,
+    writer: ClientWriter,
     context: LightweightControlContext<'_>,
 ) -> Result<()> {
     let LightweightControlContext {
@@ -286,11 +287,18 @@ pub(super) async fn handle_lightweight_control_request(
         return Ok(());
     }
 
-    let _request_activity = crate::runtime_activity::global().try_enter()?;
+    // Comm requests name their owning session. Scope admission to it so a
+    // long-lived request (await_members can hold for an hour) only blocks
+    // transfers of that session, not every /cloud move on the runtime.
+    let gate = crate::runtime_activity::global();
+    let _request_activity = match comm_request_session_id(&request) {
+        Some(session) if !session.trim().is_empty() => gate.try_enter_session(session)?,
+        _ => gate.try_enter()?,
+    };
     write_direct_event(&writer, &ServerEvent::Ack { id: request.id() }).await?;
 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let writer_clone = Arc::clone(&writer);
+    let writer_clone = writer.clone();
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             if let Err(error) = write_direct_event(&writer_clone, &event).await {
@@ -333,6 +341,19 @@ pub(super) async fn handle_lightweight_control_request(
             super::provider_control::handle_invalidate_anthropic_usage(
                 id,
                 account_label,
+                &client_event_tx,
+            )
+            .await;
+        }
+        Request::NotifyAuthChanged {
+            id, provider, auth, ..
+        } => {
+            super::provider_control::handle_unbound_notify_auth_changed(
+                id,
+                provider,
+                auth,
+                provider_template,
+                sessions,
                 &client_event_tx,
             )
             .await;

@@ -2,69 +2,6 @@ use super::*;
 use anyhow::{Result, anyhow};
 
 #[test]
-fn test_session_exists_roundtrip() -> Result<()> {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "jcode-session-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!(e))?
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(tmp_dir.join("sessions"))?;
-
-    assert!(!session_path_in_dir(&tmp_dir, "missing-session").exists());
-
-    let session_path = session_path_in_dir(&tmp_dir, "exists-session");
-    std::fs::write(&session_path, "{}")?;
-    assert!(session_path.exists());
-
-    let random_id = format!(
-        "missing-session-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!(e))?
-            .as_nanos()
-    );
-    assert!(!session_exists(&random_id));
-    Ok(())
-}
-
-#[test]
-fn released_provider_message_cache_rebuilds_from_canonical_history() {
-    let mut session = Session::create_with_id(
-        "session_provider_cache_release_test".to_string(),
-        None,
-        Some("Provider cache release".to_string()),
-    );
-    session.add_message(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "large derived payload".repeat(1024),
-            cache_control: None,
-        }],
-    );
-
-    let before = session.provider_messages().to_vec();
-    assert_eq!(before.len(), 1);
-    assert_eq!(
-        session.debug_memory_profile()["provider_messages_cache"]["count"],
-        1
-    );
-
-    session.release_provider_messages_cache();
-    let released = session.debug_memory_profile();
-    assert_eq!(released["provider_messages_cache"]["count"], 0);
-    assert_eq!(released["provider_messages_cache"]["json_bytes"], 0);
-
-    let rebuilt = session.provider_messages();
-    assert_eq!(rebuilt.len(), 1);
-    assert_eq!(
-        serde_json::to_value(rebuilt).unwrap(),
-        serde_json::to_value(before).unwrap()
-    );
-}
-
-#[test]
 fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist() {
     let mut session = Session::create_with_id(
         "session_token_usage_totals_test".to_string(),
@@ -339,7 +276,8 @@ fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> 
         content: vec![ContentBlock::Text {
             text: "hello world".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -413,7 +351,8 @@ fn load_for_remote_startup_preserves_messages_and_replay_but_skips_heavy_vectors
         content: vec![ContentBlock::Text {
             text: "hello remote startup".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -702,18 +641,89 @@ fn test_save_persists_compaction_state() -> Result<()> {
         None,
         Some("compaction persistence test".to_string()),
     );
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "saved summary".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 8,
-        original_turn_count: 8,
-        compacted_count: 8,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "saved summary".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 8,
+            original_turn_count: 8,
+            compacted_count: 8,
+        }
+        .into(),
+    );
 
     session.save()?;
 
     let loaded = Session::load("session_compaction_persist_test")?;
     assert_eq!(loaded.compaction, session.compaction);
+    Ok(())
+}
+
+/// A metadata-only stub (no transcript, no compaction loaded) that is saved
+/// through the journal must not erase the owner's compaction summary. Doing so
+/// made the next resume/split see the whole transcript and emergency-compact it.
+#[test]
+fn test_startup_stub_save_preserves_compaction_state() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-stub-compaction-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let id = "session_stub_compaction_test";
+    let mut owner = Session::create_with_id(id.to_string(), None, Some("owner".to_string()));
+    for i in 0..4 {
+        owner.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("message {i}"),
+                cache_control: None,
+            }],
+        );
+    }
+    owner.save()?;
+    // Compaction lands in the journal, as it does for a live large session.
+    owner.compaction = Some(
+        StoredCompactionState {
+            summary_text: "owner summary".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 3,
+            original_turn_count: 3,
+            compacted_count: 3,
+        }
+        .into(),
+    );
+    owner.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "after compaction".into(),
+            cache_control: None,
+        }],
+    );
+    owner.save()?;
+    // A later append marks compaction unchanged, so the stub, which reads only
+    // the latest journal metadata, never sees the summary.
+    owner.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "reply".into(),
+            cache_control: None,
+        }],
+    );
+    owner.save()?;
+
+    let mut stub = Session::load_startup_stub(id)?;
+    stub.compaction = None;
+    stub.last_pid = Some(1);
+    stub.save()?;
+    let mut stub = Session::load_startup_stub(id)?;
+    assert!(stub.messages.is_empty());
+    stub.save()?;
+
+    let loaded = Session::load(id)?;
+    assert_eq!(loaded.compaction, owner.compaction);
+    assert_eq!(loaded.messages.len(), 6);
     Ok(())
 }
 
@@ -1532,13 +1542,16 @@ fn failed_wake_errors_follow_compacted_history_window() {
     session.messages[100].timestamp = Some(start + chrono::Duration::seconds(100));
     session.record_replay_display_message("error", None, "current failure");
     session.replay_events.last_mut().unwrap().timestamp = start + chrono::Duration::seconds(101);
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "older context".into(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 20,
-        original_turn_count: 20,
-        compacted_count: 100,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "older context".into(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 20,
+            original_turn_count: 20,
+            compacted_count: 100,
+        }
+        .into(),
+    );
     let (limited, _, info) = render_messages_and_images_with_compacted_history(&session, 10);
     assert!(info.unwrap().remaining_messages > 0);
     assert!(!limited.iter().any(|message| message.content == "failure 0"));
@@ -1689,217 +1702,8 @@ fn test_render_messages_shows_auto_poke_continuations_as_system_not_user() {
     );
 }
 
-#[test]
-fn test_render_messages_renders_reasoning_before_answer_in_stored_order() {
-    // Regression: providers persist the assistant turn as `[Text, ReasoningTrace,
-    // ToolUse]` (see agent/turn_loops.rs push order). On resume/re-render the
-    // reasoning must still appear *before* the answer text to match the live
-    // streaming order, even though the Text block is stored first.
-    use jcode_render_core::REASONING_SENTINEL;
-
-    let _env_lock = lock_env();
-    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
-    crate::config::invalidate_config_cache();
-
-    let mut session = Session::create_with_id(
-        "session_render_reasoning_order_test".to_string(),
-        None,
-        Some("render reasoning order test".to_string()),
-    );
-
-    session.add_message(
-        Role::Assistant,
-        vec![
-            ContentBlock::Text {
-                text: "Here is the answer.".to_string(),
-                cache_control: None,
-            },
-            ContentBlock::ReasoningTrace {
-                text: "step one\nstep two".to_string(),
-            },
-        ],
-    );
-
-    let rendered = render_messages(&session);
-    assert_eq!(rendered.len(), 1);
-    let content = &rendered[0].content;
-    assert!(
-        content.contains(&format!("*{0}step one{0}*", REASONING_SENTINEL)),
-        "expected reasoning markup, got: {content:?}"
-    );
-    assert!(content.contains("Here is the answer."));
-    let reasoning_pos = content.find("step two").unwrap();
-    let answer_pos = content.find("Here is the answer.").unwrap();
-    assert!(
-        reasoning_pos < answer_pos,
-        "reasoning should precede the answer text even when stored after it: {content:?}"
-    );
-}
-
-#[test]
-fn test_render_messages_renders_persisted_reasoning() {
-    use jcode_render_core::REASONING_SENTINEL;
-
-    let _env_lock = lock_env();
-    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
-    crate::config::invalidate_config_cache();
-
-    let mut session = Session::create_with_id(
-        "session_render_reasoning_test".to_string(),
-        None,
-        Some("render reasoning test".to_string()),
-    );
-
-    session.add_message(
-        Role::Assistant,
-        vec![
-            ContentBlock::ReasoningTrace {
-                text: "step one\nstep two".to_string(),
-            },
-            ContentBlock::Text {
-                text: "Here is the answer.".to_string(),
-                cache_control: None,
-            },
-        ],
-    );
-
-    let rendered = render_messages(&session);
-    assert_eq!(rendered.len(), 1);
-    let content = &rendered[0].content;
-    // Reasoning lines are rendered as dim/italic markup with the sentinel.
-    assert!(
-        content.contains(&format!("*{0}step one{0}*", REASONING_SENTINEL)),
-        "expected reasoning markup, got: {content:?}"
-    );
-    assert!(
-        content.contains(&format!("*{0}step two{0}*", REASONING_SENTINEL)),
-        "expected reasoning markup, got: {content:?}"
-    );
-    // Answer text follows the reasoning block.
-    assert!(content.contains("Here is the answer."));
-    let reasoning_end = content.find("step two").unwrap();
-    let answer_start = content.find("Here is the answer.").unwrap();
-    assert!(
-        reasoning_end < answer_start,
-        "reasoning should precede the answer text: {content:?}"
-    );
-}
-
-#[test]
-fn test_render_messages_renders_legacy_reasoning_variant() {
-    use jcode_render_core::REASONING_SENTINEL;
-
-    let _env_lock = lock_env();
-    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
-    crate::config::invalidate_config_cache();
-
-    let mut session = Session::create_with_id(
-        "session_render_legacy_reasoning_test".to_string(),
-        None,
-        Some("render legacy reasoning test".to_string()),
-    );
-
-    session.add_message(
-        Role::Assistant,
-        vec![ContentBlock::Reasoning {
-            text: "legacy thought".to_string(),
-        }],
-    );
-
-    let rendered = render_messages(&session);
-    assert_eq!(rendered.len(), 1);
-    assert!(
-        rendered[0]
-            .content
-            .contains(&format!("*{0}legacy thought{0}*", REASONING_SENTINEL)),
-        "expected legacy reasoning markup, got: {:?}",
-        rendered[0].content
-    );
-}
-
-#[test]
-fn test_render_messages_hides_persisted_reasoning_in_current_mode() {
-    use jcode_render_core::REASONING_SENTINEL;
-
-    let _env_lock = lock_env();
-    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "current");
-    crate::config::invalidate_config_cache();
-
-    let mut session = Session::create_with_id(
-        "session_render_reasoning_current_test".to_string(),
-        None,
-        Some("render reasoning current test".to_string()),
-    );
-
-    session.add_message(
-        Role::Assistant,
-        vec![
-            ContentBlock::ReasoningTrace {
-                text: "step one\nstep two\nstep three".to_string(),
-            },
-            ContentBlock::Text {
-                text: "Here is the answer.".to_string(),
-                cache_control: None,
-            },
-        ],
-    );
-
-    let rendered = render_messages(&session);
-    assert_eq!(rendered.len(), 1);
-    let content = &rendered[0].content;
-    // In `current` mode only the *live* reasoning block is ever shown; it streams
-    // then is discarded once the model answers. Re-rendered history therefore
-    // shows no past reasoning at all (no trace line, no lines, no sentinel).
-    assert!(
-        !content.contains(REASONING_SENTINEL),
-        "no reasoning markup expected in current mode on reload: {content:?}"
-    );
-    assert!(
-        !content.contains("step one")
-            && !content.contains("step two")
-            && !content.contains("thought"),
-        "individual reasoning lines/trace must not be replayed in current mode: {content:?}"
-    );
-    // The answer text is preserved.
-    assert!(content.contains("Here is the answer."));
-}
-
-#[test]
-fn test_render_messages_hides_persisted_reasoning_in_off_mode() {
-    use jcode_render_core::REASONING_SENTINEL;
-
-    let _env_lock = lock_env();
-    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "off");
-    crate::config::invalidate_config_cache();
-
-    let mut session = Session::create_with_id(
-        "session_render_reasoning_off_test".to_string(),
-        None,
-        Some("render reasoning off test".to_string()),
-    );
-
-    session.add_message(
-        Role::Assistant,
-        vec![
-            ContentBlock::ReasoningTrace {
-                text: "secret thought".to_string(),
-            },
-            ContentBlock::Text {
-                text: "Here is the answer.".to_string(),
-                cache_control: None,
-            },
-        ],
-    );
-
-    let rendered = render_messages(&session);
-    assert_eq!(rendered.len(), 1);
-    let content = &rendered[0].content;
-    assert!(
-        !content.contains(REASONING_SENTINEL) && !content.contains("secret thought"),
-        "reasoning must be hidden entirely in off mode: {content:?}"
-    );
-    assert!(content.contains("Here is the answer."));
-}
+#[path = "reasoning_render_tests.rs"]
+mod reasoning_render;
 
 #[test]
 fn test_render_messages_honors_background_task_display_role_override() {
@@ -1976,13 +1780,16 @@ fn test_render_messages_shows_recent_compacted_history_by_default() {
             cache_control: None,
         }],
     );
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "old prompt and response".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 2,
-        original_turn_count: 2,
-        compacted_count: 2,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "old prompt and response".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 2,
+            original_turn_count: 2,
+            compacted_count: 2,
+        }
+        .into(),
+    );
 
     let rendered = render_messages(&session);
     assert_eq!(rendered.len(), 4);
@@ -2025,13 +1832,16 @@ fn test_render_messages_can_expand_compacted_history_window() {
             cache_control: None,
         }],
     );
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "old prompt and response".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 2,
-        original_turn_count: 2,
-        compacted_count: 2,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "old prompt and response".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 2,
+            original_turn_count: 2,
+            compacted_count: 2,
+        }
+        .into(),
+    );
 
     // A small compacted prefix (few renderable messages, a single turn) must
     // never be truncated, even when a tiny visible window is requested. A single
@@ -2101,13 +1911,16 @@ fn test_compacted_history_truncates_only_when_long_and_many_turns() {
     );
 
     let compacted_count = prefix_turns * 5; // every prefix message is compacted
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "older compacted context".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: prefix_turns,
-        original_turn_count: prefix_turns,
-        compacted_count,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "older compacted context".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: prefix_turns,
+            original_turn_count: prefix_turns,
+            compacted_count,
+        }
+        .into(),
+    );
 
     let total_renderable = prefix_turns * 5; // 100
 
@@ -2170,13 +1983,16 @@ fn test_compacted_history_never_truncates_single_long_turn() {
     );
 
     let compacted_count = 151; // prompt + 150 responses
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "older compacted context".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 1,
-        original_turn_count: 1,
-        compacted_count,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "older compacted context".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+            compacted_count,
+        }
+        .into(),
+    );
 
     // Even with a tiny requested window, a single long turn is never truncated.
     let (_rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 5);
@@ -2230,13 +2046,16 @@ fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders
             cache_control: None,
         }],
     );
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "older compacted context".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 4,
-        original_turn_count: 4,
-        compacted_count: 4,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "older compacted context".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 4,
+            original_turn_count: 4,
+            compacted_count: 4,
+        }
+        .into(),
+    );
 
     let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);
     let info = info.expect("compacted info");
@@ -2350,7 +2169,8 @@ fn reasoning_trace_survives_session_save_and_load() -> Result<()> {
                 text: "Here is my answer.".to_string(),
                 cache_control: None,
             },
-        ],
+        ]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -2833,13 +2653,16 @@ fn restored_tool_image_boundaries_follow_returned_history_rows() {
 
     // Compaction adds a synthetic notice. Boundaries count returned rows, not
     // stored message indices or user-prompt ordinals.
-    session.compaction = Some(StoredCompactionState {
-        summary_text: "summary".into(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: 1,
-        original_turn_count: 1,
-        compacted_count: 1,
-    });
+    session.compaction = Some(
+        StoredCompactionState {
+            summary_text: "summary".into(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+            compacted_count: 1,
+        }
+        .into(),
+    );
     let (messages, images, _) =
         render_messages_and_images_with_compacted_history(&session, usize::MAX);
     assert_eq!(messages[0].role, "system");
@@ -3039,7 +2862,8 @@ fn env_snapshot_past_cap_appends_instead_of_rewriting_snapshot() -> Result<()> {
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -3113,7 +2937,8 @@ fn metadata_change_on_large_session_is_journaled_not_rewritten() -> Result<()> {
             content: vec![ContentBlock::Text {
                 text: big.clone(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: Some(Utc::now()),
             tool_duration_ms: None,
@@ -3178,7 +3003,8 @@ fn route_journal_roundtrip(large: bool) -> Result<()> {
         content: vec![ContentBlock::Text {
             text: "x".repeat(if large { 2 * 1024 * 1024 } else { 10 }),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -3252,14 +3078,15 @@ fn route_journal_legacy_entries_preserve_snapshot_and_prior_journal_route() -> R
     Ok(())
 }
 
-fn big_compaction(tag: &str) -> crate::session::StoredCompactionState {
+fn big_compaction(tag: &str) -> std::sync::Arc<crate::session::StoredCompactionState> {
     crate::session::StoredCompactionState {
         summary_text: String::new(),
-        openai_encrypted_content: Some(format!("{tag}{}", "e".repeat(300 * 1024))),
+        openai_encrypted_content: Some(format!("{tag}{}", "e".repeat(300 * 1024)).into()),
         covers_up_to_turn: 3,
         original_turn_count: 3,
         compacted_count: 3,
     }
+    .into()
 }
 
 /// Multi-MB compaction state must not be repeated in every journal entry
@@ -3282,7 +3109,8 @@ fn journal_entries_elide_unchanged_compaction_but_loads_keep_it() -> Result<()> 
         content: vec![ContentBlock::Text {
             text: format!("hello {i}"),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -3351,7 +3179,8 @@ fn legacy_journal_entries_with_inline_compaction_still_load() -> Result<()> {
         content: vec![ContentBlock::Text {
             text: "hi".into(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
@@ -3398,7 +3227,8 @@ fn write_compaction_elision_compat_fixture() -> Result<()> {
             content: vec![ContentBlock::Text {
                 text: format!("compat {i}"),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: Some(Utc::now()),
             tool_duration_ms: None,
@@ -3440,3 +3270,6 @@ mod provider_identity;
 
 #[path = "memory_profile_tests.rs"]
 mod memory_profile;
+
+#[path = "cases_additional_tests.rs"]
+mod additional_test_session_exists_roundtrip;

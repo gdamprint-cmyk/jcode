@@ -10,14 +10,21 @@ use tool_handoff::{
     auto_background_allowed, incomplete_turn_stop, reload_interrupted_tool_result,
     wait_for_tool_handoff,
 };
+#[path = "stream_request_preparation.rs"]
+mod stream_request_preparation;
+
 impl Agent {
     pub(super) async fn run_turn_streaming_mpsc(
         &mut self,
-        event_tx: mpsc::UnboundedSender<ServerEvent>,
+        raw_event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
         // A new turn starts with no research lookup observed, so the
         // research-first gate is rearmed for this turn.
         crate::tool::research_gate::reset_research_state(&self.session.id);
+        // Holds streamed text back while no attached client is focused. Every
+        // other event flushes it first, and so does dropping this on return.
+        let event_tx =
+            crate::stream_batching::BatchingSender::new(raw_event_tx, self.session.id.clone());
         let _runtime_activity =
             crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.ensure_session_lease()?;
@@ -68,51 +75,14 @@ impl Agent {
                     repaired
                 ));
             }
-            // Start provider transport setup before deriving and potentially
-            // compacting the request history. This is the first point where the
-            // stable request settings are available.
-            let mut tools = self.tool_definitions().await;
-            let mut split_prompt = self.build_system_prompt_split(None);
-            self.provider
-                .prewarm(&tools, &split_prompt.static_part)
-                .await;
-            let (messages, compaction_event) = self.messages_for_provider();
-            if let Some(event) = compaction_event {
-                // Reset cache tracker and tool lock on compaction since the message history changes
-                self.cache_tracker.reset();
-                self.kv_cache_monitor.reset();
-                self.locked_tools = None;
-                logging::info(&format!(
-                    "Context compacted ({}{})",
-                    event.trigger,
-                    event
-                        .pre_tokens
-                        .map(|t| format!(" {} tokens", t))
-                        .unwrap_or_default()
-                ));
-                let _ = event_tx.send(ServerEvent::Compaction {
-                    trigger: event.trigger.clone(),
-                    pre_tokens: event.pre_tokens,
-                    post_tokens: event.post_tokens,
-                    tokens_saved: event.tokens_saved,
-                    duration_ms: event.duration_ms,
-                    messages_dropped: event.messages_dropped,
-                    messages_compacted: event.messages_compacted,
-                    summary_chars: event.summary_chars,
-                    active_messages: event.active_messages,
-                });
-                // Compaction clears the tool lock, so rebuild the foreground
-                // request metadata rather than relying on the pre-compaction snapshot.
-                tools = self.tool_definitions().await;
-                split_prompt = self.build_system_prompt_split(None);
-            }
+            let (tools, split_prompt, messages) = self.prepare_stream_request(&event_tx).await;
 
             let messages: std::sync::Arc<[Message]> = messages.into();
             // Non-blocking memory: uses pending result from last turn, spawns check for next turn
             let memory_pending = self.build_memory_prompt_nonblocking_shared(
                 std::sync::Arc::clone(&messages),
                 Some(std::sync::Arc::new({
-                    let event_tx = event_tx.clone();
+                    let event_tx = event_tx.raw().clone();
                     move |event| {
                         let _ = event_tx.send(event);
                     }
@@ -247,7 +217,7 @@ impl Agent {
                 loop {
                     tokio::select! {
                         _ = keepalive.tick() => {
-                            send_stream_keepalive_mpsc(&event_tx);
+                            send_stream_keepalive_mpsc(event_tx.raw());
                         }
                         _ = self.graceful_shutdown.notified() => {
                             logging::info(
@@ -370,7 +340,16 @@ impl Agent {
                 let next_event = std::pin::pin!(stream.next());
                 let event = tokio::select! {
                     _ = keepalive.tick() => {
-                        send_stream_keepalive_mpsc(&event_tx);
+                        send_stream_keepalive_mpsc(event_tx.raw());
+                        continue;
+                    }
+                    _ = async {
+                        match event_tx.deadline() {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        event_tx.flush();
                         continue;
                     }
                     _ = self.graceful_shutdown.notified() => {
@@ -528,7 +507,7 @@ impl Agent {
                             // identical to a dead connection and the client stall
                             // guard would cancel a healthy stream (issue #451).
                             hidden_activity_last = Instant::now();
-                            send_stream_keepalive_mpsc(&event_tx);
+                            send_stream_keepalive_mpsc(event_tx.raw());
                         }
                         // Always capture reasoning text so it can be persisted as a
                         // history-only trace, regardless of provider replay support.
@@ -879,7 +858,17 @@ impl Agent {
                     StreamEvent::ServiceTier { tier, requested } => {
                         let _ = event_tx.send(ServerEvent::ServiceTierReported { requested, tier });
                     }
+                    StreamEvent::ResolvedModel { model } => {
+                        usage_recorder.resolve_model(model);
+                    }
                     StreamEvent::RetryRollback { attempt, max } => {
+                        // Preserve reported usage from the failed attempt, but
+                        // never let its model or counters bleed into the retry.
+                        usage_recorder.finish();
+                        usage_input = None;
+                        usage_output = None;
+                        usage_cache_read = None;
+                        usage_cache_creation = None;
                         // A transient transport fault hit mid-stream after partial
                         // output was already emitted; the provider is replaying the
                         // request from the top. Discard everything accumulated for
@@ -1127,6 +1116,8 @@ impl Agent {
                 }
             }
 
+            // The stream is over, so no timer will flush what is still held.
+            event_tx.flush();
             usage_recorder.finish();
             if retry_after_stream_error {
                 // The request failed mid-stream and produced no answer: drop
@@ -1198,6 +1189,16 @@ impl Agent {
                     )
                     .saturating_add(output);
                 crate::session_metrics::record_token_usage(&self.session.id, total, output);
+                if usage_input.is_some() {
+                    crate::session_telemetry::save_context(
+                        &self.session,
+                        total.saturating_sub(output),
+                        Some(self.effective_context_budget().await),
+                        self.provider.name(),
+                        self.provider.active_resolved_credential(),
+                        self.provider.serving_oauth_account_label(),
+                    );
+                }
             }
 
             if usage_input.is_some()
@@ -1820,7 +1821,14 @@ impl Agent {
                     ));
 
                     let bg_info = crate::background::global()
-                        .adopt(&tc.name, &self.session.id, tool_handle)
+                        .adopt_with_options(
+                            &tc.name,
+                            tool_handoff::handoff_display_name(&tc.input),
+                            &self.session.id,
+                            true,
+                            false,
+                            tool_handle,
+                        )
                         .await;
 
                     let reason = if automatic_background {

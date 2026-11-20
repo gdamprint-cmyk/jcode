@@ -11,11 +11,61 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::BufRead as _;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 struct MockProvider(Option<&'static str>);
+
+#[tokio::test]
+async fn resume_todos_arrive_before_backpressured_large_history() {
+    let _env = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().unwrap();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let session_id = "session_early_todo_backpressure";
+    let item: crate::todo::TodoItem = serde_json::from_value(serde_json::json!({
+        "id": "resume", "content": "Authoritative remote plan", "status": "in_progress", "priority": "high"
+    })).unwrap();
+    crate::todo::save_todos(session_id, &[item]).unwrap();
+    let (stream, peer) = crate::transport::stream_pair().unwrap();
+    let (_, write) = stream.into_split();
+    let writer = Arc::new(Mutex::new(write));
+    let started = Instant::now();
+    let transfer = tokio::spawn(async move {
+        super::send_resume_todos(session_id, &writer).await.unwrap();
+        // An unread transcript cannot fit in the socket, reproducing the
+        // original head-of-line blocking without any model or cloud traffic.
+        tokio::io::AsyncWriteExt::write_all(&mut *writer.lock().await, &vec![b'x'; 14_000_000])
+            .await
+    });
+    let mut reader = tokio::io::BufReader::new(peer);
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+    )
+    .await
+    .expect("todos must not wait for history transfer")
+    .unwrap();
+    let elapsed = started.elapsed();
+    let event: crate::protocol::ServerEvent = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(event, crate::protocol::ServerEvent::Todos { session_id: id, payload, .. }
+        if id == session_id && payload.contains("Authoritative remote plan"))
+    );
+    assert!(
+        !transfer.is_finished(),
+        "large transcript should still be blocked while todos are usable"
+    );
+    eprintln!("authoritative todo arrival with 14 MB History blocked: {elapsed:?}");
+    transfer.abort();
+    let _ = transfer.await;
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
 
 #[derive(Clone)]
 struct StaticDiscoveryProvider(Arc<std::sync::atomic::AtomicBool>);
@@ -728,7 +778,8 @@ async fn assert_history_service_tier_and_pdf_capability(
         content: vec![crate::message::ContentBlock::Text {
             text: "persisted fallback history".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -749,7 +800,8 @@ async fn assert_history_service_tier_and_pdf_capability(
     live_session.messages[0].content = vec![crate::message::ContentBlock::Text {
         text: "live unsaved history".to_string(),
         cache_control: None,
-    }];
+    }]
+    .into();
     let agent = Arc::new(Mutex::new(Agent::new_with_session(
         provider.clone(),
         registry,
@@ -1053,6 +1105,36 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
 }
 
 #[test]
+fn history_reload_recovery_infers_pending_assistant_tool_during_reload() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new()?;
+    let runtime = tempfile::TempDir::new()?;
+    let _guard = ReloadHistoryEnvGuard::new(home.path(), runtime.path());
+    let session_id = "session_history_pending_bg";
+    let mut session = crate::session::Session::create_with_id(session_id.into(), None, None);
+    session.status = crate::session::SessionStatus::Active;
+    session.add_message(
+        crate::message::Role::Assistant,
+        vec![crate::message::ContentBlock::ToolUse {
+            id: "wait_1".into(),
+            name: "bg".into(),
+            input: serde_json::json!({"action": "wait", "max_wait_seconds": 400}),
+            thought_signature: None,
+        }],
+    );
+    session.save()?;
+    assert!(super::history_reload_recovery_snapshot(session_id, None).is_none());
+    crate::server::write_reload_state(
+        "reload-pending-bg",
+        "test-hash",
+        crate::server::ReloadPhase::SocketReady,
+        None,
+    );
+    assert!(super::history_reload_recovery_snapshot(session_id, None).is_some());
+    Ok(())
+}
+
+#[test]
 fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepted() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
@@ -1145,95 +1227,5 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
     Ok(())
 }
 
-fn delta_test_messages() -> Vec<crate::protocol::HistoryMessage> {
-    ["one", "two", "three", "four"]
-        .into_iter()
-        .enumerate()
-        .map(|(index, content)| crate::protocol::HistoryMessage {
-            response_stats: None,
-            role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
-            content: content.to_string(),
-            tool_calls: None,
-            tool_data: None,
-        })
-        .collect()
-}
-
-fn delta_test_base(
-    messages: &[crate::protocol::HistoryMessage],
-    count: usize,
-) -> crate::protocol::HistoryBase {
-    crate::protocol::HistoryBase {
-        count,
-        fingerprint: crate::protocol::history_prefix_fingerprint(
-            messages[..count]
-                .iter()
-                .map(crate::protocol::HistoryMessageRef::from),
-        ),
-        images_fingerprint: None,
-    }
-}
-
-#[test]
-fn history_base_match_sends_only_the_tail() {
-    let messages = delta_test_messages();
-    let base = delta_test_base(&messages, 3);
-    let (tail, base_count) = super::apply_history_base(messages, Some(base));
-    assert_eq!(base_count, Some(3));
-    assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0].content, "four");
-}
-
-#[test]
-fn history_base_full_match_sends_empty_tail() {
-    let messages = delta_test_messages();
-    let base = delta_test_base(&messages, 4);
-    let (tail, base_count) = super::apply_history_base(messages, Some(base));
-    assert_eq!(base_count, Some(4));
-    assert!(tail.is_empty());
-}
-
-#[test]
-fn history_base_mismatch_or_overlong_sends_full_transcript() {
-    let messages = delta_test_messages();
-    let mut edited = delta_test_messages();
-    edited[1].content = "rewound".to_string();
-    let stale = delta_test_base(&edited, 3);
-    let (full, base_count) = super::apply_history_base(messages.clone(), Some(stale));
-    assert_eq!((full.len(), base_count), (4, None));
-
-    let mut longer = delta_test_messages();
-    longer.push(longer[0].clone());
-    let overlong = delta_test_base(&longer, 5);
-    let (full, base_count) = super::apply_history_base(messages.clone(), Some(overlong));
-    assert_eq!((full.len(), base_count), (4, None));
-
-    let (full, base_count) = super::apply_history_base(messages, None);
-    assert_eq!((full.len(), base_count), (4, None));
-}
-
-#[test]
-fn history_images_base_omits_only_matching_image_sets() {
-    let image = |data: &str| crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: data.to_string(),
-        label: None,
-        source: crate::session::RenderedImageSource::UserInput,
-        anchor: None,
-        history_message_index: None,
-    };
-    let images = vec![image("a"), image("b")];
-    let base = |fingerprint| crate::protocol::HistoryBase {
-        count: 1,
-        fingerprint: 0,
-        images_fingerprint: Some(fingerprint),
-    };
-    let matching = crate::protocol::history_images_fingerprint(&images);
-    let (sent, unchanged) = super::apply_history_images_base(images.clone(), Some(base(matching)));
-    assert!(unchanged && sent.is_empty());
-    let other = crate::protocol::history_images_fingerprint(&[image("a")]);
-    let (sent, unchanged) = super::apply_history_images_base(images.clone(), Some(base(other)));
-    assert!(!unchanged && sent.len() == 2);
-    let (sent, unchanged) = super::apply_history_images_base(images, None);
-    assert!(!unchanged && sent.len() == 2);
-}
+#[path = "client_state_tests/history_delta.rs"]
+mod history_delta;

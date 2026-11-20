@@ -20,17 +20,32 @@ fn restore_env_var(key: &str, previous: Option<OsString>) {
 }
 
 #[test]
-fn hibernation_environment_override_accepts_seconds_and_zero_but_not_invalid_values() {
-    let _lock = crate::storage::lock_test_env();
-    let key = "JCODE_HIBERNATION_IDLE_SECS";
-    let previous = std::env::var_os(key);
-    for (value, expected) in [("60", 60), (" 0 ", 0), ("-1", 1800), ("invalid", 1800)] {
-        crate::env::set_var(key, value);
-        let mut config = Config::default();
-        config.apply_env_overrides();
-        assert_eq!(config.session.hibernation_idle_secs, expected, "{value}");
+fn jarvis_speech_endpoint_override_and_cache_fingerprint() {
+    let _guard = crate::storage::lock_test_env();
+    struct Restore(Option<OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            restore_env_var("JCODE_JARVIS_SPEECH_ENDPOINT", self.0.take());
+        }
     }
-    restore_env_var(key, previous);
+    let _restore = Restore(std::env::var_os("JCODE_JARVIS_SPEECH_ENDPOINT"));
+    crate::env::remove_var("JCODE_JARVIS_SPEECH_ENDPOINT");
+    let before = config_env_fingerprint();
+    crate::env::set_var(
+        "JCODE_JARVIS_SPEECH_ENDPOINT",
+        "http://127.0.0.1:8765/v1/audio/speech",
+    );
+    assert_ne!(before, config_env_fingerprint());
+    let mut config: Config =
+        toml::from_str("[jarvis.speech]\nendpoint = 'http://old.example/tts'").unwrap();
+    config.apply_env_overrides();
+    assert_eq!(
+        config.jarvis.speech.endpoint.as_deref(),
+        Some("http://127.0.0.1:8765/v1/audio/speech")
+    );
+    crate::env::set_var("JCODE_JARVIS_SPEECH_ENDPOINT", "");
+    config.apply_env_overrides();
+    assert_eq!(config.jarvis.speech.endpoint.as_deref(), Some(""));
 }
 
 struct GeminiConfigEnv {
@@ -73,103 +88,6 @@ impl Drop for GeminiConfigEnv {
         }
         Config::invalidate_cache();
     }
-}
-
-#[test]
-fn gemini_config_reload_does_not_export_sticky_environment_overrides() {
-    let _lock = crate::storage::lock_test_env();
-    let _env = GeminiConfigEnv::new();
-    let mut cfg = Config::default();
-    cfg.provider.gemini_force_oauth = true;
-    cfg.provider.gemini_project = Some(" project-a ".into());
-    cfg.save().unwrap();
-    assert!(crate::auth::gemini::force_oauth());
-    assert_eq!(
-        crate::auth::gemini::cloud_project().as_deref(),
-        Some("project-a")
-    );
-    assert!(std::env::var_os("JCODE_GEMINI_FORCE_OAUTH").is_none());
-    assert!(std::env::var_os("GOOGLE_CLOUD_PROJECT").is_none());
-
-    cfg.provider.gemini_force_oauth = false;
-    cfg.provider.gemini_project = Some("project-b".into());
-    cfg.save().unwrap();
-    assert!(!crate::auth::gemini::force_oauth());
-    assert_eq!(
-        crate::auth::gemini::cloud_project().as_deref(),
-        Some("project-b")
-    );
-
-    cfg.provider.gemini_project = None;
-    cfg.save().unwrap();
-    assert_eq!(crate::auth::gemini::cloud_project(), None);
-}
-
-#[test]
-fn gemini_environment_overrides_config_without_changing_the_file() {
-    let _lock = crate::storage::lock_test_env();
-    let _env = GeminiConfigEnv::new();
-    let mut cfg = Config::default();
-    cfg.provider.gemini_force_oauth = true;
-    cfg.provider.gemini_project = Some("from-config".into());
-    cfg.save().unwrap();
-    crate::env::set_var("JCODE_GEMINI_FORCE_OAUTH", "off");
-    crate::env::set_var("GOOGLE_CLOUD_PROJECT_ID", "from-alias");
-    Config::invalidate_cache();
-    assert!(!crate::auth::gemini::force_oauth());
-    assert_eq!(
-        crate::auth::gemini::cloud_project().as_deref(),
-        Some("from-alias")
-    );
-    crate::env::set_var("GOOGLE_CLOUD_PROJECT", "from-env");
-    Config::invalidate_cache();
-    assert_eq!(
-        crate::auth::gemini::cloud_project().as_deref(),
-        Some("from-env")
-    );
-
-    for key in [
-        "JCODE_GEMINI_FORCE_OAUTH",
-        "GOOGLE_CLOUD_PROJECT",
-        "GOOGLE_CLOUD_PROJECT_ID",
-    ] {
-        crate::env::remove_var(key);
-    }
-    Config::invalidate_cache();
-    assert!(crate::auth::gemini::force_oauth());
-    assert_eq!(
-        crate::auth::gemini::cloud_project().as_deref(),
-        Some("from-config")
-    );
-}
-
-#[test]
-fn test_openai_reasoning_effort_defaults_to_low() {
-    assert_eq!(
-        ProviderConfig::default().openai_reasoning_effort.as_deref(),
-        Some("low")
-    );
-}
-
-#[test]
-fn test_openai_fast_mode_defaults_to_priority() {
-    assert_eq!(
-        ProviderConfig::default().openai_service_tier.as_deref(),
-        Some("priority")
-    );
-}
-
-#[test]
-fn preserve_reasoning_context_defaults_to_enabled() {
-    assert!(ProviderConfig::default().preserve_reasoning_context);
-}
-
-#[test]
-fn swarm_spawn_mode_defaults_to_inline() {
-    assert_eq!(
-        Config::default().agents.swarm_spawn_mode,
-        SwarmSpawnMode::Inline
-    );
 }
 
 #[test]
@@ -364,85 +282,8 @@ fn auto_poke_environment_override_uses_standard_boolean_values() {
     restore_env_var("JCODE_AUTO_POKE", previous);
 }
 
-#[test]
-fn latex_rendering_defaults_to_image_and_parses_all_modes() {
-    assert_eq!(
-        Config::default().display.latex_rendering,
-        LatexRenderingMode::Image
-    );
-    for (value, expected) in [
-        ("none", LatexRenderingMode::None),
-        ("unicode", LatexRenderingMode::Unicode),
-        ("image", LatexRenderingMode::Image),
-    ] {
-        let cfg: Config = toml::from_str(&format!("[display]\nlatex_rendering = \"{value}\"\n"))
-            .expect("latex rendering mode should parse");
-        assert_eq!(cfg.display.latex_rendering, expected);
-        assert_eq!(LatexRenderingMode::parse(expected.as_str()), Some(expected));
-    }
-    // An unknown mode degrades to the default instead of failing the whole
-    // config parse, which used to silently discard every other setting in
-    // config.toml (issue #689).
-    let cfg: Config = toml::from_str("[display]\ncentered = true\nlatex_rendering = \"canvas\"\n")
-        .expect("an unknown latex mode must not invalidate the config");
-    assert_eq!(cfg.display.latex_rendering, LatexRenderingMode::Image);
-    assert!(cfg.display.centered, "unrelated settings must survive");
-}
-
-#[test]
-fn latex_rendering_environment_override_accepts_aliases() {
-    let _guard = crate::storage::lock_test_env();
-    let previous = std::env::var_os("JCODE_LATEX_RENDERING");
-    crate::env::set_var("JCODE_LATEX_RENDERING", "png");
-    let mut cfg = Config::default();
-    cfg.apply_env_overrides();
-    assert_eq!(cfg.display.latex_rendering, LatexRenderingMode::Image);
-    restore_env_var("JCODE_LATEX_RENDERING", previous);
-}
-
-/// The /latex command persists through set_latex_rendering, which is a
-/// read-modify-write over the real config.toml. Pin the whole roundtrip at
-/// this layer: write, then parse the file back and confirm the mode and an
-/// unrelated sibling setting both survive, so a future refactor cannot make
-/// the setter rewrite the file without keeping other keys.
-#[test]
-fn set_latex_rendering_roundtrips_through_config_toml() {
-    let _guard = crate::storage::lock_test_env();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let previous_home = std::env::var_os("JCODE_HOME");
-    crate::env::set_var("JCODE_HOME", temp.path());
-    let previous_latex = std::env::var_os("JCODE_LATEX_RENDERING");
-    crate::env::remove_var("JCODE_LATEX_RENDERING");
-
-    // Seed a non-default sibling key so the test can catch a rewrite that
-    // drops it.
-    let seed = temp.path().join("config.toml");
-    std::fs::write(
-        &seed,
-        "[display]\ncentered = false\nlatex_rendering = \"unicode\"\n",
-    )
-    .expect("seed config");
-
-    Config::set_latex_rendering(LatexRenderingMode::None).expect("save mode");
-
-    let raw = std::fs::read_to_string(&seed).expect("read config back");
-    assert!(
-        raw.contains("latex_rendering = \"none\""),
-        "mode must be persisted, got: {raw}"
-    );
-    assert!(
-        raw.contains("centered = false"),
-        "unrelated display keys must survive the rewrite, got: {raw}"
-    );
-
-    let reloaded = Config::load_strict().expect("config parses after the write");
-    assert_eq!(reloaded.display.latex_rendering, LatexRenderingMode::None);
-    assert!(!reloaded.display.centered);
-
-    restore_env_var("JCODE_LATEX_RENDERING", previous_latex);
-    restore_env_var("JCODE_HOME", previous_home);
-    Config::invalidate_cache();
-}
+#[path = "config_latex_tests.rs"]
+mod latex;
 
 #[test]
 fn swarm_max_concurrent_agents_parses_and_allows_zero_for_unbounded() {
@@ -468,6 +309,21 @@ fn swarm_spawn_mode_parses_supported_values() {
     let cfg: Config = toml::from_str("[agents]\nswarm_spawn_mode = \"visible\"\n")
         .expect("visible swarm_spawn_mode should parse");
     assert_eq!(cfg.agents.swarm_spawn_mode, SwarmSpawnMode::Visible);
+}
+
+#[test]
+fn retired_swarm_strip_settings_are_ignored() {
+    for layout in ["vertical", "horizontal", "obsolete"] {
+        let cfg: Config = toml::from_str(&format!(
+            "[agents]\nswarm_strip_layout = {layout:?}\nswarm_gallery_max_pct = 40\nswarm_spawn_mode = \"headless\"\n"
+        ))
+        .expect("retired swarm settings should be ignored in existing configs");
+        assert_eq!(cfg.agents.swarm_spawn_mode, SwarmSpawnMode::Headless);
+
+        let serialized = toml::to_string(&cfg).expect("config should serialize");
+        assert!(!serialized.contains("swarm_strip_layout"));
+        assert!(!serialized.contains("swarm_gallery_max_pct"));
+    }
 }
 
 #[test]
@@ -906,32 +762,41 @@ fn tool_config_explicit_disabled_overrides_all_enabled_sentinel() {
 }
 
 #[test]
-fn tool_config_acp_profile_allows_core_coding_plus_batch() {
-    let cfg = ToolConfig {
-        profile: "acp".to_string(),
-        ..ToolConfig::default()
-    };
-    let allowed = cfg.allowed_tools().expect("acp profile is an allow-list");
-
-    assert!(allowed.contains("bash"));
-    assert!(allowed.contains("read"));
-    assert!(allowed.contains("write"));
-    assert!(allowed.contains("apply_patch"));
-    assert!(allowed.contains("agentgrep"));
-    assert!(allowed.contains("batch"));
-    assert!(allowed.contains("mcp"));
-    assert!(allowed.contains("edit"));
-    assert!(!allowed.contains("replace"));
-    assert!(!allowed.contains("swarm"));
-    assert!(!allowed.contains("subagent"));
-    assert!(!allowed.contains("side_panel"));
+fn tool_config_acp_profile_is_the_full_toolset() {
+    // Configs written before ACP parity still say `tool_profile = "acp"`.
+    // That name must not restrict tools: ACP clients get everything the TUI
+    // gets (todo, bg, swarm, skill_manage, web search, memory, ...).
+    for profile in ["acp", "ACP", "full", ""] {
+        let cfg = ToolConfig {
+            profile: profile.to_string(),
+            ..ToolConfig::default()
+        };
+        let selection = cfg.selection();
+        assert!(
+            selection.allowed_tools.is_none(),
+            "profile {profile:?} must not be an allow-list"
+        );
+        assert!(selection.disabled_tools.is_empty());
+    }
 }
 
 #[test]
-fn acp_config_defaults_to_standard_profile_and_acp_tools() {
+fn tool_config_acp_profile_still_honors_explicit_lists() {
+    let cfg = ToolConfig {
+        profile: "acp".to_string(),
+        disabled: vec!["swarm".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+    assert!(selection.allowed_tools.is_none());
+    assert!(selection.disabled_tools.contains("swarm"));
+}
+
+#[test]
+fn acp_config_defaults_to_standard_profile_and_full_tools() {
     let cfg = Config::default();
     assert_eq!(cfg.acp.profile, "standard");
-    assert_eq!(cfg.acp.tool_profile, "acp");
+    assert_eq!(cfg.acp.tool_profile, "full");
 }
 
 #[test]
@@ -1029,7 +894,7 @@ fn test_generated_default_config_has_expected_user_defaults() {
         "generated default config should document tool profiles"
     );
     assert!(
-        content.contains("[acp]") && content.contains("tool_profile = \"acp\""),
+        content.contains("[acp]") && content.contains("tool_profile = \"full\""),
         "generated default config should document ACP profile settings"
     );
     assert!(
@@ -1148,6 +1013,30 @@ fn config_env_fingerprint_ignores_runtime_only_jcode_vars() {
     restore_env_var("JCODE_DISPLAY_CENTERED", prev_display_centered);
 }
 
+// Changing the resume override must invalidate the cached configuration.
+#[test]
+fn config_cache_reloads_after_resume_open_elsewhere_changes() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_resume = std::env::var_os("JCODE_RESUME_OPEN_ELSEWHERE");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", dir.path());
+    crate::env::set_var("JCODE_RESUME_OPEN_ELSEWHERE", "off");
+    Config::invalidate_cache();
+
+    let before = crate::config::config().display.resume_open_elsewhere;
+    crate::env::set_var("JCODE_RESUME_OPEN_ELSEWHERE", "replace");
+    let after = crate::config::config().display.resume_open_elsewhere;
+
+    // Restore process-wide state before checking the result, even on failure.
+    restore_env_var("JCODE_HOME", prev_home);
+    restore_env_var("JCODE_RESUME_OPEN_ELSEWHERE", prev_resume);
+    Config::invalidate_cache();
+
+    assert_eq!(before, jcode_config_types::ResumeOpenElsewhere::Off);
+    assert_eq!(after, jcode_config_types::ResumeOpenElsewhere::Replace);
+}
+
 #[test]
 fn config_env_fingerprint_tracks_every_apply_env_override_var() {
     let override_source = include_str!("config/env_overrides.rs");
@@ -1238,6 +1127,34 @@ fn test_provider_failover_defaults_match_new_behavior() {
         super::CrossProviderFailoverMode::Countdown
     );
     assert!(provider.same_provider_account_failover);
+    assert!(provider.openai_auto_banked_reset);
+    assert!(!provider.anthropic_auto_fable_reset);
+}
+
+#[test]
+fn automatic_banked_reset_defaults_on_and_supports_explicit_opt_out() {
+    let cfg: Config = toml::from_str("[provider]\nopenai_auto_banked_reset = false\n").unwrap();
+    assert!(!cfg.provider.openai_auto_banked_reset);
+    let cfg: Config = toml::from_str("[provider]\n").unwrap();
+    assert!(cfg.provider.openai_auto_banked_reset);
+    assert!(cfg.provider.auto_reset_only_when_no_routes);
+    assert!(!cfg.provider.anthropic_auto_fable_reset);
+    let cfg: Config = toml::from_str("[provider]\nanthropic_auto_fable_reset = true\n").unwrap();
+    assert!(cfg.provider.anthropic_auto_fable_reset);
+    assert!(cfg.provider.openai_auto_banked_reset);
+}
+
+#[test]
+fn automatic_reset_routes_first_by_default_and_can_be_overridden() {
+    let cfg: Config = toml::from_str("[provider]\n").unwrap();
+    assert!(cfg.provider.auto_reset_only_when_no_routes);
+    assert!(ProviderConfig::default().auto_reset_only_when_no_routes);
+    let cfg: Config = toml::from_str(
+        "[provider]\nopenai_auto_banked_reset = true\nanthropic_auto_fable_reset = true\nauto_reset_only_when_no_routes = false\n",
+    ).unwrap();
+    assert!(!cfg.provider.auto_reset_only_when_no_routes);
+    assert!(cfg.provider.openai_auto_banked_reset);
+    assert!(cfg.provider.anthropic_auto_fable_reset);
 }
 
 #[test]
@@ -1887,6 +1804,32 @@ fn cli_config_save_round_trips_desktop_tables() {
     Config::invalidate_cache();
 }
 
+#[test]
+fn global_voice_devices_fall_back_to_desktop_selection() {
+    let desktop: Config =
+        toml::from_str("[desktop.voice]\nglobal_devices = [\"/dev/input/event3\", \"\"]\n")
+            .unwrap();
+    assert_eq!(
+        desktop.global_voice_devices(),
+        vec![std::path::PathBuf::from("/dev/input/event3")]
+    );
+
+    let explicit: Config = toml::from_str(
+        "[dictation]\nglobal_devices = [\"/dev/input/event7\"]\n\n\
+         [desktop.voice]\nglobal_devices = [\"/dev/input/event3\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        explicit.global_voice_devices(),
+        vec![std::path::PathBuf::from("/dev/input/event7")]
+    );
+
+    assert!(Config::default().global_voice_devices().is_empty());
+}
+
+#[path = "config_tests/default_provider.rs"]
+mod default_provider;
+
 /// `display.overscroll_status` was removed; configs that still set it (users
 /// had `"on"` written by older versions) must load without losing settings.
 #[test]
@@ -1937,3 +1880,6 @@ fn browser_handoff_defaults_off_and_roundtrips() {
         assert_eq!(restored.tools.browser_handoff, enabled);
     }
 }
+
+#[path = "config_tests_additional_tests.rs"]
+mod additional_hibernation_environment_override_accepts_seconds_and_zero_but_not_invalid_values;

@@ -9,6 +9,7 @@ mod binary_lock;
 mod build_lock;
 mod deterministic_build;
 mod landing;
+mod linux_prerelease;
 mod paths;
 mod platform_support;
 mod source_state;
@@ -35,6 +36,7 @@ pub use landing::{
     recover_landing_locked, rollback_landing, save_landing_transaction, shared_server_is_pinned_to_selfdev,
     stage_build, version_build_time, version_commit, wait_for_daemon_identity, would_downgrade,
 };
+pub use linux_prerelease::{dispatch_linux_prerelease, linux_prerelease_candidate};
 pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,
     current_binary_build_time_string, current_binary_built_at, find_dev_binary,

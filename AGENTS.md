@@ -16,6 +16,10 @@
 
 ## Development Workflow
 
+- **Commit and push as you go** - Make small, scoped commits and push them to
+  the current branch's remote as meaningful work is completed, rather than
+  waiting until the end of the task. Preserve unrelated changes and never
+  force-push unless the user explicitly authorizes it.
 - **Use the user's Git identity** - Create commits with the configured
   `user.name` and `user.email`. Do not override them with `Jcode`, `Jcode agent`,
   or a fabricated agent email. Preserve existing contributor attribution when
@@ -61,6 +65,14 @@
 - Ensure `~/.local/bin` is **before** `~/.cargo/bin` in `PATH`.
 
 ## Verifying a change at runtime
+
+### Keep benchmark sessions out of user history
+
+For synthetic prompts and streaming/CPU/power benchmarks, set a dedicated
+`JCODE_HOME` and `JCODE_TEST_SESSION=1` for both the server and its clients,
+in addition to using a unique `--socket`. A private socket alone isolates the
+daemon, not persisted sessions. Never run synthetic benchmark prompts against
+the user's normal session storage.
 
 `cargo build` alone proves nothing about behavior. `jcode run` and interactive
 sessions are served by the long-lived daemon at

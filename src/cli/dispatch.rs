@@ -21,56 +21,9 @@ use super::{
 };
 use provider_init::ProviderChoice;
 
-#[cfg(any(target_os = "linux", test))]
-fn is_file_controlled_debug_client() -> bool {
-    std::env::var_os("JCODE_DEBUG_CMD_PATH").is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn is_orphan_adopter_name(name: &str) -> bool {
-    matches!(name.trim(), "init" | "systemd")
-}
-
-#[cfg(target_os = "linux")]
-fn parent_is_orphan_adopter(parent_pid: libc::pid_t) -> bool {
-    if parent_pid <= 1 {
-        return true;
-    }
-    std::fs::read_to_string(format!("/proc/{parent_pid}/comm"))
-        .is_ok_and(|name| is_orphan_adopter_name(&name))
-}
-
-/// Tie file-controlled debug clients to the process that launched them.
-///
-/// These clients are automation helpers, not user-owned terminals. Without a
-/// parent-death signal they are reparented to init when a verification script
-/// or debug server exits, retaining a full TUI and session history indefinitely.
-#[cfg(target_os = "linux")]
-fn arm_debug_client_parent_death_signal() {
-    if !is_file_controlled_debug_client() {
-        return;
-    }
-
-    // Capture the parent first, then check it again after prctl. This closes the
-    // race where the launcher exits immediately before the signal is armed.
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let parent_pid = unsafe { libc::getppid() };
-    // Safety: PR_SET_PDEATHSIG accepts a signal number as its scalar argument.
-    let armed = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } == 0;
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let current_parent_pid = unsafe { libc::getppid() };
-    if armed
-        && (parent_is_orphan_adopter(parent_pid)
-            || current_parent_pid != parent_pid
-            || parent_is_orphan_adopter(current_parent_pid))
-    {
-        std::process::exit(0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn arm_debug_client_parent_death_signal() {}
-
+#[path = "dispatch_debug_parent.rs"]
+mod debug_parent;
+use debug_parent::*;
 pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     arm_debug_client_parent_death_signal();
     if args.ssh.is_some() {
@@ -277,6 +230,10 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     println!("Jcode server is running.");
                 }
             }
+            ServerCommand::ExecWorker => {
+                crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
+                crate::tool::remote_exec::run_worker_stdio().await?;
+            }
             ServerCommand::Keepalive => {
                 run_server_keepalive(
                     &args.provider,
@@ -333,6 +290,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             flow_id,
             cancel,
             no_validate,
+            device_code,
             google,
             api_base,
             api_key,
@@ -348,6 +306,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 flow_id,
                 cancel,
                 no_validate,
+                device_code,
                 openai_compatible_api_base: api_base,
                 openai_compatible_api_key: api_key,
                 openai_compatible_api_key_env: api_key_env,
@@ -370,6 +329,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             super::args::AccountCommand::Manage => account::run_manage()?,
             super::args::AccountCommand::Logout => account::run_logout().await?,
         },
+        Some(Command::Mobile { action }) => account::run_mobile(action).await?,
         Some(Command::Repl) => {
             let (provider, registry) =
                 provider_init::init_provider_and_registry(&args.provider, args.model.as_deref())
@@ -492,8 +452,33 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         }) => {
             commands::run_transcript_command(text, map_transcript_mode(mode), session).await?;
         }
-        Some(Command::Companion { status, no_voice }) => {
-            commands::run_companion_command(status, no_voice).await?;
+        Some(Command::Companion {
+            status,
+            no_voice,
+            no_voice_waveform,
+            no_voice_notifications,
+            no_jarvis_fn_key,
+            no_jarvis_fn_launch,
+            no_open,
+            no_spawn_terminal,
+            no_lid,
+            no_browser_updates,
+        }) => {
+            commands::run_companion_command(
+                status,
+                commands::CompanionFlags {
+                    no_voice,
+                    no_voice_waveform,
+                    no_voice_notifications,
+                    no_jarvis_fn_key,
+                    no_jarvis_fn_launch,
+                    no_open,
+                    no_spawn_terminal,
+                    no_lid,
+                    no_browser_updates,
+                },
+            )
+            .await?;
         }
         Some(Command::Dictate { r#type }) => {
             commands::run_dictate_command(r#type).await?;
@@ -672,31 +657,11 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
 /// Anthropic Messages runtime with the profile's base URL and auth, while
 /// `AnthropicApi` would pin an Anthropic API-key credential the profile may
 /// not have (e.g. `auth = "none"`).
-fn provider_choice_for_named_profile(profile_name: &str) -> ProviderChoice {
-    // Same source as `apply_named_provider_profile_env`, which already
-    // validated that the profile exists.
-    match crate::config::Config::load_strict() {
-        Ok(config) => provider_choice_for_named_profile_in(profile_name, &config),
-        Err(_) => provider_choice_for_named_profile_in(profile_name, crate::config::config()),
-    }
-}
-
-fn provider_choice_for_named_profile_in(
-    profile_name: &str,
-    config: &crate::config::Config,
-) -> ProviderChoice {
-    match config.providers.get(profile_name) {
-        Some(profile)
-            if matches!(
-                profile.provider_type,
-                crate::config::NamedProviderType::AnthropicCompatible
-            ) =>
-        {
-            ProviderChoice::Auto
-        }
-        _ => ProviderChoice::OpenaiCompatible,
-    }
-}
+#[path = "dispatch/named_profiles.rs"]
+mod named_profiles;
+use named_profiles::provider_choice_for_named_profile;
+#[cfg(test)]
+use named_profiles::provider_choice_for_named_profile_in;
 
 fn auth_doctor_provider_arg<'a>(
     positional_provider: Option<&'a str>,
@@ -711,82 +676,10 @@ fn auth_doctor_provider_arg<'a>(
     })
 }
 
-fn resolve_resume_arg(args: &mut Args) -> Result<()> {
-    if let Some(ref resume_id) = args.resume {
-        let resume_id = resume_id.clone();
-        match resolve_resume_id(&resume_id) {
-            Ok(full_id) => {
-                args.resume = Some(full_id);
-            }
-            Err(e) => {
-                match resume_resolution_failure_action(&resume_id, |key| std::env::var_os(key)) {
-                    // During a reload/update/restart handoff the client re-execs
-                    // itself with `--resume <id>` and `JCODE_RESUMING=1`. In the
-                    // client/server architecture the shared server is the authority
-                    // for session lifecycle, so an id that is not in the local store
-                    // can still be valid server-side. Hard-exiting here dumped the
-                    // user back to a shell with "No session found matching ...",
-                    // making jcode unusable after an auto-update (issue #328).
-                    // Instead, keep the raw id and let the remote connection resolve
-                    // it; if the server cannot find it either, the TUI surfaces a
-                    // recoverable message and falls back to a fresh session rather
-                    // than killing the process.
-                    ResumeResolutionFailureAction::DeferToServer => {
-                        crate::logging::warn(&format!(
-                            "Resume id '{}' not found locally during reload handoff ({}); deferring resolution to the server instead of exiting",
-                            resume_id, e
-                        ));
-                        // Leave args.resume as the raw id for the server to resolve.
-                    }
-                    ResumeResolutionFailureAction::Exit => {
-                        eprintln!("Error: {}", e);
-                        if !output::quiet_enabled() {
-                            eprintln!("\nUse `jcode --resume` to list available sessions.");
-                        }
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// What to do when a `--resume <id>` cannot be resolved from the local session
-/// store. Extracted as a pure function so the reload-handoff recovery path can
-/// be unit-tested without invoking `std::process::exit` (issue #328).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResumeResolutionFailureAction {
-    /// Keep the raw id and let the shared server resolve it (reload handoff).
-    DeferToServer,
-    /// No live handoff in progress; the id is genuinely bad, so exit.
-    Exit,
-}
-
-fn resume_resolution_failure_action<F, V>(
-    _resume_id: &str,
-    var_os: F,
-) -> ResumeResolutionFailureAction
-where
-    F: Fn(&str) -> Option<V>,
-{
-    if var_os("JCODE_RESUMING").is_some() {
-        ResumeResolutionFailureAction::DeferToServer
-    } else {
-        ResumeResolutionFailureAction::Exit
-    }
-}
-
-fn resolve_resume_id(resume_id: &str) -> Result<String> {
-    match session::find_session_by_name_or_id(resume_id) {
-        Ok(full_id) => Ok(full_id),
-        Err(native_err) => match crate::import::import_external_resume_id(resume_id)? {
-            Some(imported_id) => Ok(imported_id),
-            None => Err(native_err),
-        },
-    }
-}
+mod resume;
+use resume::resolve_resume_arg;
+#[cfg(test)]
+use resume::{ResumeResolutionFailureAction, resolve_resume_id, resume_resolution_failure_action};
 
 mod subcommand_mapping;
 use subcommand_mapping::*;

@@ -488,37 +488,9 @@ impl ProviderAuth {
     }
 }
 
-fn add_cache_breakpoint(messages: &mut [Message]) -> bool {
-    let mut cache_index = None;
-    for (idx, msg) in messages.iter().enumerate().rev() {
-        if let Role::User = msg.role
-            && msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text { .. }))
-        {
-            cache_index = Some(idx);
-            break;
-        }
-    }
-
-    let Some(idx) = cache_index else {
-        return false;
-    };
-
-    let msg = &mut messages[idx];
-    for block in msg.content.iter_mut().rev() {
-        if let ContentBlock::Text { cache_control, .. } = block {
-            if cache_control.is_none() {
-                *cache_control = Some(CacheControl::ephemeral(None));
-            }
-            return true;
-        }
-    }
-
-    false
-}
-
+#[path = "lib_cache_breakpoints.rs"]
+mod cache_breakpoints;
+use cache_breakpoints::*;
 fn models_fingerprint(models: &[ModelInfo]) -> String {
     serde_json::to_string(models).unwrap_or_default()
 }
@@ -3050,50 +3022,5 @@ mod profile_catalog_backoff_tests;
 mod muse_native_tests;
 
 #[cfg(test)]
-mod placeholder_default_tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_default_is_current_flagship() {
-        assert_eq!(DEFAULT_MODEL, "anthropic/claude-opus-5.5");
-    }
-
-    #[test]
-    fn placeholder_default_promotes_to_newest_flagship() {
-        let catalog = [
-            "anthropic/claude-sonnet-4",
-            "anthropic/claude-haiku-4.5",
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-5.5",
-            "anthropic/claude-opus-5.6",
-            "openai/gpt-5.5",
-            "deepseek/deepseek-v4-pro",
-        ];
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &catalog).as_deref(),
-            Some("anthropic/claude-opus-5.6")
-        );
-    }
-
-    #[test]
-    fn placeholder_default_never_overrides_a_chosen_model() {
-        let catalog = ["anthropic/claude-sonnet-4", "anthropic/claude-opus-5.5"];
-        assert_eq!(
-            select_promoted_default("deepseek/deepseek-v4-pro", &catalog),
-            None
-        );
-    }
-
-    #[test]
-    fn placeholder_default_stays_when_catalog_has_nothing_better() {
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &["deepseek/deepseek-v4-pro"]),
-            None
-        );
-        assert_eq!(select_promoted_default(DEFAULT_MODEL, &[]), None);
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &[DEFAULT_MODEL]),
-            None
-        );
-    }
-}
+#[path = "placeholder_default_tests.rs"]
+mod placeholder_default_tests;

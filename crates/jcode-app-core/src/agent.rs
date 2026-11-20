@@ -53,7 +53,6 @@ use crate::tool::{Registry, ToolContext, ToolExecutionMode};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -81,63 +80,9 @@ static WORKING_GIT_STATE_CACHE: LazyLock<StdMutex<HashMap<PathBuf, Option<GitSta
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 const STREAM_KEEPALIVE_PONG_ID: u64 = 0;
 
-fn stable_hash_str(value: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn stable_hash_json<T: serde::Serialize + ?Sized>(value: &T) -> u64 {
-    let encoded = serde_json::to_string(value).unwrap_or_default();
-    stable_hash_str(&encoded)
-}
-
-fn stable_json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
-    serde_json::to_string(value)
-        .map(|encoded| encoded.len())
-        .unwrap_or_default()
-}
-
-fn message_hashes(messages: &[Message]) -> Vec<u64> {
-    // Hash the cache-relevant projection, not the raw Message. Raw hashing
-    // keys off non-transmitted metadata (timestamp, tool_duration_ms,
-    // ReasoningTrace blocks, cache_control markers), which triggers spurious
-    // harness:_prefix_changed KV-cache miss reports when the same message is
-    // re-serialized with backfilled metadata on the next turn.
-    crate::message::cache_relevant_message_hashes(messages)
-}
-
-fn kv_cache_request_event(
-    messages: &[Message],
-    tools: &[ToolDefinition],
-    system_static: &str,
-    ephemeral_messages: &[Message],
-) -> ServerEvent {
-    // Provider-native deferred definitions are outside the cached prefix.
-    // Late MCP discovery must not look like a harness-induced tools change
-    // when the provider reports a cache miss for some unrelated reason.
-    // Borrow definitions rather than cloning potentially large MCP schemas.
-    let eager_tools: Vec<_> = tools.iter().filter(|tool| !tool.defer_loading).collect();
-    let ephemeral_hash = if ephemeral_messages.is_empty() {
-        None
-    } else {
-        Some(stable_hash_json(ephemeral_messages))
-    };
-    ServerEvent::KvCacheRequest {
-        system_static_hash: stable_hash_str(system_static),
-        tools_hash: stable_hash_json(&eager_tools),
-        messages_hash: stable_hash_json(&crate::message::cache_relevant_messages(messages)),
-        message_hashes: message_hashes(messages),
-        message_count: messages.len(),
-        tool_count: eager_tools.len(),
-        system_static_chars: system_static.chars().count(),
-        tools_json_chars: stable_json_len(&eager_tools),
-        messages_json_chars: stable_json_len(messages),
-        ephemeral_hash,
-        ephemeral_chars: stable_json_len(ephemeral_messages),
-        ephemeral_message_count: ephemeral_messages.len(),
-    }
-}
+#[path = "agent/cache_request.rs"]
+mod cache_request;
+use cache_request::kv_cache_request_event;
 
 impl Agent {
     /// Provider identity used for cache retention lookups. Generic OpenAI is
@@ -812,7 +757,7 @@ impl Agent {
         ));
         drop(manager);
         if let Some(state) = sanitized_state {
-            self.session.compaction = state;
+            self.session.compaction = state.map(Arc::new);
             self.persist_session_best_effort("sanitized oversized OpenAI native compaction");
         }
     }
@@ -952,9 +897,8 @@ impl Agent {
         &mut self,
         manager: &crate::compaction::CompactionManager,
     ) {
-        let new_state = manager.persisted_state();
-        if self.session.compaction != new_state {
-            self.session.compaction = new_state;
+        if !manager.persisted_state_matches(self.session.compaction.as_deref()) {
+            self.session.compaction = manager.persisted_state().map(Arc::new);
             if let Err(err) = self.session.save() {
                 logging::error(&format!(
                     "Failed to persist compaction state for session {}: {}",
@@ -997,13 +941,13 @@ impl Agent {
             };
         let state = crate::session::StoredCompactionState {
             summary_text,
-            openai_encrypted_content,
+            openai_encrypted_content: openai_encrypted_content.map(Into::into),
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
         };
 
-        self.session.compaction = Some(state.clone());
+        self.session.compaction = Some(Arc::new(state.clone()));
         let mut post_tokens = None;
         if let Ok(mut manager) = compaction.try_write() {
             manager.set_budget(self.provider.context_window());
@@ -1227,7 +1171,7 @@ impl Agent {
                 let stored_message = StoredMessage {
                     id: id::new_id("message"),
                     role: Role::User,
-                    content: vec![tool_block],
+                    content: vec![tool_block].into(),
                     display_role: None,
                     timestamp: Some(chrono::Utc::now()),
                     tool_duration_ms: None,

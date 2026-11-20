@@ -16,6 +16,9 @@
 //! preparation does not prevent continued work in the original session.
 
 use super::{App, CloudHandoff, DisplayMessage};
+#[path = "commands_cloud_completion.rs"]
+mod completion;
+use completion::finish_cloud_command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CloudCommand {
@@ -41,16 +44,32 @@ pub(super) enum CloudCommand {
     Prepare {
         host: Option<String>,
     },
+    /// Restart the managed cloud daemon onto its selected runtime once idle.
+    Reload {
+        force: bool,
+    },
 }
 
 pub(super) fn parse_cloud_command(trimmed: &str) -> Option<CloudCommand> {
     let mut words = trimmed.split_whitespace();
     match words.next()? {
+        "/mobile" => Some(match words.next() {
+            None => CloudCommand::Move {
+                host: Some("jcode-cloud".into()),
+            },
+            Some("cancel") if words.next().is_none() => CloudCommand::Cancel,
+            _ => CloudCommand::MoveUsage,
+        }),
         "/cloud" => match words.next() {
             None => Some(CloudCommand::Move { host: None }),
             Some("cancel") => Some(CloudCommand::Cancel),
             Some("status") | Some("where") => Some(CloudCommand::Where),
             Some("back") | Some("return") => Some(CloudCommand::Return),
+            Some("reload") => match (words.next(), words.next()) {
+                (None, _) => Some(CloudCommand::Reload { force: false }),
+                (Some("--force"), None) => Some(CloudCommand::Reload { force: true }),
+                _ => Some(CloudCommand::MoveUsage),
+            },
             Some("replace") => {
                 let (mut host, mut yes, mut dry_run) = (None, false, false);
                 while let Some(word) = words.next() {
@@ -144,12 +163,32 @@ pub(super) fn check_cloud_handoff_input(app: &mut App, trimmed: &str) -> bool {
 
 /// Run a `/cloud` family command. Returns true when handled.
 pub(super) fn handle_cloud_command(app: &mut App, trimmed: &str, session_id: &str) -> bool {
-    let Some(command) = parse_cloud_command(trimmed) else {
+    let Some(mut command) = parse_cloud_command(trimmed) else {
         return false;
     };
+    if trimmed == "/mobile" {
+        if crate::subscription_catalog::configured_api_key().is_none() {
+            app.push_display_message(DisplayMessage::error(
+                "Sign in first with `/login jcode`, then retry /mobile. The same Jcode account must be signed in to the mobile app.",
+            ));
+            return true;
+        }
+        // A cloud-attached TUI runs locally, so also inspect its SSH target.
+        if crate::mobile_sync::session_source() == "cloud"
+            || std::env::var("JCODE_SSH_REMOTE").as_deref() == Ok("jcode-cloud")
+            || crate::storage::read_session_lease(session_id)
+                .is_some_and(|lease| lease.away_host.as_deref() == Some("jcode-cloud"))
+        {
+            command = CloudCommand::Where;
+        }
+    }
     if command == CloudCommand::MoveUsage {
         app.push_display_message(DisplayMessage::system(
-            "Usage: /cloud [host] [--include-session <id> ...] [--dry-run]. Your swarm moves together and shares one environment setup. Independent sessions require --include-session. Use --session-only to opt out of swarm migration.",
+            if trimmed.starts_with("/mobile") {
+                "Usage: /mobile or /mobile cancel. Moves this session and its swarm to Jcode Cloud, then sends a notification to your app."
+            } else {
+                "Usage: /cloud [host] [--include-session <id> ...] [--dry-run]. Your swarm moves together and shares one environment setup. Independent sessions require --include-session. Use --session-only to opt out of swarm migration."
+            },
         ));
         return true;
     }
@@ -163,6 +202,12 @@ pub(super) fn handle_cloud_command(app: &mut App, trimmed: &str, session_id: &st
         app.push_display_message(DisplayMessage::error(
             "Run /cloud replace from your local session. Use /local to return from the cloud first.".to_string(),
         ));
+        return true;
+    }
+    if trimmed != "/mobile" && managed_cloud_account_missing(&command) {
+        // Nothing is queued: a signed-out move can only fail after the host
+        // preparation child starts, with a shell-oriented error.
+        show_cloud_account_guidance(app, CloudAccountIssue::SignedOut);
         return true;
     }
     if command == CloudCommand::Cancel {
@@ -195,12 +240,12 @@ pub(super) fn handle_cloud_command(app: &mut App, trimmed: &str, session_id: &st
     if command == CloudCommand::Where && app.pending_cloud_handoff.is_some() {
         let pending = app.pending_cloud_handoff.as_ref().unwrap();
         app.push_display_message(DisplayMessage::system(format!(
-            "Pending handoff: {} (session {}). Waiting for an idle turn boundary. Use /cloud cancel to cancel.",
+            "Pending handoff: {} (session {}). Starts as soon as the host is ready. Use /cloud cancel to cancel.",
             pending.trimmed, pending.session_id
         )));
         return true;
     }
-    if !matches!(command, CloudCommand::Where) {
+    if !matches!(command, CloudCommand::Where | CloudCommand::Reload { .. }) {
         if !check_cloud_handoff_input(app, trimmed) {
             return true;
         }
@@ -222,7 +267,7 @@ pub(super) fn handle_cloud_command(app: &mut App, trimmed: &str, session_id: &st
         ) {
             "Cloud repository replacement queued for the next idle turn boundary. This session stays here. Use /cloud cancel to cancel."
         } else {
-            "Cloud handoff queued for the next idle turn boundary. The current turn continues here. Use /cloud cancel to cancel."
+            "Cloud handoff queued. The current turn continues while the host gets ready, then the transfer starts right away. Use /cloud cancel to cancel."
         };
         app.push_display_message(DisplayMessage::system(message));
         // A queued-command dispatcher may still be restoring the composer draft.
@@ -308,9 +353,18 @@ fn start_cloud_command(
         }
         CloudCommand::Replace { host, yes, dry_run } => {
             let cwd = super::commands::active_working_dir(app).or_else(|| {
-                (!app.is_remote)
-                    .then(|| std::env::current_dir().ok())
-                    .flatten()
+                if app.is_remote {
+                    return None;
+                }
+                match std::env::current_dir() {
+                    Ok(cwd) => Some(cwd),
+                    Err(error) => {
+                        crate::logging::warn(&format!(
+                            "Cannot resolve local directory for cloud replacement: {error}"
+                        ));
+                        None
+                    }
+                }
             });
             let Some(cwd) = cwd.filter(|path| path.is_dir()) else {
                 app.push_display_message(DisplayMessage::error(
@@ -326,6 +380,12 @@ fn start_cloud_command(
         CloudCommand::Cancel => unreachable!("cancel does not spawn"),
         CloudCommand::Where => {
             cmd.args(["where", "--session", session_id]);
+        }
+        CloudCommand::Reload { force } => {
+            cmd.args(["runtime", "reload"]);
+            if *force {
+                cmd.arg("--force");
+            }
         }
     }
     if app.cloud_job.is_some() {
@@ -366,7 +426,12 @@ fn start_cloud_command(
             {
                 if let Some(rest) = line.strip_prefix("[cloud ") {
                     let detail = rest.split_once("] ").map(|(_, d)| d).unwrap_or(rest);
-                    let _ = progress_tx.send(CloudEvent::Progress(detail.to_string()));
+                    if progress_tx
+                        .send(CloudEvent::Progress(detail.to_string()))
+                        .is_err()
+                    {
+                        crate::logging::debug("Cloud command progress receiver closed");
+                    }
                 }
                 collected.push_str(&line);
                 collected.push('\n');
@@ -374,14 +439,47 @@ fn start_cloud_command(
         }
         let _ = progress_tx.send(CloudEvent::Stderr(collected));
     });
+    let mobile_resume = (trimmed == "/mobile" && !matches!(command, CloudCommand::Prepare { .. }))
+        .then(|| {
+            (
+                session_id.to_string(),
+                app.session.display_title().map(str::to_string),
+            )
+        });
+    let mobile_requires_move_report = matches!(command, CloudCommand::Move { .. });
     std::thread::spawn(move || {
         let output = child.wait_with_output();
         let _ = stderr_reader.join();
+        if let Some((session_id, title)) = mobile_resume
+            && let Ok(output) = &output
+            && output.status.success()
+            && (!mobile_requires_move_report
+                || serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                    .is_ok_and(|report| report["host"].as_str() == Some("jcode-cloud")))
+        {
+            // Wait before handing off/exec: otherwise the old process can exit
+            // before an asynchronous push request reaches the control plane.
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| {
+                    runtime.block_on(crate::mobile_push::request_mobile_resume(
+                        &session_id,
+                        title.as_deref(),
+                    ))
+                });
+            let result = result.map_err(|error| format!(
+                    "Session is on cloud, but mobile push failed: {error}. Open the app and select this session, or retry /mobile."
+                ));
+            let _ = tx.send(CloudEvent::MobilePushResult(result));
+        }
         let _ = tx.send(CloudEvent::Done(output.map_err(|e| e.to_string())));
     });
     let carried = carried.filter(|(index, _)| *index < app.display_messages.len());
     let (progress_message, steps) = match carried {
         Some((index, steps)) => {
+            let index = app.move_display_message_to_end(index);
             app.replace_display_message_content(index, render_cloud_steps(&steps, 0, None));
             (index, steps)
         }
@@ -435,6 +533,7 @@ fn configure_replacement(
 pub(super) enum CloudEvent {
     Progress(String),
     Stderr(String),
+    MobilePushResult(Result<String, String>),
     Done(Result<std::process::Output, String>),
 }
 
@@ -474,12 +573,24 @@ impl App {
 
     /// Drain the running job or dispatch a pending handoff when idle.
     pub(super) fn cloud_handoff_blocks_work(&self) -> bool {
-        self.pending_cloud_handoff.is_some()
+        (self.pending_cloud_handoff.is_some() && !self.cloud_handoff_draining_reminders())
             || self
                 .cloud_job
                 .as_ref()
                 .is_some_and(|job| !matches!(job.command, CloudCommand::Prepare { .. }))
             || self.cloud_handoff_requested.is_some()
+    }
+
+    /// Queued system reminders (background task results, monitors) are
+    /// delivered to the agent before a pending handoff moves the session, so
+    /// they never block or get lost. Only reminder-only queues drain here.
+    pub(super) fn cloud_handoff_draining_reminders(&self) -> bool {
+        self.pending_cloud_handoff.is_some()
+            && self.cloud_job.is_none()
+            && self.cloud_handoff_requested.is_none()
+            && !self.hidden_queued_system_messages.is_empty()
+            && self.queued_messages.is_empty()
+            && self.queued_commands.is_empty()
     }
 
     fn has_unsent_handoff_work(&self, accepted_command: Option<&str>) -> bool {
@@ -497,10 +608,6 @@ impl App {
             ),
             (!self.queued_messages.is_empty(), "queued messages"),
             (!self.queued_commands.is_empty(), "queued commands"),
-            (
-                !self.hidden_queued_system_messages.is_empty(),
-                "queued system reminders",
-            ),
             (!self.pending_images.is_empty(), "image attachments"),
             (!self.pasted_contents.is_empty(), "pasted contents"),
             (
@@ -561,8 +668,57 @@ impl App {
         self.pending_cloud_handoff.take()
     }
 
+    /// A move waits for the host to be prepared while the turn keeps running.
+    /// Once the host is ready, stop the turn so the transfer starts right away.
+    /// The moved session gets a continue message, so the agent resumes the
+    /// interrupted task on the cloud host. Interrupts at most once per request.
+    fn interrupt_turn_for_ready_handoff(&mut self) {
+        let Some(pending) = self.pending_cloud_handoff.as_ref() else {
+            return;
+        };
+        // Only cloud moves get a continue message on arrival. `/local` keeps
+        // waiting for the turn so an interrupted task is not silently dropped.
+        let ready = matches!(
+            pending.command,
+            CloudCommand::Move { .. } | CloudCommand::MoveSelected { .. }
+        ) && pending.prepared;
+        if !ready
+            || !self.is_processing
+            || self.cloud_job.is_some()
+            || self.cloud_interrupt_sent_for == Some(pending.request_id)
+        {
+            return;
+        }
+        self.cloud_interrupt_sent_for = Some(pending.request_id);
+        self.cancel_requested = true;
+        self.cloud_remote_interrupt_pending = true;
+        self.interleave_message = None;
+        self.interleave_images.clear();
+        self.pending_soft_interrupts.clear();
+        self.pending_soft_interrupt_requests.clear();
+        self.set_status_notice("Interrupting turn to start cloud transfer...");
+    }
+
+    #[cfg(test)]
+    pub(super) fn poll_cloud_job_interrupt_only_for_test(&mut self) {
+        self.interrupt_turn_for_ready_handoff();
+    }
+
+    /// Remote mode: the running turn lives in the daemon, so the interrupt
+    /// must be sent over the socket. Returns true once per interrupt.
+    pub(super) fn take_cloud_remote_interrupt(&mut self) -> bool {
+        let take = std::mem::take(&mut self.cloud_remote_interrupt_pending);
+        if take {
+            // The daemon owns the turn here, so the local flag must not linger
+            // and cancel a later turn.
+            self.cancel_requested = false;
+        }
+        take
+    }
+
     fn cloud_handoff_can_dispatch(&self) -> bool {
         !self.is_processing
+            && self.hidden_queued_system_messages.is_empty()
             && !self.pending_turn
             && self.cloud_job.is_none()
             && self.cloud_handoff_requested.is_none()
@@ -582,6 +738,17 @@ impl App {
             let session_id = pending.session_id.clone();
             return start_cloud_command(self, command, &trimmed, &session_id, None);
         }
+        if self.cloud_handoff_draining_reminders()
+            && !self.is_processing
+            && !self.pending_turn
+            && !self.pending_queued_dispatch
+        {
+            // Deliver reminders that arrived while the handoff waited, then
+            // move once the agent has seen them.
+            self.pending_queued_dispatch = true;
+            return true;
+        }
+        self.interrupt_turn_for_ready_handoff();
         let had_pending = self.pending_cloud_handoff.is_some();
         if let Some(pending) = self.take_ready_cloud_handoff() {
             return start_cloud_command(
@@ -597,6 +764,7 @@ impl App {
         };
         let mut redraw = false;
         let mut done = None;
+        let mut mobile_push_result = None;
         while let Ok(event) = job.rx.try_recv() {
             match event {
                 CloudEvent::Progress(text) => {
@@ -604,6 +772,10 @@ impl App {
                     redraw = true;
                 }
                 CloudEvent::Stderr(text) => job.stderr = text,
+                CloudEvent::MobilePushResult(result) => {
+                    mobile_push_result = Some(result);
+                    redraw = true;
+                }
                 CloudEvent::Done(result) => {
                     done = Some(result);
                     break;
@@ -616,10 +788,28 @@ impl App {
         let finished = done
             .as_ref()
             .map(|result| result.as_ref().is_ok_and(|output| output.status.success()));
-        let index = job.progress_message;
         let content = render_cloud_steps(&job.steps, frame, finished);
         if redraw || done.is_some() {
+            // Keep the live checklist next to the composer instead of leaving
+            // it stranded above output that arrived while the turn continued.
+            let old_index = job.progress_message;
+            let index = self.move_display_message_to_end(old_index);
+            if let Some(job) = self.cloud_job.as_mut() {
+                job.progress_message = index;
+            }
+        }
+        let Some(job) = self.cloud_job.as_ref() else {
+            return redraw;
+        };
+        let index = job.progress_message;
+        if redraw || done.is_some() {
             self.replace_display_message_content(index, content);
+        }
+        if let Some(result) = mobile_push_result {
+            self.push_display_message(match result {
+                Ok(message) => DisplayMessage::system(message),
+                Err(error) => DisplayMessage::error(error),
+            });
         }
         let Some(result) = done else {
             return redraw;
@@ -706,6 +896,132 @@ fn cloud_failure_reason(details: &str) -> &str {
         .unwrap_or("No error details were returned by the cloud command.")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloudAccountIssue {
+    SignedOut,
+    SignInExpired,
+    NotEntitled,
+}
+
+/// Whether a command needs the account's managed machine: no explicit host,
+/// or the reserved managed alias.
+fn targets_managed_cloud(command: &CloudCommand) -> bool {
+    match command {
+        CloudCommand::Move { host }
+        | CloudCommand::MoveSelected { host, .. }
+        | CloudCommand::Replace { host, .. } => {
+            host.as_deref().is_none_or(|host| host == "jcode-cloud")
+        }
+        _ => false,
+    }
+}
+
+/// A signed-out user asking for the managed machine. `env_host` is
+/// `$JCODE_CLOUD_HOST`, which replaces the managed default when no host is typed.
+fn needs_cloud_account(
+    command: &CloudCommand,
+    ssh_remote: bool,
+    env_host: Option<&str>,
+    signed_in: bool,
+) -> bool {
+    if signed_in || ssh_remote || !targets_managed_cloud(command) {
+        return false;
+    }
+    let explicit_managed = matches!(
+        command,
+        CloudCommand::Move { host: Some(_) }
+            | CloudCommand::MoveSelected { host: Some(_), .. }
+            | CloudCommand::Replace { host: Some(_), .. }
+    );
+    explicit_managed || env_host.is_none_or(|host| host.trim().is_empty())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests run without credentials. Opt in to exercise the signed-out path.
+    pub(super) static TEST_CLOUD_ACCOUNT_MISSING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn managed_cloud_account_missing(command: &CloudCommand) -> bool {
+    #[cfg(test)]
+    {
+        TEST_CLOUD_ACCOUNT_MISSING.with(|missing| missing.get())
+            && needs_cloud_account(command, false, None, false)
+    }
+    #[cfg(not(test))]
+    {
+        needs_cloud_account(
+            command,
+            crate::tui::is_ssh_remote(),
+            std::env::var("JCODE_CLOUD_HOST").ok().as_deref(),
+            crate::subscription_catalog::configured_api_key()
+                .is_some_and(|key| !key.trim().is_empty()),
+        )
+    }
+}
+
+/// Account failures the cloud CLI reports. Only the user can resolve them, so
+/// they get onboarding steps rather than agent diagnosis.
+fn cloud_account_issue(details: &str) -> Option<CloudAccountIssue> {
+    use crate::subscription_catalog as catalog;
+    [
+        (
+            catalog::CLOUD_ACCOUNT_REQUIRED,
+            CloudAccountIssue::SignedOut,
+        ),
+        (
+            catalog::CLOUD_SIGN_IN_EXPIRED,
+            CloudAccountIssue::SignInExpired,
+        ),
+        (catalog::CLOUD_NOT_ENTITLED, CloudAccountIssue::NotEntitled),
+    ]
+    .into_iter()
+    .find_map(|(marker, issue)| details.contains(marker).then_some(issue))
+}
+
+fn cloud_account_guidance(issue: CloudAccountIssue) -> (String, &'static str) {
+    let pricing = crate::subscription_catalog::JCODE_PRICING_URL;
+    const OWN_MACHINE: &str =
+        "Using your own machine instead? `/cloud <ssh-alias>` needs no Jcode account.";
+    match issue {
+        CloudAccountIssue::SignedOut => (
+            format!(
+                "`/cloud` moves this session to your Jcode Cloud machine, which comes with a paid Jcode plan. You are not signed in to a Jcode account yet.\n\n\
+                 1. Run `/login jcode` to sign in or create an account. It opens a browser approval page, no key is pasted here.\n\
+                 2. Choose a plan that includes Jcode Cloud: {pricing}\n\
+                 3. Run `/cloud` again.\n\n\
+                 {OWN_MACHINE}\n\nNothing was moved."
+            ),
+            "Cloud: sign in with /login jcode",
+        ),
+        CloudAccountIssue::SignInExpired => (
+            format!(
+                "Your Jcode sign-in expired, so Jcode Cloud could not be reached.\n\n\
+                 1. Run `/login jcode` to sign in again.\n\
+                 2. Run `/cloud` again.\n\n\
+                 {OWN_MACHINE}\n\nNothing was moved."
+            ),
+            "Cloud: sign in again with /login jcode",
+        ),
+        CloudAccountIssue::NotEntitled => (
+            format!(
+                "You are signed in, but your Jcode account has no active paid plan, which Jcode Cloud requires.\n\n\
+                 1. Choose a plan: {pricing} (or run `/account jcode manage` to change yours).\n\
+                 2. Run `/cloud` again. No new sign-in is needed.\n\n\
+                 {OWN_MACHINE}\n\nNothing was moved."
+            ),
+            "Cloud: a paid Jcode plan is required",
+        ),
+    }
+}
+
+fn show_cloud_account_guidance(app: &mut App, issue: CloudAccountIssue) {
+    let (message, notice) = cloud_account_guidance(issue);
+    app.push_display_message(DisplayMessage::system(message).with_title("Jcode Cloud setup"));
+    app.set_status_notice(notice);
+}
+
 fn show_cloud_failure(
     app: &mut App,
     command: &str,
@@ -713,6 +1029,10 @@ fn show_cloud_failure(
     exit: Option<i32>,
     details: &str,
 ) {
+    if let Some(issue) = cloud_account_issue(&cloud_failure_details(details)) {
+        show_cloud_account_guidance(app, issue);
+        return;
+    }
     record_cloud_problem(command, session, exit, details);
     let already_pending = app.cloud_recovery_auto_pending
         && app
@@ -860,258 +1180,6 @@ fn record_cloud_problem(command: &str, session_id: &str, exit: Option<i32>, stde
         "cloud problem: {command} failed: {}",
         tail.lines().last().unwrap_or("")
     ));
-}
-
-fn finish_cloud_command(app: &mut App, job: CloudJob, output: std::process::Output) {
-    if matches!(job.command, CloudCommand::Prepare { .. }) {
-        // Canceled or replaced requests must never inherit stale host preparation.
-        if job.preparation_for.as_ref() != app.pending_cloud_handoff.as_ref() {
-            return;
-        }
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-        if output.status.success()
-            && let Some(host) = report["host"].as_str().filter(|host| !host.is_empty())
-        {
-            let mut steps = job.steps.clone();
-            push_cloud_step(
-                &mut steps,
-                "cloud host ready, transfer starts at the next idle turn".to_string(),
-            );
-            app.replace_display_message_content(
-                job.progress_message,
-                render_cloud_steps(&steps, 0, Some(true)),
-            );
-            if let Some(pending) = app.pending_cloud_handoff.as_mut() {
-                match &mut pending.command {
-                    CloudCommand::Move { host: target }
-                    | CloudCommand::MoveSelected { host: target, .. } => {
-                        *target = Some(host.to_string());
-                    }
-                    _ => unreachable!("only move commands prepare a host"),
-                }
-                pending.prepared = true;
-                pending.progress = Some((job.progress_message, steps));
-            }
-        } else {
-            app.pending_cloud_handoff = None;
-            app.replace_display_message_content(
-                job.progress_message,
-                render_cloud_steps(&job.steps, 0, Some(false)),
-            );
-            let details = if output.status.success() {
-                "Cloud host preparation returned an invalid response: missing non-empty host."
-                    .to_string()
-            } else {
-                cloud_output_failure(&job, &output)
-            };
-            show_cloud_failure(
-                app,
-                &job.trimmed,
-                &job.session_id,
-                output.status.code(),
-                &details,
-            );
-        }
-        return;
-    }
-    if !output.status.success() {
-        let details = cloud_output_failure(&job, &output);
-        show_cloud_failure(
-            app,
-            &job.trimmed,
-            &job.session_id,
-            output.status.code(),
-            &details,
-        );
-        return;
-    }
-    if let CloudCommand::Replace { dry_run, .. } = job.command {
-        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout);
-        if let Ok(report) = report
-            && let Some(root) = report["repo_root"].as_str().filter(|s| !s.is_empty())
-            && report["dry_run"].as_bool() == Some(dry_run)
-        {
-            let text = if dry_run {
-                format!(
-                    "Cloud replacement preview passed for {root}. Nothing replaced. Apply with /cloud replace --yes{}.",
-                    match &job.command {
-                        CloudCommand::Replace {
-                            host: Some(host), ..
-                        } => format!(" --host {host}"),
-                        _ => String::new(),
-                    }
-                )
-            } else {
-                let backup = report["backup_path"]
-                    .as_str()
-                    .unwrap_or("none (checkout was absent)");
-                format!(
-                    "Cloud repository replaced from local working files: {root}\nBackup: {backup}\nThis session stays here. No conversation or provider login was moved."
-                )
-            };
-            app.push_display_message(DisplayMessage::system(text));
-            if !dry_run {
-                let host = report["host"].as_str().or(match &job.command {
-                    CloudCommand::Replace { host, .. } => host.as_deref(),
-                    _ => None,
-                });
-                app.cloud_recovery_context = Some((
-                    job.session_id.clone(),
-                    crate::cloud_environment::replacement_guidance(host),
-                ));
-            }
-        } else {
-            show_cloud_failure(
-                app,
-                &job.trimmed,
-                &job.session_id,
-                output.status.code(),
-                "Cloud replacement returned an invalid response. Inspect the cloud checkout and backup directories before retrying.",
-            );
-        }
-        return;
-    }
-    if matches!(
-        job.command,
-        CloudCommand::Move { .. } | CloudCommand::MoveSelected { .. } | CloudCommand::Return
-    ) {
-        let report = serde_json::from_slice::<serde_json::Value>(&output.stdout);
-        let valid = report.as_ref().is_ok_and(|report| match job.command {
-            CloudCommand::Move { .. } | CloudCommand::MoveSelected { .. } => {
-                report["host"].as_str().is_some_and(|host| !host.is_empty())
-            }
-            CloudCommand::Return => report.is_object(),
-            _ => unreachable!(),
-        });
-        if !valid {
-            app.replace_display_message_content(
-                job.progress_message,
-                render_cloud_steps(&job.steps, 0, Some(false)),
-            );
-            show_cloud_failure(
-                app,
-                &job.trimmed,
-                &job.session_id,
-                output.status.code(),
-                "Cloud command returned an invalid response. Could not confirm the handoff result. Run /cloud status to check the session location before retrying.",
-            );
-            return;
-        }
-    }
-    let CloudJob {
-        command,
-        session_id,
-        ..
-    } = job;
-    let session_id = session_id.as_str();
-    if matches!(
-        command,
-        CloudCommand::Move { .. } | CloudCommand::MoveSelected { .. } | CloudCommand::Return
-    ) && app
-        .cloud_recovery_context
-        .as_ref()
-        .is_some_and(|(id, _)| id == session_id)
-    {
-        app.cloud_recovery_context = None;
-        app.cloud_recovery_auto_pending = false;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    match command {
-        CloudCommand::Cancel
-        | CloudCommand::Prepare { .. }
-        | CloudCommand::Replace { .. }
-        | CloudCommand::ReplaceUsage
-        | CloudCommand::MoveUsage => {
-            unreachable!("handled before transfer completion")
-        }
-        CloudCommand::Where => {
-            let text = if stdout.trim().is_empty() {
-                "This session has never moved.".to_string()
-            } else {
-                stdout.trim().to_string()
-            };
-            app.push_display_message(DisplayMessage::system(text));
-        }
-        CloudCommand::Move { .. } | CloudCommand::MoveSelected { .. } => {
-            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
-            let host = report["host"].as_str().unwrap_or_default().to_string();
-            let repo_root = report["repo_root"].as_str().map(str::to_string);
-            let selected = report_session_ids(&report, "members");
-            let excluded = report_session_ids(&report, "excluded_session_ids");
-            let group = selected.len() > 1;
-            let selection_note = if selected.is_empty() {
-                String::new()
-            } else {
-                format!("\nSelected sessions: {}", selected.join(", "))
-            };
-            let excluded_note = if excluded.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\nStaying local: {}. Include explicitly with --include-session <id>.",
-                    excluded.join(", ")
-                )
-            };
-            if matches!(command, CloudCommand::MoveSelected { dry_run: true, .. }) {
-                if report["dry_run"].as_bool() != Some(true) {
-                    app.push_display_message(DisplayMessage::error(
-                        "Cloud preview returned an invalid response. Check /cloud status before retrying.".to_string(),
-                    ));
-                    return;
-                }
-                app.push_display_message(DisplayMessage::system(format!(
-                    "Cloud migration preview passed for `{host}`. No session ownership moved. Run the command without --dry-run to migrate.{selection_note}{excluded_note}"
-                )));
-                return;
-            }
-            let continuation = if group {
-                "The coordinator handles shared environment setup before resuming workers. Group return is not yet supported; do not return individual members."
-            } else {
-                "Use /local to bring it back. Your local files stay editable, and git merges both sides on return."
-            };
-            app.push_display_message(DisplayMessage::system(format!(
-                "☁️ {} moved to `{host}`. Reattaching there and continuing. Its disk persists while it sleeps. {continuation}{selection_note}{excluded_note}",
-                if group { "Session group" } else { "Session" }
-            )));
-            app.cloud_handoff_requested = Some(CloudHandoff::Remote {
-                session_id: report["session_id"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or(session_id)
-                    .to_string(),
-                host,
-                working_dir: repo_root,
-            });
-            app.should_quit = true;
-        }
-        CloudCommand::Return => {
-            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
-            let merge = &report["merge"];
-            let note = match merge["result"].as_str() {
-                Some("applied") => "Cloud work was merged into your checkout.".to_string(),
-                Some("unchanged") => "No code changed on the cloud side.".to_string(),
-                Some("conflicts") => format!(
-                    "Code conflicts, working tree untouched: {}. The agent can resolve them.",
-                    merge["files"]
-                        .as_array()
-                        .map(|f| f
-                            .iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default()
-                ),
-                _ => String::new(),
-            };
-            app.push_display_message(DisplayMessage::system(format!(
-                "🏠 Session is back on this machine. {note}"
-            )));
-            app.cloud_handoff_requested = Some(CloudHandoff::Local {
-                session_id: session_id.to_string(),
-            });
-            app.should_quit = true;
-        }
-    }
 }
 
 fn report_session_ids(report: &serde_json::Value, field: &str) -> Vec<String> {

@@ -6,40 +6,11 @@ use crate::{terminal_eprintln as eprintln, terminal_print as print, terminal_pri
 #[path = "provider_prewarm.rs"]
 mod provider_prewarm;
 
+#[path = "turn_loop_policy.rs"]
+mod turn_loop_policy;
+
 impl Agent {
     /// Run turns until no more tool calls
-    /// Maximum number of context-limit compaction retries before giving up.
-    pub(super) const MAX_CONTEXT_LIMIT_RETRIES: u32 = 5;
-    pub(super) const MAX_INCOMPLETE_CONTINUATION_ATTEMPTS: u32 = 3;
-    /// Retries allowed when the provider returns an empty response right after
-    /// tool results. This is a transient provider hiccup, not a signal that the
-    /// task is finished, so a single retry is too few: one empty response
-    /// observed once in 43 turns silently ended a 20-hour benchmark run with the
-    /// task half-done. The counter is per turn-loop, so a genuinely finished
-    /// agent still exits promptly.
-    pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
-    const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
-    const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
-    fn update_sequential_tool_rounds(current: u32, tool_count: usize, used_batch: bool) -> u32 {
-        if tool_count == 1 && !used_batch {
-            current.saturating_add(1)
-        } else {
-            0
-        }
-    }
-
-    fn should_inject_batch_nudge(pending: bool, batch_available: bool) -> bool {
-        pending && batch_available
-    }
-
-    pub(super) fn plan_limit_reminder(
-        notice: &crate::subscription_notice::QuotaExceeded,
-    ) -> String {
-        format!(
-            "<system-reminder>Jcode plan limit: {notice} An upgrade card with a button is already shown to the user in the chat. Mention the limit in one short sentence, including the upgrade link if one is given. Do not open checkout or purchase anything. Continue the task without that feature.</system-reminder>"
-        )
-    }
-
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
         // A new turn starts with no research lookup observed, so the
         // research-first gate is rearmed for this turn. A lookup in turn N does
@@ -68,6 +39,8 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
+        let mut turn_tool_calls = 0usize;
+        let mut todo_nudge_sent = false;
         let mut consecutive_malformed_tool_rounds = 0u32;
         // Bounded budget for re-issuing a request after a transient stream
         // error. Reset whenever a request completes normally.
@@ -162,6 +135,16 @@ impl Agent {
                 messages_with_memory.push(Message::user(Self::BATCH_NUDGE));
                 batch_nudge_pending = false;
                 sequential_single_tool_rounds = 0;
+            }
+            if !todo_nudge_sent
+                && turn_tool_calls > Self::TOOL_CALLS_BEFORE_TODO_NUDGE
+                && tools.iter().any(|tool| tool.name == "todo")
+                && crate::todo::load_todos(&self.session.id)
+                    .map(|t| t.is_empty())
+                    .unwrap_or(false)
+            {
+                messages_with_memory.push(Message::user(Self::TODO_NUDGE));
+                todo_nudge_sent = true;
             }
             // Background features (memory recall) can hit a plan limit with no
             // visible failure. Surface it once through the agent so every UI
@@ -636,7 +619,17 @@ impl Agent {
                             eprintln!("[trace] provider_service_tier={tier}");
                         }
                     }
+                    StreamEvent::ResolvedModel { model } => {
+                        usage_recorder.resolve_model(model);
+                    }
                     StreamEvent::RetryRollback { attempt, max } => {
+                        // Preserve reported usage from the failed attempt, but
+                        // never let its model or counters bleed into the retry.
+                        usage_recorder.finish();
+                        usage_input = None;
+                        usage_output = None;
+                        usage_cache_read = None;
+                        usage_cache_creation = None;
                         // Transient transport fault mid-stream; the provider is
                         // replaying the request. Discard this attempt's partial
                         // output so the replay doesn't duplicate it in history.
@@ -935,6 +928,16 @@ impl Agent {
                     )
                     .saturating_add(output);
                 crate::session_metrics::record_token_usage(&self.session.id, total, output);
+                if usage_input.is_some() {
+                    crate::session_telemetry::save_context(
+                        &self.session,
+                        total.saturating_sub(output),
+                        Some(self.effective_context_budget().await),
+                        self.provider.name(),
+                        self.provider.active_resolved_credential(),
+                        self.provider.serving_oauth_account_label(),
+                    );
+                }
             }
 
             if print_output
@@ -1120,6 +1123,7 @@ impl Agent {
                 logging::info("Provider handles tools internally - executing native tools locally");
             }
 
+            turn_tool_calls += tool_calls.len();
             let used_batch = tool_calls.iter().any(|tc| tc.name == "batch");
             sequential_single_tool_rounds = Self::update_sequential_tool_rounds(
                 sequential_single_tool_rounds,

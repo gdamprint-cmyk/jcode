@@ -1,3 +1,5 @@
+#[path = "debug_dm_fixture.rs"]
+mod dm_fixture;
 #[path = "debug_picker_state.rs"]
 mod picker_state;
 use super::*;
@@ -114,6 +116,12 @@ impl App {
             // Return current state as JSON for easier parsing
             serde_json::json!({
                 "processing": self.is_processing,
+                "processing_status": format!("{:?}", self.status),
+                "current_message_id": self.current_message_id,
+                "pending_soft_interrupts": self.pending_soft_interrupts.len(),
+                "pending_soft_interrupt_requests": self.pending_soft_interrupt_requests.len(),
+                "pending_queued_dispatch": self.pending_queued_dispatch,
+                "remote_session_id": self.remote_session_id,
                 "terminal_title": self.terminal_title.borrow().last_sent,
                 "session_edit_lines": self.display_edit_line_counts,
                 "messages": self.messages.len(),
@@ -252,6 +260,8 @@ impl App {
                 provider: "openai".to_string(),
             });
             serde_json::json!({"ok": true, "fixture": "login-progress-exchange"}).to_string()
+        } else if cmd == "dm-fixture" {
+            self.show_debug_dm_fixture()
         } else if cmd == "expand-badge-fixture" {
             let old_string = (0..24)
                 .map(|idx| format!("old fixture line {idx}\n"))
@@ -652,6 +662,17 @@ impl App {
         } else if cmd == "mermaid:memory" {
             let profile = crate::tui::mermaid::debug_memory_profile();
             serde_json::to_string_pretty(&profile).unwrap_or_else(|_| "{}".to_string())
+        } else if cmd == "resume-latency" {
+            self.session_picker_overlay
+                .as_ref()
+                .map(|picker| picker.borrow().debug_resume_latency())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "open": false,
+                        "note": "Open /resume to collect live picker latency"
+                    })
+                })
+                .to_string()
         } else if cmd == "memory" {
             serde_json::to_string_pretty(&self.debug_memory_profile())
                 .unwrap_or_else(|_| "{}".to_string())
@@ -988,6 +1009,7 @@ impl App {
                  - mermaid:evict - clear mermaid cache\n\
                  - markdown:stats - dump markdown debug stats\n\
                  - markdown:memory - dump markdown cache memory estimate\n\
+                 - resume-latency - bounded live resume handler-to-ratatui readiness, not terminal paint\n\
                  - memory - dump aggregate client memory profile\n\
                  - memory-history - dump recent process memory samples\n\
                  - slow-frames [n] - dump recent slow-frame records\n\
@@ -1128,6 +1150,8 @@ fn attach_redraw_schedule_debug(payload: &mut serde_json::Value, app: &App) {
         "redraw_schedule".to_string(),
         serde_json::json!({
             "interval_ms": crate::tui::redraw_interval(app).as_millis() as u64,
+            "tail_catchup_active": crate::tui::ui::tail_catchup_active(),
+            "stream_reveal_pending": crate::tui::TuiState::stream_reveal_pending(app),
             "animation_fps": policy.animation_fps,
             "redraw_fps": policy.redraw_fps,
             "tier": format!("{:?}", policy.tier),
@@ -1136,6 +1160,8 @@ fn attach_redraw_schedule_debug(payload: &mut serde_json::Value, app: &App) {
             "idle_animation_area": crate::tui::ui::last_idle_animation_area()
                 .map(|a| serde_json::json!([a.x, a.y, a.width, a.height])),
             "client_focused": crate::tui::TuiState::client_focused(app),
+            "window_visibility": crate::tui::window_visibility::current().label(),
+            "wake_sources": super::wake_stats::snapshot(),
             "periodic_redraw_required": crate::tui::periodic_redraw_required(app),
             // Unlike `idle_animation.last_full_frame_reason`, which is sticky,
             // this is evaluated against current state, so an expired notice

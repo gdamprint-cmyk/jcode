@@ -22,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod build_queue;
 mod launch;
+mod logs;
 mod reload;
 mod setup;
 mod status;
@@ -47,6 +48,8 @@ struct SelfDevInput {
     /// Why this build is needed; shown to other queued/blocked agents.
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    release_notes: Option<String>,
     /// Build target for selfdev build: auto, tui, or all.
     #[serde(default)]
     target: Option<String>,
@@ -120,6 +123,8 @@ struct BuildRequest {
     session_short_name: Option<String>,
     session_title: Option<String>,
     reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_notes: Option<String>,
     repo_dir: String,
     #[serde(default)]
     repo_scope: String,
@@ -304,6 +309,21 @@ impl BuildRequest {
                     && request.state == BuildRequestState::Attached
             })
             .collect())
+    }
+
+    fn public_build_notes(&self) -> Option<String> {
+        let mut highlights = Vec::new();
+        for notes in self.release_notes.iter().cloned().chain(
+            Self::attached_watchers(&self.request_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|w| w.release_notes),
+        ) {
+            if !highlights.contains(&notes) {
+                highlights.push(notes);
+            }
+        }
+        (!highlights.is_empty()).then(|| highlights.join("\n"))
     }
 
     fn find_duplicate_pending(worktree_scope: &str, dedupe_key: &str) -> Result<Option<Self>> {
@@ -510,6 +530,7 @@ impl SelfDevTool {
                             "cancel-build",
                             "reload",
                             "reload-bridge",
+                            "logs",
                             "status",
                             "find-config",
                             "socket-info",
@@ -519,7 +540,8 @@ impl SelfDevTool {
                     },
                     "prompt": { "type": "string" },
                     "context": { "type": "string" },
-                    "reason": { "type": "string" },
+                    "reason": { "type": "string", "description": "Required for build/build-reload: private coordination reason, separate from public release notes." },
+                    "release_notes": { "type": "string", "description": "Required for build/build-reload: nonblank, public-facing build notes. For internal-only builds, state that there are no user-visible changes. Never include private reason, context, or session information." },
                     "target": {
                         "type": "string",
                         "enum": ["auto", "tui", "all"],
@@ -592,6 +614,12 @@ impl Tool for SelfDevTool {
             // Available in every session.
             "enter" => self.do_enter(params.prompt, &ctx).await,
             "setup" => self.do_setup(&ctx).await,
+            "logs" if is_selfdev => {
+                logs::output(SelfDevTool::resolve_repo_dir(ctx.working_dir.as_deref())).await
+            }
+            "logs" => Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
+                "logs",
+            ))),
             "status" => self.do_status().await,
             "find-config" => self.do_find_config(&ctx).await,
             "reload" => {
@@ -613,6 +641,7 @@ impl Tool for SelfDevTool {
             "build" => {
                 self.do_build(
                     params.reason,
+                    params.release_notes,
                     params.target,
                     params.notify,
                     params.wake,
@@ -622,8 +651,14 @@ impl Tool for SelfDevTool {
             }
             "build-reload" | "build_reload" => {
                 if is_selfdev {
-                    self.do_build_reload(params.reason, params.target, params.context, &ctx)
-                        .await
+                    self.do_build_reload(
+                        params.reason,
+                        params.release_notes,
+                        params.target,
+                        params.context,
+                        &ctx,
+                    )
+                    .await
                 } else {
                     Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
                         "build-reload",
@@ -689,7 +724,7 @@ impl Tool for SelfDevTool {
             }
             _ => Ok(ToolOutput::new(format!(
                 "Unknown action: {}. In a self-dev session use 'enter', 'setup', 'build', \
-                 'build-reload', 'test', 'cancel-build', 'reload', 'reload-bridge', 'status', 'find-config', \
+                 'build-reload', 'test', 'cancel-build', 'reload', 'reload-bridge', 'logs', 'status', 'find-config', \
                  'socket-info', or 'socket-help'. Outside self-dev mode use 'enter', 'setup', \
                  'reload', 'status', or 'find-config'.",
                 action

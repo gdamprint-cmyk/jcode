@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import tempfile
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
@@ -44,95 +47,163 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 class DiscordReleaseTests(unittest.TestCase):
+    def test_linux_selfdev_announcement(self):
+        tag = 'selfdev-linux-' + 'ab' * 20
+        format_notes = lambda body: MODULE.format_message(tag=tag, name='', body=body, url='https://example.org/download')
+        msg = format_notes('## Highlights\n- Captions update as you speak.\n- Configure the push-to-talk key.\n\n<!-- marker -->')
+        self.assertIn('**What changed**\n- Captions update as you speak.\n- Configure the push-to-talk key.', msg)
+        self.assertTrue(msg.endswith('[Download & release notes](<https://example.org/download>)'))
+        self.assertNotIn('marker', msg)
+        self.assertNotIn('What changed', format_notes('Older build without highlights.'))
+        comparison = 'https://github.com/1jehuang/jcode/compare/' + '0' * 40 + '...' + 'ab' * 20
+        self.assertIn(f'[All 19 commits](<{comparison}>)', format_notes(f'## Bundled changes\n\n[View all 19 commits]({comparison})'))
+        self.assertLessEqual(len(format_notes('## Highlights\n' + ('- ' + '🙂' * 300 + '\n') * 8).encode('utf-16-le')) // 2, 2000)
+
     def setUp(self) -> None:
         WebhookHandler.response_status = 200
 
-    def test_formats_preview_as_explicit_opt_in_with_download_and_commands(self) -> None:
+    def test_checked_in_announcement_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v-test.json"
+            with mock.patch.object(MODULE, "ANNOUNCEMENT_DIR", Path(directory)):
+                self.assertIsNone(MODULE.load_announcement("missing"))
+                self.assertIsNone(MODULE.load_announcement("../v-test"))
+                for value in ([], {}, [""], [4], ["😀" * 1001], ["a", "x" * 2001]):
+                    path.write_text(json.dumps(value))
+                    with self.subTest(value_type=type(value)), self.assertRaises(RuntimeError):
+                        MODULE.load_announcement("v-test")
+                path.write_text(json.dumps(["😀" * 1000, "second"]))
+                self.assertEqual(MODULE.load_announcement("v-test"), ["😀" * 1000, "second"])
+                path.write_text("not json")
+                with self.assertRaises(RuntimeError):
+                    MODULE.load_announcement("v-test")
+
+    def multipart_http(self, *, fail_receipt=False, fail_delivery=False, fail_pending=False):
+        release = {"id": 100, "body": "notes", "html_url": "https://example.test/v-test"}
+        posts = []
+        patches = []
+
+        def request(req, timeout):
+            if "discord.test" in req.full_url:
+                posts.append(json.loads(req.data))
+                if fail_delivery:
+                    raise urllib.error.URLError("response lost")
+                # Simulate a concurrent human edit while Discord is in flight.
+                release["body"] += "\nhuman edit"
+                result = {"id": str(len(posts))}
+            elif req.method == "PATCH":
+                body = json.loads(req.data)["body"]
+                if fail_pending and "pending" in body:
+                    raise urllib.error.URLError("pending write failed")
+                if fail_receipt and "sent:" in body:
+                    raise urllib.error.URLError("receipt write failed")
+                patches.append(body)
+                release["body"] = body
+                result = dict(release)
+            else:
+                result = dict(release)
+            return io.BytesIO(json.dumps(result).encode())
+
+        return release, posts, patches, request
+
+    def run_multipart(self):
+        return MODULE.announce_release(repository="owner/repo", tag="v-test", token="fake",
+                                       webhook_url="https://discord.test/webhook")
+
+    def test_multipart_http_receipts_and_resume(self) -> None:
+        release, posts, patches, request = self.multipart_http()
+        with (mock.patch.object(MODULE, "load_announcement", return_value=["first", "second"]),
+              mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=request)):
+            self.assertEqual(self.run_multipart(), "2")
+            self.assertEqual([p["content"] for p in posts], ["first", "second"])
+            self.assertTrue(all(p["allowed_mentions"] == {"parse": []} for p in posts))
+            self.assertEqual(sum("human edit" in p for p in patches), 4)
+            self.assertIn("sent:1", release["body"])
+            self.assertIn("sent:2", release["body"])
+            self.assertIn(MODULE.announcement_marker("v-test"), release["body"])
+            self.assertIsNone(self.run_multipart())
+            self.assertEqual(len(posts), 2)
+            # A lost final marker is safe: all individual receipts remain.
+            release["body"] = release["body"].replace(MODULE.announcement_marker("v-test"), "")
+            self.run_multipart()
+            self.assertEqual(len(posts), 2)
+            # Resume from the first durable receipt, not the beginning.
+            release["body"] = patches[1]
+            self.run_multipart()
+            self.assertEqual([p["content"] for p in posts], ["first", "second", "second"])
+
+    def test_pending_checkpoint_blocks_duplicates_after_uncertain_delivery(self) -> None:
+        for failure in ("receipt", "delivery"):
+            release, posts, _, request = self.multipart_http(
+                fail_receipt=failure == "receipt", fail_delivery=failure == "delivery")
+            with (self.subTest(failure=failure),
+                  mock.patch.object(MODULE, "load_announcement", return_value=["first", "second"]),
+                  mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=request),
+                  mock.patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                self.run_multipart()
+                self.assertIn("Partial Discord announcement", stderr.getvalue())
+                self.assertIn("pending", release["body"])
+                with self.assertRaisesRegex(RuntimeError, "Reconcile manually"):
+                    self.run_multipart()
+                self.assertEqual(len(posts), 1)
+                self.assertNotIn(MODULE.announcement_marker("v-test"), release["body"])
+
+    def test_pending_write_failure_never_sends(self) -> None:
+        _, posts, _, request = self.multipart_http(fail_pending=True)
+        with (mock.patch.object(MODULE, "load_announcement", return_value=["first"]),
+              mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=request),
+              self.assertRaises(urllib.error.URLError)):
+            self.run_multipart()
+        self.assertEqual(posts, [])
+
+    def test_changed_manifest_refuses_resume(self) -> None:
+        release, posts, patches, request = self.multipart_http()
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=request):
+            with mock.patch.object(MODULE, "load_announcement", return_value=["first", "second"]):
+                self.run_multipart()
+            release["body"] = patches[1]
+            with (mock.patch.object(MODULE, "load_announcement", return_value=["changed", "second"]),
+                  self.assertRaisesRegex(RuntimeError, "content changed")):
+                self.run_multipart()
+        self.assertEqual(len(posts), 2)
+
+    def test_preview_is_commit_list_with_single_link(self) -> None:
+        body = (
+            "## What changed\n\n5 commits since **v0.9**.\n\n"
+            "[Full comparison](https://example.test/compare/a...b)\n\n"
+            "**Highlights from commit titles**\n\n- Highlight only\n\n"
+            "## Commits\n\n"
+            "- [abc12345](https://example.test/commit/abc12345) Fix picker\n"
+            "- [def67890](https://example.test/commit/def67890) feat: see https://x.test/y\n"
+            "\n## First-time preview setup\nDO NOT INCLUDE\n"
+        )
         message = MODULE.format_message(
-            tag="v1.0.0-preview.12", name="v1 preview", body="@everyone stable notes",
-            url="https://example.test/releases/v1.0.0-preview.12",
+            tag="v1.0.0-preview.12", name="Preview", body=body,
+            url="https://example.test/releases/preview.12",
         )
-        self.assertIn("v1 Preview · opt-in", message)
-        self.assertIn("not a stable release", message)
-        self.assertIn("https://example.test/releases/v1.0.0-preview.12", message)
-        self.assertIn("jcode update --channel preview", message)
-        self.assertIn("jcode update --channel stable", message)
-        self.assertIn("current stable has no `--channel` option", message)
-        self.assertIn("Download your OS/architecture", message)
-        self.assertIn("SHA256SUMS", message)
-        self.assertIn("extract the entire archive", message)
-        self.assertIn("full path", message)
-        self.assertIn("reinstall stable", message)
-        self.assertIn("stable `v1.0.0` tag", message)
-        self.assertNotIn("@everyone", message)
-        self.assertLessEqual(len(message), MODULE.DISCORD_LIMIT)
+        self.assertEqual(message, (
+            "**jcode v1.0.0-preview.12** (preview) https://example.test/releases/preview.12\n"
+            "- Fix picker\n- feat: see <https://x.test/y>"))
+        self.assertEqual(len(re.findall(r"(?<!<)https?://", message)), 1)
 
-    def test_preview_includes_summary_categories_and_commits_before_setup(self) -> None:
-        notes = (
-            "## What changed\n3 commits in this preview.\n"
-            "### Fixes\n- Restore model switching.\n"
-            "## Commits\n- [abc1234](https://example.test/commit/abc1234) Fix picker\n"
-        )
-        message = MODULE.format_message(
-            tag="v1.0.0-preview.12", name="Preview",
-            body=notes + "## First-time preview setup\nDO NOT DUPLICATE SETUP",
-            url="https://example.test/releases/preview",
-        )
-        self.assertIn(notes.strip().replace(
-            "(https://example.test/commit/abc1234)",
-            "(<https://example.test/commit/abc1234>)"), message)
-        self.assertLess(message.index("Fix picker"), message.index("First time:"))
-        self.assertNotIn("DO NOT DUPLICATE SETUP", message)
-        self.assertNotIn("Full notes:", message)
-        self.assertLessEqual(len(message), MODULE.DISCORD_LIMIT)
-
-    def test_preview_only_release_link_can_embed(self) -> None:
-        message = MODULE.format_message(
-            tag="v1.0.0-preview.99", name="Preview",
-            body=("## What changed\n"
-                  "[Full comparison](https://example.test/compare/a...b)\n"
-                  "- [abc](https://example.test/commit/abc) Fix\n"
-                  "Already suppressed: <https://example.test/old>\n"
-                  "Bare link: https://example.test/other\n"),
-            url="https://example.test/releases/preview.99",
-        )
-        self.assertIn("Download binaries and notes: https://example.test/releases/preview.99\n", message)
-        self.assertIn("[Full comparison](<https://example.test/compare/a...b>)", message)
-        self.assertIn("[abc](<https://example.test/commit/abc>)", message)
-        self.assertIn("Bare link: <https://example.test/other>", message)
-        self.assertIn("Already suppressed: <https://example.test/old>", message)
-        self.assertNotIn("<<", message)
-
-    def test_preview_long_notes_keep_guidance_and_full_notes_link(self) -> None:
-        for url in ("https://example.test/preview", "https://example.test/" + "x" * 236,
-                    "https://example.test/" + "x" * 10_000):
-            with self.subTest(url_length=len(url)):
-                message = MODULE.format_message(
-                    tag="v1.0.0-preview.12", name="Preview",
-                    body="## What changed\n500 commits.\n## Commits\n" + "- Fix picker\n" * 5_000,
-                    url=url,
-                )
-                self.assertLessEqual(len(message), MODULE.DISCORD_LIMIT)
-                self.assertIn("500 commits.", message)
-                self.assertIn("- Fix picker", message)
-                self.assertIn("… Full notes: <", message)
-                self.assertIn("not upgraded automatically", message)
-                self.assertIn("SHA256SUMS", message)
-                self.assertIn("jcode update --channel stable", message)
-                expected = url if len(url) <= 256 else "https://github.com/1jehuang/jcode/releases"
-                self.assertIn(f"Download binaries and notes: {expected}\n", message)
-
-    def test_preview_without_summary_keeps_install_guidance(self) -> None:
-        for body in ("", "Legacy notes", "## What changed\n\n## First-time preview setup\nsetup"):
+    def test_preview_without_commits_is_header_only(self) -> None:
+        for body in ("", "@everyone legacy notes", "## What changed\n\n"):
             with self.subTest(body=body):
                 message = MODULE.format_message(
                     tag="v1.0.0-preview.12", name="Preview", body=body,
                     url="https://example.test/preview",
                 )
-                self.assertNotIn("## What changed", message)
-                self.assertIn("First time:", message)
-                self.assertIn("opt-in", message)
+                self.assertEqual(message, "**jcode v1.0.0-preview.12** (preview) https://example.test/preview")
+
+    def test_preview_long_commit_list_is_truncated(self) -> None:
+        for url in ("https://example.test/preview", "https://example.test/" + "x" * 10_000):
+            with self.subTest(url_length=len(url)):
+                body = "## Commits\n" + "- [abcdef12](https://e.test/c) Fix picker\n" * 5_000
+                message = MODULE.format_message(
+                    tag="v1.0.0-preview.12", name="Preview", body=body, url=url)
                 self.assertLessEqual(len(message), MODULE.DISCORD_LIMIT)
+                self.assertRegex(message, r"\n… \d+ more$")
+                self.assertEqual(len(re.findall(r"(?<!<)https?://", message)), 1)
 
     def test_preview_announcement_requires_public_prerelease(self) -> None:
         for flags in ({"draft": True, "prerelease": True},

@@ -31,7 +31,18 @@ pub fn set_session_env(session_id: &str, env: HashMap<String, String>) -> Result
     } else {
         entries.insert(session_id.to_owned(), env);
     }
+    crate::tool::session_http::prune(&entries);
     Ok(())
+}
+
+/// Hold the registry read lock through client selection so cleanup cannot race it.
+pub(crate) fn with_session_env<T>(
+    session: &str,
+    f: impl FnOnce(&HashMap<String, String>) -> T,
+) -> T {
+    let entries = SESSION_ENV.read().unwrap_or_else(|e| e.into_inner());
+    let empty = HashMap::new();
+    f(entries.get(session).unwrap_or(&empty))
 }
 
 /// Return an owned launch-time snapshot. Do not serialize it into diagnostics.
@@ -51,14 +62,14 @@ pub fn inherit_session_env(parent: &str, child: &str) {
     } else {
         entries.remove(child);
     }
+    crate::tool::session_http::prune(&entries);
 }
 
 /// Forget a destroyed session. Already-launched jobs retain their snapshots.
 pub fn remove_session_env(session_id: &str) {
-    SESSION_ENV
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(session_id);
+    let mut entries = SESSION_ENV.write().unwrap_or_else(|e| e.into_inner());
+    entries.remove(session_id);
+    crate::tool::session_http::prune(&entries);
 }
 
 #[cfg(test)]

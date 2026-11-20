@@ -1,8 +1,5 @@
-use crate::protocol::{ServerEvent, encode_event};
+use crate::protocol::ServerEvent;
 use anyhow::Result;
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 
 /// Project wire copies only. Persisted state and opted-in API bridges retain
 /// PDF bytes, while old native clients can decode the complete History event.
@@ -24,14 +21,40 @@ pub(super) fn side_panel_for_client(
     snapshot
 }
 
+/// The session's stored todo card state (todos, plan, goals) as a wire event.
+/// `pushes` tells the client this daemon sends the event on every change.
+pub(super) fn todos_snapshot_event(session_id: &str) -> ServerEvent {
+    let payload = serde_json::json!({
+        "todos": crate::todo::load_todos(session_id).unwrap_or_else(|error| {
+            crate::logging::warn(&format!("Failed to load todos for {session_id}: {error}"));
+            Vec::new()
+        }),
+        "plan": crate::todo::load_plan(session_id).unwrap_or_else(|error| {
+            crate::logging::warn(&format!("Failed to load todo plan for {session_id}: {error}"));
+            Default::default()
+        }),
+        "goals": crate::todo::load_goals(session_id).unwrap_or_else(|error| {
+            crate::logging::warn(&format!("Failed to load todo goals for {session_id}: {error}"));
+            Default::default()
+        }),
+    });
+    ServerEvent::Todos {
+        session_id: session_id.to_owned(),
+        payload: payload.to_string(),
+        pushes: true,
+    }
+}
+
+/// Queue an event for the connection's writer task.
+///
+/// The socket is written by exactly one task, so every producer only queues
+/// its frame. Writing from several tasks can lose the write-ready wakeup:
+/// tokio keeps a single writer waker slot per IO resource.
 pub(super) async fn write_direct_event(
-    writer: &Arc<Mutex<crate::transport::WriteHalf>>,
+    writer: &super::client_writer_task::ClientWriter,
     event: &ServerEvent,
 ) -> Result<()> {
-    let json = encode_event(event);
-    let mut w = writer.lock().await;
-    w.write_all(json.as_bytes()).await?;
-    Ok(())
+    writer.send_event(event)
 }
 
 #[cfg(test)]

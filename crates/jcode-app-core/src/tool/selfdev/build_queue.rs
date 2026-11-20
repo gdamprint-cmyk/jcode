@@ -446,6 +446,7 @@ export -f cargo
         let result = if Self::is_test_session() {
             Self::run_test_build(output_path.clone(), &reason).await?
         } else {
+            let prerelease = build::linux_prerelease_candidate(&repo_dir, &actual_source);
             let result =
                 Self::stream_build_command(repo_dir.clone(), command.clone(), output_path.clone())
                     .await?;
@@ -481,6 +482,13 @@ export -f cargo
                             "staged and smoke-tested (not yet landed)".to_string(),
                         );
                         request.save()?;
+                        if prerelease && result.status == Some(BackgroundTaskStatus::Completed) {
+                            build::dispatch_linux_prerelease(
+                                &repo_dir,
+                                &source_after_build,
+                                request.public_build_notes().as_deref(),
+                            );
+                        }
                         result
                     }
                     Err(err) => {
@@ -535,6 +543,7 @@ export -f cargo
     pub(super) async fn do_build(
         &self,
         reason: Option<String>,
+        release_notes: Option<String>,
         target: Option<String>,
         notify: Option<bool>,
         wake: Option<bool>,
@@ -548,6 +557,10 @@ export -f cargo
                     "`selfdev build` requires a non-empty `reason` so other queued agents can see why the build is needed."
                 )
             })?;
+        let release_notes = release_notes
+            .map(|notes| notes.trim().to_owned())
+            .filter(|notes| !notes.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("`selfdev build` and `build-reload` require nonblank `release_notes` suitable for public release."))?;
         let repo_dir =
             SelfDevTool::resolve_repo_dir(ctx.working_dir.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!("Could not find the jcode repository directory for selfdev build")
@@ -576,6 +589,7 @@ export -f cargo
                 repo_dir: repo_dir.display().to_string(),
                 repo_scope: requested_source.repo_scope.clone(),
                 worktree_scope: requested_source.worktree_scope.clone(),
+                release_notes: Some(release_notes),
                 command: command.display.clone(),
                 requested_at: Utc::now().to_rfc3339(),
                 started_at: None,
@@ -673,6 +687,7 @@ export -f cargo
             repo_dir: repo_dir.display().to_string(),
             repo_scope: requested_source.repo_scope.clone(),
             worktree_scope: requested_source.worktree_scope.clone(),
+            release_notes: Some(release_notes),
             command: command.display.clone(),
             requested_at: Utc::now().to_rfc3339(),
             started_at: None,
@@ -787,6 +802,7 @@ export -f cargo
     pub(super) async fn do_build_reload(
         &self,
         reason: Option<String>,
+        release_notes: Option<String>,
         target: Option<String>,
         context: Option<String>,
         ctx: &ToolContext,
@@ -795,7 +811,7 @@ export -f cargo
         // waits inline for completion, so a separate completion notification
         // would be redundant noise.
         let build_output = self
-            .do_build(reason, target, Some(false), Some(false), ctx)
+            .do_build(reason, release_notes, target, Some(false), Some(false), ctx)
             .await?;
 
         let metadata = build_output.metadata.clone().unwrap_or_else(|| json!({}));
@@ -984,6 +1000,7 @@ export -f cargo
             repo_dir: repo_dir.display().to_string(),
             repo_scope: requested_source.repo_scope.clone(),
             worktree_scope: requested_source.worktree_scope.clone(),
+            release_notes: None,
             command: shell_command.display.clone(),
             requested_at: Utc::now().to_rfc3339(),
             started_at: None,

@@ -75,12 +75,18 @@ fn blockers_and_running_tasks_pause_without_consuming_retry_budget() {
     }
     snapshot.running_background_tasks.clear();
     assert!(next_followup(&mut state, &snapshot).follow_up.is_some());
-    snapshot.todos[0].external_blocker = Some(todo::TodoExternalBlocker {
-        reason: "Owner must provide access".into(),
-        review_at: chrono::Utc::now() + chrono::Duration::hours(1),
+    snapshot.todos[0].requires_user_auth = Some(todo::TodoUserAuth {
+        reason: "Owner must approve access".into(),
     });
     assert!(next_followup(&mut state, &snapshot).follow_up.is_none());
-    snapshot.todos[0].external_blocker = None;
+    snapshot.todos[0].requires_user_auth = None;
+    assert!(next_followup(&mut state, &snapshot).follow_up.is_some());
+    snapshot.goals = vec![todo::TodoGoal {
+        cannot_complete: Some("Target host was decommissioned".into()),
+        ..Default::default()
+    }];
+    assert!(next_followup(&mut state, &snapshot).follow_up.is_none());
+    snapshot.goals.clear();
     assert!(next_followup(&mut state, &snapshot).follow_up.is_some());
 }
 
@@ -142,6 +148,8 @@ fn launch_prompts_keep_plan_and_refactor_review_semantics() {
 #[derive(Clone, Default)]
 struct RecordingProvider {
     calls: Arc<AtomicUsize>,
+    progress_session: Arc<std::sync::Mutex<Option<String>>>,
+    progress_turns: usize,
 }
 
 #[async_trait::async_trait]
@@ -153,7 +161,15 @@ impl Provider for RecordingProvider {
         _: &str,
         _: Option<&str>,
     ) -> Result<EventStream> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call <= self.progress_turns {
+            if let Some(session_id) = self.progress_session.lock().unwrap().as_ref() {
+                let mut snapshot = open_snapshot();
+                snapshot.todos[0].content =
+                    format!("Complete remaining campaign work after step {call}");
+                todo::save_todos(session_id, &snapshot.todos)?;
+            }
+        }
         Ok(Box::pin(futures::stream::iter([
             Ok(StreamEvent::TextDelta(
                 "A real remote model turn completed.".into(),
@@ -187,6 +203,190 @@ impl Drop for RestoreHome {
 }
 
 #[tokio::test]
+async fn productive_remote_campaign_exceeds_old_turn_cap_then_stops_on_no_progress() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let progress_session = Arc::new(std::sync::Mutex::new(None));
+    // Allocate a session first so the provider can publish durable progress
+    // exactly as a model's todo tool would during each real continuation.
+    let mut agent = Agent::new_with_initial_working_dir(
+        Arc::new(RecordingProvider {
+            calls: Arc::clone(&calls),
+            progress_session: Arc::clone(&progress_session),
+            progress_turns: 40,
+        }),
+        crate::tool::Registry::empty(),
+        home.path().to_str(),
+    );
+    let session_id = agent.session_id().to_string();
+    *progress_session.lock().unwrap() = Some(session_id.clone());
+    todo::save_todos(&session_id, &open_snapshot().todos).unwrap();
+    initialize_remote_session(&session_id, true).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 43);
+    let state = read_state(&state_path(&session_id).unwrap()).unwrap();
+    assert!(state.poke_enabled, "productive work must not disable poke");
+    assert_eq!(state.turns, 43);
+    initialize_remote_session(&session_id, true).unwrap();
+    run_followups(&mut agent, tx).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        43,
+        "no-progress budget survives reattach"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_session_enables_real_followups_without_client_opt_in() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider = RecordingProvider::default();
+    let mut agent = Agent::new_with_initial_working_dir(
+        Arc::new(provider.clone()),
+        crate::tool::Registry::empty(),
+        home.path().to_str(),
+    );
+    let session_id = agent.session_id().to_string();
+    todo::save_todos(&session_id, &open_snapshot().todos).unwrap();
+    assert!(!state_path(&session_id).unwrap().exists());
+    let (tx, rx) = mpsc::unbounded_channel();
+    // The daemon must continue with no observer attached and without a
+    // client-specific subscription or an explicit /poke command.
+    drop(rx);
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let persisted = std::fs::read(state_path(&session_id).unwrap()).unwrap();
+    initialize_remote_session(&session_id, true).unwrap();
+    assert_eq!(
+        std::fs::read(state_path(&session_id).unwrap()).unwrap(),
+        persisted
+    );
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        3,
+        "reattaching must not reset retry budgets"
+    );
+
+    control(&session_id, "poke", &["off".into()])
+        .unwrap()
+        .unwrap();
+    initialize_remote_session(&session_id, true).unwrap();
+    assert!(
+        !read_state(&state_path(&session_id).unwrap())
+            .unwrap()
+            .poke_enabled
+    );
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+
+    // Arming needs no Agent lock and does not launch an overlapping turn.
+    let (data, _) = control(&session_id, "poke", &["on".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(data["poke_enabled"], true);
+    assert!(data.get("next_prompt").is_none());
+    run_followups(&mut agent, tx).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+
+    initialize_remote_session("remote-disabled", false).unwrap();
+    initialize_remote_session("remote-disabled", true).unwrap();
+    assert!(
+        !read_state(&state_path("remote-disabled").unwrap())
+            .unwrap()
+            .poke_enabled
+    );
+}
+
+#[tokio::test]
+async fn ordinary_session_respects_host_default_off_and_explicit_on() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[features]\nauto_poke = false\n",
+    )
+    .unwrap();
+    crate::config::Config::invalidate_cache();
+    let provider = RecordingProvider::default();
+    let mut agent = Agent::new_with_initial_working_dir(
+        Arc::new(provider.clone()),
+        crate::tool::Registry::empty(),
+        home.path().to_str(),
+    );
+    let session_id = agent.session_id().to_string();
+    todo::save_todos(&session_id, &open_snapshot().todos).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    run_followups(&mut agent, tx.clone()).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !read_state(&state_path(&session_id).unwrap())
+            .unwrap()
+            .poke_enabled
+    );
+    assert!(rx.try_recv().is_err(), "disabled continuation is silent");
+
+    control(&session_id, "poke", &["on".into()])
+        .unwrap()
+        .unwrap();
+    run_followups(&mut agent, tx).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let mut notices = 0;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ServerEvent::Notification { from_name, .. }
+                if from_name.as_deref() == Some("daemon continuation") =>
+            {
+                notices += 1
+            }
+            ServerEvent::Done { .. } => panic!("internal continuation must not publish Done"),
+            _ => {}
+        }
+    }
+    assert_eq!(notices, 3, "observers see every daemon-owned continuation");
+}
+
+#[tokio::test]
+async fn cancelled_session_does_not_restart_for_unfinished_todos() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider = RecordingProvider::default();
+    let mut agent = Agent::new_with_initial_working_dir(
+        Arc::new(provider.clone()),
+        crate::tool::Registry::empty(),
+        home.path().to_str(),
+    );
+    let session_id = agent.session_id().to_string();
+    todo::save_todos(&session_id, &open_snapshot().todos).unwrap();
+    agent.request_graceful_shutdown();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    run_followups(&mut agent, tx).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        read_state(&state_path(&session_id).unwrap()).unwrap().turns,
+        0
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "cancel must not announce another poke"
+    );
+}
+
+#[tokio::test]
 async fn remote_loop_runtime_executes_turns_persists_controls_and_recovers_actual_context() {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::tempdir().unwrap();
@@ -201,11 +401,15 @@ async fn remote_loop_runtime_executes_turns_persists_controls_and_recovers_actua
     );
     let session_id = agent.session_id().to_string();
     let (tx, _rx) = mpsc::unbounded_channel();
-    // An ordinary/local session has no remote state and must not gain loops.
+    // Ordinary sessions now delegate to the daemon without a special subscribe.
+    // Disable explicitly here so the workflow assertions below start fresh.
+    control(&session_id, "poke", &["off".into()])
+        .unwrap()
+        .unwrap();
     todo::save_todos(&session_id, &open_snapshot().todos).unwrap();
     run_followups(&mut agent, tx.clone()).await.unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-    assert!(!state_path(&session_id).unwrap().exists());
+    assert!(state_path(&session_id).unwrap().exists());
 
     let (start, _) = execute(&mut agent, "improve", &["parser reliability".into()])
         .await

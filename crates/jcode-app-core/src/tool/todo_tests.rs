@@ -345,11 +345,54 @@ fn hierarchy_rejects_malformed_structures() {
                 .is_err()
         );
     }
-    for key in ["todos", "update", "add", "remove"] {
+    for key in ["todos", "update", "add", "remove", "cancel"] {
         let mut input = json!({"phases":[]});
         input[key] = json!([]);
         assert!(apply_todo_patch(input, || json!([])).is_err());
     }
+}
+
+#[test]
+fn hierarchy_open_items_validate_fields_and_types() {
+    let wrap =
+        |item: Value| json!({"phases":[{"phase":1,"lanes":[{"lane":"work","items":[item]}]}]});
+    let item = json!({"name":"Implement","description":"Keep the full brief",
+        "status":"pending","priority":"high","confidence":"validated",
+        "waiting_on":{"ids":["background_1"],"reason":"Build running"},
+        "requires_user_auth":{"reason":"Sign in"}});
+    let parsed = parse_todo_input(wrap(item.clone())).unwrap().todos.unwrap();
+    assert_eq!(parsed[0].content, "Implement");
+    assert_eq!(parsed[0].details.as_deref(), Some("Keep the full brief"));
+    assert_eq!(parsed[0].waiting_on, ["background_1"]);
+    assert_eq!(parsed[0].waiting_reason.as_deref(), Some("Build running"));
+    assert!(parsed[0].requires_user_auth.is_some());
+    for (field, value) in [
+        ("statuss", json!("completed")),
+        ("after", json!("Other")),
+        ("lane_dependencies", json!(["Other"])),
+        ("description", json!(42)),
+        ("confidence", json!("certain")),
+        ("status", json!("unknown")),
+        ("priority", json!([])),
+        ("waiting_on", json!({"ids":42,"reason":"Build"})),
+        ("requires_user_auth", json!({"reason":42})),
+    ] {
+        let mut invalid = item.clone();
+        invalid[field] = value;
+        assert!(parse_todo_input(wrap(invalid)).is_err(), "accepted {field}");
+    }
+    // Legacy storage fields and the bare waiting ID list remain accepted.
+    let legacy = json!({"id":"legacy","content":"Legacy","details":"Brief",
+        "status":"pending","priority":"high","confidence":80,
+        "confidence_history":[],"blocked_by":[],"assigned_to":"@self",
+        "waiting_on":["background_1"],"waiting_reason":"Building"});
+    assert!(parse_todo_input(wrap(legacy)).is_ok());
+    let mut cleared = item;
+    cleared["waiting_on"] = Value::Null;
+    cleared["requires_user_auth"] = Value::Null;
+    let parsed = parse_todo_input(wrap(cleared)).unwrap().todos.unwrap();
+    assert!(parsed[0].waiting_on.is_empty());
+    assert!(parsed[0].requires_user_auth.is_none());
 }
 
 #[test]
@@ -464,6 +507,91 @@ fn new_in_progress_todo_preserves_explicit_worker_assignment() {
 }
 
 #[test]
+fn model_facing_descriptions_stay_compact() {
+    fn description_bytes(value: &Value) -> usize {
+        match value {
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| {
+                    if key == "description" && value.is_string() {
+                        value.as_str().unwrap().len()
+                    } else {
+                        description_bytes(value)
+                    }
+                })
+                .sum(),
+            Value::Array(values) => values.iter().map(description_bytes).sum(),
+            _ => 0,
+        }
+    }
+
+    let tool = TodoTool::new();
+    let schema = tool.parameters_schema();
+    let bytes = tool.description().len() + description_bytes(&schema);
+    println!(
+        "todo description bytes: {bytes}; schema bytes: {}",
+        schema.to_string().len()
+    );
+    // Item-field guidance is written once, on add. Other routes are open.
+    assert!(bytes < 2_600, "todo descriptions grew to {bytes} bytes");
+    assert!(
+        schema.to_string().len() < 6_500,
+        "todo schema grew to {} bytes",
+        schema.to_string().len()
+    );
+    let add = &schema["properties"]["add"]["items"]["properties"];
+    for field in ["description", "status", "priority", "lane", "phase"] {
+        assert!(add[field].get("description").is_none(), "add.{field}");
+    }
+    let phase_item = &schema["properties"]["phases"]["items"]["properties"]["lanes"]["items"]["properties"]
+        ["items"]["items"]["properties"];
+    for (field, property) in phase_item.as_object().unwrap() {
+        assert!(
+            property.get("description").is_none(),
+            "phases.{field} repeats a description already given on add"
+        );
+    }
+    assert_eq!(phase_item.as_object().unwrap().len(), 4);
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["properties"]["lanes"]["items"]["properties"]["items"]
+            ["items"]["additionalProperties"],
+        true
+    );
+    // update lists only what add does not already describe.
+    let update = &schema["properties"]["update"]["items"];
+    let mut fields: Vec<&String> = update["properties"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["name", "rename_to"]);
+    assert_eq!(update["additionalProperties"], true);
+}
+
+#[test]
+fn update_rejects_fields_the_open_schema_cannot_catch() {
+    let stored = || json!([{"id": "a", "content": "a", "status": "pending", "priority": "high"}]);
+    let error = apply_todo_patch(
+        json!({"update": [{"id": "a", "statuss": "completed"}]}),
+        stored,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("unknown update field \"statuss\""),
+        "{error}"
+    );
+
+    let patched = apply_todo_patch(
+        json!({"update": [{
+            "id": "a", "status": "in_progress", "priority": "low", "lane": "x", "phase": 2,
+            "confidence": "plausible", "waiting_on": {"ids": ["t1"], "reason": "build"}
+        }]}),
+        stored,
+    )
+    .unwrap();
+    assert_eq!(patched["todos"][0]["status"], "in_progress");
+    assert_eq!(patched["todos"][0]["group"], "x");
+}
+
+#[test]
 fn add_schema_declares_all_todo_fields_and_conforms_to_gemini() {
     let schema = TodoTool::new().parameters_schema();
     let add = &schema["properties"]["add"]["items"];
@@ -472,7 +600,8 @@ fn add_schema_declares_all_todo_fields_and_conforms_to_gemini() {
         .as_object()
         .unwrap()
     {
-        assert_eq!(&add["properties"][name], property, "{name}");
+        // Core fields stay typed; enum vocabulary and optional fields live on add.
+        assert_eq!(add["properties"][name]["type"], property["type"], "{name}");
     }
     assert_eq!(add["properties"]["after"]["type"], "string");
     let errors = jcode_schema_dialect::must_not_contain_unsupported_constructs(
@@ -498,7 +627,7 @@ fn schema_advertises_intent_and_todos() {
     assert!(!props.contains_key("todos"));
     assert!(props.contains_key("plan"));
     assert!(props.contains_key("goals"));
-    for patch in ["update", "add", "remove"] {
+    for patch in ["update", "add", "cancel"] {
         assert!(
             props.contains_key(patch),
             "{patch} patch mode should be offered"
@@ -523,11 +652,12 @@ fn schema_advertises_intent_and_todos() {
     assert!(!item_props.contains_key("stage"));
     assert!(!item_props.contains_key("group"));
     assert!(item_props.contains_key("confidence"));
-    assert!(item_props.contains_key("completion_confidence"));
+    assert!(!item_props.contains_key("completion_confidence"));
+    assert!(props["add"]["items"]["properties"]["completion_confidence"].is_object());
     assert!(!item_props.contains_key("closed_feedback_loop"));
     assert_eq!(
-        item_props["confidence"]["description"],
-        "Evidence state that this todo can be completed correctly; reassess as evidence accumulates."
+        props["add"]["items"]["properties"]["confidence"]["description"],
+        "Evidence that the task can be completed correctly."
     );
 
     let plan_props = props["plan"]
@@ -538,7 +668,8 @@ fn schema_advertises_intent_and_todos() {
     assert!(plan_props.contains_key("understands_user_intent"));
     assert!(!plan_props.contains_key("alignment_score"));
     assert!(!plan_props.contains_key("user_intention_alignment"));
-    assert_eq!(plan_props.len(), 2);
+    assert!(plan_props.contains_key("title"));
+    assert_eq!(plan_props.len(), 3);
     let plan_required = props["plan"]["required"]
         .as_array()
         .expect("plan should advertise required fields");
@@ -570,7 +701,8 @@ fn schema_advertises_intent_and_todos() {
     assert!(!goal_props.contains_key("user_intention"));
     assert!(!goal_props.contains_key("alignment_score"));
     assert!(!goal_props.contains_key("objective"));
-    assert_eq!(goal_props.len(), 11);
+    assert!(goal_props.contains_key("cannot_complete"));
+    assert_eq!(goal_props.len(), 12);
     assert_eq!(
         goal_props["feedback_loop_relevance"]["enum"],
         json!([
@@ -585,10 +717,10 @@ fn schema_advertises_intent_and_todos() {
         .as_str()
         .expect("feedback-loop relevance should explain every state");
     for required_concept in [
-        "custom harnesses",
-        "real public interfaces",
-        "external constraint",
-        "Substitute-only validation is never acceptance_aligned",
+        "mocks/custom harness",
+        "real interfaces",
+        "externally blocked",
+        "never substitutes only",
     ] {
         assert!(relevance_description.contains(required_concept));
     }
@@ -618,12 +750,11 @@ fn schema_advertises_intent_and_todos() {
             .any(|value| value == "feedback_loop_traceability")
     );
 
-    let alignment_description = plan_props["understands_user_intent"]
-        .get("description")
-        .and_then(Value::as_str)
-        .expect("alignment score should describe representation coverage");
-    assert!(alignment_description.contains("what the user wants"));
-    assert!(alignment_description.contains("when guessing"));
+    assert!(
+        plan_props["understands_user_intent"]
+            .get("description")
+            .is_none()
+    );
     // Deferred continuation messages are intentionally concise. Preserve
     // their actionable guidance without requiring the legacy long rubric.
     for required_concept in [
@@ -640,16 +771,9 @@ fn schema_advertises_intent_and_todos() {
         .get("description")
         .and_then(Value::as_str)
         .expect("feedback loop should describe requirement-to-check coverage");
-    // Case-insensitive: the description opens the sentence with
-    // "Requirement-to-check", so a case-sensitive match broke when the
-    // wording moved to the front of the string (issue #730).
     let feedback_description_lower = feedback_description.to_ascii_lowercase();
     assert!(
-        feedback_description_lower.contains("requirement-to-check"),
-        "feedback_loop description omitted the requirement-to-check framing: {feedback_description}"
-    );
-    assert!(
-        feedback_description_lower.contains("explicit observation or check"),
+        feedback_description_lower.contains("check for each requirement"),
         "feedback_loop description omitted per-requirement check coverage: {feedback_description}"
     );
     for required_concept in [
@@ -662,23 +786,7 @@ fn schema_advertises_intent_and_todos() {
             "feedback gate message omitted {required_concept}"
         );
     }
-    assert!(
-        !alignment_description
-            .to_ascii_lowercase()
-            .contains("threshold")
-    );
-
-    let ownership_description = goal_props["delivery_state"]
-        .get("description")
-        .and_then(Value::as_str)
-        .expect("delivery state should have a neutral description");
-    assert!(ownership_description.contains("toward the user's outcome"));
-    assert!(!ownership_description.contains("90"));
-    assert!(
-        !ownership_description
-            .to_ascii_lowercase()
-            .contains("threshold")
-    );
+    assert!(goal_props["delivery_state"].get("description").is_none());
 
     let loop_description = goal_props["closed_feedback_loop"]
         .get("description")
@@ -703,11 +811,9 @@ fn schema_advertises_intent_and_todos() {
         );
     }
     for required_guidance in [
-        "public interfaces",
-        "integration boundaries",
-        "edge cases",
-        "packaging",
-        "likely failure modes",
+        "real interfaces",
+        "edge_and_integration_paths",
+        "check for each requirement",
     ] {
         assert!(
             model_visible_schema.contains(required_guidance),
@@ -802,7 +908,7 @@ fn rejects_unknown_todo_statuses_with_valid_vocabulary() {
     .expect("unknown status should be rejected");
     let message = error.to_string();
     assert!(message.contains("invalid todo status \"blocked\""));
-    assert!(message.contains("pending, in_progress, completed, cancelled"));
+    assert!(message.contains("pending, in_progress, completed; use cancel"));
 }
 
 #[test]
@@ -929,6 +1035,7 @@ fn goal(group: Option<&str>, state: crate::todo::FeedbackLoopState) -> TodoGoal 
 /// tests observe only closed feedback loop behavior.
 fn aligned_plan() -> TodoPlan {
     TodoPlan {
+        title: None,
         user_intention: Some("understood".to_string()),
         understands_user_intent: Some(crate::todo::IntentUnderstanding::Complete),
         understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Complete],
@@ -1097,6 +1204,7 @@ fn merge_goals_retains_unmentioned_goals() {
 #[test]
 fn merge_plan_retains_stored_intent_when_update_omits_fields() {
     let stored = TodoPlan {
+        title: None,
         user_intention: Some("make search feel instant".to_string()),
         understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
         understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Partial],
@@ -1191,4 +1299,26 @@ fn test_ctx(session_id: &str) -> ToolContext {
         graceful_shutdown_signal: None,
         execution_mode: crate::tool::ToolExecutionMode::Direct,
     }
+}
+
+/// Field report: a goals-only write for a group whose todos had been replaced
+/// returned normally and saved nothing, so the agent kept resending it.
+#[test]
+fn goal_updates_for_groups_without_todos_are_reported_not_silently_dropped() {
+    let todos = vec![todo_in_group(Some("new task"), "1")];
+    let incoming = vec![
+        goal(Some("old task"), crate::todo::FeedbackLoopState::Closed),
+        goal(Some("new task"), crate::todo::FeedbackLoopState::Strong),
+        goal(Some(" old task "), crate::todo::FeedbackLoopState::Closed),
+    ];
+    let note = ignored_goal_groups_note(&incoming, &todos).expect("dropped goal must be reported");
+    assert!(note.contains("ignored for \"old task\":"), "{note}");
+    assert!(note.contains("Current groups: \"new task\"."), "{note}");
+
+    assert_eq!(ignored_goal_groups_note(&incoming[1..2], &todos), None);
+    // An empty list prunes nothing, so there is nothing to report.
+    assert_eq!(ignored_goal_groups_note(&incoming, &[]), None);
+    let flat = vec![todo_in_group(None, "1")];
+    let note = ignored_goal_groups_note(&incoming[..1], &flat).unwrap();
+    assert!(note.contains("Current groups: (ungrouped)."), "{note}");
 }

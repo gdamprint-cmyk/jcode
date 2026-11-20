@@ -38,6 +38,7 @@ fn session(id: &str, title: &str, age: i64, path: &Path) -> SessionInfo {
             session_path: path.to_string_lossy().into_owned(),
         },
         external_path: Some(path.to_string_lossy().into_owned()),
+        todo_statuses: Vec::new(),
     }
 }
 
@@ -67,17 +68,17 @@ fn relevance_overrides_recency_and_clearing_restores_default_order_and_selection
     let whole = session("whole", "repair needle behavior", 100, &path);
     let mut picker = SessionPicker::new(vec![recent, exact, whole]);
     assert_eq!(ids(&picker), ["recent", "whole", "exact"]);
-    let selected = picker.selected_session().unwrap().id.clone();
     picker.search_query = "needle".into();
     picker.rebuild_items();
+    wait(&mut picker);
     assert_eq!(ids(&picker), ["exact", "whole", "recent"]);
-    assert_eq!(picker.selected_session().unwrap().id, selected);
+    assert_eq!(picker.selected_session().unwrap().id, "exact");
     wait(&mut picker);
     assert_eq!(ids(&picker), ["exact", "whole", "recent"]);
     picker.search_query = "  ".into();
     picker.rebuild_items();
     assert_eq!(ids(&picker), ["recent", "whole", "exact"]);
-    assert_eq!(picker.selected_session().unwrap().id, selected);
+    assert_eq!(picker.selected_session().unwrap().id, "exact");
 }
 
 #[test]
@@ -91,9 +92,9 @@ fn progressive_transcript_hits_keep_metadata_rank_and_selected_session() {
     let mut picker = SessionPicker::new(vec![transcript, partial, direct]);
     picker.search_query = "needle thread".into();
     picker.rebuild_items();
-    assert_eq!(ids(&picker), ["direct"]);
-    let selected = picker.selected_session().unwrap().id.clone();
     wait(&mut picker);
+    let selected = picker.selected_session().unwrap().id.clone();
+    assert_eq!(selected, "direct");
     assert_eq!(ids(&picker), ["direct", "partial", "transcript"]);
     assert_eq!(picker.selected_session().unwrap().id, selected);
     picker.rebuild_items();
@@ -184,6 +185,7 @@ fn global_search_does_not_boost_saved_or_server_sections() {
     );
     picker.search_query = "needle".into();
     picker.rebuild_items();
+    wait(&mut picker);
     assert_eq!(ids(&picker), ["orphan", "server", "saved"]);
     assert!(picker.item_to_session.iter().all(Option::is_some));
     picker.search_query.clear();
@@ -212,7 +214,7 @@ fn negative_fuzzy_scores_survive_async_merge() {
 }
 
 #[test]
-fn newly_discovered_stronger_hit_reorders_without_moving_selection() {
+fn newly_discovered_stronger_hit_reorders_without_moving_manually_scrolled_selection() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("absent.json");
     let mut picker = SessionPicker::new(vec![
@@ -233,8 +235,10 @@ fn newly_discovered_stronger_hit_reorders_without_moving_selection() {
             },
         ))
         .unwrap();
+    picker.search_selection.publish_next_poll_for_test();
     picker.poll_transcript_search();
     assert_eq!(picker.selected_session().unwrap().id, "first");
+    picker.scroll_preview_up(1);
     picker.scroll_offset = 7;
     picker.auto_scroll_preview = false;
     sender
@@ -246,6 +250,7 @@ fn newly_discovered_stronger_hit_reorders_without_moving_selection() {
             },
         ))
         .unwrap();
+    picker.search_selection.publish_next_poll_for_test();
     picker.poll_transcript_search();
     assert_eq!(ids(&picker), ["stronger", "first"]);
     assert_eq!(picker.selected_session().unwrap().id, "first");
@@ -302,4 +307,289 @@ fn optimized_literal_rank_preserves_unicode_and_punctuation_boundaries() {
         lowercase_field("already lowercase"),
         std::borrow::Cow::Borrowed(_)
     ));
+}
+
+#[test]
+fn retyped_wake_prompt_beats_incidental_literal_transcript_hits() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("transcript.json");
+    // A huge unrelated session can contain every query word, but not together.
+    std::fs::write(&path, r#"{"text":"do unrelated we unrelated have unrelated logs unrelated of unrelated how unrelated long unrelated it unrelated takes unrelated to unrelated conenct unrelated internet unrelated after unrelated wake"}"#).unwrap();
+    let mut target = session(
+        "wake",
+        "Network resume timing",
+        100,
+        &temp.path().join("absent.json"),
+    );
+    target.first_user_prompt = Some("do we have logs of how long it takes to connect to internet after wake from msleep? happened just now and seemed fast".into());
+    let unrelated = session("cache", "Cache miss investigation", 0, &path);
+    let mut picker = SessionPicker::new(vec![unrelated, target]);
+    for query in [
+        "do we have logs of how long",
+        "do we have logs ofhow long",
+        "do we have logs of how long it takes to conenct to internet after wake",
+        "do we have logs of how long it takes to connect to internet after wake from msleep?",
+    ] {
+        picker.search_query = query.into();
+        picker.rebuild_items();
+        wait(&mut picker);
+        assert_eq!(
+            ids(&picker).first().map(String::as_str),
+            Some("wake"),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn opening_prompt_evidence_requires_a_local_multiword_match() {
+    assert_eq!(
+        opening_prompt_rank(
+            "do something we something have something logs",
+            "do we have logs"
+        ),
+        0
+    );
+    assert_eq!(opening_prompt_rank("logs about wake", "wake logs"), 2);
+    assert_eq!(opening_prompt_rank("logs about wake", "logs logs"), 0);
+    assert_eq!(
+        opening_prompt_rank(
+            "unrelated discussion about caches",
+            "do we have logs of how long"
+        ),
+        0
+    );
+    assert!(
+        opening_prompt_rank(
+            "DO we have logs of how long?",
+            "do we have logs of how long"
+        ) > 0
+    );
+}
+
+#[test]
+fn mxabox_literal_transcript_hit_beats_recent_fuzzy_metadata_and_transcripts() {
+    let temp = tempfile::tempdir().unwrap();
+    let literal = temp.path().join("literal.json");
+    let fuzzy = temp.path().join("fuzzy.json");
+    std::fs::write(&literal, r#"{"text":"repair mxabox integration"}"#).unwrap();
+    std::fs::write(&fuzzy, r#"{"text":"repair maxbox integration"}"#).unwrap();
+    let mut picker = SessionPicker::new(vec![
+        session("metadata", "maxbox", 0, &fuzzy),
+        session("transcript", "unrelated", 1, &fuzzy),
+        session("literal", "old integration work", 1000, &literal),
+    ]);
+    picker.search_query = "mxabox".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker).first().map(String::as_str), Some("literal"));
+}
+
+#[test]
+fn fuzzy_transcript_search_rejects_distant_spellings_regardless_of_recency() {
+    let temp = tempfile::tempdir().unwrap();
+    let close = temp.path().join("close.json");
+    let loose = temp.path().join("loose.json");
+    std::fs::write(&close, r#"{"text":"maxbox"}"#).unwrap();
+    std::fs::write(&loose, r#"{"text":"maxboxes"}"#).unwrap();
+    let tokens = search_query_tokens("mxabox");
+    let cancel = AtomicBool::new(false);
+    let close_score = paths_match_scored(&[close.clone()], &tokens, &cancel).unwrap();
+    assert!(close_score > 0);
+    assert!(paths_match_scored(&[loose.clone()], &tokens, &cancel).is_none());
+    let mut picker = SessionPicker::new(vec![
+        session("loose", "unrelated", 0, &loose),
+        session("close", "unrelated", 1000, &close),
+    ]);
+    picker.search_query = "mxabox".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker), ["close"]);
+}
+
+#[test]
+fn fork_basten_does_not_find_an_incidental_tuning_fork_essay() {
+    let temp = tempfile::tempdir().unwrap();
+    let essay = temp.path().join("essay.json");
+    let target = temp.path().join("target.json");
+    std::fs::write(&essay, r#"{"messages":[{"role":"user","content":"Write a 4000 word essay on the history of timekeeping. Use no tools."},{"role":"assistant","content":"The tuning fork vibrates. A clock based on atoms. Laser cooling slowed atoms almost to a standstill. The basement laboratory kept time."}]}"#).unwrap();
+    std::fs::write(
+        &target,
+        r#"{"messages":[{"role":"user","content":"fork basten and fix the integration"}]}"#,
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let tokens = search_query_tokens("fork basten");
+    let mut scores = WordScores::default();
+    let mut streaming = Scan::new(&tokens, &[], &cancel, ScanMode::Fuzzy, &mut scores);
+    scan_file_streaming(&essay, &mut streaming);
+    assert!(streaming.evidence().is_none());
+    scan_file_streaming(&target, &mut streaming);
+    assert!(streaming.evidence().is_some());
+    let mut picker = SessionPicker::new(vec![
+        session(
+            "essay",
+            "Write a 4000 word essay on the history of timekeeping",
+            0,
+            &essay,
+        ),
+        session("target", "Integration", 1000, &target),
+    ]);
+    picker.search_query = "fork basten".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker), ["target"]);
+    // Repeat against resident token and decoded-text caches as well.
+    picker.search_query = "fork bastem".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker), ["target"]);
+}
+
+#[test]
+fn user_prompt_transcript_hit_beats_recent_tool_output_hit() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_path = temp.path().join("user.jsonl");
+    let tool_path = temp.path().join("tool.jsonl");
+    std::fs::write(
+        &user_path,
+        concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"please fix zanzibar parsing"}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &tool_path,
+        concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"grep found zanzibar parsing"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let tool = session("tool", "unrelated", 0, &tool_path);
+    let user = session("user", "unrelated", 500, &user_path);
+    let mut picker = SessionPicker::new(vec![tool, user]);
+    picker.search_query = "zanzibar parsing".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker), ["user", "tool"]);
+}
+
+#[test]
+fn repeated_rendering_requests_outrank_recent_rendering_bug_title() {
+    use super::source::{Source, push_mark};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("absent.json");
+    let mut bug = session("bug", "Desktop rendering bug", 0, &path);
+    push_mark(&mut bug.search_index, Source::User);
+    bug.search_index.push_str("fix this rendering bug");
+    push_mark(&mut bug.search_index, Source::ToolOutput);
+    bug.search_index.push_str(&" render".repeat(500));
+    let mut video = session("video", "Jcode v1 announcement", 3600, &path);
+    video.parent_id = Some("announcement".into());
+    video.first_user_prompt = Some("make faithful renders for a launch video".into());
+    push_mark(&mut video.search_index, Source::User);
+    video.search_index.push_str(
+        "make faithful renders for a launch video. wire in headless rendering. \
+         you should implement direct rendering code",
+    );
+    let mut picker = SessionPicker::new(vec![bug, video]);
+    picker.search_query = "render".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker), ["video", "bug"]);
+}
+
+#[test]
+fn user_mention_frequency_is_bounded_and_ignores_generated_text() {
+    use super::source::{Source, push_mark, user_mentions};
+    let tokens = search_query_tokens("render video");
+    let mut index = "render video ".repeat(100);
+    assert_eq!(user_mentions(&index, &tokens), 0);
+    push_mark(&mut index, Source::User);
+    index.push_str("render render video");
+    push_mark(&mut index, Source::Assistant);
+    index.push_str(&"render video ".repeat(100));
+    assert_eq!(user_mentions(&index, &tokens), 3);
+    push_mark(&mut index, Source::User);
+    index.push_str(&"render video ".repeat(100));
+    assert_eq!(user_mentions(&index, &tokens), 8);
+}
+
+#[test]
+fn retyped_later_user_prompt_beats_scattered_literal_hits() {
+    let temp = tempfile::tempdir().unwrap();
+    let target_path = temp.path().join("target.jsonl");
+    let noise_path = temp.path().join("noise.jsonl");
+    let user = |text: &str| {
+        format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n"
+        )
+    };
+    std::fs::write(
+        &target_path,
+        user("can you tell me about resume session search") + &user("okay ltes do that"),
+    )
+    .unwrap();
+    // Every query word appears literally, but never together.
+    std::fs::write(
+        &noise_path,
+        user("okay great") + &user("oaky is a typo") + &user("ltes test") + &user("do that later"),
+    )
+    .unwrap();
+    for query in [
+        "oaky ltes do that",
+        "okay ltes do that",
+        "that okay",
+        "that okay ltes",
+    ] {
+        let target = session("target", "resume search", 500, &target_path);
+        let noise = session("noise", "unrelated", 0, &noise_path);
+        let mut picker = SessionPicker::new(vec![noise, target]);
+        picker.search_query = query.into();
+        picker.rebuild_items();
+        wait(&mut picker);
+        assert_eq!(
+            ids(&picker).first().map(String::as_str),
+            Some("target"),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn typo_in_user_prompt_beats_literal_words_scattered_in_tool_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = |text: &str| {
+        format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{text}\"}}]}}}}\n"
+        )
+    };
+    let tool = |text: &str| {
+        format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"c\",\"output\":\"{text}\"}}}}\n"
+        )
+    };
+    let mut sessions = Vec::new();
+    // Every word appears literally, but "zanzibar" only in a tool dump.
+    for index in 0..8 {
+        let path = temp.path().join(format!("common{index}.jsonl"));
+        std::fs::write(&path, user("build the app") + &tool("zanzibar")).unwrap();
+        sessions.push(session(
+            &format!("common{index}"),
+            "unrelated",
+            index,
+            &path,
+        ));
+    }
+    // The user typed the distinctive word, with a typo in a common one.
+    let path = temp.path().join("rare.jsonl");
+    std::fs::write(&path, user("biuld the zanzibar parser")).unwrap();
+    sessions.push(session("rare", "unrelated", 500, &path));
+    let mut picker = SessionPicker::new(sessions);
+    picker.search_query = "build the zanzibar".into();
+    picker.rebuild_items();
+    wait(&mut picker);
+    assert_eq!(ids(&picker).first().map(String::as_str), Some("rare"));
 }

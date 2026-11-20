@@ -39,6 +39,7 @@ fn todo_completion_report_saves_full_evidence_but_renders_compactly_without_poke
         crate::todo::save_plan(
             &session_id,
             &crate::todo::TodoPlan {
+                title: None,
                 user_intention: Some("Show all evidence without another agent turn".into()),
                 understands_user_intent: Some(crate::todo::IntentUnderstanding::Clear),
                 understands_user_intent_history: vec![
@@ -108,7 +109,7 @@ fn todo_completion_report_saves_full_evidence_but_renders_compactly_without_poke
             if width == 80 {
                 assert_eq!(
                     lines[0].to_string(),
-                    format!("✓ Todo completion  {}", "●".repeat(12))
+                    format!("✓ Todo completion  {}  finished 0s ago", "●".repeat(12))
                 );
             }
             // Removing wrap whitespace lets us assert every detail even when
@@ -268,7 +269,7 @@ fn todo_completion_report_refreshes_evidence_and_preserves_previous_cycles() {
 }
 
 #[test]
-fn todo_completion_report_uses_remote_session_and_runs_before_other_gates() {
+fn todo_completion_report_can_explicitly_render_remote_session_without_continuation() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         let wrapper = app.session.id.clone();
@@ -280,6 +281,10 @@ fn todo_completion_report_uses_remote_session_and_runs_before_other_gates() {
         app.auto_poke_default_on = false;
         app.auto_poke_incomplete_todos = false;
         assert!(!app.schedule_auto_poke_followup_if_needed());
+        // Daemon turn boundaries do not read client-side policy state. An
+        // explicit report refresh still uses the selected session correctly.
+        assert!(completion_report_messages(&app).is_empty());
+        assert!(app.refresh_completed_todo_report(true));
         assert_eq!(completion_report_messages(&app).len(), 1);
         assert!(app.queued_messages.is_empty());
     });

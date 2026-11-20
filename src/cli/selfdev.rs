@@ -126,6 +126,7 @@ pub async fn run_self_dev(should_build: bool, resume_session: Option<String>) ->
 
     if should_build {
         let source = build::current_source_state(&repo_dir)?;
+        let prerelease = build::linux_prerelease_candidate(&repo_dir, &source);
         let build = build::selfdev_build_command(&repo_dir);
         output::stderr_info(format!("Building with {}...", build.display));
 
@@ -137,6 +138,9 @@ pub async fn run_self_dev(should_build: bool, resume_session: Option<String>) ->
         // inside the landing transaction, after the daemon is proven to run
         // this build.
         build::stage_local_current_build_for_source(&repo_dir, &source)?;
+        if prerelease {
+            build::dispatch_linux_prerelease(&repo_dir, &source, None);
+        }
 
         output::stderr_info("✓ Build complete; staged for landing");
     }

@@ -1,30 +1,25 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::background::TaskResult;
 use crate::plan::PlanItem;
 use crate::protocol::{
     AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, CommDeliveryMode, ContextEntry,
     HistoryMessage, PlanGraphStatus, Request, ServerEvent, SwarmChannelInfo, ToolCallSummary,
     comm_cleanup_candidate_session_ids, default_comm_await_target_statuses,
-    default_comm_cleanup_target_statuses, default_comm_run_await_statuses,
-    format_comm_awaited_members_with_reports, format_comm_channels, format_comm_context_entries,
-    format_comm_context_history, format_comm_members, format_comm_plan_followup,
-    format_comm_plan_status, format_comm_status_snapshot, format_comm_tool_summary,
-    latest_assistant_comm_report, resolve_optional_comm_target_session,
+    default_comm_cleanup_target_statuses, format_comm_awaited_members_with_reports,
+    format_comm_channels, format_comm_context_entries, format_comm_context_history,
+    format_comm_members, format_comm_plan_followup, format_comm_plan_status,
+    format_comm_status_snapshot, format_comm_tool_summary, latest_assistant_comm_report,
+    resolve_optional_comm_target_session,
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use jcode_swarm_core::validate_swarm_tldr;
+use jcode_swarm_core::{derive_swarm_task_label, validate_swarm_tldr};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
 const REQUEST_ID: u64 = 1;
-
-/// Default number of workers `run_plan` keeps active at once when the caller
-/// does not pass `concurrency_limit`.
-const DEFAULT_RUN_PLAN_CONCURRENCY: usize = 4;
 
 mod transport;
 use transport::{send_request, send_request_with_timeout};
@@ -76,10 +71,6 @@ fn default_cleanup_target_statuses() -> Vec<String> {
     default_comm_cleanup_target_statuses()
 }
 
-fn default_run_await_statuses() -> Vec<String> {
-    default_comm_run_await_statuses()
-}
-
 fn cleanup_candidate_session_ids(
     owner_session_id: &str,
     members: &[AgentInfo],
@@ -119,6 +110,7 @@ async fn fetch_swarm_members(session_id: &str) -> Result<Vec<AgentInfo>> {
     }
 }
 
+#[cfg(test)]
 fn swarm_member_is_in_flight(member: &AgentInfo) -> bool {
     matches!(
         member.status.as_deref(),
@@ -126,6 +118,7 @@ fn swarm_member_is_in_flight(member: &AgentInfo) -> bool {
     )
 }
 
+#[cfg(test)]
 fn coordination_in_flight_count(
     summary: &PlanGraphStatus,
     members: &[AgentInfo],
@@ -141,40 +134,11 @@ fn coordination_in_flight_count(
     )
 }
 
-/// Sessions `run_plan` should await as genuinely in-flight on *this* plan.
-///
-/// A member counts only when it is both in-flight (`queued`/`running`) **and** a
-/// drivable worker for this run: headless, or owned by the coordinator
-/// (`report_back_to_session_id == coordinator`). This deliberately excludes
-/// independent, client-attached human sessions that merely share the swarm and
-/// happen to sit in a `queued` status. Awaiting those would hang `run_plan`
-/// forever even though every plan task is already terminal (they are never auto
-/// driven), which is exactly the stall this scoping prevents.
-///
-/// Pure over an already-fetched member list so the coordination loop can reuse
-/// one `CommList` snapshot for both in-flight scoping and failure-wave
-/// classification.
-fn in_flight_swarm_session_ids(members: &[AgentInfo], coordinator_session_id: &str) -> Vec<String> {
-    members
-        .iter()
-        .filter(|member| member.session_id != coordinator_session_id)
-        .filter(|member| swarm_member_is_in_flight(member))
-        .filter(|member| swarm_member_is_drivable_worker(member, coordinator_session_id))
-        .map(|member| member.session_id.clone())
-        .collect()
-}
-
-/// Fetch-and-filter convenience over [`in_flight_swarm_session_ids`] for call
-/// sites that do not otherwise need the member snapshot.
-async fn fetch_in_flight_swarm_sessions(session_id: &str) -> Result<Vec<String>> {
-    let members = fetch_swarm_members(session_id).await?;
-    Ok(in_flight_swarm_session_ids(&members, session_id))
-}
-
-/// Whether `member` is a worker `run_plan` can rely on to autonomously execute an
+/// Whether `member` is a worker the coordinator can rely on to autonomously execute an
 /// assignment (and therefore one it is safe to await): a spawned headless worker,
 /// or one owned by the coordinator that issued the run. Foreign client-attached
-/// sessions are not drivable and must not gate `run_plan` completion.
+/// sessions are not drivable and must not count toward its in-flight workers.
+#[cfg(test)]
 fn swarm_member_is_drivable_worker(member: &AgentInfo, coordinator_session_id: &str) -> bool {
     member.is_headless.unwrap_or(false)
         || member.report_back_to_session_id.as_deref() == Some(coordinator_session_id)
@@ -1670,14 +1634,13 @@ impl CommunicateTool {
     }
 
     fn new_for_working_dir(working_dir: Option<&std::path::Path>) -> Self {
-        const BASE_DESCRIPTION: &str = "Coordinate agents: spawn workers for todo lanes, message them, and manage swarm plans.";
+        const BASE_DESCRIPTION: &str =
+            "Coordinate agents: spawn todo-lane workers and exchange messages.";
         let swarm_prompt = crate::prompt::load_swarm_prompt(working_dir);
         let description = if swarm_prompt.is_empty() {
             BASE_DESCRIPTION.to_string()
         } else {
-            format!(
-                "{BASE_DESCRIPTION}\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n{swarm_prompt}"
-            )
+            format!("{BASE_DESCRIPTION}\n\nSwarm prompt:\n{swarm_prompt}")
         };
         Self { description }
     }
@@ -1685,11 +1648,10 @@ impl CommunicateTool {
 
 /// Swarm actions advertised to models. Real usage is dominated by messaging,
 /// listing and spawning; the plan/task-graph actions (propose_plan,
-/// assign_task, assign_next, fill_slots, run_plan, resync_plan, ...) are
-/// subsumed by `launch` and lane-owning `spawn`. Unlisted actions still
+/// assign_task, assign_next, resync_plan, ...) are subsumed by worker-owned
+/// todo lanes, which the server dispatches itself, and lane-owning `spawn`. Unlisted actions still
 /// execute for old transcripts and scripts, they are just not offered.
 const ADVERTISED_SWARM_ACTIONS: &[&str] = &[
-    "launch",
     "spawn",
     "message",
     "status",
@@ -1761,11 +1723,7 @@ struct CommunicateInput {
     #[serde(default)]
     delivery: Option<CommDeliveryMode>,
     #[serde(default)]
-    concurrency_limit: Option<usize>,
-    #[serde(default)]
     force: Option<bool>,
-    #[serde(default)]
-    retain_agents: Option<bool>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -1870,63 +1828,53 @@ impl Tool for CommunicateTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ADVERTISED_SWARM_ACTIONS,
-                    "description": "launch: lanes. spawn requires label. message: agent/channel, coordinator-only broadcast. list_models."
+                    "enum": ADVERTISED_SWARM_ACTIONS
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message body. Goes to to_session, or to channel; with neither, everyone (coordinator only)."
+                    "description": "Routes to to_session, then channel, else broadcasts (coordinator only)."
                 },
                 "tldr": {
                     "type": "string",
-                    "description": "Optional one-line summary (under ~120 chars); recommended for bodies over 240 chars, else auto-derived."
+                    "description": "Summary under ~120 chars; auto-derived if omitted."
                 },
                 "to_session": {
                     "type": "string",
-                    "description": "Session ID or unique friendly name of one agent. Alias of target_session."
+                    "description": "Agent ID/unique name."
                 },
                 "to_swarm": {
                     "type": "string",
-                    "description": "Cross-swarm DM: swarm label or id (see list_swarms). With to_session, that agent; else its coordinator."
+                    "description": "Swarm ID/label; targets to_session or its coordinator."
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Channel name for channel actions. Discouraged: prefer DMs."
-                },
-                "target_session": {
-                    "type": "string",
-                    "description": "Session ID or unique friendly name for management actions. Alias of to_session."
+                    "description": "Prefer DMs."
                 },
                 "label": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Required for spawn: lane name, the source of truth. Existing lane tasks are prepopulated and synced."
+                    "description": "Required for spawn: todo lane (source of truth)."
                 },
                 "phase": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "For spawn: which phase the worker's lane belongs to. Defaults to the active phase."
+                    "description": "Spawn lane phase; defaults to active phase."
                 },
                 "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for spawn."
+                    "type": "string"
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Optional extra context for spawn. Lane tasks are prepopulated: do not repeat its tasks."
-                },
-                "initial_message": {
-                    "type": "string",
-                    "description": "Alias of prompt for spawn; wins when both are set."
+                    "description": "Extra spawn context, not lane tasks."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional max items for summary-style reads."
+                    "description": "Max summary items."
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Optional plan task ID. When omitted the coordinator picks or resumes the relevant task."
+                    "description": "Plan task; auto-selected if omitted."
                 },
                 "spawn_mode": {
                     "type": "string",
@@ -1940,85 +1888,41 @@ impl Tool for CommunicateTool {
                 "mode": {
                     "type": "string",
                     "enum": ["all", "any"],
-                    "description": "await_members: all or any."
+                    "description": "await_members."
                 },
                 "target_status": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional completion statuses for await_members. Defaults to ready/completed/stopped/failed."
+                    "description": "await_members; defaults to ready/completed/stopped/failed."
                 },
                 "timeout_minutes": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "await_members timeout. Returned dependency ID pauses todo.waiting_on until completion or timeout."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "For launch/run_plan: detach as a background task (default true); false blocks until the plan resolves."
+                    "description": "await_members; returned ID can be used in todo.waiting_on."
                 },
                 "notify": {
                     "type": "boolean",
-                    "description": "For await_members/run_plan: show a notification when resolved. Defaults to true."
-                },
-                "concurrency_limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Max live workers for launch."
+                    "description": "await_members: default true."
                 },
                 "force": {
                     "type": "boolean",
-                    "description": "For stop/cleanup: allow stopping non-owned/user-created swarm sessions. Defaults to false."
-                },
-                "retain_agents": {
-                    "type": "boolean",
-                    "description": "For launch/run_plan: keep spawned workers after the plan finishes. Defaults to false."
+                    "description": "stop: allow stopping non-owned/user-created sessions; default false."
                 },
                 "wake": {
                     "type": "boolean",
-                    "description": "Wake this agent when a message or awaited background task resolves (default true)."
+                    "description": "Wake on message/await completion; default true."
                 },
                 "delivery": {
                     "type": "string",
-                    "enum": ["notify", "interrupt", "wake"],
-                    "description": "Optional delivery mode for dm/channel messaging."
+                    "enum": ["notify", "interrupt", "wake"]
                 },
             }
         });
 
-        // `swarm` is a multi-action tool, so putting `label` in the top-level
-        // `required` array would incorrectly require it for read/list/message and
-        // every other action. Use mutually exclusive action branches instead:
-        // the spawn branch requires label, while the non-spawn branch does not.
-        // `anyOf` object branches are supported by our provider schema adapters
-        // and avoid the less-portable JSON Schema `if`/`then` keywords.
-        let non_spawn_actions: Vec<Value> = schema["properties"]["action"]["enum"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|action| action.as_str() != Some("spawn"))
-            .cloned()
-            .collect();
-        schema["anyOf"] = json!([
-            {
-                "type": "object",
-                "required": ["action", "label"],
-                "properties": {
-                    "action": { "type": "string", "enum": ["spawn"] },
-                    // Gemini validates that every `required` name is defined in
-                    // the same object's `properties` and rejects the whole
-                    // request otherwise (issue #655), so declare `label` here
-                    // instead of relying on the parent schema's declaration.
-                    "label": { "type": "string", "minLength": 1 }
-                }
-            },
-            {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": { "type": "string", "enum": non_spawn_actions }
-                }
-            }
-        ]);
+        // Advertise one spelling per capability. target_session and
+        // initial_message remain accepted by execute for older callers.
+        // required_spawn_label checks spawn's conditional requirement locally,
+        // before dispatch, without repeating the action enum in schema branches.
 
         apply_swarm_model_policy(&mut schema, &crate::config::config().agents);
         schema
@@ -2482,16 +2386,13 @@ impl Tool for CommunicateTool {
                 let label = params.required_spawn_label()?;
                 // Every spawned worker owns one lane in the coordinator's todo
                 // list: the lane named `label` in `phase` (default: the active
-                // phase), created from the prompt when it does not exist. The
+                // phase). When it does not exist it is created with one todo
+                // named after the label, with the prompt as its details. The
                 // worker's own todo list is that lane and syncs only it.
                 let prompt = params.spawn_initial_message();
                 let (lane_id, seeded_count) = {
                     let todos = crate::todo::load_todos(&ctx.session_id).unwrap_or_default();
-                    let title = prompt
-                        .as_deref()
-                        .and_then(|prompt| prompt.lines().map(str::trim).find(|l| !l.is_empty()))
-                        .map(|line| line.chars().take(60).collect::<String>())
-                        .unwrap_or_else(|| label.clone());
+                    let title = derive_swarm_task_label(&label).unwrap_or_else(|| label.clone());
                     let (updated, lane_id) = crate::todo::stages::ensure_spawn_lane(
                         &todos,
                         &label,
@@ -2858,100 +2759,12 @@ impl Tool for CommunicateTool {
                 }
             }
 
-            "fill_slots" => {
-                let concurrency_limit = params.concurrency_limit.ok_or_else(|| {
-                    anyhow::anyhow!("'concurrency_limit' is required for fill_slots action")
-                })?;
-
-                let summary = fetch_plan_status(&ctx.session_id).await?;
-                let members = fetch_swarm_members(&ctx.session_id).await?;
-
-                let active_count =
-                    coordination_in_flight_count(&summary, &members, &ctx.session_id);
-                if active_count >= concurrency_limit {
-                    return Ok(ToolOutput::new(format!(
-                        "Window already full: {} active/in-flight task(s) >= limit {}",
-                        active_count, concurrency_limit
-                    )));
-                }
-
-                let mut assignments = Vec::new();
-                let available_slots = concurrency_limit.saturating_sub(active_count);
-                for _ in 0..available_slots {
-                    let request = Request::CommAssignNext {
-                        id: REQUEST_ID,
-                        session_id: ctx.session_id.clone(),
-                        target_session: params.target_session.clone(),
-                        working_dir: params.working_dir.clone(),
-                        prefer_spawn: params.prefer_spawn,
-                        spawn_if_needed: params.spawn_if_needed,
-                        message: params.message.clone(),
-                        model: params.model.clone(),
-                        // Worker effort is not agent-controlled: the server applies
-                        // `agents.swarm_effort` (default "low").
-                        effort: None,
-                    };
-
-                    match send_request(request).await {
-                        Ok(ServerEvent::CommAssignTaskResponse {
-                            task_id,
-                            target_session,
-                            ..
-                        }) => assignments.push(format!("{} -> {}", task_id, target_session)),
-                        Ok(ServerEvent::Error { message, .. })
-                            if message.contains("No runnable unassigned tasks")
-                                || message.contains("No ready or completed swarm agents") =>
-                        {
-                            break;
-                        }
-                        Ok(response) => {
-                            ensure_success(&response)?;
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to fill slots: {}", e));
-                        }
-                    }
-                }
-
-                if assignments.is_empty() {
-                    Ok(ToolOutput::new(format!(
-                        "No assignments made. Active: {}, limit: {}",
-                        active_count, concurrency_limit
-                    )))
-                } else {
-                    let mut output = format!(
-                        "Filled {} slot(s):\n{}",
-                        assignments.len(),
-                        assignments
-                            .into_iter()
-                            .map(|line| format!("- {}", line))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    if let Ok(summary) = fetch_plan_status(&ctx.session_id).await {
-                        output.push_str(&format!("\n{}", format_plan_followup(&summary)));
-                    }
-                    Ok(ToolOutput::new(output))
-                }
-            }
-
-            "launch" | "run_plan" => {
-                // The coordinator's todo list is the plan: each lane (a group
-                // within a stage) becomes one item owned by one worker, whose
-                // own todo list is the lane. `launch` re-syncs every time so
-                // the plan never drifts; legacy `run_plan` keeps a hand-written
-                // `propose_plan` by only seeding an empty plan.
-                sync_plan_from_todos(&ctx, params.action == "run_plan").await?;
-                // Background-by-default: the plan driver runs as a managed
-                // background task (progress card, bg tool, notify/wake) so the
-                // coordinating agent stays responsive. Pass background=false
-                // to block inline until the plan reaches a terminal state.
-                if params.background.unwrap_or(true) {
-                    run_swarm_plan_in_background(&ctx, params.clone()).await
-                } else {
-                    run_swarm_plan_to_terminal(&ctx, &params, &RunPlanReporter::inline()).await
-                }
-            }
+            "launch" | "run_plan" | "fill_slots" => Err(anyhow::anyhow!(
+                "'{}' was removed. Mark a todo lane `owner: \"worker\"` (todo phases[].lanes[].owner, \
+                 or update lane_owner) and the server spawns a worker for it as soon as its \
+                 dependencies are met. Use `plan_status` to watch lanes.",
+                params.action
+            )),
 
             "start" | "start_task" | "wake" | "resume" | "retry" | "reassign" | "replace"
             | "salvage" => {
@@ -3086,8 +2899,7 @@ impl Tool for CommunicateTool {
                 let timeout_minutes = params.timeout_minutes.unwrap_or(60);
                 let timeout_secs = timeout_minutes * 60;
                 // Public member waits are always asynchronous. The blocking
-                // CommAwaitMembers protocol remains available internally for the
-                // run_plan coordination loop, but agents must not park an entire
+                // CommAwaitMembers protocol remains available internally, but agents must not park an entire
                 // turn waiting on a worker or a long-lived socket.
                 let blocking_was_requested = params.background == Some(false);
                 let background = true;
@@ -3151,7 +2963,7 @@ impl Tool for CommunicateTool {
             _ => Err(anyhow::anyhow!(
                 "Unknown action '{}'. Valid actions: share, share_append, read, message, broadcast, dm, channel, list, list_channels, channel_members, \
                  propose_plan, approve_plan, reject_plan, spawn, stop, assign_role, status, plan_status, summary, read_context, \
-                 resync_plan, assign_task, assign_next, fill_slots, run_plan, cleanup, start, start_task, wake, resume, retry, reassign, replace, salvage, subscribe_channel, unsubscribe_channel, await_members. \
+                 resync_plan, assign_task, assign_next, cleanup, start, start_task, wake, resume, retry, reassign, replace, salvage, subscribe_channel, unsubscribe_channel, await_members. \
                  To read messages addressed to you, use action='read'.",
                 params.action
             )),

@@ -320,7 +320,8 @@ fn format_context_includes_roles_and_tools() {
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -331,7 +332,8 @@ fn format_context_includes_roles_and_tools() {
                 tool_use_id: "tool-2".to_string(),
                 content: "boom".to_string(),
                 is_error: Some(true),
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -355,7 +357,8 @@ fn extraction_context_keeps_tool_io_details() {
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -989,7 +992,7 @@ fn focused_query_excludes_multiline_tool_errors_but_keeps_later_user_prose() {
                 text: "Keep the token rotation behavior unchanged.".to_string(),
                 cache_control: None,
             },
-        ],
+        ].into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
