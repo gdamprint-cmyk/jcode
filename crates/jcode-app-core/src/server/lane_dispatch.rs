@@ -1,5 +1,10 @@
 //! Automatic worker dispatch for worker-owned todo lanes.
 //!
+// reference: no prior art, searched "cleanup_finished_workers_for_capacity" and
+// "member cap recovery" in the jcode fork repo (github.com/1jehuang/jcode, commit 93cb1e471,
+// crates/jcode-app-core/src/tool/communicate.rs:278) and upstream 553db9088; upstream never had the
+// helper, the fork's copy was dropped by 2f2b78796. Re-implemented server-side here.
+//!
 //! A root session marks a todo lane `owner: "worker"`. Whenever its todo list
 //! is saved (including mirrored saves when a worker finishes a lane item), the
 //! server spawns one swarm worker for every worker-owned lane whose
@@ -13,6 +18,7 @@
 //! a duplicate for the same lane.
 
 use super::comm_session::handle_comm_spawn;
+use super::comm_session::swarm_stop_target::stop_swarm_member_now;
 use super::swarm_mutation_state::SwarmMutationRuntime;
 use super::{
     ChannelSubscriptions, ClientConnectionInfo, SessionAgents, SessionInterruptQueues, SwarmEvent,
@@ -155,7 +161,7 @@ async fn dispatch(session_id: String, lanes: Vec<String>) {
     if !is_root {
         return;
     }
-    for lane in lanes {
+    for lane in lanes.clone() {
         let key = (session_id.clone(), lane.clone());
         if !in_flight()
             .lock()
@@ -189,6 +195,30 @@ async fn dispatch(session_id: String, lanes: Vec<String>) {
                 crate::logging::info(&format!(
                     "lane dispatch: {session_id} lane {lane} queued: {message}"
                 ));
+                // Re-ported fork recovery: a cap refusal used to retire this
+                // coordinator's idle workers before waiting. Without it their
+                // slots stay held until an explicit `swarm stop`, and a large
+                // plan wedges at the cap.
+                // Protect lanes already assigned earlier in this loop whose
+                // queued status may not have propagated yet.
+                let exclude: Vec<String> = lanes
+                    .iter()
+                    .flat_map(|pending| {
+                        crate::todo::load_todos(&session_id)
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .filter(|todo| crate::todo::stages::lane_id(todo) == *pending)
+                            .filter_map(|todo| todo.assigned_to.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                let stopped = recover_member_capacity(context, &session_id, &exclude).await;
+                if stopped > 0 {
+                    crate::logging::info(&format!(
+                        "lane dispatch: member-cap recovery stopped {stopped} finished worker(s) for {session_id}"
+                    ));
+                }
                 schedule_queued_retry(&session_id);
                 // Later lanes would hit the same cap.
                 break;
@@ -202,6 +232,95 @@ async fn dispatch(session_id: String, lanes: Vec<String>) {
 
 fn is_capacity_error(message: &str) -> bool {
     message.contains("live-agent limit reached") || message.contains("member limit reached")
+}
+
+/// Free swarm member slots by stopping this coordinator's finished workers.
+///
+/// The spawn path refuses new workers while the live-agent cap is full
+/// (`comm_session.rs` cap check). A lane blocked only by the cap used to wait
+/// for its own finished workers to be stopped; after the upstream merge that
+/// recovery was dropped and the cap error only schedules a retry, so idle
+/// workers held their slots until an explicit `swarm stop`. This restores the
+/// recovery on the server side: on a cap refusal, retire the coordinator's
+/// idle, slot-holding workers and re-queue the lane.
+///
+/// Returns the number of workers actually stopped.
+async fn recover_member_capacity(
+    context: &LaneDispatchContext,
+    session_id: &str,
+    exclude: &[String],
+) -> usize {
+    let swarm_id = {
+        let members = context.swarm_state.members.read().await;
+        members
+            .get(session_id)
+            .and_then(|member| member.swarm_id.clone())
+    };
+    let Some(swarm_id) = swarm_id else {
+        return 0;
+    };
+
+    let candidates = {
+        let members = context.swarm_state.members.read().await;
+        capacity_recovery_candidates(&members, session_id, &swarm_id, exclude)
+    };
+
+    let mut stopped = 0usize;
+    for target in candidates {
+        let removed = stop_swarm_member_now(
+            &target,
+            session_id,
+            &context.sessions,
+            &context.swarm_state.members,
+            &context.swarm_state.swarms_by_id,
+            &context.swarm_state.coordinators,
+            &context.swarm_state.plans,
+            &context.channel_subscriptions,
+            &context.channel_subscriptions_by_session,
+            &context.event_history,
+            &context.event_counter,
+            &context.swarm_event_tx,
+            &context.soft_interrupt_queues,
+        )
+        .await;
+        if removed {
+            stopped += 1;
+        }
+    }
+    stopped
+}
+
+/// Finished, capacity-consuming workers of `session_id` in `swarm_id` that a
+/// cap-blocked dispatch may retire. Pure so the selection rule is testable.
+///
+/// A candidate must be *alive and idle*: `member_consumes_swarm_capacity` is
+/// false for every terminal status (`completed`/`failed`/`stopped`/...), so a
+/// completed worker holds no slot and stopping it would free nothing. The
+/// statuses that do hold a slot and are safe to stop are the idle ones
+/// (`ready` and the empty legacy status). Excludes the coordinator itself,
+/// foreign owners, in-flight workers and the `exclude` set (lanes assigned
+/// earlier in this dispatch loop).
+fn capacity_recovery_candidates(
+    members: &HashMap<String, SwarmMember>,
+    session_id: &str,
+    swarm_id: &str,
+    exclude: &[String],
+) -> Vec<String> {
+    const IDLE_CANDIDATE_STATUSES: [&str; 2] = ["ready", ""];
+    let mut ids: Vec<String> = members
+        .values()
+        .filter(|member| member.session_id != session_id)
+        .filter(|member| member.swarm_id.as_deref() == Some(swarm_id))
+        .filter(|member| super::member_consumes_swarm_capacity(member))
+        .filter(|member| IDLE_CANDIDATE_STATUSES.contains(&member.status.as_str()))
+        // Only this coordinator's own workers: a sibling coordinator's agents
+        // are not ours to retire.
+        .filter(|member| member.report_back_to_session_id.as_deref() == Some(session_id))
+        .filter(|member| !exclude.iter().any(|assigned| assigned == &member.session_id))
+        .map(|member| member.session_id.clone())
+        .collect();
+    ids.sort();
+    ids
 }
 
 fn schedule_queued_retry(session_id: &str) {

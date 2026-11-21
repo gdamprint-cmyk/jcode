@@ -930,15 +930,6 @@ pub(super) async fn handle_comm_stop(
         return;
     }
 
-    let _ = fanout_session_event(
-        swarm_members,
-        &target_session,
-        ServerEvent::SessionCloseRequested {
-            reason: format!("Stopped by coordinator {req_session_id}"),
-        },
-    )
-    .await;
-
     let mutation_key = request_key(&req_session_id, "stop", &[swarm_id, target_session.clone()]);
     let Some(mutation_state) = begin_or_replay(
         swarm_mutation_runtime,
@@ -953,89 +944,24 @@ pub(super) async fn handle_comm_stop(
         return;
     };
 
-    // Cancel the worker's in-flight turn before its handles are removed, or it
-    // keeps generating and editing files with nothing left to stop it by.
-    super::swarm::cancel_active_turns(&target_session);
-
-    let removed_agent = super::remove_session_entry(sessions, &target_session).await;
-    let removed_live_agent = removed_agent.is_some();
-    if let Some(agent_arc) = removed_agent {
-        remove_session_interrupt_queue(soft_interrupt_queues, &target_session).await;
-        remove_background_tool_signal(&target_session);
-        if let Ok(mut agent) = agent_arc.try_lock() {
-            agent.mark_closed();
-            let memory_enabled = agent.memory_enabled();
-            let transcript = if memory_enabled {
-                Some(agent.build_transcript_for_extraction())
-            } else {
-                None
-            };
-            let sid = target_session.clone();
-            let working_dir = agent.working_dir().map(|dir| dir.to_string());
-            drop(agent);
-            if let Some(transcript) = transcript {
-                crate::memory_agent::trigger_final_extraction_with_dir(
-                    transcript,
-                    sid,
-                    working_dir,
-                );
-            }
-        } else {
-            // The agent was mid-turn so its lock was busy; still record that
-            // the session is closed, or it looks alive on disk forever (and
-            // reload keeps re-announcing awaits on it).
-            if let Ok(mut session) = crate::session::Session::load(&target_session) {
-                session.mark_closed();
-                // save_prepared: a worker stopped before it wrote any message
-                // must still persist Closed (plain save skips empty sessions).
-                if let Err(error) = session.save_prepared() {
-                    crate::logging::warn(&format!(
-                        "stop {target_session}: failed to persist closed status: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
-    let (removed_swarm_id, removed_name) = {
-        let mut members = swarm_members.write().await;
-        if let Some(member) = members.remove(&target_session) {
-            (member.swarm_id, member.friendly_name)
-        } else {
-            (None, None)
-        }
-    };
-    if let Some(ref swarm_id) = removed_swarm_id {
-        record_swarm_event(
-            event_history,
-            event_counter,
-            swarm_event_tx,
-            target_session.clone(),
-            removed_name.clone(),
-            Some(swarm_id.clone()),
-            SwarmEventType::MemberChange {
-                action: "left".to_string(),
-            },
-        )
-        .await;
-        remove_session_from_swarm(
-            &target_session,
-            swarm_id,
-            swarm_members,
-            swarms_by_id,
-            swarm_coordinators,
-            swarm_plans,
-        )
-        .await;
-    }
-    remove_session_channel_subscriptions(
+    let removed = stop_swarm_member_now(
         &target_session,
+        &req_session_id,
+        sessions,
+        swarm_members,
+        swarms_by_id,
+        swarm_coordinators,
+        swarm_plans,
         channel_subscriptions,
         channel_subscriptions_by_session,
+        event_history,
+        event_counter,
+        swarm_event_tx,
+        soft_interrupt_queues,
     )
     .await;
 
-    let response = if removed_live_agent || removed_swarm_id.is_some() {
+    let response = if removed {
         PersistedSwarmMutationResponse::Done
     } else {
         PersistedSwarmMutationResponse::Error {
@@ -1047,7 +973,7 @@ pub(super) async fn handle_comm_stop(
 }
 
 #[path = "swarm_stop_target.rs"]
-mod swarm_stop_target;
+pub(crate) mod swarm_stop_target;
 use swarm_stop_target::*;
 
 fn swarm_member_status_is_stale_for_coordination(status: &str) -> bool {
