@@ -288,10 +288,15 @@ fn pause_schema_is_shared_strict_and_carries_the_guidance() {
     ] {
         assert!(update.get(removed).is_none(), "{removed}");
     }
-    // Pause rules live on the fields, not in the one-sentence tool description.
+    // Pause rules live on the fields, not in the tool description. The fork's
+    // merge-semantics and unique-name sentences are the part the model needs
+    // (cfc8b4cb0): pin those phrases rather than a punctuation count, which
+    // breaks on every wording edit.
     let description = TodoTool::new().description().to_string();
     assert!(!description.contains("block"), "{description}");
-    assert_eq!(description.matches(['.', ';']).count(), 2, "{description}");
+    assert!(description.contains("MERGES"), "{description}");
+    assert!(description.contains("remove"), "{description}");
+    assert!(description.contains("unique short names"), "{description}");
     let auth = update["requires_user_auth"]["description"]
         .as_str()
         .unwrap();

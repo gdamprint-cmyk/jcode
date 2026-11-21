@@ -1679,17 +1679,20 @@ async fn test_single_output_ceiling_is_absolute_not_only_proportional() {
 }
 
 #[tokio::test]
-async fn initiative_is_not_registered_or_advertised() {
+async fn initiative_is_registered_and_advertised() {
+    // Re-enabled by c17a62bd0 after 4928a1c92 unregistered it with no recorded
+    // reason; the store, side panel and display modes had survived, so only the
+    // registration was missing. This pins the restoration.
     let registry = Registry::new(Arc::new(MockProvider)).await;
     let names = registry.tool_names().await;
     assert!(names.iter().any(|name| name == "todo"));
-    assert!(!names.iter().any(|name| name == "initiative"));
+    assert!(names.iter().any(|name| name == "initiative"));
     assert!(
         registry
             .definitions(None)
             .await
             .iter()
-            .all(|definition| definition.name != "initiative")
+            .any(|definition| definition.name == "initiative")
     );
 }
 
@@ -1809,8 +1812,10 @@ async fn only_the_known_open_world_tools_are_ineligible_for_openai_strict_mode()
     // root combiners are now flattened (OpenAI rejects them outright).
     // todo's update items are open on purpose: repeating every item field a
     // third time cost ~230 tokens per request. apply_todo_patch rejects
-    // unknown fields instead.
-    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch", "browser", "todo"];
+    // unknown fields instead. initiative's milestone/step schemas are open
+    // maps (`additionalProperties: true`) so stored milestones keep arbitrary
+    // fields; it has been non-strict since its re-enable (c17a62bd0).
+    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch", "browser", "initiative", "todo"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
