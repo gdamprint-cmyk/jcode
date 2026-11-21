@@ -40,6 +40,36 @@ async fn attachment_was_replaced(
     }
 }
 
+/// Is some client attached to this session, or has a successor replaced this
+/// connection's swarm attachment? Cleanup answers this twice: once before it
+/// takes the per-session claim gate, and once while holding it, because a
+/// successor may claim in that window.
+async fn successor_is_connected(
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    session_id: &str,
+    client_event_tx: &mpsc::UnboundedSender<crate::protocol::ServerEvent>,
+    allow_reconnect: bool,
+    originally_registered: bool,
+) -> bool {
+    if client_connections
+        .read()
+        .await
+        .values()
+        .any(|info| info.session_id == session_id)
+    {
+        return true;
+    }
+    allow_reconnect
+        && attachment_was_replaced(
+            swarm_members,
+            session_id,
+            client_event_tx,
+            originally_registered,
+        )
+        .await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisconnectDisposition {
     Closed,
@@ -225,23 +255,24 @@ pub(super) async fn cleanup_client_connection(
     // reclaim the same session without tripping duplicate-attach guards.
     tokio::task::yield_now().await;
 
-    // Resume claims use this same lock before accessing the sessions map.
-    // Keep it through destructive cleanup so a successor cannot be claimed
-    // between the check and session/status/control-handle removal.
-    let connections = client_connections.write().await;
-    let successor_connected = connections
-        .values()
-        .any(|info| info.session_id == client_session_id);
-    if successor_connected
-        || (allow_reconnect
-            && attachment_was_replaced(
-                swarm_members,
-                client_session_id,
-                client_event_tx,
-                originally_registered,
-            )
-            .await)
-    {
+    // First successor check. This read deliberately does not serialize the
+    // window: a claim may attach right after it. The authoritative answer is
+    // taken under the per-session claim gate below, and only that one gates
+    // destructive teardown. Holding the write lock here across the agent mutex,
+    // swarm teardown and channel/file cleanup made every other connection's
+    // subscribe wait for one disconnect's whole teardown (measured 2026-11-19:
+    // 248 subscribes acked, 0 reached the handler's end during the reconnect
+    // storm, p50 2.35 s).
+    let successor_connected = successor_is_connected(
+        client_connections,
+        swarm_members,
+        client_session_id,
+        client_event_tx,
+        allow_reconnect,
+        originally_registered,
+    )
+    .await;
+    if successor_connected {
         crate::logging::info(&format!(
             "Skipping destructive disconnect cleanup for {} because another client is still attached",
             client_session_id
@@ -250,6 +281,49 @@ pub(super) async fn cleanup_client_connection(
         // its writer handle so it can retain and await the task using the same
         // continuation path as an explicitly detached remote turn. Merely
         // dropping the JoinHandle here would lose completion/status handling.
+        if processing_task.is_some() {
+            return Ok(Some(event_handle));
+        }
+        event_handle.abort();
+        return Ok(None);
+    }
+
+    // Test-only observation point: cleanup has answered the first ownership
+    // question and is about to take the per-session claim gate.
+    #[cfg(test)]
+    if let Some(pause) =
+        crate::server::client_disconnect_grace_test_pause::take(client_session_id)
+    {
+        pause.wait_for_release().await;
+    }
+
+    // This reservation does not lock the registry, so it does not by itself
+    // exclude another writer, and it is NOT the mechanism that protects the
+    // re-read below. It is taken on the session being cleaned up, while a resume
+    // claim holds the reservation of its own target and releases it before its
+    // teardown. What protects the re-read is that it scans the same id a claim
+    // publishes into `client_connections`, and the claim is the sole writer of a
+    // live session id there. The reservation still buys ordering against a claim
+    // already publishing THIS id, and claims for other sessions proceed
+    // independently.
+    let _successor_claim_gate = sessions.reserve(client_session_id).await;
+    // Re-check under the gate. The first check released the registry guard, so
+    // a successor could have claimed in between; removing now would take a
+    // session that is already owned again.
+    if successor_is_connected(
+        client_connections,
+        swarm_members,
+        client_session_id,
+        client_event_tx,
+        allow_reconnect,
+        originally_registered,
+    )
+    .await
+    {
+        crate::logging::info(&format!(
+            "Skipping destructive disconnect cleanup for {} because a successor claimed it during disconnect",
+            client_session_id
+        ));
         if processing_task.is_some() {
             return Ok(Some(event_handle));
         }
@@ -419,7 +493,11 @@ pub(super) async fn cleanup_client_connection(
     remove_background_tool_signal(client_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, client_session_id).await;
 
-    drop(connections);
+    #[cfg(test)]
+    if let Some(pause) = crate::server::client_disconnect_grace_test_pause::take(client_session_id)
+    {
+        pause.mark_finished();
+    }
     event_handle.abort();
     Ok(None)
 }

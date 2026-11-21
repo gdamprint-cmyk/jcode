@@ -1260,6 +1260,28 @@ async fn remove_detached_source_if_unclaimed(
     owns_source
 }
 
+/// Test-only handle on the real claim path, so a test can drive a claim while
+/// cleanup is parked instead of simulating one with a bare registry write.
+#[cfg(test)]
+pub(crate) async fn claim_live_target_agent_for_test(
+    session_id: &str,
+    client_connection_id: &str,
+    client_instance_id: Option<&str>,
+    source_agent: &Arc<Mutex<Agent>>,
+    sessions: &SessionAgents,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+) -> Option<Arc<Mutex<Agent>>> {
+    claim_live_target_agent(
+        session_id,
+        client_connection_id,
+        client_instance_id,
+        source_agent,
+        sessions,
+        client_connections,
+    )
+    .await
+}
+
 /// Atomically reserves an existing live target for this connection.
 ///
 /// Reserving under the connection write lock prevents another connection's
