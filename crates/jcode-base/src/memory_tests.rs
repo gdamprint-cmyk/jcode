@@ -1043,7 +1043,8 @@ fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
             content: vec![ContentBlock::Text {
                 text: catalogue,
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1052,7 +1053,8 @@ fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
             content: vec![ContentBlock::Text {
                 text: "What is the jcode memory verification nonce?".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1091,7 +1093,8 @@ fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
                 text: "<system-reminder>\n# Session Context\nDate: 2026-11-05\n</system-reminder>"
                     .to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1100,7 +1103,8 @@ fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
             content: vec![ContentBlock::Text {
                 text: catalogue,
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -1109,7 +1113,8 @@ fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
             content: vec![ContentBlock::Text {
                 text: ".".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },

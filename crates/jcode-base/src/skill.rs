@@ -1333,7 +1333,7 @@ mod tests {
         for name in names {
             reg_a
                 .skills
-                .insert(name.to_string(), test_skill(name, "d", "c"));
+                .insert(name.to_string(), test_skill(name, "d", "c").into());
         }
 
         // Build a second registry with the reverse insertion order to maximize
@@ -1342,7 +1342,7 @@ mod tests {
         for name in names.iter().rev() {
             reg_b
                 .skills
-                .insert(name.to_string(), test_skill(name, "d", "c"));
+                .insert(name.to_string(), test_skill(name, "d", "c").into());
         }
 
         let order_a: Vec<&str> = reg_a.list().iter().map(|s| s.name.as_str()).collect();
@@ -1454,7 +1454,7 @@ mod tests {
         let mut base = SkillRegistry::default();
         base.skills.insert(
             "session-skill".to_string(),
-            test_skill("session-skill", "global variant", "global body"),
+            test_skill("session-skill", "global variant", "global body").into(),
         );
         let effective = SkillRegistry::effective_for_working_dir(&base, Some(temp.path()));
         let skill = effective
