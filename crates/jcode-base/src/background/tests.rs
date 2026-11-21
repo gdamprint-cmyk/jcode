@@ -719,6 +719,48 @@ async fn reconcile_marks_orphan_from_dead_process_failed() -> Result<()> {
     Ok(())
 }
 
+/// A PID that is alive right now but belongs to a different process.
+///
+/// Unix: PID 1 (init) is always alive. Windows has no PID 1, so enumerate the
+/// process snapshot (same ToolHelp pattern as platform_reparent_tests) and
+/// pick the first PID that passes the production liveness check.
+fn live_foreign_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        1
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            assert_ne!(snapshot, INVALID_HANDLE_VALUE, "process snapshot failed");
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let self_pid = std::process::id();
+            let mut found = None;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let pid = entry.th32ProcessID;
+                    if pid != self_pid && crate::platform::is_process_running(pid) {
+                        found = Some(pid);
+                        break;
+                    }
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            found.expect("expected at least one live foreign process")
+        }
+    }
+}
+
 #[tokio::test]
 async fn reconcile_leaves_non_orphans_alone() -> Result<()> {
     let tmp = tempdir()?;
@@ -734,9 +776,9 @@ async fn reconcile_leaves_non_orphans_alone() -> Result<()> {
     let legacy = running_status_fixture("keep2bbbb", "session-keep");
     write_status_fixture(&manager, &legacy).await;
 
-    // Owned by a live foreign process (PID 1 is always alive on Unix).
+    // Owned by a live foreign process (init on Unix, any other live PID on Windows).
     let mut foreign = running_status_fixture("keep3cccc", "session-keep");
-    foreign.owner_pid = Some(1);
+    foreign.owner_pid = Some(live_foreign_pid());
     foreign.owner_instance = Some("init-instance".to_string());
     write_status_fixture(&manager, &foreign).await;
 
