@@ -1,6 +1,19 @@
 use super::*;
 use jcode_session_types::StoredMessage;
 
+/// Set a file's mtime explicitly.
+///
+/// `File::set_modified`/`set_times` need a WRITABLE handle on Windows (a
+/// read-only handle fails with ERROR_ACCESS_DENIED), so open with write access.
+fn set_file_mtime(path: &Path, mtime: SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for mtime")
+        .set_modified(mtime)
+        .expect("set mtime");
+}
+
 // The pre-cache implementation remains the output oracle, including storage's
 // backup recovery behavior rather than a permissive top-level enabled parser.
 fn uncached_mobile_state() -> MobileSyncState {
@@ -254,18 +267,12 @@ fn parsed_state_reuse_matches_old_output_and_reads_current_bytes() {
     // Equal byte length and identical mtime still require fresh authorization.
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     std::fs::write(&path, valid.replace("\"generation\":7", "\"generation\":8")).unwrap();
-    std::fs::File::open(&path)
-        .unwrap()
-        .set_modified(before)
-        .unwrap();
+    set_file_mtime(&path, before);
     assert_eq!(load_state(), uncached_mobile_state());
     assert!(!sync_still_enabled(7));
     assert!(sync_still_enabled(8));
     std::fs::write(&path, valid.replace("true", "null")).unwrap();
-    std::fs::File::open(&path)
-        .unwrap()
-        .set_modified(before)
-        .unwrap();
+    set_file_mtime(&path, before);
     assert_eq!(load_state(), uncached_mobile_state());
     assert!(!is_enabled());
     for contents in [

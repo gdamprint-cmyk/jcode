@@ -126,10 +126,7 @@ async fn unchanged_pass_and_identical_commit_do_not_rewrite_state() {
     )]);
     commit_progress(generation, &updates).unwrap();
     let state = state_path().unwrap();
-    std::fs::File::open(&state)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
-        .unwrap();
+    set_file_mtime(&state, UNIX_EPOCH + Duration::from_secs(100));
     let before = session_revision(&state);
     commit_progress(generation, &updates).unwrap();
     assert_eq!(
