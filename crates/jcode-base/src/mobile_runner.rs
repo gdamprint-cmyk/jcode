@@ -802,6 +802,21 @@ mod tests {
                         break;
                     }
                 }
+                // Read the declared body before answering. This fake serves
+                // POSTs as well as GETs: closing while the client is still
+                // sending its request body makes Windows deliver a RST to the
+                // sender (WSAECONNRESET 10054), which surfaces as
+                // "error sending request" rather than the response we wrote.
+                let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map_or(0, |len| len.parse::<usize>().unwrap());
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 {
+                    socket.read_exact(&mut body).await.unwrap();
+                    request.extend_from_slice(&body);
+                }
                 requests.push(String::from_utf8(request).unwrap());
                 let body = page.to_string();
                 let response = format!(
