@@ -167,7 +167,7 @@ impl Tool for ApplyPatchTool {
                         path,
                         "created",
                         &diff,
-                        super::edit_stats::line_delta(old.as_deref().unwrap_or(""), contents),
+                        super::edit_stats::line_delta(old.as_deref().unwrap_or(""), &contents),
                         params.intent.as_deref(),
                     );
                     touched_paths.push(path.clone());

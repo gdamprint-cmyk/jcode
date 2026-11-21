@@ -412,10 +412,19 @@ impl SkillTool {
         };
 
         let root = skill_write::skills_root(working_dir);
+        // Journaling is opt-in: the ledger records a skill edit nobody could
+        // otherwise prove or revert, but it writes to a shared file.
+        let ledger = skill_write::ledger_path();
         let outcome = match action {
-            skill_write::SkillAction::Create => skill_write::create_skill(&root, &request)?,
-            skill_write::SkillAction::Patch => skill_write::patch_skill(&root, &request)?,
-            skill_write::SkillAction::WriteFile => skill_write::write_skill_file(&root, &request)?,
+            skill_write::SkillAction::Create => {
+                skill_write::create_skill(&root, &request, ledger.as_deref())?
+            }
+            skill_write::SkillAction::Patch => {
+                skill_write::patch_skill(&root, &request, ledger.as_deref())?
+            }
+            skill_write::SkillAction::WriteFile => {
+                skill_write::write_skill_file(&root, &request, ledger.as_deref())?
+            }
         };
 
         // A new SKILL.md is only visible to the registry after a reload.

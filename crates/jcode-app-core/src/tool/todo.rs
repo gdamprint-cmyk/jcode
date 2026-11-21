@@ -799,7 +799,7 @@ fn flatten_phases(input: &mut Value) -> Result<()> {
                     .as_object()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("item must be an object"))?;
-                if [
+                if let Some(key) = [
                     "phase",
                     "lane",
                     "stage",
@@ -810,7 +810,7 @@ fn flatten_phases(input: &mut Value) -> Result<()> {
                     "lane_owner",
                 ]
                 .iter()
-                .any(|key| item.contains_key(*key))
+                .find(|key| item.contains_key(**key))
                 {
                     bail!(
                         "hierarchical items must not own {key:?} \

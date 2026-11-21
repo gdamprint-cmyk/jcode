@@ -684,6 +684,8 @@ impl SkillRegistry {
 
         let name = scalar("name")?;
         let description = scalar("description")?;
+        let disable_model_invocation = scalar("disable-model-invocation")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
         let allowed_tools = entries
             .iter()
             .find(|(entry, _)| *entry == "allowed-tools")
@@ -707,6 +709,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
         })
     }
 

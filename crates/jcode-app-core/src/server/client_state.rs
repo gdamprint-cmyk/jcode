@@ -380,11 +380,11 @@ pub(super) async fn handle_get_model_catalog(
             crate::logging::warn(&format!(
                 "Model catalog request failed without disconnecting session {session_id}: {error:#}"
             ));
-            writer.send_event(&ServerEvent::Error {
+            return writer.send_event(&ServerEvent::Error {
                 id,
                 message: format!("Could not refresh model catalog: {error}"),
                 retry_after_secs: None,
-            })
+            });
         }
     };
     let encode_started = Instant::now();
@@ -1208,9 +1208,6 @@ async fn send_history_with_guard(
     let result = writer.send_frames(&frames);
     timing.result(&result);
     let writer_lock_ms = writer_lock_start.elapsed().as_millis();
-    // Release the serialized payload before any further work (logging below
-    // only needs the captured length).
-    drop(json);
     let write_ms = writer_lock_start.elapsed().as_millis();
 
     crate::logging::info(&format!(

@@ -1863,7 +1863,7 @@ impl Provider for MultiProvider {
         // OpenRouter runtime). Fall back to the instance route catalog.
         let active_profile_id = ProviderRegistry::new(self).active_compatible_profile_id();
         let mut fallback: Option<String> = None;
-        for route in self.fresh_routes_memo_entry().routes {
+        for route in &self.fresh_routes_memo_entry().routes {
             if !route.available || route.model != model {
                 continue;
             }
