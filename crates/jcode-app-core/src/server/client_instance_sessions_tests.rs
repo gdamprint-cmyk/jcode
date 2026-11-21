@@ -19,6 +19,7 @@ use crate::message::{Message, ToolDefinition};
 use crate::provider::EventStream;
 use crate::server::client_instance_sessions::ClientInstanceSessions;
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 /// A provider that never runs: these tests only exercise Subscribe.
 struct NoRequests;
@@ -199,6 +200,7 @@ async fn reconnect_without_target_reattaches_to_the_same_session() {
             crash_on_disconnect: false,
             continue_on_disconnect: false,
             terminal_env: Vec::new(),
+            client_name: None,
         })
         .unwrap(),
     )
@@ -242,6 +244,7 @@ async fn reconnect_without_target_reattaches_to_the_same_session() {
             crash_on_disconnect: false,
             continue_on_disconnect: false,
             terminal_env: Vec::new(),
+            client_name: None,
         })
         .unwrap(),
     )
@@ -295,6 +298,7 @@ async fn a_different_client_instance_does_not_inherit_the_session() {
             crash_on_disconnect: false,
             continue_on_disconnect: false,
             terminal_env: Vec::new(),
+            client_name: None,
         })
         .unwrap(),
     )
@@ -331,6 +335,7 @@ async fn a_different_client_instance_does_not_inherit_the_session() {
             crash_on_disconnect: false,
             continue_on_disconnect: false,
             terminal_env: Vec::new(),
+            client_name: None,
         })
         .unwrap(),
     )

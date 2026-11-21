@@ -279,7 +279,11 @@ async fn import_preserves_unrelated_state_and_plan_without_starting_agents() {
         agents.read().await.is_empty(),
         "import must not auto-resume any session"
     );
-    assert_eq!(state.members.read().await["worker"].status, "stopped");
+    assert_eq!(
+        state.members.read().await["worker"].status,
+        "ready",
+        "a transferred headless worker with its session file on disk is restorable, not stopped (worker_revive)"
+    );
     assert_eq!(
         state.members.read().await["worker"].task_label.as_deref(),
         Some("owned lane")
@@ -405,7 +409,11 @@ async fn reserve_fences_before_install_and_import_keeps_members_blocked() {
     .unwrap();
     assert!(session.migration_lease_block().is_some());
     assert!(sessions.read().await.is_empty());
-    assert_eq!(state.members.read().await["worker"].status, "stopped");
+    assert_eq!(
+        state.members.read().await["worker"].status,
+        "ready",
+        "reserve/install keeps the restorable headless worker ready (worker_revive)"
+    );
     assert_eq!(
         state.members.read().await["worker"].working_dir.as_deref(),
         Some(std::path::Path::new("/destination/project"))

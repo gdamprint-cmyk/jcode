@@ -109,6 +109,7 @@ fn a_todos_confidence_history_is_dropped_but_the_current_state_stays() {
 #[test]
 fn the_plan_keeps_its_intent_state_and_drops_the_history() {
     let plan = TodoPlan {
+        title: None,
         user_intention: Some("ship the thing".to_string()),
         understands_user_intent: Some(IntentUnderstanding::Clear),
         understands_user_intent_history: vec![
@@ -138,6 +139,7 @@ fn the_tool_metadata_still_carries_both_histories() {
         ConfidenceState::Validated,
     ];
     let plan = TodoPlan {
+        title: None,
         user_intention: Some("ship the thing".to_string()),
         understands_user_intent: Some(IntentUnderstanding::Clear),
         understands_user_intent_history: vec![

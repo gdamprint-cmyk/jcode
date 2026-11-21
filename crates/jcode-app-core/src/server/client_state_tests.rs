@@ -30,14 +30,18 @@ async fn resume_todos_arrive_before_backpressured_large_history() {
     crate::todo::save_todos(session_id, &[item]).unwrap();
     let (stream, peer) = crate::transport::stream_pair().unwrap();
     let (_, write) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write));
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write);
     let started = Instant::now();
     let transfer = tokio::spawn(async move {
         super::send_resume_todos(session_id, &writer).await.unwrap();
         // An unread transcript cannot fit in the socket, reproducing the
         // original head-of-line blocking without any model or cloud traffic.
-        tokio::io::AsyncWriteExt::write_all(&mut *writer.lock().await, &vec![b'x'; 14_000_000])
-            .await
+        // The single writer task drains the queue in order, so the todos frame
+        // reaches the socket before this oversized frame parks the writer.
+        writer.send_frame(vec![b'x'; 14_000_000]).unwrap();
+        std::future::pending::<()>().await;
+        Ok::<(), anyhow::Error>(())
     });
     let mut reader = tokio::io::BufReader::new(peer);
     let mut line = String::new();
@@ -833,8 +837,12 @@ async fn assert_history_service_tier_and_pdf_capability(
         tokio::pin!(turn);
         assert!(futures::poll!(&mut turn).is_pending());
 
-        // The snapshot must release the agent BEFORE the socket write, so the
-        // racing turn can take the agent while the history is still in flight.
+        // The snapshot must release the agent before the history is queued:
+        // the racing turn may then take the agent while the history is still
+        // in flight. `ClientWriter` queues without parking, so the whole
+        // history build completes on the first poll and the turn is polled
+        // only afterwards: the assertion that matters is that the history does
+        // NOT need the racing turn's agent lock to finish.
         let history = super::send_history_with_guard(
             42,
             session_id,
@@ -853,19 +861,16 @@ async fn assert_history_service_tier_and_pdf_capability(
             None,
         );
         tokio::pin!(history);
-        let turn_guard = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            &mut turn,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => panic!("snapshot must release agent before socket write"),
-        };
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut history)
             .await
             .expect("history must not reacquire the racing turn's lock")
             .expect("write live history");
+        let turn_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            &mut turn,
+        )
+        .await
+        .expect("racing turn must acquire the agent released after the snapshot");
         drop(turn_guard);
     } else {
         tokio::time::timeout(

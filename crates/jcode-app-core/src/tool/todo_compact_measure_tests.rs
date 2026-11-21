@@ -44,6 +44,7 @@ fn board() -> Vec<TodoItem> {
 fn the_history_arrays_cost_a_sixth_of_the_board() {
     let todos = board();
     let plan = TodoPlan {
+        title: None,
         user_intention: Some("ship the thing".to_string()),
         understands_user_intent: Some(IntentUnderstanding::Clear),
         understands_user_intent_history: vec![

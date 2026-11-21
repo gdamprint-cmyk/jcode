@@ -282,7 +282,8 @@ async fn recent_history_live_and_busy_bootstrap_and_expansion() {
         for visible in [Some(2), None] {
             let (stream, peer) = crate::transport::stream_pair().unwrap();
             let (_, write) = stream.into_split();
-            let writer = Arc::new(Mutex::new(write));
+            let (writer, _writer_handle) =
+                crate::server::client_writer_task::spawn_test_client_writer(write);
             tokio::time::timeout(
                 Duration::from_secs(2),
                 super::super::handle_get_history(
@@ -327,7 +328,8 @@ async fn recent_history_live_and_busy_bootstrap_and_expansion() {
         for visible in [4, 100] {
             let (stream, peer) = crate::transport::stream_pair().unwrap();
             let (_, write) = stream.into_split();
-            let writer = Arc::new(Mutex::new(write));
+            let (writer, _writer_handle) =
+                crate::server::client_writer_task::spawn_test_client_writer(write);
             tokio::time::timeout(
                 Duration::from_secs(2),
                 super::super::handle_get_compacted_history(

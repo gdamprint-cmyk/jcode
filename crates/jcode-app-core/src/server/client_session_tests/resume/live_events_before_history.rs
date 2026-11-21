@@ -101,7 +101,6 @@ async fn restored_resume_with_history_backpressure(recovery_turn: bool) -> Resul
 
     let mut client_selfdev = false;
     let mut client_session_id = temp_session_id.to_string();
-    let writer_guard = writer.lock().await;
 
     let resume_task = tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -120,7 +119,7 @@ async fn restored_resume_with_history_backpressure(recovery_turn: bool) -> Resul
         let swarm_plans = Arc::clone(&swarm_plans);
         let swarm_coordinators = Arc::clone(&swarm_coordinators);
         let client_count = Arc::clone(&client_count);
-        let writer = Arc::clone(&writer);
+        let writer = writer.clone();
         let client_event_tx = client_event_tx.clone();
         let mcp_pool = Arc::clone(&mcp_pool);
         let event_history = Arc::clone(&event_history);
@@ -204,8 +203,6 @@ async fn restored_resume_with_history_backpressure(recovery_turn: bool) -> Resul
     } else {
         None
     };
-    drop(writer_guard);
-
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), resume_task).await;
     assert!(
         result.is_ok(),

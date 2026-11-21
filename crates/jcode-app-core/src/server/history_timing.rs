@@ -123,7 +123,7 @@ mod tests {
         let (stream, peer) = crate::transport::stream_pair().unwrap();
         let (_, write) = stream.into_split();
         drop(peer);
-        let (writer, handle) = super::super::client_writer_task::spawn_client_writer(write);
+        let (writer, handle) = crate::server::client_writer_task::spawn_client_writer(write);
         // Dropping every sender closes the channel, which is how the single
         // writer task reports a torn-down connection to its producers.
         let closed = writer.clone();

@@ -11,7 +11,6 @@ use crate::protocol::{
 use crate::provider::Provider;
 use crate::session::{Session, SessionStatus};
 use super::client_writer_task::ClientWriter;
-use crate::transport::WriteHalf;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -21,7 +20,6 @@ use std::time::{Duration, Instant};
 pub(super) enum HistoryPayloadMode {
     Full,
 }
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 const ATTACH_MODEL_PREFETCH_DEBOUNCE_SECS: u64 = 15;
@@ -1045,8 +1043,12 @@ async fn send_history_with_guard(
         .is_none()
         .then(|| session_interrupted_by_reload(agent_guard.session_for_history()));
 
-    // Only snapshot preparation needs the agent. Never hold it across session
-    // metadata locks or socket backpressure.
+    // The snapshot must be captured, but the agent must NOT stay held across
+    // the blocking IO below: `run_blocking_io` uses `block_in_place` on the
+    // multithread runtime, which parks this task while it still holds the
+    // guard. A racing turn queued on the same worker thread then waits for
+    // the test timeout before it can be scheduled at all. Drop as soon as
+    // the snapshot exists.
     drop(agent_guard);
 
     // The model-name catalog is fetched after the agent is released: on a

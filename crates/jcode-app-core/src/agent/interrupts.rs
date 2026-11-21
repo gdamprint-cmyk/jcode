@@ -604,7 +604,11 @@ mod frozen_snapshot_memory_tests {
         let mut description = String::with_capacity(256);
         description.push_str("private-skill-description");
         let expected_capacity = name.capacity() + description.capacity();
-        let skills = [crate::prompt::SkillInfo { name, description }];
+        let skills = [crate::prompt::SkillInfo {
+            name,
+            description,
+            user_invoked_only: false,
+        }];
         let profile = frozen_snapshot_memory_profile(None, Some(&agents_md), &skills);
         assert_eq!(
             profile["agents_md_snapshot_capacity_bytes"],

@@ -60,6 +60,7 @@ pub(super) async fn write_direct_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::encode_event;
     use crate::side_panel::{
         SidePanelPage, SidePanelPageFormat, SidePanelPageSource, SidePanelSnapshot,
     };

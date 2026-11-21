@@ -17,7 +17,6 @@ use crate::message::ContentBlock;
 use crate::protocol::{NotificationType, ServerEvent};
 use crate::provider::Provider;
 use crate::tool::Registry;
-use crate::transport::WriteHalf;
 use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::InterruptSignal;

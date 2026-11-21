@@ -134,6 +134,7 @@ async fn continuation_socket_workflow(disable_from_observer: bool) {
             soft_interrupt_queues.clone(),
             AwaitMembersRuntime::default(),
             SwarmMutationRuntime::default(),
+            crate::server::client_instance_sessions::new_client_instance_sessions(),
         ));
         let (reader, writer) = client.into_split();
         (task, BufReader::new(reader), writer)

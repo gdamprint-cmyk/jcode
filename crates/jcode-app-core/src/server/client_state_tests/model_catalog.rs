@@ -44,7 +44,8 @@ async fn assert_model_catalog_service_tier(tier: Option<&'static str>, busy: boo
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
     let (reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(writer_a);
 
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
