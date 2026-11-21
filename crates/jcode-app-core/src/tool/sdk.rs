@@ -56,6 +56,40 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Release this connection's OWNERSHIP of every session it configured, while
+/// leaving its callback channel in place.
+///
+/// Detach is an ownership transfer, not a disconnect: the socket stays open and
+/// a turn may still be waiting for a tool result this connection must deliver.
+/// Nulling the sender (what disconnect does) makes such a callback fail with
+/// "owner disconnected" and the turn reports a tool error instead of the
+/// client's answer. `release_connection` is for the other trigger, a session
+/// binding change, where this connection stops owning those sessions outright.
+///
+/// reference: Rust RAII/Drop semantics -
+/// https://doc.rust-lang.org/rust-by-example/scope/raii.html and
+/// https://doc.rust-lang.org/reference/destructors.html. A Drop guard cannot
+/// partially release, so an explicit release is needed for the detach case.
+pub(crate) fn release_ownership(owner: &str) {
+    let mut state = STATE.write().unwrap_or_else(|e| e.into_inner());
+    for overlay in state.overlays.values_mut().filter(|o| o.owner == owner) {
+        overlay.owner = String::new();
+    }
+}
+
+/// Retire every overlay this connection owns: close its callback channel and
+/// cancel its pending callbacks. A connection whose session binding moves to a
+/// different session stops owning the sessions it left, so a later turn on an
+/// old session must not route its callback into this channel. Definitions
+/// survive, as `ConnectionGuard` keeps them on a real disconnect.
+pub(crate) fn release_connection(owner: &str) {
+    let mut state = STATE.write().unwrap_or_else(|e| e.into_inner());
+    for overlay in state.overlays.values_mut().filter(|o| o.owner == owner) {
+        overlay.sender = None;
+    }
+    state.pending.retain(|_, pending| pending.owner != owner);
+}
+
 pub(crate) fn remove_session(session: &str) {
     crate::screen_context::remove_session(session);
     let mut state = STATE.write().unwrap_or_else(|e| e.into_inner());
@@ -127,20 +161,31 @@ pub(crate) fn configure(
                 previous.owner == owner,
                 "Session tools are owned by another client"
             );
-            state.overlays.remove(session);
-            state
-                .pending
-                .retain(|_, pending| pending.session != session);
         }
+        // Clearing the session tools is the owner's own call: it drops the
+        // in-flight callback for this session, so the waiting turn learns the
+        // call was cancelled instead of hanging until its deadline.
+        state.overlays.remove(session);
+        state
+            .pending
+            .retain(|_, pending| pending.session != session);
         crate::screen_context::remove_session(session);
         return Ok(());
     }
     if let Some(previous) = state.overlays.get(session) {
+        // An empty owner means the previous owner detached: the callback
+        // channel is still live for in-flight calls, but the session is free
+        // to be adopted by a new owner.
         anyhow::ensure!(
-            previous.owner == owner || previous.sender.is_none(),
+            previous.owner == owner
+                || previous.owner.is_empty()
+                || previous.sender.is_none(),
             "Session tools are owned by another client"
         );
     }
+    // A callback already awaiting this session's tool result means a turn is
+    // parked in its rendezvous. Reconfiguring here would drop the overlay out
+    // from under it, so the caller must settle the turn first.
     anyhow::ensure!(
         !state.pending.values().any(|p| p.session == session),
         "Session tool callbacks are busy"
@@ -190,6 +235,18 @@ pub(crate) fn config(session: &str) -> Option<SessionToolConfig> {
 pub(crate) fn has_runtime_overlays() -> bool {
     let state = STATE.read().unwrap_or_else(|e| e.into_inner());
     !state.overlays.is_empty() || !state.pending.is_empty()
+}
+
+/// Whether a callback is currently awaiting this session's tool result.
+/// A turn that waits for an SDK callback is still busy even when it has
+/// released the agent lock, so this is what the busy check must consult.
+pub(crate) fn has_pending_callback(session: &str) -> bool {
+    STATE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending
+        .values()
+        .any(|pending| pending.session == session)
 }
 
 pub(crate) fn custom(session: &str, name: &str) -> bool {

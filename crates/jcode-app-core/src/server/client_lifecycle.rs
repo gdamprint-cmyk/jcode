@@ -962,13 +962,19 @@ pub(super) async fn handle_client(
                         .map(|()| ServerEvent::Ack { id })
                 }
                 Request::ConfigureTools { tools, .. } => {
-                    if client_is_processing || crate::turn_cancel_registry::has_active_turn(&client_session_id) { Err(anyhow::anyhow!("Session is busy")) }
-                    else {
+                    if client_is_processing
+                        || crate::turn_cancel_registry::has_active_turn(&client_session_id)
+                        || crate::tool::sdk::has_pending_callback(&client_session_id)
+                    {
+                        Err(anyhow::anyhow!("Session is busy"))
+                    } else {
                         // Startup/catalog prewarming briefly owns this mutex too.
                         // That is not an active turn and must not reject client
                         // capabilities before the first user message.
                         let mut locked = agent.lock().await;
-                        if crate::turn_cancel_registry::has_active_turn(&client_session_id) {
+                        if crate::turn_cancel_registry::has_active_turn(&client_session_id)
+                            || crate::tool::sdk::has_pending_callback(locked.session_id())
+                        {
                             Err(anyhow::anyhow!("Session is busy"))
                         } else {
                             let result = crate::tool::sdk::configure(locked.session_id(), &client_connection_id, tools, client_event_tx.clone());
@@ -1554,7 +1560,15 @@ pub(super) async fn handle_client(
             }
 
             Request::PrepareDisconnect { id } => {
-                drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
+                // Detach releases OWNERSHIP, not the callback channel. A turn
+                // that is still waiting for this connection's tool result must
+                // keep receiving it: nulling the overlay sender made an
+                // in-flight callback fail with "owner disconnected" while the
+                // connection stayed open, so the turn saw a tool error instead
+                // of the client's answer. `release_ownership` clears the owner
+                // but keeps the sender; `ConnectionGuard` closes it for real
+                // when the connection ends.
+                crate::tool::sdk::release_ownership(&client_connection_id);
                 if writer.send_event(&ServerEvent::Done { id }).is_err() {
                     break;
                 }
@@ -3382,7 +3396,7 @@ pub(super) async fn handle_client(
             crate::mobile_push::note_client_attached(&client_session_id, name);
         }
         if sdk_session_before_request != client_session_id {
-            drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
+            crate::tool::sdk::release_connection(&client_connection_id);
         }
         if request_lifecycle_logged {
             log_request_lifecycle_handled(
