@@ -614,7 +614,7 @@ impl Tool for BgTool {
                 "max_age_hours": { "type": "integer", "description": "cleanup: default 24." },
                 "notify": { "type": "boolean", "description": "delivery: default true." },
                 "wake": { "type": "boolean", "description": "delivery: default true." },
-                "stall_wake_seconds": { "type": "integer", "description": "wait: arm a stall watchdog that wakes after N seconds without output/progress (min 30, resets on activity). Default is half max_wait_seconds. delivery/watch: arm on an existing task." },
+                "stall_wake_seconds": { "type": "integer", "description": "Wake after N quiet secs (min 30, reset on activity); wait default half max_wait_seconds." },
                 "max_wait_seconds": { "type": "integer", "description": "wait: default 60, cap 3600, 0 checks without blocking." },
                 "return_on_progress": { "type": "boolean", "description": "wait: also return on first progress event. Default true." },
                 "wait_mode": { "type": "string", "enum": ["any", "all", "first_failure"], "description": "Multi-task wait. Default any." },

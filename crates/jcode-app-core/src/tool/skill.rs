@@ -101,7 +101,7 @@ impl Tool for SkillTool {
                         "load", "list", "reload", "reload_all", "read",
                         "create", "patch", "write_file"
                     ],
-                    "description": "Action. 'create' writes a new skill, 'patch' changes an existing one, 'write_file' adds a support file under it."
+                    "description": "Action. 'create' makes a skill, 'patch' edits one, 'write_file' adds a support file under it."
                 },
                 "name": {
                     "type": "string",
@@ -109,11 +109,11 @@ impl Tool for SkillTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "SKILL.md body for 'create' (YAML frontmatter with name and description, then markdown), or the body of a support file for 'write_file'."
+                    "description": "'create': SKILL.md (YAML frontmatter name+description, then markdown). 'write_file': file body."
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path of the support file relative to the skill directory, for 'write_file' (e.g. 'references/detail.md')."
+                    "description": "Support file path relative to the skill directory, for 'write_file' (e.g. 'references/detail.md')."
                 },
                 "old_string": {
                     "type": "string",

@@ -30,7 +30,7 @@ pub(super) fn apply_swarm_model_policy(schema: &mut Value, agents: &crate::confi
         properties.insert("model".to_string(), json!({
             "type": "string",
             "enum": routes,
-            "description": "Optional worker model. Only exact user-allowlisted routes are permitted, plus 'inherit' for the coordinator's own model (which overrides any configured default). Omit to use the configured default."
+            "description": "Allowlisted route or 'inherit'=coordinator model (overrides default). Omit uses configured default."
         }));
     }
 }
