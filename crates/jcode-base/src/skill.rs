@@ -615,14 +615,15 @@ impl SkillRegistry {
             // which strict YAML rejects as a nested mapping. Those tools read
             // the field as plain text, so do the same rather than dropping
             // the whole skill.
-            // Only for syntax errors: well-formed YAML with a wrong field type
-            // is a real mistake and stays an error.
-            Err(strict_error) if serde_yaml::from_str::<serde_yaml::Value>(yaml).is_ok() => {
-                anyhow::bail!("invalid skill frontmatter: {strict_error}")
-            }
+            //
+            // Only a plain scalar that strict YAML could not read gets this
+            // treatment, and the required keys stay mandatory: frontmatter
+            // missing `name`/`description` must be an error, not a silent skip
+            // (issue #952). See `parse_frontmatter_lenient` for how the
+            // leniency boundary is kept narrow.
             Err(strict_error) => Self::parse_frontmatter_lenient(yaml).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "invalid YAML frontmatter: {strict_error}. Quote values that contain ': ' \
+                    "invalid skill frontmatter: {strict_error}. Quote values that contain ': ' \
                      or use a block scalar (description: >-)"
                 )
             })?,
@@ -664,6 +665,22 @@ impl SkillRegistry {
                 lines.push(line);
             }
         }
+
+        // Leniency is scoped to the one shape it exists for: a plain scalar
+        // whose value contains `: `. Anything else strict YAML rejected must stay
+        // an error, so the required keys are read from the entry groups rather
+        // than by skipping whatever does not parse. In particular the
+        // reported-malformed fixture (`summary: Triggers: invalid yaml`, no
+        // `description`) still fails here and is reported, never silently loaded.
+        let has_colon_in_value = entries.iter().any(|(_, lines)| {
+            lines
+                .first()
+                .is_some_and(|line| line.trim().split_once(':').is_some_and(|(_, tail)| tail.contains(' ')))
+        });
+        if !has_colon_in_value {
+            return None;
+        }
+
         let scalar = |key: &str| -> Option<String> {
             let (_, lines) = entries.iter().find(|(entry, _)| *entry == key)?;
             let first = lines[0].trim();
@@ -1415,7 +1432,12 @@ mod tests {
         write_skill_file(
             &skills_dir,
             "malformed",
-            "---\nname: malformed\ndescription: Triggers: invalid yaml\n---\n\nBroken.\n",
+            // Same fixture as the canonical test in `skill_tests.rs`: an
+            // unknown key whose value holds a colon, and no `description`.
+            // A description containing `: ` is NOT malformed - agentskills.io
+            // defines it as free text and upstream reads it leniently - so this
+            // copy must not use one as its "malformed" example.
+            "---\nname: malformed\nsummary: Triggers: invalid yaml\n---\n\nBroken.\n",
         );
 
         let mut registry = SkillRegistry::default();
@@ -1424,6 +1446,7 @@ mod tests {
             .expect("load skills while skipping malformed file");
         assert!(registry.contains("valid"));
         assert!(!registry.contains("malformed"));
+        assert_eq!(registry.load_errors().len(), 1);
 
         let mut counted_registry = SkillRegistry::default();
         let count = counted_registry

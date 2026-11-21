@@ -96,10 +96,16 @@ fn load_cache() -> Option<Arc<PricingCache>> {
 fn save_cache(cache: PricingCache) -> Arc<PricingCache> {
     let path = cache_path();
     let cache = Arc::new(cache);
-    if let Ok(mut memory) = MEMORY_CACHE.lock() {
+    // Publish only after the disk write succeeds. Publishing first made a
+    // failed write (read-only dir, full disk) leave memory holding the new
+    // cache while disk still had the old one; every later `load_cache()` hit
+    // the in-memory entry and returned the never-persisted cache, so a
+    // restart silently reverted pricing.
+    if crate::storage::write_json(&path, cache.as_ref()).is_ok()
+        && let Ok(mut memory) = MEMORY_CACHE.lock()
+    {
         *memory = Some((path.clone(), Arc::clone(&cache)));
     }
-    let _ = crate::storage::write_json(&path, cache.as_ref());
     cache
 }
 
@@ -553,20 +559,49 @@ mod tests {
         clear_memory_cache_for_tests();
         assert_eq!(lookup("deepseek", "future-model"), Some(expected_cost));
 
-        // A disk failure must not prevent publication of the moved cache.
+        // A failed disk write must not leave memory holding a cache that never
+        // reached disk: `load_cache()` short-circuits on the in-memory entry, so
+        // publishing before the write would serve the caller data a restart
+        // cannot recover.
+        //
+        // The failure is produced against the storage layer rather than by
+        // planting a directory at the file path: on Windows `write_json` moves
+        // an existing directory out of the way (rename to `.bak`) and succeeds,
+        // so that trick does not fail there.
         clear_memory_cache_for_tests();
         std::fs::remove_file(cache_path()).expect("remove cache file");
-        std::fs::create_dir(cache_path()).expect("block disk write with directory");
         let saved = save_cache(PricingCache {
             cached_at_unix_secs: now_unix_secs(),
             providers: HashMap::new(),
         });
+        // The caller still receives the moved allocation ...
+        assert!(saved.providers.is_empty());
+        // ... and a reader sees exactly that cache, because the write succeeded.
         assert!(Arc::ptr_eq(
             &saved,
-            &load_cache().expect("published despite disk failure")
+            &load_cache().expect("published cache")
         ));
-        assert!(cache_path().is_dir());
+        assert!(!cache_path().is_dir(), "cache is a file, not a directory");
         assert_eq!(lookup("deepseek", "future-model"), None);
+
+        clear_memory_cache_for_tests();
+        // Now block the write for real. A read-only attribute is not enough:
+        // its owner still holds WRITE_DAC, so Windows lets the create through.
+        // `blocked::home` contains an empty path component, so `create_dir_all`
+        // fails on every platform - no ACL semantics to reason about.
+        let blocked = crate::storage::jcode_dir().expect("jcode dir");
+        std::fs::remove_dir_all(blocked.join("cache")).ok();
+        let blocked_home = temp.path().join("blocked::home");
+        crate::env::set_var("JCODE_HOME", &blocked_home);
+        save_cache(PricingCache {
+            cached_at_unix_secs: now_unix_secs(),
+            providers: HashMap::new(),
+        });
+        crate::env::set_var("JCODE_HOME", temp.path());
+        // Memory must not have been updated: with no publish, a later
+        // `load_cache()` reads disk, which has no cache file at all.
+        assert!(load_cache().is_none());
+        std::fs::create_dir_all(blocked.join("cache")).expect("restore cache dir");
 
         clear_memory_cache_for_tests();
         if let Some(prev) = prev_home {
