@@ -1668,7 +1668,7 @@ impl Agent {
                             Err(e) => Err(anyhow::anyhow!("Tool task panicked: {}", e)),
                         });
                     }
-                    automatic = wait_for_tool_handoff(&bg_signal, &shutdown_signal, auto_background_allowed(&tc.name, &tc.input), foreground_budget) => {
+                    automatic = wait_for_tool_handoff(&bg_signal, &shutdown_signal, auto_background_allowed(&tc.name, &tc.input) && !tool_handoff::is_sdk_callback(self.session_id(), &tc.name), foreground_budget) => {
                         automatic_background = automatic;
                         if self.is_graceful_shutdown() && allow_reload_handoff {
                             tool_result = match tokio::time::timeout(

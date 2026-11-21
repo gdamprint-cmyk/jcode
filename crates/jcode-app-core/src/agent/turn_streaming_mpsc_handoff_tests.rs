@@ -342,3 +342,47 @@ async fn manual_background_and_shutdown_do_not_wait_for_budget() {
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 }
+
+/// An SDK callback waits for an EXTERNAL client to send the tool result, so it
+/// must never be moved to the background when the foreground budget expires.
+/// Moving it ends the turn with a "moved to background" message while the
+/// client is still expected to answer.
+///
+/// The check must be session-aware: SDK tool names are user-defined, so the
+/// name alone cannot identify an SDK callback.
+#[tokio::test]
+async fn sdk_callback_is_not_an_automatic_background_candidate() {
+    let session = "sdk-handoff-test-session";
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::tool::sdk::configure(
+        session,
+        "handoff-owner",
+        crate::protocol::SessionToolConfig {
+            custom: vec![crate::protocol::SessionToolDefinition {
+                name: "read".into(),
+                description: "SDK read callback".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            ..Default::default()
+        },
+        tx,
+    )
+    .expect("configure sdk tools");
+
+    // The tool IS an SDK callback for this session ...
+    assert!(
+        super::tool_handoff::is_sdk_callback(session, "read"),
+        "a configured SDK tool must be recognised as a callback"
+    );
+    // ... and the `functions.` prefix the protocol allows does not hide it.
+    assert!(
+        super::tool_handoff::is_sdk_callback(session, "functions.read"),
+        "the functions. prefix must be stripped before the lookup"
+    );
+    // The same name is NOT an SDK callback for another session.
+    assert!(
+        !super::tool_handoff::is_sdk_callback("other-session", "read"),
+        "another session must not inherit the SDK callback"
+    );
+    crate::tool::sdk::remove_session(session);
+}

@@ -14,6 +14,21 @@ pub(super) fn auto_background_allowed(name: &str, input: &serde_json::Value) -> 
         && !(name == "bg" && input.get("action").and_then(|value| value.as_str()) == Some("wait"))
 }
 
+/// Whether a tool call is an SDK callback for this session.
+///
+/// An SDK callback waits for an EXTERNAL client to send the tool result. It is
+/// not a backgroundable unit of work: moving it to background after the
+/// foreground budget ends the turn with a "moved to background" message while
+/// the client is still expected to answer, so the client and the daemon
+/// disagree about what the turn is doing.
+///
+/// The check is session-aware because SDK tool names are user-defined: the
+/// name alone cannot tell an SDK callback from a built-in tool.
+pub(in crate::agent) fn is_sdk_callback(session_id: &str, name: &str) -> bool {
+    let unqualified = name.strip_prefix("functions.").unwrap_or(name);
+    crate::tool::sdk::custom(session_id, unqualified)
+}
+
 /// Name a handed-off task after the call's `intent`, so wait rows read
 /// "Waiting for Run parser tests" instead of "Waiting for bash".
 pub(super) fn handoff_display_name(input: &serde_json::Value) -> Option<String> {
@@ -39,7 +54,8 @@ async fn execute_with_background_budget(
     ctx: ToolContext,
     budget: Duration,
 ) -> Result<crate::tool::ToolOutput> {
-    let auto_background = auto_background_allowed(&name, &input);
+    let auto_background =
+        auto_background_allowed(&name, &input) && !is_sdk_callback(&ctx.session_id, &name);
     let session_id = ctx.session_id.clone();
     let tool_name = name.clone();
     let display_name = handoff_display_name(&input);
