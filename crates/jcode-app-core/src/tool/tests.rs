@@ -1855,12 +1855,15 @@ fn touched_paths_include_patch_headers_and_path_keys() {
         .into_iter()
         .map(|(key, path)| format!("{key}:{}", path.display()))
         .collect();
+    // resolve_path joins with native separators (backslash on Windows);
+    // expect the platform's own spelling instead of forcing forward slashes.
+    let work = std::path::Path::new("/work");
     assert_eq!(
         paths,
         vec![
-            "file_path:/work/notes.md",
-            "patch:/work/docs/a.md",
-            "patch:/abs/b.txt",
+            format!("file_path:{}", work.join("notes.md").display()),
+            format!("patch:{}", work.join("docs/a.md").display()),
+            format!("patch:{}", work.join("/abs/b.txt").display()),
         ]
     );
 
