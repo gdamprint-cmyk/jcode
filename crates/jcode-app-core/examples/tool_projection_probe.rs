@@ -58,6 +58,7 @@ fn baseline(msg: &StoredMessage) -> Cow<'_, str> {
         _ => Cow::Owned(parts.join("\n")),
     }
 }
+#[cfg(unix)]
 fn cpu_ns() -> u128 {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -68,6 +69,15 @@ fn cpu_ns() -> u128 {
         0
     );
     time.tv_sec as u128 * 1_000_000_000 + time.tv_nsec as u128
+}
+// Windows has no CLOCK_THREAD_CPUTIME_ID: this path measures monotonic wall
+// time, not thread CPU time.
+#[cfg(windows)]
+fn cpu_ns() -> u128 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos()
 }
 fn execute(msg: &StoredMessage, new: bool) {
     if new {
