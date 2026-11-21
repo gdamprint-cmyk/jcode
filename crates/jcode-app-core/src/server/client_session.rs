@@ -1202,10 +1202,20 @@ async fn cleanup_detached_source_session_if_unused(
     }
 }
 
-/// Removes a detached source only while holding the same connection-registry
-/// write lock used to claim a live resume target. The connection registry is
-/// the attachment authority, so the lock order for transitions is always
-/// `client_connections` then `sessions`.
+/// Removes a detached source only while no other connection owns it.
+///
+/// The registry decides ownership, but it must not be held while awaiting the
+/// session map: that let one resume's source teardown serialize against every
+/// other connection's subscribe and cleanup, the same global-guard stall as
+/// disconnect cleanup. Ownership here is the per-session reservation plus a
+/// re-read of the same id a claim publishes.
+///
+/// reference: clippy `await_holding_lock` (suspicious, warn) —
+/// https://rust-lang.github.io/rust-clippy/master/index.html#await_holding_lock
+/// ("ensure the mutex is unlocked before calling `await`, either by introducing
+/// a scope or an explicit call to `Drop::drop`"); std::sync::MutexGuard is a
+/// scoped RAII lock released on drop at end of scope
+/// (https://doc.rust-lang.org/std/sync/struct.MutexGuard.html).
 async fn remove_detached_source_if_unclaimed(
     old_session_id: &str,
     client_connection_id: &str,
@@ -1213,11 +1223,33 @@ async fn remove_detached_source_if_unclaimed(
     sessions: &SessionAgents,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
 ) -> bool {
-    let connections = client_connections.write().await;
-    if connections
-        .values()
-        .any(|info| info.client_id != client_connection_id && info.session_id == old_session_id)
-    {
+    let still_claimed = |connections: &HashMap<String, ClientConnectionInfo>| {
+        connections
+            .values()
+            .any(|info| info.client_id != client_connection_id && info.session_id == old_session_id)
+    };
+    if still_claimed(&*client_connections.read().await) {
+        return false;
+    }
+
+    // Test-only observation point: the cheap registry read is done and the claim
+    // gate is next. A claim can attach in exactly this window.
+    #[cfg(test)]
+    if let Some(pause) = crate::server::client_disconnect_grace_test_pause::take(old_session_id) {
+        pause.wait_for_release().await;
+    }
+
+    // The reservation is an ordering point, not the mechanism that excludes a
+    // claim. Two different reservation keys are involved: this takes the
+    // reservation of the id being removed, while a resume claim holds the
+    // reservation of its target and releases it before it tears down a source
+    // (`handle_resume_session`). What makes the re-read below correct is that it
+    // scans the same id a claim publishes into `client_connections`, and the
+    // claim is the sole writer of a live session id there. The reservation still
+    // buys ordering against any claim already publishing THIS id, and other
+    // sessions are unaffected.
+    let _claim_gate = sessions.reserve(old_session_id).await;
+    if still_claimed(&*client_connections.read().await) {
         return false;
     }
 

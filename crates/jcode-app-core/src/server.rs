@@ -13,6 +13,9 @@ mod client_comm_context;
 mod client_comm_message;
 mod client_comm_swarms;
 mod client_disconnect_cleanup;
+#[path = "server/client_disconnect_grace_test_pause.rs"]
+#[cfg(test)]
+pub(crate) mod client_disconnect_grace_test_pause;
 mod client_instance_sessions;
 mod client_lifecycle;
 mod client_lifecycle_logging;
