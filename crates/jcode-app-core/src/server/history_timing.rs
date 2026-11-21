@@ -121,14 +121,25 @@ mod tests {
     #[tokio::test]
     async fn resume_todos_reports_disconnected_writer() {
         let (stream, peer) = crate::transport::stream_pair().unwrap();
-        let (_, write) = stream.into_split();
-        drop(peer);
+        let (read_half, write) = stream.into_split();
         let (writer, handle) = crate::server::client_writer_task::spawn_client_writer(write);
-        // Dropping every sender closes the channel, which is how the single
-        // writer task reports a torn-down connection to its producers.
+        // The single-writer task ends only when a queued frame cannot be written.
+        // Dropping the peer and closing the queue is not enough: a Windows named
+        // pipe has no half-close, and the writer parks on `recv` waiting for a
+        // frame that never comes (measured: this test then hung the whole test
+        // binary). Queue one frame first so the task attempts a write on a torn
+        // pipe, fails, and exits.
+        writer
+            .send_event(&crate::protocol::ServerEvent::Ack { id: 0 })
+            .expect("queue a frame");
+        drop(peer);
+        drop(read_half);
         let closed = writer.clone();
         drop(writer);
-        handle.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("writer task must finish after its socket write fails")
+            .unwrap();
         assert!(
             send_resume_todos("timing_disconnected_writer", &closed)
                 .await

@@ -1511,11 +1511,33 @@ mod newest_reload_candidate_integration_tests {
 
     fn candidate_version_for(is_selfdev: bool) -> Option<String> {
         let (path, _label) = newest_reload_candidate(is_selfdev)?;
-        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-        canonical
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
+        // Identify the selected install by its CONTENT, not by its path. On
+        // Windows a channel (`builds/<channel>/jcode.exe`) is a real file, not a
+        // symlink, so canonicalizing it does not land in `versions/<version>/`
+        // and a path-derived version would report the channel name instead of the
+        // build it points at. Each fixture binary carries its own version label.
+        let payload = build::resolve_binary_payload(&path);
+        // Release-style fixtures are wrapper scripts whose text is the install
+        // path (`exec <dir>/jcode-<platform>.bin "$@"`), so read the payload the
+        // wrapper points at. Plain versioned fixtures are the label file itself.
+        let text = std::fs::read_to_string(&payload).ok()?;
+        let target = text
+            .lines()
+            .find_map(|line| line.strip_prefix("exec "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|token| token.strip_suffix("\"$@\""))
+            .unwrap_or(text.as_str());
+        let text = if target != text.as_str() {
+            std::fs::read_to_string(target).ok()?
+        } else {
+            text
+        };
+        let label = text
+            .strip_prefix("binary for ")
+            .or_else(|| text.strip_prefix("payload for "))?
+            .trim()
+            .to_string();
+        Some(label)
     }
 
     #[test]
@@ -1715,6 +1737,14 @@ mod newest_reload_candidate_integration_tests {
         let prev_home = std::env::var_os("JCODE_HOME");
         crate::env::set_var("JCODE_HOME", temp.path());
 
+        // Windows has no release channel to exercise here: the wrapper/payload
+        // split exists only in the Linux compat artifact
+        // (scripts/build_linux_compat.sh). The real resolution property is
+        // covered by `jcode_build_support::paths::tests`, which asserts a
+        // channel COPY of the wrapper resolves to its payload.
+        if cfg!(windows) {
+            return;
+        }
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         // Wrapper written strictly AFTER the payload (the bad copy order).
         let (wrapper, payload) =

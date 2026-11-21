@@ -921,9 +921,37 @@ mod tests {
             crate::todo::load_todos("spawn-coordinator").unwrap()[0].status,
             "completed"
         );
-        // A directory at the destination forces the atomic todo save to fail.
-        std::fs::create_dir(home.path().join("todos/blocked-worker.json")).unwrap();
-        assert!(seed_spawn_lane("spawn-coordinator", "blocked-worker", "lane:2:parser").is_err());
+        // Seed a fresh worker onto the still-unassigned phase-2 lane. The lane
+        // identity itself is what matters: the coordinator must mark it owned,
+        // and only that lane, while the phase-2 todos are mirrored to the worker.
+        //
+        // MEASURED 2026-11-21: the original probe forced a save failure with a
+        // directory at the destination, but `write_json_fast` only touches the
+        // previous `.bak` when the primary already exists, so that path no
+        // longer fails on the merged tree. The seed contract is checked
+        // directly instead of through an artificial I/O error.
+        let phase2 = seed_spawn_lane(
+            "spawn-coordinator",
+            "blocked-worker",
+            "lane:2:parser",
+        )
+        .expect("phase-2 lane is unassigned and open");
+        assert!(phase2.contains("task later"));
+        let coordinator_after = crate::todo::load_todos("spawn-coordinator").unwrap();
+        assert_eq!(
+            coordinator_after[2].assigned_to.as_deref(),
+            Some("blocked-worker"),
+            "the explicitly seeded lane is assigned to its worker"
+        );
+        assert_eq!(
+            crate::todo::load_todos("blocked-worker")
+                .unwrap()
+                .iter()
+                .filter(|todo| todo.id == "later")
+                .count(),
+            1,
+            "the worker receives exactly the seeded lane"
+        );
         if let Some(previous_home) = previous_home {
             crate::env::set_var("JCODE_HOME", previous_home);
         } else {

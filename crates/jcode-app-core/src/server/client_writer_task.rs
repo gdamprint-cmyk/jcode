@@ -38,6 +38,8 @@
 
 use super::*;
 use crate::protocol::encode_event;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -51,6 +53,10 @@ pub(super) type ClientFrame = Vec<u8>;
 #[derive(Clone)]
 pub(super) struct ClientWriter {
     tx: mpsc::UnboundedSender<ClientFrame>,
+    /// Set once the writer task has ended. The queue can be closed while the
+    /// socket is still draining, so `tx.is_closed()` alone does not mean a frame
+    /// will never be written.
+    closed: Arc<AtomicBool>,
 }
 
 impl ClientWriter {
@@ -58,6 +64,9 @@ impl ClientWriter {
     ///
     /// The frame is queued, not written: the writer task owns the socket.
     pub(super) fn send_frame(&self, frame: ClientFrame) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("client connection closed"));
+        }
         self.tx
             .send(frame)
             .map_err(|_| anyhow::anyhow!("client connection closed"))
@@ -86,7 +95,7 @@ impl ClientWriter {
 
     /// Whether the writer task is still alive.
     pub(super) fn is_open(&self) -> bool {
-        !self.tx.is_closed()
+        !self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -98,6 +107,8 @@ pub(super) fn spawn_client_writer(
     mut writer: crate::transport::WriteHalf,
 ) -> (ClientWriter, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientFrame>();
+    let closed = Arc::new(AtomicBool::new(false));
+    let task_closed = Arc::clone(&closed);
     let handle = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let result = writer.write_all(&frame).await;
@@ -113,8 +124,9 @@ pub(super) fn spawn_client_writer(
                 break;
             }
         }
+        task_closed.store(true, Ordering::Release);
     });
-    (ClientWriter { tx }, handle)
+    (ClientWriter { tx, closed }, handle)
 }
 
 /// Start the writer task for a client connection whose peer is a test.

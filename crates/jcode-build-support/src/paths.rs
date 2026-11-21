@@ -130,7 +130,46 @@ fn wrapper_payload_sibling(path: &Path) -> Option<PathBuf> {
             payload = Some(entry.path());
         }
     }
-    payload.filter(|p| p.is_file())
+    if let Some(payload) = payload.filter(|p| p.is_file()) {
+        return Some(payload);
+    }
+    // A channel entry is a COPY of the version's wrapper (Windows cannot keep a
+    // symlink to a running executable), so the payload is NOT its sibling: the
+    // channel directory holds only `jcode.exe`. The copy still names its payload
+    // in the `exec` line, so follow that. Without this, the channel wrapper is
+    // compared against the running payload and a freshly installed release looks
+    // strictly newer than itself forever.
+    //
+    // reference: MoveFileExA, MOVEFILE_REPLACE_EXISTING, "If lpNewFileName names
+    // an existing directory, an error is reported" (MS Learn) - the same reason
+    // the channel entry is staged as a copy rather than a symlink.
+    // reference: scripts/build_linux_compat.sh (wrapper `exec "$self_dir/<artifact>.bin"`)
+    wrapper_exec_payload(path)
+}
+
+/// The payload a release wrapper script execs, when that payload sits next to the
+/// script. Only `<dir>/<artifact>.bin` targets are followed.
+fn wrapper_exec_payload(wrapper: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(wrapper).ok()?;
+    let dir = wrapper.parent()?;
+    let mut found: Option<PathBuf> = None;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("exec ") else {
+            continue;
+        };
+        for token in rest.split_whitespace() {
+            let token = token.trim_matches('"');
+            let payload = dir.join(token);
+            if payload.extension().is_some_and(|ext| ext == "bin") && payload.is_file() {
+                if found.is_some() {
+                    // Ambiguous: two different payloads named. Refuse to guess.
+                    return None;
+                }
+                found = Some(payload);
+            }
+        }
+    }
+    found
 }
 
 fn profile_binary_path(repo_dir: &Path, profile: &str) -> PathBuf {
