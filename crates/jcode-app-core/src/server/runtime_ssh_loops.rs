@@ -389,16 +389,11 @@ pub(super) async fn run_reserved_followups(
             return Ok(());
         }
         let mut snapshot = snapshot(&session_id)?;
-        snapshot.running_background_tasks = crate::background::global()
-            .list()
-            .await
-            .into_iter()
-            .filter(|task| {
-                task.session_id == session_id
-                    && matches!(task.status, crate::bus::BackgroundTaskStatus::Running)
-            })
-            .map(|task| task.task_id)
-            .collect();
+        // Session-scoped, never a machine-wide `list()`: that scan reads every
+        // finished task through the blocking pool and stalled the wake turn
+        // before it could publish its terminal status.
+        snapshot.running_background_tasks =
+            crate::background::global().running_task_ids_for_session(&session_id);
         let decision = update_state(&session_id, |state| {
             state
                 .policy

@@ -1552,6 +1552,38 @@ impl BackgroundTaskManager {
         matches.sort_by(|a, b| a.task_id.cmp(&b.task_id));
         matches
     }
+
+    /// Running task ids for one session, without scanning the whole task dir.
+    ///
+    /// [`Self::list`] opens, parses and reconciles every status file on the
+    /// machine. That is right for `bg list` and wrong on a per-turn path: a
+    /// wake turn re-read thousands of finished tasks through the blocking pool
+    /// and then never publishes its terminal status, so attached clients hang
+    /// and the session reservation is never released. Live tasks come from the
+    /// in-memory map; tasks that outlived their owning process come from the
+    /// cached detached index. Reconciliation stays with [`Self::sweep`], which
+    /// the runtime heartbeat already runs.
+    pub fn running_task_ids_for_session(&self, session_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .tasks
+            .try_read()
+            .map(|tasks| {
+                tasks
+                    .values()
+                    .filter(|task| task.session_id == session_id)
+                    .map(|task| task.task_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.extend(
+            self.persisted_detached_running_tasks_for_session(session_id)
+                .into_iter()
+                .map(|status| status.task_id),
+        );
+        ids.sort();
+        ids.dedup();
+        ids
+    }
 }
 
 impl Default for BackgroundTaskManager {

@@ -87,12 +87,16 @@ fn recent_history_negotiation_preserves_local_verified_prefix() {
 async fn recent_history_page_request_explicitly_selects_normal_transcript() {
     let mut remote = RemoteConnection::dummy();
     let id = remote.get_compacted_history(192, true).await.unwrap();
-    let peer = remote._dummy_peer.as_ref().unwrap();
-    peer.readable().await.unwrap();
-    let mut bytes = [0; 256];
-    let count = peer.try_read(&mut bytes).unwrap();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        matches!(serde_json::from_slice::<Request>(&bytes[..count]).unwrap(),
+        matches!(serde_json::from_str::<Request>(&line).unwrap(),
         Request::GetCompactedHistory { id: actual, visible_messages: 192, recent_history: true } if actual == id)
     );
 }
@@ -107,19 +111,23 @@ async fn slow_usage_hydration_does_not_block_subscribe_or_async_runtime() {
         false
     });
     started_rx.await.unwrap();
-    let remote = RemoteConnection::dummy();
-    let peer = remote._dummy_peer.as_ref().unwrap();
+    let mut remote = RemoteConnection::dummy();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = BufReader::new(reader);
     let start = Instant::now();
     let result = tokio::time::timeout(Duration::from_millis(250), async {
         remote
             .send_request(Request::GetHistory { id: 9 })
             .await
             .unwrap();
-        let mut bytes = [0; 256];
-        peer.readable().await.unwrap();
-        let count = peer.try_read(&mut bytes).unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            serde_json::from_slice::<Request>(&bytes[..count]).unwrap(),
+            serde_json::from_str::<Request>(&line).unwrap(),
             Request::GetHistory { id: 9 }
         ));
     })
