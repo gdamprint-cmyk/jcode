@@ -13,7 +13,6 @@ use super::{
 };
 #[cfg(unix)]
 use super::{connect_socket, reap_stale_socket_if_dead};
-#[cfg(unix)]
 use crate::transport::Listener;
 use std::time::Duration;
 
@@ -638,20 +637,51 @@ async fn inspect_reload_wait_status_reports_ready_for_socket_ready_marker() {
     }
 }
 
-#[cfg(unix)]
+/// Spawn a short-lived child and reap it, so a test holds a pid that is
+/// reliably dead at the moment of selection. Retries guard against the
+/// (extremely rare) case where the kernel immediately recycles the pid for
+/// another test thread's process.
+fn spawn_and_reap_dead_pid() -> u32 {
+    use std::process::Command;
+    for _ in 0..16 {
+        let mut child = if cfg!(unix) {
+            Command::new("/bin/sh").arg("-c").arg("exit 0").spawn()
+        } else {
+            Command::new("cmd").arg("/c").arg("exit 0").spawn()
+        }
+        .expect("spawn short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        if !reload_process_alive(pid) {
+            return pid;
+        }
+    }
+    panic!("could not obtain a reliably-dead pid");
+}
+
+/// A live socket beats the marker's pid.
+///
+/// MEASURED 2026-11-22: on Windows a reload is `spawn` + `exit(0)`, NOT an
+/// exec, so the marker's pid is the OLD daemon and is already dead when the
+/// replacement takes the socket. The replacement cleared the marker as a
+/// foreign/stale one on startup and, finding nothing at the socket-ready publish
+/// point, never advanced it to `SocketReady`. The marker therefore stayed
+/// `Starting` with a DEAD pid, and the old verdict reported `Failed` while the
+/// replacement was already serving - which rolled back a landing whose daemon
+/// was running the target.
 #[tokio::test]
-async fn inspect_reload_wait_status_keeps_waiting_while_starting_marker_is_active_even_if_socket_is_live()
- {
+async fn inspect_reload_wait_status_reports_ready_when_socket_is_live_with_a_dead_marker_pid() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
     crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
 
+    let dead_pid = spawn_and_reap_dead_pid();
     ReloadState {
         request_id: "test-request".to_string(),
         hash: "test-hash".to_string(),
         phase: ReloadPhase::Starting,
-        pid: std::process::id(),
+        pid: dead_pid,
         timestamp: chrono::Utc::now().to_rfc3339(),
         detail: None,
     }
@@ -663,9 +693,48 @@ async fn inspect_reload_wait_status_keeps_waiting_while_starting_marker_is_activ
     let status = inspect_reload_wait_status(&socket_path, Duration::from_secs(30), None).await;
     assert_eq!(
         status,
-        ReloadWaitStatus::Waiting {
-            pid: Some(std::process::id())
-        }
+        ReloadWaitStatus::Ready,
+        "a live socket means the handoff landed, whatever pid the marker remembers"
+    );
+
+    clear_reload_marker();
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+}
+
+/// Negative control for the above: the same dead-pid `Starting` marker with NO
+/// live socket must still report `Failed`. Otherwise the fix would turn every
+/// failed reload into a false success.
+#[tokio::test]
+async fn inspect_reload_wait_status_still_fails_for_dead_marker_pid_without_a_socket() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+    let dead_pid = spawn_and_reap_dead_pid();
+    ReloadState {
+        request_id: "test-request".to_string(),
+        hash: "test-hash".to_string(),
+        phase: ReloadPhase::Starting,
+        pid: dead_pid,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        detail: None,
+    }
+    .write();
+
+    let status = inspect_reload_wait_status(
+        &temp.path().join("missing.sock"),
+        Duration::from_secs(5),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(&status, ReloadWaitStatus::Failed(detail) if detail.as_deref().is_some_and(|d| d.contains("exited before becoming ready"))),
+        "without a live socket the dead reload pid must still be a failure, got {status:?}"
     );
 
     clear_reload_marker();

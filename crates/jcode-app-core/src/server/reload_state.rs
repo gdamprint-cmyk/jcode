@@ -228,6 +228,37 @@ pub async fn inspect_reload_wait_status(
             ReloadPhase::SocketReady => ReloadWaitStatus::Ready,
             ReloadPhase::Failed => ReloadWaitStatus::Failed(state.detail),
             ReloadPhase::Starting => {
+                // A live socket wins over the marker's pid.
+                //
+                // MEASURED 2026-11-22: on Windows `replace_process` is
+                // `spawn` + `exit(0)` (`jcode-base/src/platform.rs:664`), NOT an
+                // exec, so the pid does not survive the handoff: the old daemon
+                // dies while the replacement, which has a NEW pid, takes the
+                // socket. `CreateProcessW` "Creates a new process and its primary
+                // thread" and "The process is assigned a process identifier"
+                // (Microsoft Learn, processthreadsapiCreateProcessW), so there is
+                // no Windows equivalent of preserving the image's pid.
+                //
+                // The replacement then cleared the marker as foreign/stale on
+                // startup (`server.rs:2099`) and, finding nothing at the
+                // socket-ready publish point, never advanced it to `SocketReady`.
+                // The marker therefore stayed `Starting` with a DEAD pid, and this
+                // branch reported `Failed("reload process 20944 exited before
+                // becoming ready")` while the replacement was already serving
+                // (log 2026-11-22 08:00:10.035). A landing that trusted that answer
+                // rolled back and left the client channels on the old build.
+                //
+                // The socket is the observable the caller actually waits for, so
+                // it must be asked first: a live listener means the handoff
+                // landed, whatever pid the marker remembers.
+                if is_server_ready(socket_path).await || has_live_listener(socket_path).await {
+                    crate::logging::info(&format!(
+                        "inspect_reload_wait_status: socket {} is live while marker phase is Starting (pid={}); reporting ready",
+                        socket_path.display(),
+                        state.pid
+                    ));
+                    return ReloadWaitStatus::Ready;
+                }
                 if reload_process_alive(state.pid) {
                     ReloadWaitStatus::Waiting {
                         pid: Some(state.pid),
