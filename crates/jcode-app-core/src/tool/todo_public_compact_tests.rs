@@ -39,13 +39,10 @@ fn a_completed_card_is_dropped_from_the_board() {
     let long = "y".repeat(9_000);
     let todos = vec![item("done", "completed", &long)];
     let public = super::public_todos_compact(&todos).expect("public todos");
-    assert!(
-        public.as_array().is_none_or(|items| {
-            items
-                .iter()
-                .all(|entry| entry["status"].as_str() != Some("completed"))
-        }),
-        "a board with only finished cards must not render finished cards: {public}"
+    assert_eq!(
+        public.as_array().map(Vec::len),
+        Some(0),
+        "a board with only finished cards must render an empty array: {public}"
     );
 }
 
@@ -183,17 +180,18 @@ fn the_tool_metadata_still_carries_both_histories() {
 }
 
 #[test]
-fn a_finished_board_collapses_to_a_counter() {
+fn a_finished_board_collapses_to_an_empty_array() {
     let todos: Vec<TodoItem> = (0..100)
         .map(|index| item(&format!("card-{index}"), "completed", "note"))
         .collect();
     let public = super::public_todos_compact(&todos).expect("public todos");
-    let compacted = serde_json::to_string(&public).expect("serialize");
-    let full = serde_json::to_string(&names::public_todos(&todos).expect("full")).expect("s");
+    assert_eq!(public.as_array().map(Vec::len), Some(0));
+    // The count travels as text after the JSON, never as a fake card.
+    let output = super::build_todo_output(todos, TodoPlan::default(), Vec::new(), None, None, Vec::new())
+        .expect("todo output");
     assert!(
-        compacted.len() * 4 < full.len(),
-        "compacted {} vs full {} bytes",
-        compacted.len(),
-        full.len()
+        output.output.contains("[100 finished cards omitted]"),
+        "the omission count must be reported: {}",
+        output.output
     );
 }

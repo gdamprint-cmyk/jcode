@@ -60,19 +60,22 @@ fn finished_cards_leave_the_model_facing_board() {
     before.push_str(&serde_json::to_string_pretty(&plan).expect("serialize"));
 
     // AFTER: the current model-facing rendering.
-    let after = super::public_todos_compact(&todos).expect("compact");
-    let mut after_text = serde_json::to_string_pretty(&after).expect("serialize");
-    after_text.push_str("\n\nPlan:\n");
-    after_text.push_str(&super::model_facing_json(&plan).expect("plan"));
+    let output = super::build_todo_output(todos.clone(), plan, Vec::new(), None, None, Vec::new())
+        .expect("todo output");
 
     eprintln!("MEASURE_BEFORE_BYTES={}", before.len());
-    eprintln!("MEASURE_AFTER_BYTES={}", after_text.len());
+    eprintln!("MEASURE_AFTER_BYTES={}", output.output.len());
     assert_eq!(before.len(), 231_095, "measured full rendering size");
-    assert_eq!(after_text.len(), 188, "measured compacted rendering size");
+    assert_eq!(output.output.len(), 118, "measured compacted rendering size");
     assert!(
-        after_text.len() * 10 < before.len(),
+        output.output.len() * 10 < before.len(),
         "finished cards must be gone from the board: {} vs {} bytes",
-        after_text.len(),
+        output.output.len(),
         before.len()
+    );
+    assert!(
+        output.output.contains("[100 finished cards omitted]"),
+        "the omission count must be reported as text: {}",
+        output.output
     );
 }

@@ -1364,13 +1364,15 @@ fn public_todos_compact(todos: &[TodoItem]) -> Result<Value> {
     Ok(value)
 }
 
-/// Drop cards that are finished from the model-facing array, replacing them with
-/// one counter line.
+/// Drop cards that are finished from the model-facing array.
+///
+/// A fake counter CARD is deliberately not added here: the TUI parses this array
+/// into `TodoItem`s and an invented status would render as a bogus task. The
+/// count is reported as text after the JSON instead (see `build_todo_output`).
 fn drop_terminal_cards(value: &mut Value) {
     let Some(items) = value.as_array_mut() else {
         return;
     };
-    let before = items.len();
     items.retain(|item| {
         item.get("status")
             .and_then(Value::as_str)
@@ -1378,14 +1380,6 @@ fn drop_terminal_cards(value: &mut Value) {
                 status == "pending" || status == "in_progress" || status == "blocked"
             })
     });
-    let dropped = before - items.len();
-    if dropped > 0 {
-        items.push(json!({
-            "name": format!("[{dropped} finished cards omitted]"),
-            "status": "summary",
-            "priority": "low",
-        }));
-    }
 }
 
 fn build_todo_output(
@@ -1400,7 +1394,18 @@ fn build_todo_output(
         .iter()
         .filter(|todo| todo.status != "completed")
         .count();
+    let finished = todos
+        .iter()
+        .filter(|todo| {
+            todo.status == "completed"
+                || crate::todo::todo_status_is_cancelled(&todo.status)
+        })
+        .count();
     let mut text = serde_json::to_string_pretty(&public_todos_compact(&todos)?)?;
+    if finished > 0 {
+        // Text, not a fake card: the TUI parses the JSON array into TodoItems.
+        text.push_str(&format!("\n\n[{finished} finished cards omitted]"));
+    }
     if plan != TodoPlan::default() {
         text.push_str("\n\nPlan:\n");
         text.push_str(&model_facing_json(&plan)?);
