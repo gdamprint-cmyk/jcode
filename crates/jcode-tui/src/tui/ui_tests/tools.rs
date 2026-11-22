@@ -1481,13 +1481,30 @@ fn test_tool_summary_mcp_names_the_concrete_tool() {
             "action": "call",
             "server": "cgrep",
             "tool": "cgrep_agent_locate",
-            "arguments": { "query": "mcp label", "intent": "find the label" }
+            "arguments": { "query": "mcp label" },
+            "intent": "find the label"
         }),
         intent: None,
         thought_signature: None,
     };
-    let summary = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(80));
-    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+    // The tool name always leads; the essence follows while the row has room.
+    let wide = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(80));
+    assert_eq!(
+        wide,
+        "cgrep / cgrep_agent_locate · find the label",
+        "summary={wide:?}"
+    );
+    // Below the combined length the row degrades by truncation, and the name is
+    // still the head of it rather than being displaced by the essence.
+    let narrow = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(20));
+    assert!(narrow.starts_with("cgrep"), "narrow={narrow:?}");
+
+    // Short essence comes from the call's own intent, so it costs no model call.
+    let roomy = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(120));
+    assert_eq!(
+        roomy, wide,
+        "a wider row must not change the label: roomy={roomy:?} wide={wide:?}"
+    );
 
     let dispatch = ToolCall {
         id: "call_mcp_dispatch".to_string(),
@@ -1501,7 +1518,11 @@ fn test_tool_summary_mcp_names_the_concrete_tool() {
         thought_signature: None,
     };
     let summary = tools_ui::get_tool_summary_with_budget(&dispatch, 50, Some(80));
-    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+    assert_eq!(
+        summary,
+        "cgrep / cgrep_agent_locate · find the label",
+        "summary={summary:?}"
+    );
 
     // Same call data, different key order: the label must not depend on it.
     let reordered = ToolCall {
@@ -1516,6 +1537,22 @@ fn test_tool_summary_mcp_names_the_concrete_tool() {
         thought_signature: None,
     };
     let summary = tools_ui::get_tool_summary_with_budget(&reordered, 50, Some(80));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+
+    // No intent and no query: the row stays a bare name rather than inventing text.
+    let bare = ToolCall {
+        id: "call_mcp_bare".to_string(),
+        name: "mcp_call".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate",
+            "arguments": {}
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&bare, 50, Some(120));
     assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
 }
 

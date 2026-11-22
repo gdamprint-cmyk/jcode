@@ -1051,7 +1051,18 @@ pub(super) fn get_tool_summary_with_budget(
                     .unwrap_or("mcp")
                     .to_string(),
             };
-            truncate_middle_display(&label, bounded(64))
+            // The call's own intent is the short essence: it is already in the
+            // transcript, so showing it costs no model call. A bare query is the
+            // fallback for calls the model sent without an intent.
+            // `bounded` falls back to a default when max_width is None, which
+            // would let a row exceed the width the caller reserved. Cap it.
+            let budget = |preferred: usize| max_width.unwrap_or(preferred).min(preferred);
+            let essence = mcp_essence(&tool.input, budget(24));
+            if essence.is_empty() {
+                truncate_middle_display(&label, budget(64))
+            } else {
+                truncate_middle_display(&format!("{label} · {essence}"), budget(88))
+            }
         }
         "todo" => {
             if let Some(count) = tool
@@ -1382,7 +1393,16 @@ pub(super) fn get_tool_summary_with_budget(
             truncate_middle_display(cmd, bounded(40))
         }
         name if name.starts_with("mcp__") => {
-            mcp_dispatch_name_display(name, bounded(64))
+            let label = mcp_dispatch_name_display(name, bounded(64));
+            // Same rule as the `mcp` arm: the call's own intent is the short
+            // essence, so a dispatch-named call carries it too.
+            let budget = |preferred: usize| max_width.unwrap_or(preferred).min(preferred);
+            let essence = mcp_essence(&tool.input, budget(24));
+            if essence.is_empty() {
+                label
+            } else {
+                truncate_middle_display(&format!("{label} · {essence}"), budget(88))
+            }
         }
         // Generic fallback: most action-shaped tools (ambient tools, future
         // additions) at least carry an "action" field. Showing it beats an
@@ -1413,6 +1433,22 @@ fn mcp_display_tool_name_from_dispatch(name: &str) -> Option<String> {
         return None;
     }
     Some(format!("{} / {tool}", server.replace('_', "-")))
+}
+
+/// Short essence of an MCP call, taken from the call itself: `intent` first,
+/// then the first few words of `query`. Truncated to `budget` cells, so a long
+/// intent degrades to a prefix instead of pushing the tool name off the row.
+fn mcp_essence(input: &serde_json::Value, budget: usize) -> String {
+    let raw = input
+        .get("intent")
+        .or_else(|| input.get("query"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let words: Vec<&str> = raw.split_whitespace().take(4).collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    truncate_middle_display(&words.join(" "), budget)
 }
 
 /// Row prefix for a dispatch-named MCP call. Falls back to the trimmed
