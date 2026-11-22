@@ -1660,6 +1660,34 @@ fn row_display_name_leaves_non_mcp_tools_alone() {
         "mcp: cgrep / cgrep_agent_locate"
     );
 
+    // Every (server, tool) pair that actually occurs in the live transcript, so
+    // the row name is checked against real traffic rather than one fixture.
+    for (server, tool) in [
+        ("cgrep", "cgrep_search"),
+        ("graft", "graft_check_freshness"),
+        ("serena", "activate_project"),
+        ("serena", "find_symbol"),
+        ("serena", "get_symbols_overview"),
+        ("windows-mcp", "PowerShell"),
+    ] {
+        let call = ToolCall {
+            id: format!("call_real_{server}_{tool}"),
+            name: "mcp".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": server,
+                "tool": tool
+            }),
+            intent: None,
+            thought_signature: None,
+        };
+        assert_eq!(
+            tools_ui::resolve_row_display_name(&call),
+            format!("mcp: {server} / {tool}"),
+            "server={server} tool={tool}"
+        );
+    }
+
     // A real `action=search`/`list` call carries no `tool` (measured on the live
     // transcript: 5 of 18 MCP calls, of which 4 still carry `server`). Naming it
     // `mcp: serena` adds nothing when no concrete tool exists, so the row keeps
