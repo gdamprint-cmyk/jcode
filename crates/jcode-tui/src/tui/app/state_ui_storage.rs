@@ -450,6 +450,50 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
                 .unwrap_or(serde_json::Value::Null);
             obj(vec![("tool_calls", tool_calls)])
         }
+        // MCP calls: the row identity lives in `server`/`tool` (and the
+        // essence in `intent`/`query`). Without this arm the generic fallback
+        // kept only `action`, so a completed or restored MCP row lost the
+        // concrete tool name entirely and rendered as bare `mcp · <intent>`.
+        "mcp" | "mcp_call" => obj(vec![
+            (
+                "server",
+                input
+                    .get("server")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "tool",
+                input
+                    .get("tool")
+                    .or_else(|| input.get("tool_name"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "intent",
+                input
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "query",
+                input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "action",
+                input
+                    .get("action")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        ]),
         // Generic fallback: keep the action field (when present) so
         // action-shaped tool rows still render a summary after reload.
         _ => obj(vec![(

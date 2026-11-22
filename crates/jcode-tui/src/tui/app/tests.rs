@@ -1,5 +1,7 @@
 #![cfg_attr(test, allow(clippy::clone_on_copy))]
 mod tool_duration;
+#[path = "tests/live_tool_row_render.rs"]
+mod live_tool_row_render;
 include!("tests/streaming_hash.rs");
 include!("tests/provider_env.rs");
 include!("tests/cache_diagnostics.rs");
