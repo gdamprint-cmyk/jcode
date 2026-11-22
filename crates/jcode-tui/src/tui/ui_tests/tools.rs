@@ -1659,6 +1659,37 @@ fn row_display_name_leaves_non_mcp_tools_alone() {
         tools_ui::resolve_row_display_name(&mcp),
         "mcp: cgrep / cgrep_agent_locate"
     );
+
+    // A real `action=search`/`list` call carries no `tool` (measured on the live
+    // transcript: 5 of 18 MCP calls, of which 4 still carry `server`). Naming it
+    // `mcp: serena` adds nothing when no concrete tool exists, so the row keeps
+    // the bare tool name instead of a suffix that names only the server.
+    for (action, server) in [
+        ("search", None),
+        ("list", None),
+        ("search", Some("windows-mcp")),
+        ("list", Some("serena")),
+    ] {
+        let mut input = serde_json::json!({
+            "action": action,
+            "intent": "List configured MCP servers"
+        });
+        if let Some(server) = server {
+            input["server"] = serde_json::Value::String(server.to_string());
+        }
+        let catalog = ToolCall {
+            id: format!("call_mcp_{action}_{server:?}"),
+            name: "mcp".to_string(),
+            input,
+            intent: None,
+            thought_signature: None,
+        };
+        assert_eq!(
+            tools_ui::resolve_row_display_name(&catalog),
+            "mcp",
+            "action={action} server={server:?} must not gain a suffix"
+        );
+    }
 }
 
 /// The live activity line should surface the model-provided `intent` for any
