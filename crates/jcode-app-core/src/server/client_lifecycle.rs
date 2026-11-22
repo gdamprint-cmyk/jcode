@@ -3396,7 +3396,14 @@ pub(super) async fn handle_client(
             crate::mobile_push::note_client_attached(&client_session_id, name);
         }
         if sdk_session_before_request != client_session_id {
-            crate::tool::sdk::release_connection(&client_connection_id);
+            // Release only the session this connection LEFT. Blanket-releasing
+            // every overlay it owns also killed the callback channel of a
+            // session it still owns, so a later turn on that session failed
+            // with "SDK tool owner disconnected" while the socket stayed open.
+            crate::tool::sdk::release_connection_for_session(
+                &client_connection_id,
+                &sdk_session_before_request,
+            );
         }
         if request_lifecycle_logged {
             log_request_lifecycle_handled(

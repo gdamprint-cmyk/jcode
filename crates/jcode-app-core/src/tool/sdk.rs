@@ -90,6 +90,26 @@ pub(crate) fn release_connection(owner: &str) {
     state.pending.retain(|_, pending| pending.owner != owner);
 }
 
+/// Close the callback channel of ONE session this connection left.
+///
+/// A binding change retires the left session's channel but keeps its tool
+/// configuration: `list_tools` and the model's tool list must not change just
+/// because the owning socket moved to another session, and the retained config
+/// is what lets a later owner re-adopt that session. Sessions the connection
+/// still owns keep their channel — that is the whole point, since a turn on such
+/// a session must still reach its owner.
+pub(crate) fn release_connection_for_session(owner: &str, session: &str) {
+    let mut state = STATE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(overlay) = state.overlays.get_mut(session) {
+        if overlay.owner == owner {
+            overlay.sender = None;
+            state
+                .pending
+                .retain(|_, pending| !(pending.session == session && pending.owner == owner));
+        }
+    }
+}
+
 pub(crate) fn remove_session(session: &str) {
     crate::screen_context::remove_session(session);
     let mut state = STATE.write().unwrap_or_else(|e| e.into_inner());
@@ -666,5 +686,49 @@ mod tests {
         assert!(complete("timeout-owner", session, &call_id, "late".into(), None).is_err());
         configure(session, "timeout-owner", SessionToolConfig::default(), tx).unwrap();
         remove_session(session);
+    }
+
+    // A session binding change releases the connection's ownership of the
+    // session it LEFT. Retiring the overlay here also killed the callback
+    // channel the same connection needs after it comes back to that session,
+    // so a later turn failed with "SDK tool owner disconnected" (the
+    // sdk_socket_configure_list_callback_and_busy_rejection failure).
+    #[tokio::test]
+    async fn session_binding_change_releases_only_left_sessions() {
+        let owner = "binding-change-owner";
+        let left = "sdk-binding-left";
+        let kept = "sdk-binding-kept";
+        let tools = || SessionToolConfig {
+            custom: vec![SessionToolDefinition {
+                name: "callback".into(),
+                description: "test callback".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            ..Default::default()
+        };
+        let (left_tx, _left_rx) = mpsc::unbounded_channel();
+        let (kept_tx, mut kept_rx) = mpsc::unbounded_channel();
+        configure(left, owner, tools(), left_tx).unwrap();
+        configure(kept, owner, tools(), kept_tx).unwrap();
+
+        crate::tool::sdk::release_connection_for_session(owner, left);
+
+        assert!(config(left).is_some(), "left session keeps its configuration");
+        let left_error = execute(left, "callback", Value::Null)
+            .await
+            .expect_err("left session's channel must be closed");
+        assert!(
+            left_error.to_string().contains("owner disconnected"),
+            "unexpected error: {left_error}"
+        );
+        assert!(config(kept).is_some(), "kept session overlay must survive");
+        let task = tokio::spawn(execute(kept, "callback", Value::Null));
+        let ServerEvent::ToolCall { call_id, .. } = kept_rx.recv().await.unwrap() else {
+            unreachable!()
+        };
+        assert!(complete(owner, kept, &call_id, "late".into(), None).is_ok());
+        task.await.unwrap().unwrap();
+        remove_session(left);
+        remove_session(kept);
     }
 }
