@@ -1373,9 +1373,14 @@ fn drop_terminal_cards(value: &mut Value) {
     let Some(items) = value.as_array_mut() else {
         return;
     };
+    // Canonicalize, do not match spellings: persisted sessions carry the
+    // legacy synonyms `done`/`finished`/`complete`/`canceled`
+    // (`canonical_todo_status`), and a card left in the board is exactly the
+    // finished work this compaction exists to remove.
     items.retain(|item| {
         item.get("status")
             .and_then(Value::as_str)
+            .and_then(crate::todo::canonical_todo_status)
             .is_none_or(|status| {
                 status == "pending" || status == "in_progress" || status == "blocked"
             })

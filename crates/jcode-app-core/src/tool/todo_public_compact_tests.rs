@@ -47,6 +47,21 @@ fn a_completed_card_is_dropped_from_the_board() {
 }
 
 #[test]
+fn a_legacy_completion_synonym_is_dropped_too() {
+    // `canonical_todo_status` has always accepted `done`/`finished`/`complete`
+    // from persisted sessions, so the filter must not rely on one spelling.
+    for status in ["done", "finished", "complete", "canceled"] {
+        let todos = vec![item("legacy", status, "note")];
+        let public = super::public_todos_compact(&todos).expect("public todos");
+        assert_eq!(
+            public.as_array().map(Vec::len),
+            Some(0),
+            "{status} is a terminal status and must leave the board: {public}"
+        );
+    }
+}
+
+#[test]
 fn a_cancelled_card_is_dropped_and_an_open_card_survives() {
     let todos = vec![
         item("done", "completed", "short note"),
