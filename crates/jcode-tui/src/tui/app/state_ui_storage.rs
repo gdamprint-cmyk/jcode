@@ -602,6 +602,37 @@ mod tests {
     }
 
     #[test]
+    fn compaction_keeps_mcp_identity_for_the_row_name() {
+        let mut message = tool_message(
+            "mcp",
+            serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" },
+                "intent": "find the label",
+                "unrelated": "dropped"
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        assert_eq!(tool.input.get("server").and_then(|v| v.as_str()), Some("cgrep"));
+        assert_eq!(
+            tool.input.get("tool").and_then(|v| v.as_str()),
+            Some("cgrep_agent_locate")
+        );
+        assert_eq!(
+            tool.input.get("intent").and_then(|v| v.as_str()),
+            Some("find the label")
+        );
+        assert!(
+            tool.input.get("unrelated").is_none(),
+            "unrelated input must still be dropped: {}",
+            tool.input
+        );
+    }
+
+    #[test]
     fn compaction_keeps_webfetch_url_for_transcript_summary() {
         let mut message = tool_message(
             "webfetch",
