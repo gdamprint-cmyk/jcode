@@ -1443,6 +1443,15 @@ fn mcp_display_tool_name_from_dispatch(name: &str) -> Option<String> {
 /// reads only "mcp · <intent>" and the concrete tool is invisible.
 pub(super) fn resolve_row_display_name(tool: &ToolCall) -> String {
     let resolved = resolve_display_tool_name(&tool.name).to_string();
+    // Only MCP spellings carry (server, tool). Other tools have their own
+    // `tool` field with a different meaning - `integration_tools` uses it for a
+    // product name - so keying off the field alone would mislabel their rows.
+    let is_mcp = tool.name == "mcp"
+        || tool.name == "mcp_call"
+        || tool.name.starts_with("mcp__");
+    if !is_mcp {
+        return resolved;
+    }
     let tool_name = tool
         .input
         .get("tool")

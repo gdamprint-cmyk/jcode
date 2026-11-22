@@ -1590,6 +1590,44 @@ fn render_tool_message_mcp_row_keeps_the_tool_name_with_intent() {
     assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
 }
 
+/// A tool whose input happens to carry a `tool` field must keep its own name.
+/// `integration_tools` (discover) uses `tool` for a PRODUCT name, so an
+/// MCP-shaped suffix there would be a mislabel, not a clarification.
+#[test]
+fn row_display_name_leaves_non_mcp_tools_alone() {
+    let discover = ToolCall {
+        id: "call_discover".to_string(),
+        name: "integration_tools".to_string(),
+        input: serde_json::json!({
+            "action": "suggest",
+            "category": "payments",
+            "tool": "Stripe"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(
+        tools_ui::resolve_row_display_name(&discover),
+        "integration_tools"
+    );
+
+    let mcp = ToolCall {
+        id: "call_mcp_named".to_string(),
+        name: "mcp".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(
+        tools_ui::resolve_row_display_name(&mcp),
+        "mcp: cgrep / cgrep_agent_locate"
+    );
+}
+
 /// The live activity line should surface the model-provided `intent` for any
 /// tool (including swarm) ahead of the technical summary when tool call
 /// details are enabled.
