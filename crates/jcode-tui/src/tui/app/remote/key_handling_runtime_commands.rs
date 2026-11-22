@@ -11,9 +11,7 @@ pub(super) async fn apply_remote_effort_direction(
     // available, header hints during the pre-History bootstrap window) so
     // effort cycling works immediately after spawn instead of claiming the
     // provider does not support it until the History payload settles.
-    let (provider_name, provider_model) = app.remote_effort_identity();
-    let efforts =
-        app_mod::inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref());
+    let efforts = app.remote_reasoning_effort_ladder();
     if efforts.is_empty() {
         app.set_status_notice("Reasoning effort not available for this provider");
         return Ok(());

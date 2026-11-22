@@ -653,6 +653,13 @@ pub enum ServerEvent {
         /// Authoritative service tiers from the live provider, including an empty unsupported list.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_service_tiers: Option<Vec<String>>,
+        /// Authoritative reasoning-effort ladder from the live provider.
+        /// `None` means the server did not report one (older daemon, or a
+        /// provider whose catalog path predates this field); an empty vec means
+        /// the live provider reported "no selectable levels", which must NOT
+        /// fall back to name inference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        available_reasoning_efforts: Option<Vec<String>>,
         /// Connected MCP server names
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mcp_servers: Vec<String>,
@@ -903,6 +910,9 @@ pub enum ServerEvent {
         available_models: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         available_model_routes: Vec<jcode_provider_core::ModelRoute>,
+        /// Authoritative reasoning-effort ladder; `None` when the sender has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        available_reasoning_efforts: Option<Vec<String>>,
     },
 
     /// Notification from another agent (file conflict, message, shared context)

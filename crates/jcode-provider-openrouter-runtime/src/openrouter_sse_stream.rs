@@ -52,6 +52,32 @@ fn http_status_hint(status: u16, api_base: &str, model: &str) -> &'static str {
 // SSE Stream Parser
 // ============================================================================
 
+/// Carry a server retry hint into the next attempt without letting one stale
+/// value pin the whole loop.
+///
+/// The delay is stored as an absolute deadline and only used while it is still
+/// in the future. A loop that waits out a long rate window refreshes the hint
+/// from the error each attempt, so the next attempt sees the window the server
+/// is reporting NOW. Once the deadline has passed the loop falls back to its own
+/// bounded backoff instead of sleeping zero forever.
+#[derive(Clone, Copy)]
+struct RetryDelay {
+    deadline: std::time::Instant,
+}
+
+impl RetryDelay {
+    fn from_hint(remaining: std::time::Duration) -> Option<Self> {
+        (remaining > std::time::Duration::ZERO).then(|| Self {
+            deadline: std::time::Instant::now() + remaining,
+        })
+    }
+
+    fn take(self) -> Option<std::time::Duration> {
+        let remaining = self.deadline.saturating_duration_since(std::time::Instant::now());
+        (remaining > std::time::Duration::ZERO).then_some(remaining)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "stream helpers thread transport, auth, request, event channel, and pin state explicitly"
@@ -70,7 +96,7 @@ pub(super) async fn run_stream_with_retries(
     responses_api: bool,
 ) {
     let mut last_error = None;
-    let mut next_retry_delay = None;
+    let mut next_retry_delay: Option<RetryDelay> = None;
     let config = jcode_base::config::config();
     let max_retries = config.provider.max_retries.max(1);
     let retry_backoff_cap =
@@ -78,12 +104,19 @@ pub(super) async fn run_stream_with_retries(
 
     for attempt in 0..max_retries {
         if attempt > 0 {
-            let delay = jcode_provider_core::retry_after::retry_delay(
-                attempt,
-                RETRY_BASE_DELAY_MS,
-                next_retry_delay.take(),
-            )
-            .min(retry_backoff_cap);
+            // A server hint is authoritative and already bounded by
+            // MAX_RETRY_HONORED; only the fallback backoff is capped. The
+            // retry_backoff_cap_secs config intentionally does NOT truncate a
+            // rate-limit window, because a truncated wait guarantees another 429.
+            let delay = match next_retry_delay.take().and_then(RetryDelay::take) {
+                Some(hint) => hint,
+                None => jcode_provider_core::retry_after::retry_delay(
+                    attempt,
+                    RETRY_BASE_DELAY_MS,
+                    None,
+                )
+                .min(retry_backoff_cap),
+            };
             tokio::time::sleep(delay).await;
             jcode_base::logging::info(&format!(
                 "Retrying API request using {} (attempt {}/{})",
@@ -163,7 +196,8 @@ pub(super) async fn run_stream_with_retries(
                             e
                         ));
                     }
-                    next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&e);
+                    next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&e)
+                        .and_then(RetryDelay::from_hint);
                     last_error = Some(e);
                     continue;
                 }
@@ -271,7 +305,15 @@ async fn stream_response(
 
     if !response.status().is_success() {
         let status = response.status();
-        let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
+        // Status 429's own `Retry-After` describes the upstream rate window, not
+        // a transport hiccup, so it must be read UNCAPPED. Capping it at the
+        // in-request MAX_RETRY_AFTER (60s) made the retry land inside the same
+        // fair-share window and fail again: measured 2026-11-22, Nous answers a
+        // free-model 429 with `retry-after: 297` while the account bucket is
+        // untouched (`x-ratelimit-remaining-requests: 396/400`). The loop still
+        // bounds the TOTAL wait: `RetryAfter::MAX_RETRY_HONORED` caps the hint,
+        // and a long hint is spent once and never refreshed by the stale value.
+        let retry_after = jcode_provider_core::retry_after::retry_after_uncapped(response.headers());
         let body = jcode_base::util::http_error_body(response, "HTTP error").await;
         let hint = if azure_responses {
             match status.as_u16() {

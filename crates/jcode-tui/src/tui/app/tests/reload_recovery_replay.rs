@@ -45,6 +45,7 @@ fn reload_replay_history(
         reasoning_effort: None,
         service_tier: None,
         available_service_tiers: None,
+            available_reasoning_efforts: None,
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: Default::default(),

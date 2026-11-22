@@ -356,6 +356,10 @@ struct ModelPickerBuildContext {
     remote_provider_name: Option<String>,
     current_api_method: Option<String>,
     current_effort: Option<String>,
+    /// Server-reported ladder for a remote session, already normalized to
+    /// `&'static str` values. `None` lets the builder fall back to name
+    /// inference (older server, or a local session).
+    remote_efforts: Option<Vec<&'static str>>,
     recent_authenticated_provider: Option<String>,
 }
 
@@ -1382,6 +1386,13 @@ pub struct App {
         Vec<crate::session::RenderedImage>,
     )>,
     remote_reasoning_effort: Option<String>,
+    /// Authoritative reasoning-effort ladder reported by the live server.
+    /// `None` means the server did not report one (older daemon), so the client
+    /// falls back to inferring from the provider/model name. An empty vec means
+    /// the server reported "no selectable levels", which must NOT fall back:
+    /// otherwise a provider with no dials would still show a ladder inferred
+    /// from a model id.
+    remote_available_reasoning_efforts: Option<Vec<String>>,
     remote_service_tier: Option<String>,
     remote_available_service_tiers: Option<Vec<String>>,
     remote_reported_service_tier: Option<(Option<String>, String)>,

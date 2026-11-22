@@ -1309,10 +1309,7 @@ impl App {
             self.provider.reasoning_effort()
         };
         let available_efforts = if self.is_remote {
-            inferred_reasoning_efforts(
-                self.remote_provider_name.as_deref(),
-                self.remote_provider_model.as_deref(),
-            )
+            self.remote_reasoning_effort_ladder()
         } else {
             self.provider.available_efforts()
         };
@@ -1428,6 +1425,7 @@ impl App {
             } else {
                 self.provider.reasoning_effort()
             },
+            remote_efforts: self.is_remote.then(|| self.remote_reasoning_effort_ladder()),
             recent_authenticated_provider: self
                 .recent_authenticated_provider
                 .as_ref()
@@ -1450,6 +1448,7 @@ impl App {
             remote_provider_name,
             current_api_method,
             current_effort,
+            remote_efforts,
             recent_authenticated_provider,
         } = ctx;
         // UI preferences may be local, but provider defaults must not be.
@@ -1636,15 +1635,21 @@ impl App {
             // Expand each route only across the effort ladder its runtime can
             // actually apply. The same model can be reachable through native
             // OpenAI (where `max` is real) and OpenRouter (where `max` aliases
-            // `xhigh`), so model-id-only inference over-advertises values.
+            // `xhigh`), so model-id-only inference over-advertises values. A
+            // remote session that already knows its server-reported ladder
+            // uses that instead: a named OpenAI-compatible profile is the only
+            // place that knows its own vocabulary.
+            let remote_ladder = remote_efforts.as_ref();
             let mut effort_routes = Vec::new();
             let mut plain_routes = Vec::new();
-            let mut model_efforts = Vec::new();
+            let mut model_efforts: Vec<&'static str> = Vec::new();
             for route in entry_routes {
-                let efforts = if route_supports_reasoning_effort(&route.api_method) {
-                    inferred_reasoning_efforts(Some(&route.api_method), Some(name))
-                } else {
-                    Vec::new()
+                let efforts: Vec<&'static str> = match remote_ladder.as_ref() {
+                    Some(ladder) => ladder.to_vec(),
+                    None if route_supports_reasoning_effort(&route.api_method) => {
+                        inferred_reasoning_efforts(Some(&route.api_method), Some(name))
+                    }
+                    None => Vec::new(),
                 };
                 if efforts.is_empty() {
                     plain_routes.push(route);
@@ -2040,10 +2045,7 @@ impl App {
             self.provider.reasoning_effort()
         };
         let available_efforts = if self.is_remote {
-            inferred_reasoning_efforts(
-                self.remote_provider_name.as_deref(),
-                self.remote_provider_model.as_deref(),
-            )
+            self.remote_reasoning_effort_ladder()
         } else {
             self.provider.available_efforts()
         };

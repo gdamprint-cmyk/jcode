@@ -801,6 +801,7 @@ fn test_available_models_updated_event_surfaces_authed_provider_in_remote_model_
                     cheapness: None,
                 },
             ],
+                available_reasoning_efforts: None,
         },
         &mut remote,
     );
@@ -882,6 +883,7 @@ fn test_duplicate_available_models_updated_event_is_a_no_op() {
                 usage: None,
                 cheapness: None,
             }],
+            available_reasoning_efforts: None,
         };
 
         let first_redraw = app.handle_server_event(event(), &mut remote);
@@ -947,6 +949,7 @@ fn test_remote_final_catalog_replaces_post_login_loading_state_in_place() {
                 usage: None,
                 cheapness: None,
             }],
+                available_reasoning_efforts: None,
         },
         &mut remote,
     );

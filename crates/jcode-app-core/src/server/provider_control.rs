@@ -49,12 +49,25 @@ fn finish_auth_refresh(session_id: &str, generation: u64) {
     }
 }
 
+/// Ordered reasoning-effort ladder the live provider accepts.
+///
+/// `None` when the provider exposes no levels at all (a genuinely empty
+/// ladder is `Some(vec![])`), so a client can distinguish "this provider has no
+/// dials" from "this server is too old to say". The ladder is authoritative
+/// over the client's name-based inference: only the provider knows that a named
+/// OpenAI-compatible profile opts into the OpenAI vocabulary.
+pub(super) fn provider_effort_ladder(provider: &dyn Provider) -> Option<Vec<String>> {
+    let efforts = provider.available_efforts();
+    (!efforts.is_empty()).then(|| efforts.iter().map(|effort| effort.to_string()).collect())
+}
+
 fn available_models_snapshot_into_event(snapshot: ModelCatalogSnapshot) -> ServerEvent {
     ServerEvent::AvailableModelsUpdated {
         provider_name: snapshot.provider_name,
         provider_model: snapshot.provider_model,
         available_models: snapshot.available_models,
         available_model_routes: snapshot.model_routes,
+        available_reasoning_efforts: None,
     }
 }
 

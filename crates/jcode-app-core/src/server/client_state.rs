@@ -11,6 +11,7 @@ use crate::protocol::{
 use crate::provider::Provider;
 use crate::session::{Session, SessionStatus};
 use super::client_writer_task::ClientWriter;
+use super::provider_control::provider_effort_ladder;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -234,6 +235,7 @@ async fn build_model_catalog(
             provider.reasoning_effort(),
             provider_oauth_email(provider.as_ref()),
             provider.serving_oauth_account_label(),
+            provider_effort_ladder(provider.as_ref()),
         )
     })
     .await?;
@@ -249,9 +251,13 @@ async fn build_model_catalog(
         source,
         provider_oauth_email,
         provider_oauth_account_label,
+        available_reasoning_efforts,
     ) = {
         match live {
-            Some((catalog, (credential, tier, tiers, effort, email, account_label))) => {
+            Some((
+                catalog,
+                (credential, tier, tiers, effort, email, account_label, efforts),
+            )) => {
                 let catalog = catalog.snapshot();
                 (
                     catalog.provider_name,
@@ -265,6 +271,7 @@ async fn build_model_catalog(
                     "live",
                     email,
                     account_label,
+                    efforts,
                 )
             }
             None => {
@@ -305,6 +312,7 @@ async fn build_model_catalog(
                         "fallback",
                         provider_oauth_email(provider.as_ref()),
                         provider.serving_oauth_account_label(),
+                        provider_effort_ladder(provider.as_ref()),
                     )
                 })
                 .await?
@@ -325,6 +333,7 @@ async fn build_model_catalog(
         available_models,
         available_model_routes,
         available_service_tiers,
+        available_reasoning_efforts,
         mcp_servers: Vec::new(),
         skills: Vec::new(),
         total_tokens: None,
@@ -786,6 +795,7 @@ async fn send_history_from_persisted_session(
         .reasoning_effort
         .clone()
         .or_else(|| provider.reasoning_effort());
+    let available_reasoning_efforts = provider_effort_ladder(provider.as_ref());
     let agent_model_overrides = session.agent_model_overrides.clone();
     let inferred_interrupted = was_interrupted
         .is_none()
@@ -860,6 +870,7 @@ async fn send_history_from_persisted_session(
         provider_oauth_email: provider_oauth_email(provider.as_ref()),
         provider_oauth_account_label: provider.serving_oauth_account_label(),
         reasoning_effort,
+        available_reasoning_efforts,
         // The transcript is persisted, but the tier is live provider state and
         // can be read without waiting for the busy agent's mutex.
         service_tier: provider.service_tier(),
@@ -956,6 +967,7 @@ async fn send_history_with_guard(
         status_detail,
         reasoning_effort,
         service_tier,
+        available_reasoning_efforts,
         compaction_mode,
         token_usage_totals,
         history_snapshot_ms,
@@ -993,6 +1005,7 @@ async fn send_history_with_guard(
         let provider_meta_start = Instant::now();
         let reasoning_effort = provider.reasoning_effort();
         let service_tier = provider.service_tier();
+        let available_reasoning_efforts = provider_effort_ladder(provider.as_ref());
         let provider_meta_ms = provider_meta_start.elapsed().as_millis();
 
         let compaction_mode_start = Instant::now();
@@ -1017,6 +1030,7 @@ async fn send_history_with_guard(
             agent_guard.last_status_detail(),
             reasoning_effort,
             service_tier,
+            available_reasoning_efforts,
             compaction_mode,
             agent_guard.token_usage_totals(),
             history_snapshot_ms,
@@ -1183,6 +1197,7 @@ async fn send_history_with_guard(
         provider_oauth_email,
         provider_oauth_account_label,
         reasoning_effort,
+        available_reasoning_efforts,
         service_tier,
         compaction_mode,
         activity,

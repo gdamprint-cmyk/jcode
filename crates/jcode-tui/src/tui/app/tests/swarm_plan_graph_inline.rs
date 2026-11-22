@@ -566,6 +566,7 @@ fn history_event_for_session(session_id: &str) -> crate::protocol::ServerEvent {
         reasoning_effort: None,
         service_tier: None,
         available_service_tiers: None,
+            available_reasoning_efforts: None,
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: crate::side_panel::SidePanelSnapshot::default(),

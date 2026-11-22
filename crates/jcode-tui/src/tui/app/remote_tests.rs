@@ -566,6 +566,7 @@ fn startup_history(session_id: &str) -> ServerEvent {
         reasoning_effort: None,
         service_tier: None,
         available_service_tiers: None,
+            available_reasoning_efforts: None,
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -648,6 +649,7 @@ fn history_speed_capabilities_are_authoritative_and_identity_scoped() {
             provider_model: Some("gpt-6-astra".into()),
             available_models: vec![],
             available_model_routes: vec![],
+                available_reasoning_efforts: None,
         },
         &mut remote,
     );

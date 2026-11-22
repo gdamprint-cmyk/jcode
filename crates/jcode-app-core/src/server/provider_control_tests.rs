@@ -487,6 +487,7 @@ async fn notify_auth_changed_emits_available_models_updated_after_provider_updat
                 provider_model,
                 available_models,
                 available_model_routes,
+                available_reasoning_efforts: _,
             } => {
                 saw_models = Some((
                     provider_name,

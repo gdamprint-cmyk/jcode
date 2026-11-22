@@ -218,6 +218,39 @@ impl App {
         (provider, model)
     }
 
+    /// Best-known reasoning-effort ladder for the remote session.
+    ///
+    /// The server's report is authoritative: only the live provider knows which
+    /// levels its endpoint honours, and a named OpenAI-compatible profile (e.g.
+    /// `nous-free`) is the only place that knows it opted into a vocabulary the
+    /// model id does not reveal. Name inference stays as the pre-History and
+    /// older-server fallback, never as an override.
+    pub(super) fn remote_reasoning_effort_ladder(&self) -> Vec<&'static str> {
+        let Some(efforts) = self.remote_available_reasoning_efforts.as_ref() else {
+            // Older server (or a snapshot taken before it reported): fall back to
+            // the name-inferred ladder, which is what the client always did.
+            let (provider_name, provider_model) = self.remote_effort_identity();
+            return inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref());
+        };
+        // The server reported a ladder. An EMPTY report is a real answer ("this
+        // provider has no selectable levels"), not a missing field, so it must
+        // not fall back to inference: a named profile whose model id looks
+        // OpenAI-ish would otherwise advertise levels its endpoint rejects.
+        // Copy into a `&'static str` vector because the caller's signature is
+        // shared with the local provider's `available_efforts()`.
+        let mut ladder: Vec<&'static str> = Vec::with_capacity(efforts.len());
+        for effort in efforts {
+            let normalized = effort.trim();
+            if normalized.eq_ignore_ascii_case("swarm") {
+                ladder.push("swarm");
+            } else if let Some(static_effort) = jcode_provider_core::canonical_reasoning_effort(normalized)
+            {
+                ladder.push(static_effort);
+            }
+        }
+        ladder
+    }
+
     /// Best-known current reasoning effort for the remote session. Falls back
     /// to the configured provider-family default when the server has not
     /// reported one yet, so pre-settle effort cycling starts from the value the

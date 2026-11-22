@@ -20,6 +20,7 @@ fn test_detailed_catalog_replaces_placeholder_routes_after_names_only_update() {
                 provider_model: Some("claude-opus-4.6".to_string()),
                 available_models: vec!["claude-opus-4.6".to_string()],
                 available_model_routes: Vec::new(),
+                available_reasoning_efforts: None,
             },
             &mut remote,
         );
@@ -39,6 +40,7 @@ fn test_detailed_catalog_replaces_placeholder_routes_after_names_only_update() {
                     usage: None,
                     cheapness: None,
                 }],
+                available_reasoning_efforts: None,
             },
             &mut remote,
         );

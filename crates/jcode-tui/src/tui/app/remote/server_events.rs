@@ -1539,6 +1539,7 @@ fn handle_server_event_inner(
             provider_oauth_email,
             provider_oauth_account_label,
             reasoning_effort,
+            available_reasoning_efforts,
             service_tier,
             available_service_tiers,
             compaction_mode,
@@ -1845,6 +1846,13 @@ fn handle_server_event_inner(
             if session_changed || reasoning_effort.is_some() {
                 app.remote_reasoning_effort = reasoning_effort;
             }
+            // The ladder is a property of the provider/model, not of the
+            // session, but it can only arrive with a History payload. Always
+            // replace when the server reports one (and clear it when the server
+            // reports none), so a provider that genuinely has no dials cannot
+            // keep a ladder inferred from the previous provider's model id.
+            app.remote_available_reasoning_efforts = available_reasoning_efforts;
+            app.invalidate_model_picker_cache();
             app.remote_service_tier = service_tier;
             app.remote_compaction_mode = Some(compaction_mode);
             history_laps.push(("pre_header_hint", history_lap.elapsed().as_millis()));
@@ -2673,6 +2681,7 @@ fn handle_server_event_inner(
             provider_model,
             available_models,
             available_model_routes,
+            available_reasoning_efforts: _,
         } => {
             // Prefetch can hydrate account capabilities after initial History.
             // This legacy event has no tiers, so request authoritative metadata.

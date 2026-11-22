@@ -250,6 +250,53 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The server-reported ladder must win over name inference for a named
+    /// OpenAI-compatible profile whose model id looks like nothing at all.
+    ///
+    /// Regression: `/effort` on `nous-free:qwen/qwen4-max:free` printed
+    /// "Reasoning effort not available for this provider" because the client
+    /// inferred the ladder from `nous-free`/`qwen4-max` and found no branch,
+    /// even though the live provider had a full ladder.
+    #[test]
+    fn reported_ladder_overrides_name_inference_for_unknown_profiles() {
+        let mut app = App::new_for_remote(None);
+        app.remote_provider_name = Some("Nous".into());
+        app.remote_provider_model = Some("qwen/qwen4-max:free".into());
+        app.remote_available_reasoning_efforts = Some(vec![
+            "none".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "swarm".to_string(),
+        ]);
+        assert_eq!(
+            app.remote_reasoning_effort_ladder(),
+            vec!["none", "low", "medium", "high", "swarm"]
+        );
+
+        // An empty report is a real answer: no dials, and no inference.
+        app.remote_available_reasoning_efforts = Some(Vec::new());
+        assert!(app.remote_reasoning_effort_ladder().is_empty());
+
+        // Older server: no report at all, so name inference stays in charge.
+        app.remote_available_reasoning_efforts = None;
+        assert_eq!(
+            app.remote_reasoning_effort_ladder(),
+            Vec::<&'static str>::new(),
+            "nous-free/qwen4-max has no inference branch; without a server report there is no ladder"
+        );
+
+        // An older server also still knows claude-oauth, so the inference path is intact.
+        app.remote_provider_name = Some("Anthropic".into());
+        app.remote_provider_model = Some("claude-opus-4.8".into());
+        let anthropic_ladder = app.remote_reasoning_effort_ladder();
+        assert_eq!(&anthropic_ladder[..4], &["none", "low", "medium", "high"]);
+        assert!(
+            anthropic_ladder.last() == Some(&"swarm"),
+            "the swarm sentinel stays selectable: {anthropic_ladder:?}"
+        );
+    }
+
     #[test]
     fn bare_model_ignores_route_prefix_and_case() {
         assert_eq!(

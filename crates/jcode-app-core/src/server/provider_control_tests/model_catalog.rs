@@ -104,6 +104,7 @@ async fn refresh_models_emits_available_models_updated_after_prefetch() {
                 provider_model,
                 available_models,
                 available_model_routes,
+                available_reasoning_efforts: _,
             } => {
                 saw_models = Some((
                     provider_name,
