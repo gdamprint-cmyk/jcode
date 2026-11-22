@@ -1435,6 +1435,38 @@ fn mcp_display_tool_name_from_dispatch(name: &str) -> Option<String> {
     Some(format!("{} / {tool}", server.replace('_', "-")))
 }
 
+/// Always-visible name of a tool row.
+///
+/// MCP names carry no tool identity on their own (`mcp`, or a hashed
+/// `mcp__server__tool`), and `display.tool_call_details` defaults to false, in
+/// which mode the technical summary is dropped entirely. Without this the row
+/// reads only "mcp · <intent>" and the concrete tool is invisible.
+pub(super) fn resolve_row_display_name(tool: &ToolCall) -> String {
+    let resolved = resolve_display_tool_name(&tool.name).to_string();
+    let tool_name = tool
+        .input
+        .get("tool")
+        .or_else(|| tool.input.get("tool_name"))
+        .and_then(|v| v.as_str());
+    let server = tool
+        .input
+        .get("server")
+        .or_else(|| tool.input.get("server_name"))
+        .and_then(|v| v.as_str());
+    let label = match (server, tool_name) {
+        (Some(server), Some(tool_name)) => Some(mcp_display_tool_name(server, tool_name)),
+        (_, Some(tool_name)) => Some(
+            mcp_display_tool_name_from_dispatch(tool_name)
+                .unwrap_or_else(|| tool_name.trim_start_matches("mcp__").to_string()),
+        ),
+        _ => None,
+    };
+    match label {
+        Some(label) => format!("{}: {label}", resolved),
+        None => resolved,
+    }
+}
+
 /// Short essence of an MCP call, taken from the call itself: `intent` first,
 /// then the first few words of `query`. Truncated to `budget` cells, so a long
 /// intent degrades to a prefix instead of pushing the tool name off the row.

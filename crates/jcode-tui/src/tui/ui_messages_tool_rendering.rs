@@ -185,7 +185,7 @@ pub(crate) fn render_tool_message(
         width as usize
     };
     let row_width = block_width.saturating_sub(1);
-    let display_name = tools_ui::resolve_display_tool_name(&tc.name).to_string();
+    let display_name = tools_ui::resolve_row_display_name(tc);
     let base_prefix = format!("  {} {} ", icon, display_name);
     let token_suffix_width =
         UnicodeWidthStr::width(format!(" · {}", token_badge.label.as_str()).as_str());

@@ -1556,6 +1556,40 @@ fn test_tool_summary_mcp_names_the_concrete_tool() {
     assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
 }
 
+/// An MCP row must name the concrete tool even when the model also sent an
+/// intent, because the live config keeps `display.tool_call_details = false` and
+/// in that mode the technical summary is dropped entirely. Without this the row
+/// reads only "mcp · <intent>" and the fix is invisible to the user.
+#[test]
+fn render_tool_message_mcp_row_keeps_the_tool_name_with_intent() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: Some(3.0),
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_mcp_render".to_string(),
+            name: "mcp".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" },
+                "intent": "find the label"
+            }),
+            intent: Some("find the label".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+
+    assert!(rendered.contains("cgrep_agent_locate"), "rendered={rendered}");
+    assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
+}
+
 /// The live activity line should surface the model-provided `intent` for any
 /// tool (including swarm) ahead of the technical summary when tool call
 /// details are enabled.
