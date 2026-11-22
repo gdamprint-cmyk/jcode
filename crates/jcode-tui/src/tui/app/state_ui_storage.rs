@@ -615,7 +615,7 @@ mod tests {
             }),
         );
         compact_display_message_tool_data(&mut message);
-        let tool = message.tool_data.expect("tool data");
+        let tool = message.tool_data.as_ref().expect("tool data");
         assert_eq!(tool.input.get("server").and_then(|v| v.as_str()), Some("cgrep"));
         assert_eq!(
             tool.input.get("tool").and_then(|v| v.as_str()),
@@ -629,6 +629,25 @@ mod tests {
             tool.input.get("unrelated").is_none(),
             "unrelated input must still be dropped: {}",
             tool.input
+        );
+        // Compaction runs on every push AND on restore, so a second pass must
+        // not add anything: otherwise a row would grow each reload.
+        let once = message
+            .tool_data
+            .as_ref()
+            .expect("tool data")
+            .input
+            .clone();
+        compact_display_message_tool_data(&mut message);
+        let twice = message
+            .tool_data
+            .as_ref()
+            .expect("tool data")
+            .input
+            .clone();
+        assert_eq!(
+            twice, once,
+            "compaction must be idempotent: {once} vs {twice}"
         );
     }
 
