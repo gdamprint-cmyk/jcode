@@ -1590,6 +1590,39 @@ fn render_tool_message_mcp_row_keeps_the_tool_name_with_intent() {
     assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
 }
 
+/// Same guarantee without an intent: in the default mode a row with no intent
+/// falls back to the technical summary, which still carries the tool name. The
+/// assertion checks the DISPLAY slot (`mcp_call: …`), because the summary alone
+/// would satisfy a bare `contains` and mask a regression that empties the name.
+#[test]
+fn render_tool_message_mcp_row_keeps_the_tool_name_without_intent() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: Some(2.0),
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_mcp_no_intent".to_string(),
+            name: "mcp_call".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" }
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+
+    assert!(rendered.contains("mcp_call: cgrep / cgrep_agent_locate"), "rendered={rendered}");
+    assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
+}
+
 /// A tool whose input happens to carry a `tool` field must keep its own name.
 /// `integration_tools` (discover) uses `tool` for a PRODUCT name, so an
 /// MCP-shaped suffix there would be a mislabel, not a clarification.
