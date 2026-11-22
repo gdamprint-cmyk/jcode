@@ -23,6 +23,34 @@ pub(crate) fn show_tool_call_details() -> bool {
     tests_tool_call_details_override::get()
 }
 
+/// Prefix each completed tool row with the local wall-clock start time.
+#[cfg(not(test))]
+pub(crate) fn show_tool_call_local_time() -> bool {
+    crate::config::config().display.tool_call_local_time
+}
+
+#[cfg(test)]
+pub(crate) fn show_tool_call_local_time() -> bool {
+    tests_tool_call_local_time_override::get()
+}
+
+#[cfg(test)]
+pub(crate) mod tests_tool_call_local_time_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHOW_LOCAL_TIME: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn get() -> bool {
+        SHOW_LOCAL_TIME.with(Cell::get)
+    }
+
+    pub(crate) fn set(value: bool) {
+        SHOW_LOCAL_TIME.with(|cell| cell.set(value));
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests_tool_call_details_override {
     use std::cell::Cell;
@@ -1629,6 +1657,9 @@ pub(super) fn render_batch_subcall_line(
     output_content: Option<&str>,
 ) -> Line<'static> {
     let display_name = resolve_display_tool_name(&tool.name).to_string();
+    let local_time = output_content
+        .filter(|_| show_tool_call_local_time())
+        .map(|content| jcode_tui_messages::DisplayMessage::tool_start_local_label(content, chrono::Local::now()));
     let token_badge = output_content.map(|content| {
         let tokens = crate::util::estimate_tokens(content);
         let color = match crate::util::approx_tool_output_token_severity(tokens) {
@@ -1659,6 +1690,10 @@ pub(super) fn render_batch_subcall_line(
         UnicodeWidthStr::width(" · ") + UnicodeWidthStr::width(intent.as_str())
     });
     let reserved = UnicodeWidthStr::width(format!("    {} {}", icon, display_name).as_str())
+        + local_time
+            .as_ref()
+            .map(|time| UnicodeWidthStr::width(format!(" {} ", time).as_str()))
+            .unwrap_or(0)
         + 1
         + intent_width
         + token_badge.as_ref().map_or(0, |(label, _)| {
@@ -1671,6 +1706,12 @@ pub(super) fn render_batch_subcall_line(
         Span::styled(format!("    {} ", icon), Style::default().fg(icon_color)),
         Span::styled(display_name, Style::default().fg(tool_color())),
     ];
+    if let Some(time) = local_time.as_ref() {
+        spans.push(Span::styled(
+            format!(" {} ", time),
+            Style::default().fg(dim_color()),
+        ));
+    }
     if let Some(intent) = intent_display {
         spans.push(Span::styled(" · ", Style::default().fg(dim_color())));
         spans.push(Span::styled(

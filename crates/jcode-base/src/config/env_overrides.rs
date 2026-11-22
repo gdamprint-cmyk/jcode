@@ -331,6 +331,11 @@ impl Config {
                 self.display.tool_call_details = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_TOOL_CALL_LOCAL_TIME") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.tool_call_local_time = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_LATEX_RENDERING")
             && let Some(mode) = LatexRenderingMode::parse(&v)
         {

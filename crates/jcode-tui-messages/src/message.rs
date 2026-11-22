@@ -268,7 +268,7 @@ impl DisplayMessage {
 
     /// Read only the runner's leading timing header, not timing text in tool output.
     /// Some display paths prefix the header with `[tool_name]`.
-    pub fn tool_duration_from_output(output: &str) -> Option<f32> {
+    pub fn tool_timing_header_from_output(output: &str) -> Option<&str> {
         let mut prefix = output.trim_start();
         if !prefix.starts_with("[tool timing:") {
             let (label, rest) = prefix.strip_prefix('[')?.split_once(']')?;
@@ -278,6 +278,23 @@ impl DisplayMessage {
             prefix = rest.trim_start();
         }
         let header = prefix.strip_prefix("[tool timing:")?.split_once(']')?.0;
+        Some(header)
+    }
+
+    /// Local wall-clock time at which the tool run started, from the runner's
+    /// `[tool timing: start=...]` header. Falls back to "now" when the header
+    /// is absent (older transcripts, or a row built without runner timing).
+    pub fn tool_start_local_label(output: &str, now: chrono::DateTime<chrono::Local>) -> String {
+        let start = Self::tool_timing_header_from_output(output)
+            .and_then(|header| header.split_once("start=")?.1.split(' ').next())
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|utc| utc.with_timezone(&now.timezone()))
+            .unwrap_or(now);
+        start.format("%H:%M").to_string()
+    }
+
+    pub fn tool_duration_from_output(output: &str) -> Option<f32> {
+        let header = Self::tool_timing_header_from_output(output)?;
         let value = header.split_once("duration=")?.1.trim();
         let seconds = if let Some(ms) = value.strip_suffix("ms") {
             ms.parse::<u64>().ok()? as f64 / 1000.0
@@ -511,6 +528,24 @@ mod tests {
         ] {
             assert_eq!(DisplayMessage::tool_duration_from_output(output), None);
         }
+    }
+
+    #[test]
+    fn tool_start_local_label_reads_the_runner_header_in_local_time() {
+        let now = chrono::Local::now();
+        let label = DisplayMessage::tool_start_local_label(
+            "[tool timing: start=2026-05-14T14:10:08.525Z finish=2026-05-14T14:10:08.598Z duration=73ms] ok",
+            now,
+        );
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-05-14T14:10:08.525Z")
+            .unwrap()
+            .with_timezone(&now.timezone())
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(label, expected);
+
+        let fallback = DisplayMessage::tool_start_local_label("plain output", now);
+        assert_eq!(fallback, now.format("%H:%M").to_string());
     }
 
     #[test]

@@ -2799,6 +2799,51 @@ fn render_tool_message_keeps_error_summary_when_details_hidden() {
 }
 
 #[test]
+fn render_tool_message_shows_local_start_time_prefix_when_enabled() {
+    use crate::tui::ui::tools_ui::tests_tool_call_local_time_override as local_time_override;
+
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "[tool timing: start=2026-05-14T14:10:08.525Z finish=2026-05-14T14:10:08.598Z duration=73ms] ok"
+            .to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_clock".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let expected = chrono::DateTime::parse_from_rfc3339("2026-05-14T14:10:08.525Z")
+        .unwrap()
+        .with_timezone(&chrono::Local::now().timezone())
+        .format("%H:%M")
+        .to_string();
+
+    local_time_override::set(false);
+    let without = extract_line_text(&render_tool_message(
+        &msg,
+        120,
+        crate::config::DiffDisplayMode::Off,
+    )[0]);
+    assert!(!without.contains(&expected), "{without}");
+
+    local_time_override::set(true);
+    let with = extract_line_text(&render_tool_message(
+        &msg,
+        120,
+        crate::config::DiffDisplayMode::Off,
+    )[0]);
+    assert!(with.contains(&format!("✓ {expected} bash")), "{with}");
+    assert!(with.contains("73ms, 23 tok"), "{with}");
+    local_time_override::set(false);
+}
+
+#[test]
 fn render_tool_message_shows_token_badge() {
     let msg = DisplayMessage {
         role: "tool".to_string(),

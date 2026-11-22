@@ -229,6 +229,10 @@ prompt_entry_animation = true
 # technical detail.
 # tool_call_details = false
 
+# Prefix each completed tool row with the local wall-clock time it started at,
+# e.g. `✓ 21:01 bash · ... · 1.8s, 385 tok` (default: true).
+# tool_call_local_time = true
+
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)
 # when you keep doing something the slow way (e.g. /resume) instead of using
 # its configured shortcut. Set false to disable all such hints (default: true).

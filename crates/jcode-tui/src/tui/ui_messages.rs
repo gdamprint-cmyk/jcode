@@ -4399,6 +4399,15 @@ pub(crate) fn render_tool_message(
     };
     let row_width = block_width.saturating_sub(1);
     let display_name = tools_ui::resolve_display_tool_name(&tc.name).to_string();
+    let local_time = tools_ui::show_tool_call_local_time()
+        .then(|| jcode_tui_messages::DisplayMessage::tool_start_local_label(
+            &msg.content,
+            chrono::Local::now(),
+        ));
+    let local_time_prefix = local_time
+        .as_ref()
+        .map(|time| format!("{} ", time))
+        .unwrap_or_default();
     let base_prefix = format!("  {} {} ", icon, display_name);
     let token_suffix_width =
         UnicodeWidthStr::width(format!(" · {}", token_badge.label.as_str()).as_str());
@@ -4409,6 +4418,7 @@ pub(crate) fn render_tool_message(
     };
     let reserved_summary_width = row_width
         .saturating_sub(UnicodeWidthStr::width(base_prefix.as_str()))
+        .saturating_sub(UnicodeWidthStr::width(local_time_prefix.as_str()))
         .saturating_sub(token_suffix_width)
         .saturating_sub(edit_suffix_width);
 
@@ -4466,8 +4476,14 @@ pub(crate) fn render_tool_message(
 
     let mut tool_line = vec![
         Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(display_name, Style::default().fg(tool_color())),
     ];
+    if let Some(time) = local_time.as_ref() {
+        tool_line.push(Span::styled(
+            format!("{} ", time),
+            Style::default().fg(dim_color()),
+        ));
+    }
+    tool_line.push(Span::styled(display_name, Style::default().fg(tool_color())));
     if let Some(intent) = intent {
         tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
         tool_line.push(Span::styled(
