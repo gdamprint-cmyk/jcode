@@ -1272,16 +1272,6 @@ fn record_reframe_observations(
     (observations, immediate)
 }
 
-/// Longest description kept in the model-facing todo list for a COMPLETED card.
-///
-/// reference: no prior art for this bound; the repo's established tool-output
-/// bounding helper is `crate::util::truncate_str` (used by bash/read/edit/
-/// agentgrep/apply_patch with 600..10000 byte limits). Measured on this host's
-/// 520-card board: 2000 bytes -> 40% of the description bytes saved, 800 ->
-/// 63%, 400 -> 76%, 200 -> 85%. 400 keeps a finished item's conclusion
-/// readable while removing three quarters of the bulk.
-const PUBLIC_DESCRIPTION_MAX_BYTES: usize = 400;
-
 /// Tool-maintained history arrays.
 ///
 /// reference: in-repo precedent for field removal at the tool boundary is
@@ -1359,47 +1349,42 @@ fn model_facing_json<T: Serialize>(value: &T) -> Result<String> {
 /// stays in the tool's metadata and in the on-disk store, so nothing is lost
 /// - only the model-facing rendering is compacted.
 ///
+/// MEASURED 2026-11-22: one live `todo` result was 105,325 B / 183 cards, of which
+/// 179 completed (88,399 B) and 2 cancelled; the OPEN cards were 5,504 B. A board
+/// never shrinks and every call renders the whole stored list, so finished work
+/// dominates what is re-sent each turn. Completion gates read the STORED structs,
+/// so dropping closed cards from this rendering loses them nothing.
+///
 /// reference: no prior art, searched "public_todos" and "details truncate" in
 /// crates/jcode-app-core/src (only hit is `todo_names::public_todos` itself).
 fn public_todos_compact(todos: &[TodoItem]) -> Result<Value> {
     let mut value = names::public_todos(todos)?;
-    truncate_completed_descriptions(&mut value);
     strip_tool_maintained_history(&mut value);
+    drop_terminal_cards(&mut value);
     Ok(value)
 }
 
-/// Truncate the description of every COMPLETED card, in place.
-fn truncate_completed_descriptions(value: &mut Value) {
+/// Drop cards that are finished from the model-facing array, replacing them with
+/// one counter line.
+fn drop_terminal_cards(value: &mut Value) {
     let Some(items) = value.as_array_mut() else {
         return;
     };
-    for item in items {
-        let Some(fields) = item.as_object_mut() else {
-            continue;
-        };
-        let completed = fields
-            .get("status")
+    let before = items.len();
+    items.retain(|item| {
+        item.get("status")
             .and_then(Value::as_str)
-            .map(|status| status == "completed")
-            .unwrap_or(false);
-        let Some(description) = fields.get("description").and_then(Value::as_str) else {
-            continue;
-        };
-        // An OPEN card's description is the brief the model is working
-        // from - keep it whole. A COMPLETED card's description is finished
-        // prose the model only needs a trace of.
-        if !completed || description.len() <= PUBLIC_DESCRIPTION_MAX_BYTES {
-            continue;
-        }
-        let truncated = crate::util::truncate_str(description, PUBLIC_DESCRIPTION_MAX_BYTES);
-        fields.insert(
-            "description".into(),
-            json!(format!(
-                "{truncated}\n[truncated: {} bytes total]",
-                description.len()
-            )),
-        );
-        fields.insert("description_truncated".into(), Value::Bool(true));
+            .is_none_or(|status| {
+                status == "pending" || status == "in_progress" || status == "blocked"
+            })
+    });
+    let dropped = before - items.len();
+    if dropped > 0 {
+        items.push(json!({
+            "name": format!("[{dropped} finished cards omitted]"),
+            "status": "summary",
+            "priority": "low",
+        }));
     }
 }
 

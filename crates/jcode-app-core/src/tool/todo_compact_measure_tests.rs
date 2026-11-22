@@ -1,16 +1,13 @@
-//! Measurement harness for the layer-2 compaction.
+//! Measurement harness for the model-facing compaction.
 //!
 //! reference: no prior art, searched "public_todos_compact" and "confidence
 //! history" in crates/jcode-app-core/src (the tool's own helpers only). It
-//! renders the same board through the same code path, once with the history
-//! arrays (the pre-layer-2 rendering) and once without, and compares the two
-//! byte counts.
+//! renders the same board through the same code path, once with every card and
+//! the history arrays kept, and once compacted, and compares byte counts.
 //!
-//! Measured on this host (2026-11-08): a 100-card board with a 5-entry
-//! confidence history per card and a 5-entry plan intent history renders at
-//! 77695 bytes before layer 2 and 64578 bytes after - 13117 bytes (16.9%)
-//! saved. The histories keep growing while the board does not, so the saving
-//! grows with the number of observations.
+//! MEASURED 2026-11-22 on this host: a live `todo` result was 105,325 B / 183
+//! cards, of which 179 completed (88,399 B) and 2 cancelled; the open cards
+//! were 5,504 B. Finished work is the dominant term, so it is what leaves.
 
 use crate::todo::{ConfidenceState, IntentUnderstanding, TodoItem, TodoPlan};
 use crate::tool::todo::names;
@@ -41,7 +38,7 @@ fn board() -> Vec<TodoItem> {
 }
 
 #[test]
-fn the_history_arrays_cost_a_sixth_of_the_board() {
+fn finished_cards_leave_the_model_facing_board() {
     let todos = board();
     let plan = TodoPlan {
         title: None,
@@ -56,14 +53,13 @@ fn the_history_arrays_cost_a_sixth_of_the_board() {
         ],
     };
 
-    // BEFORE: layer-1 compaction only (truncated descriptions, histories kept).
-    let mut before_list = names::public_todos(&todos).expect("public");
-    super::truncate_completed_descriptions(&mut before_list);
+    // BEFORE: every card rendered with its description and its history arrays.
+    let before_list = names::public_todos(&todos).expect("public");
     let mut before = serde_json::to_string_pretty(&before_list).expect("serialize");
     before.push_str("\n\nPlan:\n");
     before.push_str(&serde_json::to_string_pretty(&plan).expect("serialize"));
 
-    // AFTER: layer-2 compaction (histories dropped too).
+    // AFTER: the current model-facing rendering.
     let after = super::public_todos_compact(&todos).expect("compact");
     let mut after_text = serde_json::to_string_pretty(&after).expect("serialize");
     after_text.push_str("\n\nPlan:\n");
@@ -71,11 +67,11 @@ fn the_history_arrays_cost_a_sixth_of_the_board() {
 
     eprintln!("MEASURE_BEFORE_BYTES={}", before.len());
     eprintln!("MEASURE_AFTER_BYTES={}", after_text.len());
-    assert_eq!(before.len(), 77_695, "measured layer-1 rendering size");
-    assert_eq!(after_text.len(), 64_578, "measured layer-2 rendering size");
+    assert_eq!(before.len(), 231_095, "measured full rendering size");
+    assert_eq!(after_text.len(), 188, "measured compacted rendering size");
     assert!(
-        after_text.len() * 10 < before.len() * 9,
-        "the history arrays must cost a real share of the board: {} vs {} bytes",
+        after_text.len() * 10 < before.len(),
+        "finished cards must be gone from the board: {} vs {} bytes",
         after_text.len(),
         before.len()
     );

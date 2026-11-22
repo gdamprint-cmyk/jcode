@@ -33,44 +33,52 @@ fn an_open_card_keeps_its_full_description() {
 }
 
 #[test]
-fn a_completed_card_is_truncated_and_marked() {
+fn a_completed_card_is_dropped_from_the_board() {
+    // The model never re-plans finished work; the completion gates read the
+    // stored structs, so the closed card can leave the model-facing list.
     let long = "y".repeat(9_000);
     let todos = vec![item("done", "completed", &long)];
     let public = super::public_todos_compact(&todos).expect("public todos");
-    let description = public[0]["description"].as_str().expect("description");
     assert!(
-        description.len() < long.len(),
-        "a completed card's description must be cut down"
-    );
-    assert!(
-        description.contains("[truncated:"),
-        "a truncated description must say so: {description}"
-    );
-    assert_eq!(
-        public[0]["description_truncated"].as_bool(),
-        Some(true),
-        "the card must be marked as truncated"
+        public.as_array().is_none_or(|items| {
+            items
+                .iter()
+                .all(|entry| entry["status"].as_str() != Some("completed"))
+        }),
+        "a board with only finished cards must not render finished cards: {public}"
     );
 }
 
 #[test]
-fn a_short_completed_card_is_left_alone() {
-    let todos = vec![item("done", "completed", "short note")];
+fn a_cancelled_card_is_dropped_and_an_open_card_survives() {
+    let todos = vec![
+        item("done", "completed", "short note"),
+        item("cancelled", "cancelled", "dropped"),
+        item("open", "in_progress", "the brief"),
+    ];
     let public = super::public_todos_compact(&todos).expect("public todos");
-    assert_eq!(public[0]["description"].as_str(), Some("short note"));
-    assert!(public[0].get("description_truncated").is_none());
+    let names: Vec<&str> = public
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(names.contains(&"open"), "the open card must survive: {names:?}");
+    assert!(!names.contains(&"done"), "the finished card must be gone: {names:?}");
+    assert!(!names.contains(&"cancelled"), "{names:?}");
 }
 
 #[test]
 fn the_plan_shape_survives_compaction() {
     // Compaction may shrink prose, but never the structure the model plans with.
+    // A still-open card is the one whose shape matters here.
     let long = "z".repeat(9_000);
-    let mut todo = item("done", "completed", &long);
+    let mut todo = item("open", "in_progress", &long);
     todo.group = Some("lane-a".to_string());
     let todos = vec![todo];
     let public = super::public_todos_compact(&todos).expect("public todos");
-    assert_eq!(public[0]["name"].as_str(), Some("done"));
-    assert_eq!(public[0]["status"].as_str(), Some("completed"));
+    assert_eq!(public[0]["name"].as_str(), Some("open"));
+    assert_eq!(public[0]["status"].as_str(), Some("in_progress"));
     assert_eq!(public[0]["priority"].as_str(), Some("medium"));
     assert_eq!(public[0]["group"].as_str(), Some("lane-a"));
 }
@@ -175,12 +183,9 @@ fn the_tool_metadata_still_carries_both_histories() {
 }
 
 #[test]
-fn a_full_board_of_completed_cards_shrinks_to_a_fraction() {
-    // The measured problem: 520 cards / 844 KB, of which 838 KB was `details`
-    // on completed cards. The compacted list must be far smaller.
-    let long = "w".repeat(9_000);
+fn a_finished_board_collapses_to_a_counter() {
     let todos: Vec<TodoItem> = (0..100)
-        .map(|index| item(&format!("card-{index}"), "completed", &long))
+        .map(|index| item(&format!("card-{index}"), "completed", "note"))
         .collect();
     let public = super::public_todos_compact(&todos).expect("public todos");
     let compacted = serde_json::to_string(&public).expect("serialize");
