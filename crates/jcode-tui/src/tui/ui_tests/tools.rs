@@ -1469,6 +1469,56 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
     }
 }
 
+/// MCP rows must name the concrete tool, not the action verb: a row that says
+/// only "call" does not identify what ran. Both spellings are covered -
+/// `mcp action=call` with a raw server/tool pair, and a dispatch-named call.
+#[test]
+fn test_tool_summary_mcp_names_the_concrete_tool() {
+    let pair = ToolCall {
+        id: "call_mcp_pair".to_string(),
+        name: "mcp".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate",
+            "arguments": { "query": "mcp label", "intent": "find the label" }
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(80));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+
+    let dispatch = ToolCall {
+        id: "call_mcp_dispatch".to_string(),
+        name: "mcp__cgrep__cgrep_agent_locate".to_string(),
+        input: serde_json::json!({
+            "intent": "find the label",
+            "query": "mcp label",
+            "path": "crates"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&dispatch, 50, Some(80));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+
+    // Same call data, different key order: the label must not depend on it.
+    let reordered = ToolCall {
+        id: "call_mcp_reordered".to_string(),
+        name: "mcp_call".to_string(),
+        input: serde_json::json!({
+            "arguments": {},
+            "tool": "cgrep_agent_locate",
+            "server": "cgrep"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&reordered, 50, Some(80));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+}
+
 /// The live activity line should surface the model-provided `intent` for any
 /// tool (including swarm) ahead of the technical summary when tool call
 /// details are enabled.

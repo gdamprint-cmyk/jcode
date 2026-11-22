@@ -1025,22 +1025,33 @@ pub(super) fn get_tool_summary_with_budget(
                 .unwrap_or_default();
             format!("{} {}", action, target).trim().to_string()
         }
-        "mcp" => {
-            let action = tool
+        // Deterministic MCP label: the tool name identifies the call, so it is
+        // read by name and never depends on argument order. `server` stays out of
+        // the prefix because the tool name already carries it.
+        "mcp" | "mcp_call" => {
+            let tool_name = tool
                 .input
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .get("tool")
+                .or_else(|| tool.input.get("tool_name"))
+                .and_then(|v| v.as_str());
             let server = tool
                 .input
                 .get("server")
                 .or_else(|| tool.input.get("server_name"))
                 .and_then(|v| v.as_str());
-            if let Some(s) = server {
-                format!("{} {}", action, s)
-            } else {
-                action.to_string()
-            }
+            let label = match (server, tool_name) {
+                (Some(server), Some(tool_name)) => mcp_display_tool_name(server, tool_name),
+                (_, Some(tool_name)) => mcp_display_tool_name_from_dispatch(tool_name)
+                    .unwrap_or_else(|| tool_name.trim_start_matches("mcp__").to_string()),
+                (Some(server), None) => format!("{} / tool", server),
+                (None, None) => tool
+                    .input
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp")
+                    .to_string(),
+            };
+            truncate_middle_display(&label, bounded(64))
         }
         "todo" => {
             if let Some(count) = tool
@@ -1370,13 +1381,9 @@ pub(super) fn get_tool_summary_with_budget(
                 .unwrap_or("debug_socket");
             truncate_middle_display(cmd, bounded(40))
         }
-        name if name.starts_with("mcp__") => tool
-            .input
-            .as_object()
-            .and_then(|obj| obj.iter().find(|(_, v)| v.is_string()))
-            .and_then(|(_, v)| v.as_str())
-            .map(|s| truncate_middle_display(s, bounded(40)))
-            .unwrap_or_default(),
+        name if name.starts_with("mcp__") => {
+            mcp_dispatch_name_display(name, bounded(64))
+        }
         // Generic fallback: most action-shaped tools (ambient tools, future
         // additions) at least carry an "action" field. Showing it beats an
         // empty summary, which reads like the row failed to render.
@@ -1387,6 +1394,33 @@ pub(super) fn get_tool_summary_with_budget(
             .map(|action| action.to_string())
             .unwrap_or_default(),
     }
+}
+
+/// Human-readable MCP tool label for a `(server, tool)` pair. Reuses the
+/// dispatch-name normalizer so the row and the registry agree on identity.
+fn mcp_display_tool_name(server: &str, tool: &str) -> String {
+    let dispatch = crate::mcp::dispatch_name(server, tool);
+    mcp_display_tool_name_from_dispatch(&dispatch)
+        .unwrap_or_else(|| dispatch.trim_start_matches("mcp__").to_string())
+}
+
+/// `mcp__<server>__<tool>` -> `server / tool`. Returns `None` for names whose
+/// tool half was truncated to a hash suffix, where a split would be misleading.
+fn mcp_display_tool_name_from_dispatch(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{} / {tool}", server.replace('_', "-")))
+}
+
+/// Row prefix for a dispatch-named MCP call. Falls back to the trimmed
+/// dispatch name so a truncated/hash-suffixed tool still shows its identity.
+fn mcp_dispatch_name_display(name: &str, budget: usize) -> String {
+    let label = mcp_display_tool_name_from_dispatch(name)
+        .unwrap_or_else(|| name.trim_start_matches("mcp__").to_string());
+    truncate_middle_display(&label, budget)
 }
 
 /// Keep timing and token usage together as one compact metadata group.
