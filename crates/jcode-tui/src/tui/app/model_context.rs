@@ -1299,19 +1299,50 @@ impl App {
                 .session
                 .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
             if stripped > 0 {
-                self.messages.clear();
-                self.reseed_compaction_from_provider_messages();
+                self.refresh_provider_messages_from_session();
                 self.push_display_message(DisplayMessage::error(format!(
                     "Error: {} Dropped {} oversized image(s); you can retry.",
                     visible_error, stripped
                 )));
-            } else {
+            } else if self.session.strip_all_images() > 0 {
+                // The 413 came from the whole body, so an image can be far under
+                // the per-image byte budget and still be the payload that pushes
+                // the request over the gateway ceiling. `strip_oversized_images`
+                // only drops images above `PAYLOAD_IMAGE_CHAR_BUDGET` and returns
+                // 0 here, which used to strand the session on `/fix`. Dropping
+                // every inline image is the same deterministic move the
+                // image-rejection recovery already makes (#1712): the request
+                // shrinks, the turn can proceed, and the context survives as
+                // text notes. No message is removed and nothing is persisted
+                // until the next save, so the user can still re-open the images.
+                crate::logging::warn(
+                    "Request-too-large recovery: no image exceeded the per-image budget; dropped every inline image so the whole body fits",
+                );
+                self.refresh_provider_messages_from_session();
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Request body was too large but no inline images could be dropped. Run /fix to try manual recovery.",
+                    "Error: {} Dropped all inline images so the request fits; you can retry.",
                     visible_error
                 )));
-                super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
-                self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+            } else {
+                // No inline image left to drop: the body is text (or already
+                // stripped), so this is an ordinary size-overflow recovery, not
+                // a dead end. Reuse the context-limit path, which hard-compacts
+                // and then truncates large tool results; only if that also fails
+                // is the turn genuinely stuck and auto-poke gets disarmed.
+                let recovery = self.auto_recover_context_limit();
+                let recovered = recovery.is_some();
+                let hint = match recovery {
+                    Some(msg) => format!(" {}", msg),
+                    None => " Request body was too large and auto-recovery could not shrink it. Run /fix to try manual recovery.".to_string(),
+                };
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {}{}",
+                    visible_error, hint
+                )));
+                if !recovered {
+                    super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
+                    self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+                }
             }
             return;
         }

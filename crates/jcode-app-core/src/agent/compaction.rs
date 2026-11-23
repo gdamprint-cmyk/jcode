@@ -237,6 +237,26 @@ impl Agent {
     /// the token context window. We strip oversized images from the persisted
     /// transcript, oldest-first, down to a conservative byte budget and reset the
     /// provider session/cache so the caller can retry the same turn immediately.
+    ///
+    /// The cap is on the whole body, not on each image. An aggregator such as Nous
+    /// Research's `inference-api.nousresearch.com` answers
+    /// `413 Request in excess of 10MB` for a body whose images are each far below
+    /// `PAYLOAD_IMAGE_CHAR_BUDGET` (measured 2026-11-23: 24 screenshots of ~0.42
+    /// MiB, every one under the per-image cap). When that strip therefore removes
+    /// nothing, dropping every remaining inline image is the same deterministic
+    /// move the image-rejection recovery already makes (#1712) and is what gets
+    /// the retry under the ceiling. Only a body with no images left at all is
+    /// handed back to the caller.
+    ///
+    /// reference: request-body size ceilings are provider policy.
+    ///   Anthropic Messages API: 128 MB max request size, 413 `request_too_large`
+    ///   (https://docs.claude.com/en/api/errors, "Request size limits").
+    ///   HTTP 413 constrains the request content, not any single field
+    ///   (https://www.rfc-editor.org/rfc/rfc9110.html#name-413-content-too-large).
+    ///   Nous Research inference-api.nousresearch.com: measured 413
+    ///   "Request in excess of 10MB. That's too big." on 2026-11-23; no public
+    ///   page states the limit, the value comes from the observed gateway
+    ///   response and the request-body character counts in the session log.
     fn try_recover_after_payload_too_large(&mut self, error: &str) -> bool {
         if !crate::compaction::is_request_payload_too_large_error(error) {
             return false;
@@ -245,7 +265,18 @@ impl Agent {
         let stripped = self
             .session
             .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-        if stripped == 0 {
+        let stripped_all = if stripped == 0 {
+            let all = self.session.strip_all_images();
+            if all > 0 {
+                logging::warn(
+                    "Request-too-large recovery: no image exceeded the per-image budget; dropped every inline image so the whole body fits",
+                );
+            }
+            all
+        } else {
+            0
+        };
+        if stripped == 0 && stripped_all == 0 {
             logging::warn(
                 "Request-too-large recovery skipped: no oversized inline images to strip",
             );
@@ -263,7 +294,9 @@ impl Agent {
                 "request_payload_too_large",
             )
             .with_session_id(self.session.id.clone())
-            .with_detail(format!("images_stripped={stripped}"))
+            .with_detail(format!(
+                "images_stripped={stripped},all_images_stripped={stripped_all}"
+            ))
             .force_attribution(),
         );
 

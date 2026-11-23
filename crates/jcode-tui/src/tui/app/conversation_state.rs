@@ -18,6 +18,24 @@ impl App {
         }
     }
 
+    /// Rebuild the in-memory provider snapshot from the authoritative stored
+    /// transcript after that transcript was rewritten underneath us.
+    ///
+    /// `strip_oversized_images`/`strip_all_images` mutate `session.messages`
+    /// and deliberately leave `messages` (the materialized scratch copy) alone:
+    /// `run_compaction_retry_turn` clears it itself. A recovery path that reports
+    /// success without refreshing the snapshot would leave the next request
+    /// rebuilding from the OLD copy, so the 413 would repeat with every image
+    /// still attached. Measured 2026-11-23 while fixing the humpback 413.
+    pub(super) fn refresh_provider_messages_from_session(&mut self) {
+        if self.is_remote || !self.messages.is_empty() {
+            return;
+        }
+        let provider_messages = self.session.messages_for_provider_uncached();
+        self.messages = provider_messages;
+        self.reset_tool_output_tracking();
+    }
+
     pub(super) fn local_transcript_message_count(&self) -> usize {
         if self.is_remote {
             self.messages.len()

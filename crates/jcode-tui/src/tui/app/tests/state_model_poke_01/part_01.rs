@@ -1387,5 +1387,104 @@ fn test_mouse_scroll_over_tool_side_panel_scrolls_shared_right_pane_without_chan
     assert!(!app.diff_pane_auto_scroll);
 }
 
+#[test]
+fn test_payload_too_large_with_images_under_budget_drops_all_images() {
+    use crate::message::ContentBlock;
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+    // Auto-poke must be armed so the assertion proves this path keeps it alive.
+    app.auto_poke_incomplete_todos = true;
+    app.auto_poke_default_on = true;
+
+    // The measured humpback 413: the gateway ceiling counts the WHOLE body, so
+    // images can each be far under `PAYLOAD_IMAGE_CHAR_BUDGET` (a total, not a
+    // per-image cap) and `strip_oversized_images` still removes nothing. The old
+    // code then wrote "no inline images could be dropped" and disarmed auto-poke,
+    // stranding an unattended session on `/fix`.
+    let image = "a".repeat(1024 * 1024); // 1 MiB base64 each
+    for _ in 0..4 {
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: image.clone(),
+            }],
+        );
+    }
+
+    app.handle_turn_error(
+        "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large\n  \
+         response: {\"status\":413,\"message\":\"Request in excess of 10MB. That's too big.\"}",
+    );
+
+    // 4 MiB of images is under the 6 MiB total budget, so the per-image strip
+    // must NOT be what saved us: every image had to go.
+    assert_eq!(
+        app.session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.content[0], ContentBlock::Image { .. }))
+            .count(),
+        0,
+        "a body-size 413 with images under the budget must drop every inline image"
+    );
+    assert!(
+        app.session
+            .messages
+            .iter()
+            .all(|message| matches!(message.content[0], ContentBlock::Text { .. })),
+        "dropped images must survive as text notes, not vanish"
+    );
+    assert!(
+        app.auto_poke_incomplete_todos,
+        "a 413 that can be retried must not disarm the follow-up"
+    );
+    assert!(app.auto_poke_default_on);
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|message| message.content.contains("Dropped all inline images")),
+        "the session must be told that every image was dropped"
+    );
+    assert!(
+        !app
+            .display_messages
+            .iter()
+            .any(|message| message.content.contains("no inline images could be dropped")),
+        "the session must not be told to run /fix for a retryable body-size rejection"
+    );
+}
+
+#[test]
+fn test_payload_too_large_without_images_still_stops_auto_poke_when_recovery_fails() {
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+    app.auto_poke_incomplete_todos = true;
+    app.auto_poke_default_on = true;
+    app.session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a long text-only transcript".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    app.handle_turn_error(
+        "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large",
+    );
+
+    // Negative control: a single short text message cannot be compacted, so the
+    // failure is genuinely unrecoverable here and auto-poke must be disarmed.
+    assert!(!app.auto_poke_incomplete_todos);
+    assert!(!app.auto_poke_default_on);
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|message| message.role == "error"
+                && message.content.contains("auto-recovery could not shrink it")),
+        "the user must be told that recovery was attempted and failed"
+    );
+}
+
 #[path = "part_01/side_pane_extent.rs"]
 mod side_pane_extent;
