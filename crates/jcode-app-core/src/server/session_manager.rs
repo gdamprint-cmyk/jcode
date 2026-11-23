@@ -99,20 +99,11 @@ impl SessionManager {
         Ok(agent)
     }
 
-    /// Retire the published runtime for `session_id`. The registry entry and its
-    /// owner tombstone go together: hiding a live runtime must not leave an
-    /// upgradeable tombstone behind, or the next restore is banned forever while
-    /// the retiring handle stays alive (measured 2026-11-23:
-    /// `resume_restore_failed ... still has a runtime owner`).
     pub(super) async fn remove(&self, session_id: &str) -> Option<AgentHandle> {
         let mut agents = self.agents.write().await;
         let removed = agents.remove(session_id);
         if removed.is_some() {
             self.observers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(session_id);
-            self.owners
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(session_id);
@@ -122,36 +113,28 @@ impl SessionManager {
 
     pub(super) async fn remove_if_same(&self, session_id: &str, expected: &AgentHandle) -> bool {
         let mut agents = self.agents.write().await;
-        if !agents
+        if agents
             .get(session_id)
             .is_some_and(|agent| Arc::ptr_eq(agent, expected))
         {
-            return false;
+            agents.remove(session_id);
+            self.observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
+            true
+        } else {
+            false
         }
-        agents.remove(session_id);
-        self.observers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
-        self.owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
-        true
     }
 
     pub(super) async fn retain(&self, mut keep: impl FnMut(&String, &AgentHandle) -> bool) {
         let mut agents = self.agents.write().await;
         agents.retain(|id, agent| keep(id, agent));
-        let live: std::collections::HashSet<&String> = agents.keys().collect();
         self.observers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|id, _| live.contains(id));
-        self.owners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|id, _| live.contains(id));
+            .retain(|id, _| agents.contains_key(id));
     }
 
     #[cfg(test)]
