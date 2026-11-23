@@ -105,8 +105,7 @@ impl Config {
 - Spawn hook: {}
 - Review: {}
 - Judge: {}
-- Memory recall: Jev ({})
-- Memory extraction sidecar: {}
+- Memory recall: {}
 - Ambient: {}
 
 **Gateway:**
@@ -300,12 +299,7 @@ impl Config {
                 .model
                 .as_deref()
                 .unwrap_or("(inherit current session)"),
-            self.agents.memory_jev_provider,
-            if self.agents.memory_sidecar_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
+            self.agents.memory_provider,
             self.ambient
                 .model
                 .as_deref()
@@ -378,5 +372,31 @@ impl Config {
                 "disabled"
             },
         )
+    }
+}
+
+impl Config {
+    /// Keyboards the companion watches for global push-to-talk.
+    ///
+    /// `[dictation] global_devices` wins. When it is empty, the keyboards
+    /// already chosen in Jcode Desktop (`[desktop.voice] global_devices`) are
+    /// used, so push-to-talk keeps working while Desktop is closed.
+    pub fn global_voice_devices(&self) -> Vec<std::path::PathBuf> {
+        if !self.dictation.global_devices.is_empty() {
+            return self.dictation.global_devices.clone();
+        }
+        self.desktop
+            .as_ref()
+            .and_then(|desktop| desktop.get("voice"))
+            .and_then(|voice| voice.get("global_devices"))
+            .and_then(|devices| devices.as_array())
+            // Missing legacy desktop devices means there are no configured
+            // devices, not a configuration read or parse failure.
+            .into_iter()
+            .flatten()
+            .filter_map(|device| device.as_str())
+            .filter(|device| !device.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 }

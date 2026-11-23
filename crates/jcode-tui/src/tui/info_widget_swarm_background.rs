@@ -1,5 +1,5 @@
 use super::frame::{self, Framed};
-use super::{BackgroundInfo, InfoWidgetData, SwarmInfo, truncate_smart};
+use super::{BackgroundInfo, InfoWidgetData, SwarmInfo, clip};
 use crate::protocol::SwarmMemberStatus;
 use crate::tui::color_support::rgb;
 use ratatui::prelude::*;
@@ -27,7 +27,7 @@ pub(super) fn render_swarm_widget(data: &InfoWidgetData, inner: Rect) -> Framed 
         lines.push(Line::from(vec![
             Span::styled("▶ ", Style::default().fg(rgb(255, 200, 100))),
             Span::styled(
-                truncate_smart(status, inner.width.saturating_sub(4) as usize),
+                clip(status, inner.width.saturating_sub(4) as usize),
                 Style::default().fg(rgb(200, 200, 210)),
             ),
         ]));
@@ -157,7 +157,7 @@ fn swarm_member_line(member: &SwarmMemberStatus, max_width: usize) -> Line<'stat
         detail = format!(" - {}", detail);
     }
     let role_prefix = swarm_role_prefix(member);
-    let line_text = truncate_smart(&format!("{} {}{}", name, member.status, detail), max_width);
+    let line_text = clip(&format!("{} {}{}", name, member.status, detail), max_width);
     let (color, icon) = swarm_status_style(&member.status);
     Line::from(vec![
         Span::styled(
@@ -186,7 +186,7 @@ fn render_swarm_name_line(name: &str, max_name_len: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled("  · ", Style::default().fg(rgb(100, 100, 110))),
         Span::styled(
-            truncate_smart(name, max_name_len),
+            clip(name, max_name_len),
             Style::default().fg(rgb(140, 140, 150)),
         ),
     ])
@@ -259,12 +259,12 @@ fn background_task_rows(
             None
         };
         let row_text = if let Some(detail) = detail {
-            truncate_smart(
+            clip(
                 &format!("{} · {}", task, detail),
                 row_width.saturating_sub(2),
             )
         } else {
-            truncate_smart(task, row_width.saturating_sub(2))
+            clip(task, row_width.saturating_sub(2))
         };
         lines.push(Line::from(vec![
             Span::raw(indent),
@@ -338,24 +338,7 @@ pub(crate) fn background_task_row_line(
 
 fn truncate_task_label(label: &str, max_width: usize) -> String {
     let label = label.replace(['\r', '\n'], " ");
-    if UnicodeWidthStr::width(label.as_str()) <= max_width {
-        return label;
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    let mut truncated = String::new();
-    let mut used = 0usize;
-    for ch in label.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w + 1 > max_width {
-            break;
-        }
-        used += w;
-        truncated.push(ch);
-    }
-    truncated.push('…');
-    truncated
+    clip(&label, max_width)
 }
 
 fn background_summary(info: &BackgroundInfo) -> Option<String> {
@@ -399,6 +382,9 @@ fn dock_is_attention(status: &str) -> bool {
 /// The dock owns lifecycle health and alerts. Task titles and ordinary live
 /// activity belong to the todo lanes, so do not echo them here.
 fn dock_activity(member: &SwarmMemberStatus) -> String {
+    if let Some(note) = super::swarm_gallery::member_wait_note(member) {
+        return note;
+    }
     let detail = member.detail.as_deref().unwrap_or_default().trim();
     let is_message = detail.starts_with("DM from ") || detail.starts_with("Cross-swarm DM from ");
     if !dock_is_attention(&member.status) && !is_message {
@@ -495,8 +481,9 @@ fn render_swarm_dock(info: &SwarmInfo, inner: Rect) -> Framed {
 
     let mut lines = Vec::with_capacity(rows);
     for member in shown {
-        let accent = status_accent(&member.status);
-        let glyph = status_glyph(&member.status, info.spinner_frame);
+        let display_status = super::swarm_gallery::member_display_status(member);
+        let accent = status_accent(display_status);
+        let glyph = status_glyph(display_status, info.spinner_frame);
         let finished = dock_is_finished(&member.status);
 
         let right = member
@@ -666,6 +653,31 @@ mod substantive_footer_tests {
         let clipped = render_swarm_widget(&data, Rect::new(0, 0, 40, 1));
         assert_eq!(clipped.lines.len(), 1);
         assert!(clipped.footer.unwrap().to_string().contains("+1 more"));
+    }
+
+    #[test]
+    fn dock_wait_has_clock_and_reason_instead_of_false_quiet_alert() {
+        let mut worker = member("one", "running");
+        worker.runtime.wait_reason = Some("Waiting for build".into());
+        worker.runtime.wait_age_secs = Some(180);
+        worker.runtime.activity_age_secs = Some(300);
+        assert_eq!(dock_activity(&worker), "Waiting for build · 3m");
+        let data = InfoWidgetData {
+            swarm_info: Some(SwarmInfo {
+                managed_members: vec![worker],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rendered = render_swarm_widget(&data, Rect::new(0, 0, 80, 2));
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(text.contains('◷'), "{text}");
+        assert!(text.contains("Waiting for build"), "{text}");
+        assert!(!text.contains("quiet"), "{text}");
     }
 
     #[test]

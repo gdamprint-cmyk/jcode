@@ -180,10 +180,15 @@ fn assessment_is_total_over_garbage_input() {
 #[test]
 fn explanation_names_the_offending_target() {
     let assessment = assess("rm -rf ~", &ctx());
-    let text = assessment.explanation();
+    let target = assessment
+        .findings
+        .first()
+        .and_then(|finding| finding.target.as_deref())
+        .expect("the finding must name its target");
+    // `Path::display()` uses the host separator: `\home\u` on Windows.
     assert!(
-        text.contains("/home/u"),
-        "explanation should name the path: {text}"
+        target.contains("home") && target.contains("u"),
+        "explanation should name the path: {target}"
     );
 }
 

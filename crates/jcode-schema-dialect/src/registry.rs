@@ -6,6 +6,14 @@
 //! keyword the provider would have accepted is a slightly less expressive tool
 //! schema, while the cost of listing one it rejects is every request failing.
 
+// reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+// The Gemini `Schema` resource: `type` is one enum value, `nullable` is a
+// separate boolean. That is why the Gemini-family dialects carry the
+// `union_type_as_nullable` transform. The rejected union form is reported
+// publicly with identical error text in
+// https://github.com/n8n-io/n8n/issues/15553 and
+// https://github.com/langchain-ai/langchainjs/issues/9691.
+
 use crate::dialect::{DialectSpec, DialectTransforms};
 
 /// Annotations and validation keywords the OpenAI function-parameters subset
@@ -100,9 +108,15 @@ pub const GEMINI: DialectSpec = DialectSpec {
         // the `swarm` tool expresses its spawn/non-spawn branches. Nested
         // `anyOf` inside a property is fine, so only the root is widened.
         flatten_top_level_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // `type` is a single enum in the Schema proto, so a JSON Schema union
+        // (`["array", "null"]`) has no proto spelling and the whole request is
+        // rejected while parsing the payload.
+        // reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+        union_type_as_nullable: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -193,9 +207,14 @@ pub const ANTIGRAVITY_CLAUDE: DialectSpec = DialectSpec {
     supported_string_formats: &[],
     transforms: DialectTransforms {
         flatten_all_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // Every Antigravity request is a `generateContent` payload, so it has
+        // the same single-value `type` field as the Gemini dialect.
+        // reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+        union_type_as_nullable: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -223,9 +242,13 @@ pub const ANTIGRAVITY_BRIDGE: DialectSpec = DialectSpec {
     supported_string_formats: &[],
     transforms: DialectTransforms {
         flatten_all_combiners: true,
+        scalar_types: true,
         prune_dangling_required: true,
         const_as_enum: true,
         one_of_as_any_of: true,
+        // Same `generateContent` payload as the Gemini dialect above.
+        // reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+        union_type_as_nullable: true,
         ..DEFAULT_TRANSFORMS
     },
 };
@@ -237,7 +260,9 @@ const DEFAULT_TRANSFORMS: DialectTransforms = DialectTransforms {
     prune_dangling_required: false,
     const_as_enum: false,
     one_of_as_any_of: false,
+    scalar_types: false,
     merge_all_of_branches: false,
+    union_type_as_nullable: false,
 };
 
 /// Every registered dialect, for conformance sweeps.

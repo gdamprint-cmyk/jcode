@@ -3,6 +3,20 @@ use super::openrouter_sse_stream::run_stream_with_retries;
 use super::*;
 use jcode_base::provider::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
 
+fn canonical_input_parts(request: &Value) -> (&[Value], Option<&Value>, Option<&Value>, usize) {
+    let items = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let system = items
+        .first()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"));
+    let tools = request.get("tools");
+    let count = tools.and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    (items, system, tools, count)
+}
+
 #[async_trait]
 impl Provider for OpenRouterProvider {
     fn runtime_display_name(&self) -> String {
@@ -15,6 +29,10 @@ impl Provider for OpenRouterProvider {
 
     fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
         OpenRouterProvider::direct_openai_compatible_route_parts(self)
+    }
+
+    fn openai_compatible_profile_id_for_model(&self, model: &str) -> Option<String> {
+        OpenRouterProvider::openai_compatible_profile_id_for_model(self, model)
     }
 
     fn explicit_provider_pin_for_current_model(&self) -> Option<String> {
@@ -278,21 +296,8 @@ impl Provider for OpenRouterProvider {
             }
         }
 
-        let message_items = request
-            .get("messages")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let tools_value = request.get("tools").cloned();
-        let system_value = message_items
-            .first()
-            .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("system"))
-            .cloned();
-        let tool_count = tools_value
-            .as_ref()
-            .and_then(|value| value.as_array())
-            .map(|tools| tools.len())
-            .unwrap_or(0);
+        let (message_items, system_value, tools_value, tool_count) =
+            canonical_input_parts(&request);
         jcode_provider_core::fingerprint::log_provider_canonical_input(
             if self.supports_provider_features {
                 "openrouter"
@@ -306,9 +311,9 @@ impl Provider for OpenRouterProvider {
                 "chat_completions"
             },
             &request,
-            &message_items,
-            system_value.as_ref(),
-            tools_value.as_ref(),
+            message_items,
+            system_value,
+            tools_value,
             Some(tool_count),
             &[
                 ("cache_supported", cache_supported.to_string()),
@@ -580,6 +585,12 @@ impl Provider for OpenRouterProvider {
             self.send_openrouter_headers,
         ) {
             jcode_provider_core::OPENROUTER_SELECTABLE_EFFORTS.to_vec()
+        } else if self.reasoning_effort_support == Some(false) {
+            // A profile that declared itself as NOT supporting reasoning effort
+            // gets no level rungs, so the ladder cannot offer dials that do
+            // nothing. The swarm sentinel stays: it is a Jcode UI mode rather
+            // than a wire-level effort, so `/effort swarm` keeps working.
+            vec!["swarm"]
         } else {
             vec![]
         }
@@ -1025,7 +1036,7 @@ impl OpenRouterProvider {
     /// Standard/direct OpenRouter and built-in profiles keep the existing
     /// env-var-driven `cache_path()` semantics.
     pub(crate) fn foreground_cache_namespace(&self) -> Option<String> {
-        self.is_user_named_profile()
+        (self.is_user_named_profile() || self.profile_id.as_deref() == Some("grok-build"))
             .then(|| self.profile_id.clone())
             .flatten()
     }
@@ -1135,3 +1146,7 @@ fn declares_image_input(model: &jcode_provider_openrouter::ModelInfo) -> bool {
         .iter()
         .any(|modality| modality.eq_ignore_ascii_case("image"))
 }
+
+#[cfg(test)]
+#[path = "openrouter_canonical_input_tests.rs"]
+mod canonical_input_tests;

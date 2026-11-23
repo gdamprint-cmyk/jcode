@@ -1,3 +1,7 @@
+// reference: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw (CreateProcessW -> PROCESS_INFORMATION.dwProcessId; the process id stays valid until the process terminates)
+// reference: https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject (a process handle becomes signaled when the process terminates)
+// reference: ~/.jcode/scratch/herdr_input_path.md (herdr 0.9.5 sources: the pane shell waits for its foreground job and the multiplexer has no input hand-back)
+// reference: ~/.jcode/scratch/server_attach_analysis.md (the server socket is already closed before the exec, so the successor can attach without a takeover conflict)
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
@@ -462,6 +466,39 @@ pub fn spawn_detached_without_console_window(
     }
 }
 
+/// Detach a command from the console of the process that runs it.
+///
+/// A Windows console's input mode belongs to the CONSOLE, not to a process, so
+/// a child that shares the parent's console also shares its input mode - and
+/// can reset it. Measured on this host (2026-11-10): the shared server spawned
+/// without these flags inherited the client's console, which left the client's
+/// console cooked (0x8F = PROC|LINE|ECHO|WIN|EXT, no VT input) while the TUI
+/// still believed it owned the terminal, so keystrokes were echoed by the
+/// console instead of reaching the session. The same sharing meant that closing
+/// the client's terminal window killed the server with it.
+///
+/// `CREATE_NO_WINDOW` gives the child its own console with no visible window
+/// and descendants inherit it, so the whole subtree stays invisible.
+/// `CREATE_NEW_PROCESS_GROUP` keeps the client console's Ctrl+C from reaching
+/// the detached process. The two cannot be combined with `DETACHED_PROCESS`,
+/// which is documented as invalid together with `CREATE_NO_WINDOW`.
+///
+/// No-op on Unix: there a console is not the unit of input mode, and the
+/// session detachment is done with `setsid()` in the spawn path.
+pub fn isolate_from_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Reap a detached child without blocking the caller.
 pub fn reap_detached(child: std::process::Child) {
     #[cfg(unix)]
@@ -487,6 +524,122 @@ fn spawn_replacement_process(
     cmd: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     cmd.spawn()
+}
+
+/// Replace the current process with a new command, keeping the new process a
+/// child of the current process' parent (Windows only reparenting).
+///
+/// On Unix this is plain `exec()`, which keeps the PID and therefore the
+/// parent. On Windows `Command::spawn()` would record this soon-to-die
+/// process as the parent, which breaks the pane's process tree. This variant
+/// asks Windows for `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` so the replacement
+/// lands directly under our parent.
+///
+/// Never fails because of the reparenting: any error falls back to a plain
+/// spawn and is logged.
+///
+/// The replacement is spawned, and this process keeps running as the exec
+/// supervisor when the pane shell is waiting for it (see
+/// [`crate::exec_supervisor`]). Exiting immediately would let the pane shell
+/// return to its prompt and take the console input away from the replacement
+/// client.
+pub fn replace_process_reparented(cmd: &mut std::process::Command) -> std::io::Error {
+    // Hand the chain depth to the replacement. The replacement must know that
+    // it is not the client the pane shell waits for, so it exits right after
+    // its own replacement instead of becoming a second supervisor.
+    cmd.env(
+        crate::exec_supervisor::SUPERVISOR_DEPTH_ENV,
+        crate::exec_supervisor::successor_depth().to_string(),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        crate::logging::error(&format!(
+            "replace_process failed: {} ({})",
+            err,
+            crate::util::process_fd_diagnostic_snapshot()
+        ));
+        err
+    }
+    #[cfg(windows)]
+    {
+        let successor_name = crate::exec_supervisor::program_name(cmd.get_program());
+        // From this moment the successor owns the pane, so this process must
+        // stop speaking for the pane. Otherwise the supervisor's own agent
+        // state report would carry a newer sequence number than the live
+        // successor's and would make the pane look finished while the
+        // successor is still working.
+        crate::exec_supervisor::mark_pane_handed_off();
+        match crate::platform_reparent::spawn_reparented(cmd) {
+            Ok(pid) => {
+                crate::logging::info(&format!(
+                    "replace_process: replacement process {pid} reparented to our parent"
+                ));
+                supervise_replacement(pid, successor_name);
+            }
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "replace_process: reparented spawn failed ({e}); falling back to a plain spawn"
+                ));
+                match spawn_replacement_process(cmd) {
+                    Ok(child) => supervise_replacement(child.id(), successor_name),
+                    Err(e) => {
+                        // No successor exists, so this process keeps the pane and
+                        // must keep reporting its state.
+                        crate::exec_supervisor::clear_pane_handoff();
+                        e
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Stay alive as the exec supervisor until the replacement process is gone.
+///
+/// The pane shell (`pwsh`) launches the client as a native command and waits
+/// for it. If this process exits right after spawning the replacement, the
+/// shell wakes up, returns to its prompt and reads the console input - so the
+/// replacement's TUI paints but never receives the keystrokes. Keeping this
+/// process alive keeps the shell waiting, and the replacement reads the input.
+///
+/// The supervisor is skipped when it cannot help: a successor of a successor
+/// does not gate the shell's wait, and a non-console parent does not wait for
+/// its child at all.
+fn supervise_replacement(replacement_pid: u32, successor_name: Option<String>) -> ! {
+    if !crate::exec_supervisor::should_supervise() {
+        crate::logging::info(&format!(
+            "replace_process: exiting without supervision of replacement {replacement_pid}"
+        ));
+        std::process::exit(0);
+    }
+
+    // The successor's own name is what identifies it in the console. A
+    // `/reload` can hand over to a binary at a different path, so the
+    // supervisor's own name would not match the successor. The supervisor's
+    // own name is only the fallback.
+    let exe_name = successor_name
+        .or_else(crate::exec_supervisor::own_exe_name)
+        .unwrap_or_else(|| {
+            crate::logging::warn(
+                "replace_process: cannot identify the replacement's executable; exiting without supervision",
+            );
+            std::process::exit(0);
+        });
+
+    crate::logging::info(&format!(
+        "replace_process: supervising replacement {replacement_pid} to keep the pane shell waiting"
+    ));
+    let target = crate::exec_supervisor::SupervisorTarget {
+        successor_pid: replacement_pid,
+        exe_name,
+    };
+    let exit = crate::exec_supervisor::wait_for_client_exit(&target);
+    crate::logging::info(&format!(
+        "replace_process: supervisor finished ({exit:?}); releasing the pane"
+    ));
+    std::process::exit(0);
 }
 
 /// Replace the current process with a new command (exec on Unix).

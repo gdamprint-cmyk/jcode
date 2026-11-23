@@ -6,7 +6,10 @@
 //! In left-aligned mode, widgets only appear on the right margin.
 
 pub use super::cloud_git::{DualGitInfo, RepoState};
-pub use super::cloud_status::{CloudMachineStats, CloudProbeState, CloudStatusInfo};
+pub use super::cloud_status::{
+    CloudDirectoryEntry, CloudDirectorySnapshot, CloudMachineStats, CloudProbeState,
+    CloudStatusInfo,
+};
 use super::color_support::rgb;
 #[path = "info_widget_commits.rs"]
 mod commits;
@@ -64,10 +67,12 @@ pub(crate) use memory_utils::is_traceworthy_memory_event;
 use memory_utils::{memory_active_summary, memory_last_trace_summary, memory_state_detail};
 use model::{overview_runtime_height, render_model_info, render_model_widget, runtime_has_data};
 use swarm_background::{render_background_compact, render_background_widget, render_swarm_widget};
-use text::{truncate_smart, truncate_with_ellipsis};
+use text::clip;
 pub(crate) use tips::occasional_status_tip;
 use tips::render_tips_widget;
+pub(crate) use usage_render::render_inline_limit_bar;
 pub(crate) use usage_render::render_labeled_bar as render_usage_limit_bar;
+pub(crate) use usage_render::{LimitBar, limit_color as usage_limit_color};
 use usage_render::{render_usage_compact, render_usage_widget};
 
 /// Overview rows used by the Changes section, mirroring [`render_sections`].
@@ -115,6 +120,8 @@ pub enum WidgetKind {
     GitStatus,
     /// Native SSH cloud machine and workspace details.
     CloudVm,
+    /// Directories known to the attached cloud VM.
+    CloudDirectories,
     /// Commits: recent history on the current branch
     Commits,
 }
@@ -134,6 +141,7 @@ impl WidgetKind {
             WidgetKind::BackgroundTasks => 10,
             WidgetKind::GitStatus => 11,
             WidgetKind::CloudVm => 12,
+            WidgetKind::CloudDirectories => 12,
             WidgetKind::Commits => 12,
             WidgetKind::SwarmStatus => 12, // Session list - lower priority
             WidgetKind::AmbientMode => 13, // Scheduled agent - lower priority
@@ -158,6 +166,7 @@ impl WidgetKind {
             WidgetKind::Tips => Side::Left,
             WidgetKind::GitStatus => Side::Left,
             WidgetKind::CloudVm => Side::Left,
+            WidgetKind::CloudDirectories => Side::Left,
             WidgetKind::Commits => Side::Left,
         }
     }
@@ -179,6 +188,7 @@ impl WidgetKind {
             WidgetKind::Tips => 3,
             WidgetKind::GitStatus => 1,
             WidgetKind::CloudVm => 16,
+            WidgetKind::CloudDirectories => 3,
             WidgetKind::Commits => 1,
         }
     }
@@ -190,13 +200,13 @@ impl WidgetKind {
             WidgetKind::WorkspaceMap,
             WidgetKind::Overview,
             WidgetKind::UsageLimits,
-            WidgetKind::KvCache,
             WidgetKind::MemoryActivity,
             WidgetKind::ModelInfo,
             WidgetKind::Compaction,
             WidgetKind::BackgroundTasks,
             WidgetKind::GitStatus,
             WidgetKind::CloudVm,
+            WidgetKind::CloudDirectories,
             WidgetKind::Commits,
             WidgetKind::SwarmStatus,
             WidgetKind::AmbientMode,
@@ -220,6 +230,7 @@ impl WidgetKind {
             WidgetKind::Tips => "tips",
             WidgetKind::GitStatus => "git",
             WidgetKind::CloudVm => "cloud",
+            WidgetKind::CloudDirectories => "cloud-directories",
             WidgetKind::Commits => "commits",
         }
     }
@@ -669,6 +680,8 @@ pub struct InfoWidgetData {
     pub context_info: Option<ContextInfo>,
     /// True when context state is being updated and no authoritative snapshot is available.
     pub context_info_stale: bool,
+    /// Resume previews show a measured past request, not the active prompt.
+    pub historical_context: bool,
     pub queue_mode: Option<bool>,
     pub context_limit: Option<usize>,
     pub model: Option<String>,
@@ -686,6 +699,8 @@ pub struct InfoWidgetData {
     pub session_name: Option<String>,
     /// Current working directory for this session.
     pub working_dir: Option<String>,
+    /// Session origin, if its working directory has changed.
+    pub original_working_dir: Option<String>,
     pub client_count: Option<usize>,
     /// Memory system statistics
     pub memory_info: Option<MemoryInfo>,
@@ -826,11 +841,9 @@ impl InfoWidgetData {
                 .as_ref()
                 .map(MemoryInfo::should_render)
                 .unwrap_or(false),
-            WidgetKind::SwarmStatus => self
-                .swarm_info
-                .as_ref()
-                .map(|s| !s.managed_members.is_empty())
-                .unwrap_or(false),
+            // The pinned progress view already presents managed agents.
+            // Do not duplicate that information in the margin HUD.
+            WidgetKind::SwarmStatus => false,
             WidgetKind::BackgroundTasks => self
                 .background_info
                 .as_ref()
@@ -858,6 +871,7 @@ impl InfoWidgetData {
                         .unwrap_or(false)
             }
             WidgetKind::CloudVm => self.cloud_info.is_some(),
+            WidgetKind::CloudDirectories => self.cloud_info.is_some(),
             WidgetKind::Commits => self
                 .git_info
                 .as_ref()
@@ -1006,9 +1020,17 @@ impl Default for WidgetsState {
 
 /// Global widget state (for polling across frames)
 static WIDGETS_STATE: Mutex<Option<WidgetsState>> = Mutex::new(None);
+/// Separate widget state for secondary renders (resume preview) so their
+/// placements and animations never disturb the live session's widgets.
+static SECONDARY_WIDGETS_STATE: Mutex<Option<WidgetsState>> = Mutex::new(None);
 
 fn get_or_init_state() -> std::sync::MutexGuard<'static, Option<WidgetsState>> {
-    let mut guard = WIDGETS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = if super::ui::secondary_render_active() {
+        &SECONDARY_WIDGETS_STATE
+    } else {
+        &WIDGETS_STATE
+    };
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(WidgetsState::default());
     }
@@ -1118,7 +1140,8 @@ pub fn calculate_placements(
 
 /// Repack cloud details only when asynchronously loaded Overview rows cannot
 /// grow inside their original anchor. Keep the resident layout unless a fresh
-/// priority pass fits the full Overview without losing any visible widget.
+/// priority pass fits the full Overview without losing primary visible widgets.
+/// The supplemental directory inventory may yield when the viewport is short.
 pub(super) fn calculate_placements_with_cloud_reflow(
     area: Rect,
     margins: &Margins,
@@ -1149,10 +1172,10 @@ pub(super) fn calculate_placements_with_cloud_reflow(
             && p.rect.height
                 >= calculate_widget_height(WidgetKind::Overview, data, p.rect.width, area.height)
     });
-    let preserves = resident
-        .visible
-        .iter()
-        .all(|old| fresh.visible.iter().any(|new| new.kind == old.kind));
+    let preserves = resident.visible.iter().all(|old| {
+        old.kind == WidgetKind::CloudDirectories
+            || fresh.visible.iter().any(|new| new.kind == old.kind)
+    });
     if fits && preserves { fresh } else { resident }
 }
 
@@ -1169,6 +1192,7 @@ const SCROLL_CHURN_GRACE: Duration = Duration::from_millis(1500);
 /// into visible up/down flicker. Standing down through a short linger converts
 /// the churn into "strip stays hidden"; a genuine dock removal only delays the
 /// strip's return by this much, once.
+#[cfg_attr(not(test), allow(dead_code))]
 const SWARM_STRIP_STAND_DOWN_LINGER: Duration = Duration::from_millis(2000);
 
 /// Whether the SwarmStatus dock widget is engaged: either actually placed, or
@@ -1197,6 +1221,7 @@ fn swarm_dock_engaged(state: &WidgetsState) -> bool {
 /// placement churn cannot toggle the strip row on and off, which resizes the
 /// bottom chrome and makes the whole transcript jump up and down (flicker).
 /// One frame of overlap when the dock first appears is visually harmless.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn swarm_strip_stands_down_for_dock() -> bool {
     let guard = get_or_init_state();
     let Some(state) = guard.as_ref() else {
@@ -1470,7 +1495,12 @@ fn overview_footer(data: &InfoWidgetData) -> String {
                 ""
             };
             format!(
-                "{estimate}{} ctx left",
+                "{}{estimate}{} ctx left",
+                if data.historical_context {
+                    "saved "
+                } else {
+                    ""
+                },
                 crate::kv_cache_monitor::format_token_count(left)
             )
         }
@@ -1771,6 +1801,9 @@ fn render_widget_content(kind: WidgetKind, data: &InfoWidgetData, inner: Rect) -
         WidgetKind::Tips => render_tips_widget(inner),
         WidgetKind::GitStatus => render_changes_framed(data, inner),
         WidgetKind::CloudVm => super::info_widget_cloud::render_cloud_widget(data, inner),
+        WidgetKind::CloudDirectories => {
+            super::info_widget_cloud_directories::render_cloud_directories(data, inner)
+        }
         WidgetKind::Commits => render_commits_widget(data, inner),
     };
     framed.settle()
@@ -1806,7 +1839,7 @@ fn render_compaction_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
         format!("{summary} · {}", info.mode.trim())
     };
     Framed::body(vec![Line::from(Span::styled(
-        truncate_smart(&detail, inner.width as usize),
+        clip(&detail, inner.width as usize),
         Style::default().fg(rgb(180, 180, 190)),
     ))])
     .title(Line::from(vec![
@@ -1816,228 +1849,11 @@ fn render_compaction_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
     .footer(frame::dim(footer))
 }
 
-fn render_kv_cache_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
-    let Some(cache) = data.cache_hit_info.as_ref() else {
-        return Framed::default();
-    };
-    // Top border: the headline yield. Body: the per-rate breakdown, then the
-    // misses themselves. Bottom border: the miss total and overflow.
-    let mut framed =
-        Framed::body(vec![render_kv_cache_rates_line(cache)]).title(render_kv_cache_title(cache));
-
-    if cache.miss_attributions.is_empty() {
-        return framed.footer_right(Span::styled(
-            "no misses",
-            Style::default().fg(rgb(110, 210, 140)),
-        ));
-    }
-
-    let total_missed: u64 = cache
-        .miss_attributions
-        .iter()
-        .map(|sample| sample.missed_tokens)
-        .sum();
-    framed = framed.footer_right(Line::from(vec![
-        Span::styled(
-            compact_token_count(total_missed),
-            Style::default().fg(rgb(255, 200, 100)),
-        ),
-        frame::dim(" missed"),
-    ]));
-
-    let max_w = inner.width as usize;
-    for sample in cache.miss_attributions.iter().take(5) {
-        let head = format!(
-            "{} {} miss ",
-            format_cache_turn_label(sample.turn_number, sample.call_index),
-            compact_token_count(sample.missed_tokens)
-        );
-        let reason_w = max_w.saturating_sub(UnicodeWidthStr::width(head.as_str()) + 2);
-        framed.lines.push(Line::from(vec![
-            Span::styled(
-                format_cache_turn_label(sample.turn_number, sample.call_index),
-                Style::default().fg(rgb(140, 180, 255)).bold(),
-            ),
-            Span::styled(
-                format!(" {} miss ", compact_token_count(sample.missed_tokens)),
-                Style::default().fg(rgb(255, 200, 100)),
-            ),
-            Span::styled(
-                format!("({})", truncate_smart(&sample.reason, reason_w.max(4))),
-                Style::default().fg(rgb(140, 140, 150)),
-            ),
-        ]));
-    }
-
-    if cache.miss_attributions.len() > 5 {
-        framed = framed.footer(frame::more(cache.miss_attributions.len() - 5));
-    }
-
-    framed
-}
-
-fn kv_cache_pcts(cache: &CacheHitInfo) -> Option<(u8, Option<u8>, Option<u8>, Color)> {
-    let lifetime_ratio = cache.hit_ratio()?;
-    let lifetime_pct = ratio_pct(lifetime_ratio);
-    let warm_pct = cache.optimal_ratio().map(ratio_pct);
-    let last_pct = cache.last_ratio().map(ratio_pct);
-    let last_optimal_pct = cache.last_optimal_ratio().map(ratio_pct);
-    let health_pct = last_optimal_pct
-        .or(last_pct)
-        .or(warm_pct)
-        .unwrap_or(lifetime_pct);
-    Some((
-        lifetime_pct,
-        warm_pct,
-        last_pct,
-        kv_cache_optimal_color(health_pct),
-    ))
-}
-
-/// Border headline: `KV cache 90% yield`, or observed hit rate without a baseline.
-fn render_kv_cache_title(cache: &CacheHitInfo) -> Line<'static> {
-    let mut spans = vec![frame::label("KV cache ")];
-    match kv_cache_pcts(cache) {
-        Some((_, Some(warm), _, color)) => {
-            spans.push(Span::styled(
-                format!("{warm}%"),
-                Style::default().fg(color).bold(),
-            ));
-            spans.push(frame::dim(" yield"));
-        }
-        Some((lifetime_pct, None, _, color)) => {
-            // Restored sessions lack the historical reusable-prefix denominator.
-            // That is missing telemetry, not evidence the cache is still warming.
-            spans.push(Span::styled(
-                format!("{lifetime_pct}%"),
-                Style::default().fg(color).bold(),
-            ));
-            spans.push(frame::dim(" hit"));
-        }
-        None => {}
-    }
-    Line::from(spans)
-}
-
-/// Body row: `last 94% · session 39%`.
-fn render_kv_cache_rates_line(cache: &CacheHitInfo) -> Line<'static> {
-    let Some((lifetime_pct, _, last_pct, color)) = kv_cache_pcts(cache) else {
-        return Line::default();
-    };
-    let mut spans = Vec::new();
-    if let Some(last_pct) = last_pct {
-        spans.push(Span::styled(
-            "last ",
-            Style::default().fg(rgb(140, 140, 150)),
-        ));
-        spans.push(Span::styled(
-            format!("{}%", last_pct),
-            Style::default().fg(color).bold(),
-        ));
-        spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
-    }
-    spans.push(Span::styled(
-        "session ",
-        Style::default().fg(rgb(140, 140, 150)),
-    ));
-    spans.push(Span::styled(
-        format!("{}%", lifetime_pct),
-        Style::default().fg(color).bold(),
-    ));
-    Line::from(spans)
-}
-
-fn render_kv_cache_summary_line(cache: &CacheHitInfo) -> Line<'static> {
-    let Some(lifetime_ratio) = cache.hit_ratio() else {
-        return Line::default();
-    };
-
-    let lifetime_pct = ratio_pct(lifetime_ratio);
-    let warm_pct = cache.optimal_ratio().map(ratio_pct);
-    let last_pct = cache.last_ratio().map(ratio_pct);
-    let last_optimal_pct = cache.last_optimal_ratio().map(ratio_pct);
-    let health_pct = last_optimal_pct
-        .or(last_pct)
-        .or(warm_pct)
-        .unwrap_or(lifetime_pct);
-    let color = kv_cache_optimal_color(health_pct);
-
-    let mut spans = vec![Span::styled(
-        "KV cache: ",
-        Style::default().fg(rgb(180, 180, 190)).bold(),
-    )];
-
-    if let Some(warm_pct) = warm_pct {
-        spans.push(Span::styled(
-            "yield ",
-            Style::default().fg(rgb(140, 140, 150)),
-        ));
-        spans.push(Span::styled(
-            format!("{}%", warm_pct),
-            Style::default().fg(color).bold(),
-        ));
-    } else {
-        spans.push(Span::styled(
-            format!("hit {}%", lifetime_pct),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    if let Some(last_pct) = last_pct {
-        spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
-        spans.push(Span::styled(
-            "last ",
-            Style::default().fg(rgb(140, 140, 150)),
-        ));
-        spans.push(Span::styled(
-            format!("{}%", last_pct),
-            Style::default().fg(color).bold(),
-        ));
-    }
-
-    spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
-    spans.push(Span::styled(
-        "session ",
-        Style::default().fg(rgb(140, 140, 150)),
-    ));
-    spans.push(Span::styled(
-        format!("{}%", lifetime_pct),
-        Style::default().fg(color).bold(),
-    ));
-
-    Line::from(spans)
-}
-
-fn ratio_pct(ratio: f32) -> u8 {
-    (ratio * 100.0).round().clamp(0.0, 100.0) as u8
-}
-
-fn kv_cache_optimal_color(pct: u8) -> Color {
-    match pct {
-        0..=24 => rgb(255, 110, 110),
-        25..=59 => rgb(255, 200, 100),
-        60..=84 => rgb(140, 180, 255),
-        _ => rgb(110, 210, 140),
-    }
-}
-
-fn format_cache_turn_label(turn_number: usize, call_index: u16) -> String {
-    if call_index <= 1 {
-        format!("{}>", turn_number)
-    } else {
-        format!("{}.{}>", turn_number, call_index)
-    }
-}
-
-fn compact_token_count(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f32 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.0}k", tokens as f32 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
+#[path = "info_widget_cache.rs"]
+mod cache_render;
+#[cfg(test)]
+use cache_render::render_kv_cache_summary_line;
+use cache_render::render_kv_cache_widget;
 
 /// Render ambient mode status widget
 fn render_ambient_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
@@ -2074,7 +1890,7 @@ fn render_ambient_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
             "⏸",
             format!(
                 "Paused: {}",
-                truncate_smart(reason, inner.width.saturating_sub(12) as usize)
+                clip(reason, inner.width.saturating_sub(12) as usize)
             ),
             rgb(255, 200, 100),
         ),
@@ -2121,7 +1937,7 @@ fn render_ambient_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
         let mut spans = vec![Span::styled(count_text, Style::default().fg(label_color))];
         if let Some(preview) = queue_preview {
             spans.push(Span::styled(
-                truncate_smart(&format!(" ({})", preview), max_w.saturating_sub(16)),
+                clip(&format!(" ({})", preview), max_w.saturating_sub(16)),
                 Style::default().fg(dim),
             ));
         }
@@ -2146,7 +1962,7 @@ fn render_ambient_widget(data: &InfoWidgetData, inner: Rect) -> Framed {
             };
             if remaining > 5 {
                 spans.push(Span::styled(
-                    truncate_smart(
+                    clip(
                         &if last_run_in_footer {
                             summary.clone()
                         } else {
@@ -2241,7 +2057,7 @@ pub(super) fn startup_usage_lines(width: u16) -> Vec<Line<'static>> {
         .into_iter()
         .map(|text| {
             Line::from(Span::styled(
-                truncate_with_ellipsis(text, width as usize),
+                clip(text, width as usize),
                 Style::default().fg(rgb(140, 140, 150)),
             ))
         })
@@ -2283,10 +2099,6 @@ fn render_sections(
         inner.width,
     ));
 
-    if let Some(cache) = data.cache_hit_info.as_ref() {
-        lines.push(render_kv_cache_summary_line(cache));
-    }
-
     // Changed files (the detail behind the line's git counts).
     if data.dual_git_info.is_some() || data.git_info.as_ref().is_some_and(changes_has_data) {
         lines.extend(render_git_widget(data, inner));
@@ -2322,19 +2134,15 @@ fn format_event_for_expanded(
     match &event.kind {
         MemoryEventKind::EmbeddingComplete { latency_ms, hits } => (
             "→",
-            truncate_with_ellipsis(&format!("{} hits ({}ms)", hits, latency_ms), max_width),
+            clip(&format!("{} hits ({}ms)", hits, latency_ms), max_width),
             rgb(140, 180, 255),
         ),
-        MemoryEventKind::SidecarRelevant { memory_preview } => (
-            "✓",
-            truncate_with_ellipsis(memory_preview, max_width),
-            rgb(100, 200, 100),
-        ),
-        MemoryEventKind::MemorySurfaced { memory_preview } => (
-            "★",
-            truncate_with_ellipsis(memory_preview, max_width),
-            rgb(255, 220, 100),
-        ),
+        MemoryEventKind::SidecarRelevant { memory_preview } => {
+            ("✓", clip(memory_preview, max_width), rgb(100, 200, 100))
+        }
+        MemoryEventKind::MemorySurfaced { memory_preview } => {
+            ("★", clip(memory_preview, max_width), rgb(255, 220, 100))
+        }
         MemoryEventKind::MemoryInjected {
             count,
             prompt_chars,
@@ -2348,7 +2156,7 @@ fn format_event_for_expanded(
                 .unwrap_or_default();
             (
                 "↳",
-                truncate_with_ellipsis(
+                clip(
                     &format!("{} {} ({}c){}", count, plural, prompt_chars, detail),
                     max_width,
                 ),
@@ -2357,49 +2165,43 @@ fn format_event_for_expanded(
         }
         MemoryEventKind::MaintenanceComplete { latency_ms } => (
             "🌿",
-            truncate_with_ellipsis(&format!("maintained ({}ms)", latency_ms), max_width),
+            clip(&format!("maintained ({}ms)", latency_ms), max_width),
             rgb(120, 220, 180),
         ),
         MemoryEventKind::ExtractionStarted { reason } => (
             "🧠",
-            truncate_with_ellipsis(&format!("extracting: {}", reason), max_width),
+            clip(&format!("extracting: {}", reason), max_width),
             rgb(200, 150, 255),
         ),
         MemoryEventKind::ExtractionComplete { count } => (
             "✓",
-            truncate_with_ellipsis(&format!("saved {} memories", count), max_width),
+            clip(&format!("saved {} memories", count), max_width),
             rgb(100, 200, 100),
         ),
-        MemoryEventKind::Error { message } => (
-            "!",
-            truncate_with_ellipsis(message, max_width),
-            rgb(255, 100, 100),
-        ),
+        MemoryEventKind::Error { message } => ("!", clip(message, max_width), rgb(255, 100, 100)),
         MemoryEventKind::ToolRemembered {
             content, category, ..
         } => (
             "💾",
-            truncate_with_ellipsis(&format!("[{}] {}", category, content), max_width),
+            clip(&format!("[{}] {}", category, content), max_width),
             rgb(100, 200, 100),
         ),
         MemoryEventKind::ToolRecalled { query, count } => (
             "🔍",
-            truncate_with_ellipsis(&format!("{} found for '{}'", count, query), max_width),
+            clip(&format!("{} found for '{}'", count, query), max_width),
             rgb(140, 180, 255),
         ),
-        MemoryEventKind::ToolForgot { id } => (
-            "🗑\u{fe0f}",
-            truncate_with_ellipsis(id, max_width),
-            rgb(255, 170, 100),
-        ),
+        MemoryEventKind::ToolForgot { id } => {
+            ("🗑\u{fe0f}", clip(id, max_width), rgb(255, 170, 100))
+        }
         MemoryEventKind::ToolTagged { id, tags } => (
             "🏷\u{fe0f}",
-            truncate_with_ellipsis(&format!("{} +{}", id, tags), max_width),
+            clip(&format!("{} +{}", id, tags), max_width),
             rgb(140, 200, 255),
         ),
         MemoryEventKind::ToolLinked { from, to } => (
             "🔗",
-            truncate_with_ellipsis(&format!("{} → {}", from, to), max_width),
+            clip(&format!("{} → {}", from, to), max_width),
             rgb(200, 180, 255),
         ),
         MemoryEventKind::ToolListed { count } => {

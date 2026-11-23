@@ -1,9 +1,42 @@
+// reference: in-repo prior art - `publish_local_current_build_for_source` in
+// this same file (the build-time publish: validate, install the immutable
+// versioned binary, smoke-test it, move the channels). The staging variant
+// keeps the first three steps and drops the channel moves, so the channel
+// moves happen only inside the landing transaction
+// (crates/jcode-build-support/src/landing.rs, whose provenance is declared
+// there).
+mod binary_lock;
+mod build_lock;
+mod deterministic_build;
+mod landing;
+mod linux_prerelease;
 mod paths;
 mod platform_support;
 mod source_state;
 mod storage_helpers;
 mod version_gc;
 
+pub use binary_lock::{is_locked, prepare_binary_for_overwrite, rename_binary_aside};
+pub use build_lock::{BuildLockGuard, build_lock_path};
+pub use deterministic_build::{
+    DeterministicBuildOutcome, current_buildable_source, run_deterministic_build,
+    run_staging_build_with,
+};
+pub use landing::{
+    DaemonIdentity, LandingLock, LandingOutcome, LandingPhase, LandingRecovery, LandingReport,
+    LandingSession, LandingTransaction, ReleaseLandingPlan, activate_client_channels,
+    activate_clients_after_verified_daemon, advance_landing, begin_landing,
+    clear_landing_transaction, daemon_identity_matches_version, daemon_identity_path,
+    daemon_identity_proves_version, daemon_runs_version, decide_landing_recovery,
+    guard_landing_target_is_not_a_downgrade, is_main_channel_label,
+    is_release_version_label, is_valid_version_label, land_installed_version, land_release_version,
+    land_version, landing_command, landing_journal_path, landing_lock_path,
+    load_landing_transaction, log_landing_step, plan_release_landing, prepare_shared_server,
+    publish_daemon_identity, read_daemon_identity, record_handoff_requested, recover_landing,
+    recover_landing_locked, rollback_landing, save_landing_transaction, shared_server_is_pinned_to_selfdev,
+    stage_build, version_build_time, version_commit, wait_for_daemon_identity, would_downgrade,
+};
+pub use linux_prerelease::{dispatch_linux_prerelease, linux_prerelease_candidate};
 pub use paths::{
     SELFDEV_CARGO_PROFILE, binary_name, binary_stem, client_update_candidate,
     current_binary_build_time_string, current_binary_built_at, find_dev_binary,
@@ -21,10 +54,11 @@ pub use source_state::{
 pub use storage_helpers::{
     build_log_path, build_progress_path, builds_dir, canary_binary_path, clear_build_progress,
     clear_migration_context, current_binary_path, current_version_file, load_migration_context,
-    manifest_path, migration_context_path, read_build_progress, read_current_version,
-    read_shared_server_version, read_stable_version, save_migration_context,
-    shared_server_binary_path, shared_server_version_file, stable_binary_path, stable_version_file,
-    version_binary_path, write_build_progress,
+    manifest_path, migration_context_path, publication_ledger_path, read_build_progress,
+    read_current_version, read_shared_server_version, read_stable_version, read_staged_version,
+    save_migration_context, shared_server_binary_path, shared_server_version_file,
+    stable_binary_path, stable_version_file, staged_version_file, version_binary_path,
+    write_build_progress, write_staged_version,
 };
 pub use version_gc::{
     DEFAULT_KEEP_RECENT_VERSIONS, KEEP_VERSIONS_ENV, VersionPruneReport, prune_old_versions,
@@ -35,10 +69,39 @@ use anyhow::Result;
 use chrono::Utc;
 use jcode_storage as storage;
 use serde::{Deserialize, Serialize};
+
+/// Whether two binaries are the SAME FILE BY CONTENT.
+///
+/// Comparing canonical paths is not portable: on Unix a channel entry is a
+/// symlink into `versions/<v>/`, so both paths canonicalize to the same file.
+/// On Windows the channel entry is a COPY (Windows keeps a running executable
+/// open, so `platform_support::atomic_symlink_swap` copies and renames aside
+/// instead of symlinking), so the two paths are DIFFERENT files with the SAME
+/// content.
+///
+/// The question the callers actually ask is "does this channel serve that
+/// version", which is a statement about content, not about path identity.
+///
+/// reference: https://docs.rs/rustc-std-workspace-std/latest/std/fs/index.html
+/// (read 2026-11-16) - `std::fs::read` "Reads the entire contents of a file
+/// into a bytes vector"; `canonicalize` "Returns the canonical, absolute form
+/// of a path with all intermediate components normalized and symbolic links
+/// resolved", which is exactly why it cannot equate a Windows copy with the
+/// file it was copied from.
+pub fn same_binary_content(left: &Path, right: &Path) -> bool {
+    match (std::fs::read(left), std::fs::read(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+// On unix `Write` is already imported above (with BufRead/BufReader); on other
+// platforms the ledger writer needs it for `write_all`.
+#[cfg(not(unix))]
+use std::io::Write;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
@@ -168,6 +231,114 @@ impl BuildManifest {
     }
 }
 
+/// One row of the append-only publication ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationRecord {
+    /// The version label that was published.
+    pub version: String,
+    /// The source fingerprint the version was built from.
+    #[serde(default)]
+    pub source_fingerprint: String,
+    /// When the publication happened.
+    pub published_at: chrono::DateTime<Utc>,
+    /// Whether the installed binary was VALIDATED against its source.
+    ///
+    /// The ledger row is written when the binary is INSTALLED, which is BEFORE
+    /// the post-install smoke test and the hash check
+    /// (`stage_local_current_build_for_source_with`: install at :972, smoke
+    /// test at :973, hash check at :985). A row without this flag therefore
+    /// proves INSTALLATION, not PUBLICATION.
+    ///
+    /// A validated row is appended after the checks pass. Consumers that need
+    /// the strong proof must require it; consumers that accept "this label was
+    /// installed" may accept either.
+    #[serde(default)]
+    pub validated: bool,
+}
+
+/// Append a publication to the durable ledger.
+///
+/// The ledger is APPEND-ONLY and never truncated: one JSON object per line.
+/// It is the durable proof that a version label was published, because the
+/// manifest history truncates to 20 rows and `builds/versions/` is garbage
+/// collected by the daily version GC - both lossy under a daemon restart.
+///
+/// The whole line is serialized into ONE buffer and written with a single
+/// `write_all`, so a concurrent reader (or a process killed mid-append) can
+/// never observe a torn half-line, and two concurrent appenders cannot
+/// interleave fragments. This mirrors the house pattern in
+/// `jcode_storage::append_json_line_fast`.
+///
+/// reference: `storage_helpers::publication_ledger_path` for the rationale and
+/// the measured failure this replaces.
+/// reference: https://doc.rust-lang.org/std/fs/struct.File.html - `flush()`
+/// on a `File` is a no-op on Unix and Windows ("Since a File structure doesn't
+/// contain any buffers, this function is currently a no-op on Unix and
+/// Windows"), so `sync_data()` is what actually reaches the filesystem.
+pub fn record_publication(record: &PublicationRecord) -> Result<()> {
+    let path = publication_ledger_path()?;
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    // MUTATION-PROOF MARKER: the `.append(true)` flag above is load-bearing.
+    // Removing it (or switching to `.write(true)`) must make
+    // `publication_ledger_keeps_every_version` FAIL, because the second
+    // publication would then overwrite the first instead of adding to it.
+    file.write_all(&line)?;
+    // `flush()` is a no-op on a raw File; `sync_data()` is what pushes the
+    // record to the filesystem, so a power loss cannot lose a publication.
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Every version label recorded in the durable publication ledger.
+///
+/// A malformed line is SKIPPED, not fatal: the ledger is append-only and a
+/// truncated final line (a crash mid-write) must not make the whole ledger
+/// unreadable.
+pub fn published_versions_from_ledger() -> Vec<String> {
+    ledger_labels(|record| true)
+}
+
+/// The version labels in the ledger whose row was VALIDATED.
+///
+/// A ledger row is written when the binary is INSTALLED, which happens before
+/// the post-install smoke test and the hash check. Only a row with
+/// `validated: true` proves that the binary was verified against its source.
+///
+/// This is the STRONG proof, matching what the build-request records enforce
+/// (a record counts only when `validated` is true). Use this when a false
+/// positive is worse than a false negative.
+pub fn validated_versions_from_ledger() -> Vec<String> {
+    ledger_labels(|record| record.validated)
+}
+
+fn ledger_labels(keep: impl Fn(&PublicationRecord) -> bool) -> Vec<String> {
+    let Ok(path) = publication_ledger_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<PublicationRecord>(line) else {
+            continue;
+        };
+        if !record.version.is_empty() && keep(&record) {
+            labels.push(record.version);
+        }
+    }
+    labels
+}
+
 pub fn complete_pending_activation_for_session(session_id: &str) -> Result<Option<String>> {
     let mut manifest = BuildManifest::load()?;
     let Some(pending) = manifest.pending_activation.clone() else {
@@ -209,6 +380,28 @@ pub fn rollback_pending_activation_for_session(session_id: &str) -> Result<Optio
 }
 
 /// Install a binary at a specific immutable version path.
+///
+/// This is the SINGLE point where a version directory is created under
+/// `builds/versions/`, so it is also the single point where the durable
+/// publication ledger is written. Every publishing path installs a version
+/// HERE - the session build request, the debug `reload`, the self-dev
+/// `reload`, `/rebuild` (`install_local_release`) and the release updater
+/// (`update.rs`) - so every one of them leaves a durable proof.
+///
+/// WHY THE LEDGER EXISTS: the manifest history truncates to 20 rows
+/// (`BuildManifest::add_to_history`) and `builds/versions/` is garbage
+/// collected by the daily version GC. Both are lossy under exactly the
+/// operation a landing performs (a daemon restart). Measured 2026-11-16 on
+/// this host: a landing that restarted the daemon ran that GC, which removed
+/// 9 version directories and evicted 2 more rows from the truncated history,
+/// so four Harbor queue entries from other sessions lost their ONLY
+/// publication proof and the acceptance checker reported 8 failures for fixes
+/// that were demonstrably live.
+///
+/// reference: in-repo prior art - `write_dev_binary_source_metadata` in this
+/// same file (the sidecar that carries the build's fingerprint) and the
+/// append-only semantics of the session journal
+/// (`crates/jcode-base/src/session/persistence.rs`).
 pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Result<PathBuf> {
     if !source.exists() {
         anyhow::bail!("Binary not found at {:?}", source);
@@ -231,7 +424,64 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
     }
     crate::platform_support::set_permissions_executable(&dest)?;
 
+    // Record the INSTALLATION in the DURABLE ledger.
+    //
+    // The version is PUBLISHED once its immutable binary is installed and
+    // executable: from that moment on the label names an installable
+    // artifact, and every other record of it (the manifest history, the
+    // build-request records) is lossy.
+    //
+    // This row records an INSTALLATION, not yet a validated publication: the
+    // smoke test and the hash check run AFTER this point. The staging path
+    // appends a second row with `validated: true` once they pass, so a
+    // consumer that needs the strong proof can require that flag.
+    //
+    // A failure to record MUST NOT fail the installation: the binary is
+    // already installed and executable at this point, and losing the build
+    // would be worse than losing the record. The checker then falls back to
+    // the other evidence sources.
+    if let Err(err) = record_publication(&PublicationRecord {
+        version: version.to_string(),
+        source_fingerprint: publication_fingerprint_for(source, version),
+        published_at: Utc::now(),
+        validated: false,
+    }) {
+        eprintln!(
+            "warning: could not record the publication of {version} in the durable ledger: {err}"
+        );
+    }
+    // MUTATION-PROOF MARKER: the `record_publication` call above is load-bearing.
+    // Removing it must make `installing_a_version_records_a_publication` FAIL:
+    // a version installed by a path other than the staging path would then
+    // leave NO durable publication proof, and the acceptance checker would
+    // report a live fix as unpublished.
+
     Ok(dest)
+}
+
+/// The source fingerprint to record for a version installed from `source`.
+///
+/// The TRUE fingerprint is the 16-char value the build recorded in the sidecar
+/// next to the built binary (`write_dev_binary_source_metadata`). It is only
+/// trusted when the sidecar describes THIS version: a stale sidecar from an
+/// earlier build must never be recorded against a different label.
+///
+/// When there is no usable sidecar (a release build has none), the 12-char
+/// fingerprint embedded in a dirty version label (`{short}-dirty-{fingerprint}`)
+/// is the best available evidence.
+fn publication_fingerprint_for(source: &Path, version: &str) -> String {
+    let sidecar = binary_source_metadata_path(source);
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        if let Ok(metadata) = serde_json::from_str::<DevBinarySourceMetadata>(&text) {
+            if metadata.version_label == version {
+                return metadata.source_fingerprint;
+            }
+        }
+    }
+    version
+        .split_once("-dirty-")
+        .map(|(_, fingerprint)| fingerprint.to_string())
+        .unwrap_or_default()
 }
 
 fn binary_source_metadata_path(binary: &Path) -> PathBuf {
@@ -439,7 +689,24 @@ fn validate_dev_binary_matches_source(
     binary: &Path,
     source: &SourceState,
 ) -> Result<()> {
-    let report = read_binary_version_report(binary)?;
+    validate_dev_binary_matches_source_with(repo_dir, binary, source, read_binary_version_report)
+}
+
+/// The source check with the binary version report injected.
+///
+/// `report_for` reads the version report of a built binary. It is injected so
+/// the staging contract can be tested without a real executable; the real
+/// caller always uses [`read_binary_version_report`].
+fn validate_dev_binary_matches_source_with<F>(
+    repo_dir: &Path,
+    binary: &Path,
+    source: &SourceState,
+    report_for: F,
+) -> Result<()>
+where
+    F: Fn(&Path) -> Result<BinaryVersionReport>,
+{
+    let report = report_for(binary)?;
     if report.version.as_deref().unwrap_or_default().is_empty() {
         anyhow::bail!(
             "Binary smoke test for {} returned JSON without a version field",
@@ -720,6 +987,106 @@ pub fn publish_local_current_build_for_source(
     })
 }
 
+/// STAGE a build: install the immutable versioned binary and record it as
+/// the landing target, WITHOUT moving any channel.
+///
+/// This is the build-time half of the landing split. It does exactly what a
+/// build is allowed to do:
+///
+/// - install the immutable binary under `builds/versions/<label>/`,
+/// - smoke-test that binary,
+/// - record the label as the STAGED version, the landing's target.
+///
+/// It does NOT move `current`, the launcher, or `shared-server`. Those move
+/// only inside a landing transaction, where the daemon is handed off and
+/// PROVEN to run the target before the client channels follow.
+///
+/// Why the split matters: while the build moved `current` and the launcher
+/// but the daemon was still on the old build, any new client attached to an
+/// older daemon. That window is what this function removes.
+pub fn stage_local_current_build_for_source(
+    repo_dir: &Path,
+    source: &SourceState,
+) -> Result<PublishedBuild> {
+    stage_local_current_build_for_source_with(repo_dir, source, read_binary_version_report)
+}
+
+/// The staging step with the binary smoke test injected.
+///
+/// `report_for` reads the version report of a built binary. It is injected so
+/// the staging contract can be tested without a real executable; the real
+/// caller always uses [`read_binary_version_report`].
+pub fn stage_local_current_build_for_source_with<F>(
+    repo_dir: &Path,
+    source: &SourceState,
+    report_for: F,
+) -> Result<PublishedBuild>
+where
+    F: Fn(&Path) -> Result<BinaryVersionReport>,
+{
+    let binary = find_dev_binary(repo_dir)
+        .ok_or_else(|| anyhow::anyhow!("Binary not found in target/selfdev or target/release"))?;
+    if !binary.exists() {
+        anyhow::bail!("Binary not found at {:?}", binary);
+    }
+
+    validate_dev_binary_matches_source_with(repo_dir, &binary, source, &report_for)?;
+    let previous_current_version = read_current_version()?;
+    let versioned_path = install_binary_at_version(&binary, &source.version_label)?;
+    let installed_report = report_for(&versioned_path)?;
+    if installed_report
+        .version
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        anyhow::bail!(
+            "Binary smoke test for {} returned JSON without a version field",
+            versioned_path.display()
+        );
+    }
+    validate_binary_version_matches_source_report(&installed_report, &versioned_path, source)?;
+
+    // The staged marker is written LAST: it is the promise that the build is
+    // complete and installable, so it must not exist before the binary is
+    // verified.
+    write_staged_version(&source.version_label)?;
+
+    // The INSTALLATION row of the durable ledger was written by
+    // `install_binary_at_version` above - the single point where a version
+    // directory is created. It records that the label names an installable
+    // artifact, but it was written BEFORE the smoke test and the hash check
+    // that just passed.
+    //
+    // Append the VALIDATED row now: a consumer that needs the strong proof
+    // ("this label names a binary that was verified against its source")
+    // requires a row with `validated: true`. The install row stays in place:
+    // the ledger is append-only, and both rows describe one installation.
+    if let Err(err) = record_publication(&PublicationRecord {
+        version: source.version_label.clone(),
+        source_fingerprint: source.fingerprint.clone(),
+        published_at: Utc::now(),
+        validated: true,
+    }) {
+        eprintln!(
+            "warning: could not record the validated publication of {} in the durable ledger: {err}",
+            source.version_label
+        );
+    }
+
+    // The channel links are the CURRENT channel's links, unchanged by this
+    // build. They are reported so a caller can see where the clients still
+    // point.
+    Ok(PublishedBuild {
+        version: source.version_label.clone(),
+        source_fingerprint: source.fingerprint.clone(),
+        versioned_path,
+        current_link: current_binary_path()?,
+        launcher_link: launcher_binary_path()?,
+        previous_current_version,
+    })
+}
+
 /// Install the local release binary into immutable versions and make it the active `current`
 /// build + launcher, while keeping `stable` untouched.
 pub fn publish_local_current_build(repo_dir: &std::path::Path) -> Result<PathBuf> {
@@ -909,8 +1276,20 @@ fn shared_server_binary_is_strictly_older_than(
     }
 }
 
-/// Install release binary into immutable versions, promote it to stable, and also make it the
-/// active current/launcher build.
+/// Install the local release binary into the immutable versions directory and
+/// LAND it onto the whole ecosystem as ONE transaction, while keeping `stable`
+/// untouched until the landing succeeded.
+///
+/// The previous implementation moved the `stable`, `current`, `shared-server`
+/// and launcher channels inline, in the OPPOSITE order from the release
+/// update path. Two independent sequences moving the same channels is exactly
+/// how a daemon/client split was produced: a crash between the daemon channel
+/// move and the client channel move left the daemon on the new build and the
+/// clients on the old one, with no journal to recover from.
+///
+/// The landing transaction fixes both: it moves the daemon channel, hands the
+/// daemon off, PROVES the daemon runs the target, and only then moves the
+/// client channels - as one journaled unit that recovers on its own.
 pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     let source = release_binary_path(repo_dir);
     if !source.exists() {
@@ -920,10 +1299,17 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     let version = repo_build_version(repo_dir)?;
 
     let versioned = install_binary_at_version(&source, &version)?;
-    update_stable_symlink(&version)?;
-    update_current_symlink(&version)?;
-    update_shared_server_symlink(&version)?;
-    update_launcher_symlink_to_current()?;
+
+    // The landing is run by the TARGET's own versioned binary, so the channel
+    // moves happen inside the transaction and never in this process.
+    //
+    // The pin is overridden here on purpose: a local `/rebuild` is the user
+    // asking for THIS exact local build, so it lands over a pinned self-dev
+    // daemon - atomically, so the ecosystem moves together and there is no
+    // split either way.
+    land_release_version(&version, true, &mut |version| {
+        land_installed_version(version)
+    })?;
 
     Ok(versioned)
 }
@@ -940,5 +1326,27 @@ pub fn update_canary_symlink(hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// The process-wide lock guarding `JCODE_HOME` in tests.
+///
+/// It lives in the crate root, not in a test module, because BOTH
+/// `tests.rs` and `landing_tests.rs` redirect `JCODE_HOME` into a temp dir.
+/// `JCODE_HOME` is process-global, so two modules with two different mutexes
+/// would race: one test would change the home under the other, and the
+/// other's channel assertions would read the wrong directory.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod landing_tests;
+#[cfg(test)]
+mod deterministic_build_tests;
+#[cfg(test)]
+mod publication_ledger_tests;
 #[cfg(test)]
 mod tests;

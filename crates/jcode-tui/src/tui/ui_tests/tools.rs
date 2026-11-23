@@ -491,9 +491,7 @@ Completed: 2 succeeded, 1 failed"
         "rendered={rendered:?}"
     );
     assert!(
-        rendered
-            .iter()
-            .any(|line| line.contains("✗ agentgrep")),
+        rendered.iter().any(|line| line.contains("✗ agentgrep")),
         "failed subcall should be attributed to agentgrep: {rendered:?}"
     );
     assert!(
@@ -1471,72 +1469,259 @@ fn test_action_tools_degrade_to_tool_name_when_action_absent() {
     }
 }
 
+/// MCP rows must name the concrete tool, not the action verb: a row that says
+/// only "call" does not identify what ran. Both spellings are covered -
+/// `mcp action=call` with a raw server/tool pair, and a dispatch-named call.
+#[test]
+fn test_tool_summary_mcp_names_the_concrete_tool() {
+    let pair = ToolCall {
+        id: "call_mcp_pair".to_string(),
+        name: "mcp".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate",
+            "arguments": { "query": "mcp label" },
+            "intent": "find the label"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    // The tool name always leads; the essence follows while the row has room.
+    let wide = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(80));
+    assert_eq!(
+        wide,
+        "cgrep / cgrep_agent_locate · find the label",
+        "summary={wide:?}"
+    );
+    // Below the combined length the row degrades by truncation, and the name is
+    // still the head of it rather than being displaced by the essence.
+    let narrow = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(20));
+    assert!(narrow.starts_with("cgrep"), "narrow={narrow:?}");
+
+    // Short essence comes from the call's own intent, so it costs no model call.
+    let roomy = tools_ui::get_tool_summary_with_budget(&pair, 50, Some(120));
+    assert_eq!(
+        roomy, wide,
+        "a wider row must not change the label: roomy={roomy:?} wide={wide:?}"
+    );
+
+    let dispatch = ToolCall {
+        id: "call_mcp_dispatch".to_string(),
+        name: "mcp__cgrep__cgrep_agent_locate".to_string(),
+        input: serde_json::json!({
+            "intent": "find the label",
+            "query": "mcp label",
+            "path": "crates"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&dispatch, 50, Some(80));
+    assert_eq!(
+        summary,
+        "cgrep / cgrep_agent_locate · find the label",
+        "summary={summary:?}"
+    );
+
+    // Same call data, different key order: the label must not depend on it.
+    let reordered = ToolCall {
+        id: "call_mcp_reordered".to_string(),
+        name: "mcp_call".to_string(),
+        input: serde_json::json!({
+            "arguments": {},
+            "tool": "cgrep_agent_locate",
+            "server": "cgrep"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&reordered, 50, Some(80));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+
+    // No intent and no query: the row stays a bare name rather than inventing text.
+    let bare = ToolCall {
+        id: "call_mcp_bare".to_string(),
+        name: "mcp_call".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate",
+            "arguments": {}
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    let summary = tools_ui::get_tool_summary_with_budget(&bare, 50, Some(120));
+    assert_eq!(summary, "cgrep / cgrep_agent_locate", "summary={summary:?}");
+}
+
+/// An MCP row must name the concrete tool even when the model also sent an
+/// intent, because the live config keeps `display.tool_call_details = false` and
+/// in that mode the technical summary is dropped entirely. Without this the row
+/// reads only "mcp · <intent>" and the fix is invisible to the user.
+#[test]
+fn render_tool_message_mcp_row_keeps_the_tool_name_with_intent() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: Some(3.0),
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_mcp_render".to_string(),
+            name: "mcp".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" },
+                "intent": "find the label"
+            }),
+            intent: Some("find the label".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+
+    assert!(rendered.contains("cgrep_agent_locate"), "rendered={rendered}");
+    assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
+}
+
+/// Same guarantee without an intent: in the default mode a row with no intent
+/// falls back to the technical summary, which still carries the tool name. The
+/// assertion checks the DISPLAY slot (`mcp_call: …`), because the summary alone
+/// would satisfy a bare `contains` and mask a regression that empties the name.
+#[test]
+fn render_tool_message_mcp_row_keeps_the_tool_name_without_intent() {
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: Some(2.0),
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_mcp_no_intent".to_string(),
+            name: "mcp_call".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" }
+            }),
+            intent: None,
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+
+    assert!(rendered.contains("mcp_call: cgrep / cgrep_agent_locate"), "rendered={rendered}");
+    assert!(!rendered.contains("call cgrep"), "rendered={rendered}");
+}
+
+/// A tool whose input happens to carry a `tool` field must keep its own name.
+/// `integration_tools` (discover) uses `tool` for a PRODUCT name, so an
+/// MCP-shaped suffix there would be a mislabel, not a clarification.
+#[test]
+fn row_display_name_leaves_non_mcp_tools_alone() {
+    let discover = ToolCall {
+        id: "call_discover".to_string(),
+        name: "integration_tools".to_string(),
+        input: serde_json::json!({
+            "action": "suggest",
+            "category": "payments",
+            "tool": "Stripe"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(
+        tools_ui::resolve_row_display_name(&discover),
+        "integration_tools"
+    );
+
+    let mcp = ToolCall {
+        id: "call_mcp_named".to_string(),
+        name: "mcp".to_string(),
+        input: serde_json::json!({
+            "action": "call",
+            "server": "cgrep",
+            "tool": "cgrep_agent_locate"
+        }),
+        intent: None,
+        thought_signature: None,
+    };
+    assert_eq!(
+        tools_ui::resolve_row_display_name(&mcp),
+        "mcp: cgrep / cgrep_agent_locate"
+    );
+
+    // Every (server, tool) pair that actually occurs in the live transcript, so
+    // the row name is checked against real traffic rather than one fixture.
+    for (server, tool) in [
+        ("cgrep", "cgrep_search"),
+        ("graft", "graft_check_freshness"),
+        ("serena", "activate_project"),
+        ("serena", "find_symbol"),
+        ("serena", "get_symbols_overview"),
+        ("windows-mcp", "PowerShell"),
+    ] {
+        let call = ToolCall {
+            id: format!("call_real_{server}_{tool}"),
+            name: "mcp".to_string(),
+            input: serde_json::json!({
+                "action": "call",
+                "server": server,
+                "tool": tool
+            }),
+            intent: None,
+            thought_signature: None,
+        };
+        assert_eq!(
+            tools_ui::resolve_row_display_name(&call),
+            format!("mcp: {server} / {tool}"),
+            "server={server} tool={tool}"
+        );
+    }
+
+    // A real `action=search`/`list` call carries no `tool` (measured on the live
+    // transcript: 5 of 18 MCP calls, of which 4 still carry `server`). Naming it
+    // `mcp: serena` adds nothing when no concrete tool exists, so the row keeps
+    // the bare tool name instead of a suffix that names only the server.
+    for (action, server) in [
+        ("search", None),
+        ("list", None),
+        ("search", Some("windows-mcp")),
+        ("list", Some("serena")),
+    ] {
+        let mut input = serde_json::json!({
+            "action": action,
+            "intent": "List configured MCP servers"
+        });
+        if let Some(server) = server {
+            input["server"] = serde_json::Value::String(server.to_string());
+        }
+        let catalog = ToolCall {
+            id: format!("call_mcp_{action}_{server:?}"),
+            name: "mcp".to_string(),
+            input,
+            intent: None,
+            thought_signature: None,
+        };
+        assert_eq!(
+            tools_ui::resolve_row_display_name(&catalog),
+            "mcp",
+            "action={action} server={server:?} must not gain a suffix"
+        );
+    }
+}
+
 /// The live activity line should surface the model-provided `intent` for any
 /// tool (including swarm) ahead of the technical summary when tool call
 /// details are enabled.
-#[test]
-fn test_activity_detail_prefers_intent_and_appends_summary() {
-    tools_ui::tests_tool_call_details_override::set(true);
-    let tool = ToolCall {
-        id: "swarm-1".to_string(),
-        name: "swarm".to_string(),
-        input: serde_json::json!({
-            "intent": "Spin up a worker for the parser fix",
-            "action": "spawn",
-            "prompt": "Fix the parser bug in crates/parser"
-        }),
-        intent: Some("Spin up a worker for the parser fix".to_string()),
-        thought_signature: None,
-    };
-
-    let detail = tools_ui::get_tool_activity_detail(&tool);
-    assert!(
-        detail.starts_with("Spin up a worker for the parser fix"),
-        "intent should lead the activity detail: {detail:?}"
-    );
-    assert!(
-        detail.contains("spawn"),
-        "technical summary should still appear: {detail:?}"
-    );
-    tools_ui::tests_tool_call_details_override::set(false);
-}
-
-/// When the `ToolCall.intent` field is not populated yet (e.g. streamed input
-/// parsed but intent refresh missed), fall back to the raw `intent` input key.
-#[test]
-fn test_activity_detail_falls_back_to_input_intent_field() {
-    let tool = ToolCall {
-        id: "swarm-2".to_string(),
-        name: "swarm".to_string(),
-        input: serde_json::json!({
-            "intent": "Check on worker progress",
-            "action": "status",
-            "target_session": "worker-1"
-        }),
-        intent: None,
-        thought_signature: None,
-    };
-
-    let detail = tools_ui::get_tool_activity_detail(&tool);
-    assert!(
-        detail.starts_with("Check on worker progress"),
-        "input intent should be used when the field is unset: {detail:?}"
-    );
-}
-
-/// Without an intent, the activity detail matches the plain technical summary.
-#[test]
-fn test_activity_detail_without_intent_matches_summary() {
-    let tool = ToolCall {
-        id: "swarm-3".to_string(),
-        name: "swarm".to_string(),
-        input: serde_json::json!({ "action": "dm", "to_session": "worker-1", "message": "hello" }),
-        intent: None,
-        thought_signature: None,
-    };
-
-    let detail = tools_ui::get_tool_activity_detail(&tool);
-    let summary = tools_ui::get_tool_summary(&tool);
-    assert_eq!(detail, summary);
-    assert!(!detail.is_empty());
-}
+#[path = "tool_activity_tests.rs"]
+mod activity;

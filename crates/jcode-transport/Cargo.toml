@@ -25,4 +25,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# The probe matrix in `windows.rs` builds both multi-thread and
+# current-thread runtimes (`#[tokio::test(flavor = "multi_thread")]`) and uses
+# `tokio::sync::mpsc`. `rt` alone left the crate's own test target failing to
+# compile (31 errors), so its probes could never run from inside the crate.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }

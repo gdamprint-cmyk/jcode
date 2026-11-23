@@ -100,24 +100,92 @@ fn retry_after_delay_at(headers: &HeaderMap, now: SystemTime) -> Option<Duration
     )
 }
 
+/// Parse a server `Retry-After` header without the in-request cap.
+///
+/// Same grammar as [`retry_after`] (delta-seconds or HTTP-date, RFC 9110 section
+/// 10.2.3; header guide: https://http.dev/retry-after), but bounded by
+/// [`RetryAfter::MAX_RETRY_HONORED`] instead of [`MAX_RETRY_AFTER`]. A retry loop
+/// willing to wait out a long upstream queue must see the real delay: capping it
+/// makes the next attempt land inside the same window and fail again.
+pub fn retry_after_uncapped(headers: &HeaderMap) -> Option<RetryAfter> {
+    retry_after_delay_at_uncapped(headers, SystemTime::now()).map(RetryAfter::new)
+}
+
+fn retry_after_delay_at_uncapped(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let max_secs = RetryAfter::MAX_RETRY_HONORED.as_secs();
+        let seconds = value.bytes().fold(0u64, |seconds, byte| {
+            seconds
+                .saturating_mul(10)
+                .saturating_add(u64::from(byte - b'0'))
+                .min(max_secs)
+        });
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .min(RetryAfter::MAX_RETRY_HONORED),
+    )
+}
+
 /// A bounded server retry hint represented as a monotonic deadline.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryAfter {
     deadline: Instant,
+    asked: Duration,
 }
 
 impl RetryAfter {
     fn new(delay: Duration) -> Self {
         Self {
             deadline: Instant::now() + delay,
+            asked: delay,
         }
     }
 
     /// Time still remaining on the hint. Time spent reading and classifying an
-    /// error response counts toward the requested wait.
+    /// response counts toward the requested wait.
     pub fn remaining(self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
+
+    /// The delay the server asked for, before any caller-side cap.
+    ///
+    /// A retry loop that caps its own sleep still needs the real value: a
+    /// fair-share window the server says is 297s does not admit the next attempt
+    /// at 60s, so sleeping the capped value only burns attempts.
+    pub fn requested(self) -> Duration {
+        self.asked
+    }
+
+    /// Convert into a still-pending delay, or `None` when the window is over.
+    ///
+    /// Lets a caller hold the hint as a deadline without treating a long-wait
+    /// hint as a fresh zero-length sleep once the deadline passes.
+    pub fn remaining_into_delay(self) -> Option<Duration> {
+        (self.remaining() > Duration::ZERO).then(|| self.remaining())
+    }
+
+    /// Longest server-requested delay a provider retry loop will honor.
+    ///
+    /// Larger than [`MAX_RETRY_AFTER`] on purpose. That cap protects a turn from
+    /// a hostile header by limiting how long one attempt waits; this cap bounds
+    /// the total wait a retry loop is willing to spend on a legitimate upstream
+    /// queue. Measured 2026-11-22: Nous answers a free-model fair-share 429 with
+    /// `retry-after: 297` while the account bucket is untouched
+    /// (`x-ratelimit-remaining-requests: 396/400`), so the delay is a per-model
+    /// token window, not a punishment. Honouring it ends the turn in one wait;
+    /// capping it at 60s produced repeated 429s and a turn that looked stuck.
+    pub const MAX_RETRY_HONORED: Duration = Duration::from_secs(900);
 }
 
 /// Error wrapper that preserves the provider's user-facing message while
@@ -216,6 +284,32 @@ mod tests {
         assert_eq!(
             retry_after_delay_at(&headers(value), now),
             Some(MAX_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn uncapped_header_keeps_a_long_fair_share_window() {
+        let headers = headers(HeaderValue::from_static("297"));
+        assert_eq!(
+            retry_after_delay_at_uncapped(&headers, SystemTime::UNIX_EPOCH),
+            Some(Duration::from_secs(297))
+        );
+        assert_eq!(
+            retry_after_delay_at(&headers, SystemTime::UNIX_EPOCH),
+            Some(MAX_RETRY_AFTER),
+            "the in-request parser stays capped"
+        );
+        let hint = retry_after_uncapped(&headers).expect("uncapped hint");
+        assert_eq!(hint.requested(), Duration::from_secs(297));
+        assert!(hint.remaining() <= Duration::from_secs(297));
+    }
+
+    #[test]
+    fn uncapped_header_is_still_bounded() {
+        let value = HeaderValue::from_static("999999999999999999999999999999999999999999");
+        assert_eq!(
+            retry_after_delay_at_uncapped(&headers(value), SystemTime::UNIX_EPOCH),
+            Some(RetryAfter::MAX_RETRY_HONORED)
         );
     }
 
@@ -329,6 +423,7 @@ mod tests {
     fn elapsed_hint_does_not_add_another_wait() {
         let retry_after = RetryAfter {
             deadline: Instant::now() - Duration::from_secs(1),
+            asked: Duration::from_secs(1),
         };
         let error = error_with_retry_after("rate limited".to_string(), Some(retry_after));
         assert_eq!(retry_after_from_error(&error), Some(Duration::ZERO));

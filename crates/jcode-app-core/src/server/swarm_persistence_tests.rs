@@ -138,12 +138,26 @@ fn persisted_swarm_state_round_trips_and_marks_running_stale() {
 }
 
 #[test]
-fn ready_headless_member_with_report_stops_without_losing_report() {
-    // A headless worker that finished its task has no process after restart.
-    // Preserve its report, but do not eagerly reconstruct the full Agent just
-    // to keep an idle worker reusable indefinitely.
+fn ready_headless_member_with_report_survives_reload_when_its_session_exists() {
+    // A headless worker that finished its task has no process after restart, but
+    // its session file is still on disk, so `worker_revive` can rebuild its
+    // agent on demand. Keep the member `ready` (and reusable) instead of
+    // stopping it and telling the coordinator to spawn a replacement.
+    //
+    // MEASURED 2026-11-16: all 14 persisted `ready` headless members on this
+    // host still had their session file; every one of them was recoverable.
     let dir = tempfile::TempDir::new().expect("tempdir");
     let _env = test_env(&dir);
+    let home = tempfile::TempDir::new().expect("home");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
+    let sessions_dir = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    std::fs::write(
+        sessions_dir.join("session-ready.json"),
+        br#"{"id":"session-ready","messages":[]}"#,
+    )
+    .expect("session file");
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let members = vec![SwarmMember {
@@ -173,15 +187,76 @@ fn ready_headless_member_with_report_stops_without_losing_report() {
     let loaded = load_runtime_state();
 
     let recovered = loaded.members.get("session-ready").expect("member");
-    assert_eq!(recovered.status, "stopped");
-    assert_eq!(
-        recovered.detail.as_deref(),
-        Some("idle worker not restored after server restart")
+    assert_eq!(recovered.status, "ready");
+    assert!(
+        !recovered
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains(IDLE_WORKER_NOT_RESTORED_NOTE),
+        "a restorable worker must not be reported as unrestored: {:?}",
+        recovered.detail
     );
     assert_eq!(
         recovered.latest_completion_report.as_deref(),
         Some("Done. Built the worker; all tests pass.")
     );
+    if let Some(value) = previous_home {
+        crate::env::set_var("JCODE_HOME", value);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn ready_headless_member_without_session_file_is_reported_unrestored() {
+    // The session file is gone: the worker cannot be revived, so it IS
+    // genuinely unrestorable and the coordinator must be told to replace it.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let _env = test_env(&dir);
+    let home = tempfile::TempDir::new().expect("home");
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let members = vec![SwarmMember {
+        session_id: "session-gone".to_string(),
+        event_tx,
+        event_txs: HashMap::new(),
+        working_dir: Some(PathBuf::from("/tmp/swarm-delta")),
+        swarm_id: Some("swarm-delta".to_string()),
+        swarm_enabled: true,
+        status: "ready".to_string(),
+        detail: None,
+        friendly_name: Some("goat".to_string()),
+        report_back_to_session_id: Some("session-coordinator".to_string()),
+        latest_completion_report: Some("Done.".to_string()),
+        role: "agent".to_string(),
+        joined_at: Instant::now(),
+        last_status_change: Instant::now(),
+        is_headless: true,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+        task_label: None,
+    }];
+
+    persist_swarm_state("swarm-delta", None, None, &members);
+    let loaded = load_runtime_state();
+
+    let recovered = loaded.members.get("session-gone").expect("member");
+    assert_eq!(recovered.status, "stopped");
+    assert_eq!(
+        recovered.detail.as_deref(),
+        Some(IDLE_WORKER_NOT_RESTORED_NOTE)
+    );
+    assert_eq!(recovered.latest_completion_report.as_deref(), Some("Done."));
+    if let Some(value) = previous_home {
+        crate::env::set_var("JCODE_HOME", value);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
 }
 
 #[test]

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-pub use jcode_task_types::{Goal, GoalMilestone, GoalScope, GoalStatus, GoalStep, GoalUpdate};
+pub use jcode_task_types::{
+    Goal, GoalMilestone, GoalReviewCondition, GoalScope, GoalStatus, GoalStep, GoalUpdate,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalDisplayMode {
@@ -39,6 +41,12 @@ pub struct GoalCreateInput {
     pub blockers: Vec<String>,
     pub current_milestone_id: Option<String>,
     pub progress_percent: Option<u8>,
+    /// The condition under which a deferred goal becomes worth reconsidering.
+    ///
+    /// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    ///   ("Record the goal key, the budget constraint, the reason the old
+    ///   option failed and the evidence that would justify reconsideration").
+    pub review_condition: Option<GoalReviewCondition>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +62,10 @@ pub struct GoalUpdateInput {
     pub current_milestone_id: Option<Option<String>>,
     pub progress_percent: Option<Option<u8>>,
     pub checkpoint_summary: Option<String>,
+    /// The condition under which a deferred goal becomes worth reconsidering.
+    ///
+    /// `None` leaves the condition untouched; `Some(None)` clears it.
+    pub review_condition: Option<Option<GoalReviewCondition>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +101,7 @@ pub fn create_goal(input: GoalCreateInput, working_dir: Option<&Path>) -> Result
     goal.blockers = trim_vec(input.blockers);
     goal.current_milestone_id = input.current_milestone_id;
     goal.progress_percent = input.progress_percent.map(|p| p.min(100));
+    goal.review_condition = input.review_condition;
     goal.updated_at = Utc::now();
     save_goal(&goal, working_dir)?;
     sync_goal_memory(&goal, working_dir)?;
@@ -139,6 +152,9 @@ pub fn update_goal(
     }
     if let Some(progress_percent) = update.progress_percent {
         goal.progress_percent = progress_percent.map(|p| p.min(100));
+    }
+    if let Some(review_condition) = update.review_condition {
+        goal.review_condition = review_condition;
     }
     if let Some(summary) = update
         .checkpoint_summary

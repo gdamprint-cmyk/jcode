@@ -202,7 +202,9 @@ impl McpManager {
                 total_failures.extend(failures);
 
                 // Acquire handles for shared servers only
-                let all_handles = pool.acquire_handles(&self.session_id).await;
+                let all_handles = pool
+                    .acquire_handles(&self.session_id, self.project_dir.as_deref())
+                    .await;
                 let shared_names: std::collections::HashSet<&String> =
                     shared_servers.iter().map(|(name, _)| *name).collect();
                 let mut pool_handles = self.pool_handles.write().await;
@@ -267,8 +269,11 @@ impl McpManager {
         }
         if config.shared {
             if let Some(pool) = &self.pool {
-                pool.connect_server(name, config).await?;
-                if let Some(handle) = pool.get_handle(name).await {
+                pool.connect_server(name, config, self.project_dir.as_deref())
+                    .await?;
+                if let Some(handle) =
+                    pool.get_handle_for_dir(name, config, self.project_dir.as_deref()).await
+                {
                     self.pool_handles
                         .write()
                         .await
@@ -365,8 +370,12 @@ impl McpManager {
             let mut handles = self.pool_handles.write().await;
             if handles.remove(name).is_some() {
                 if let Some(pool) = &self.pool {
-                    pool.release_handles(&self.session_id, &[name.to_string()])
-                        .await;
+                    pool.release_handles(
+                        &self.session_id,
+                        &[name.to_string()],
+                        self.project_dir.as_deref(),
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -391,7 +400,12 @@ impl McpManager {
             let names: Vec<String> = handles.keys().cloned().collect();
             handles.clear();
             if let Some(pool) = &self.pool {
-                pool.release_handles(&self.session_id, &names).await;
+                pool.release_handles(
+                    &self.session_id,
+                    &names,
+                    self.project_dir.as_deref(),
+                )
+                .await;
             }
         }
 
@@ -784,6 +798,7 @@ mod tests {
                 enabled: Some(false),
                 disabled: None,
                 timeout_secs: None,
+                per_project: false,
             },
         );
         let manager = McpManager::with_config(config);
@@ -819,6 +834,7 @@ mod tests {
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                per_project: false,
             },
         );
         let manager = McpManager::with_config(config);
@@ -1053,6 +1069,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                per_project: false,
             },
         );
         let manager = McpManager::with_config(config.clone());

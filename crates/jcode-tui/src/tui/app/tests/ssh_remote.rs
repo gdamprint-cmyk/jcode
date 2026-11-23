@@ -1,4 +1,9 @@
 fn with_ssh_remote_test_home(f: impl FnOnce()) {
+    let thread = std::thread::current();
+    let test_name = thread.name().expect("named test thread");
+    if super::commands_dispatch::ssh_test_runs_in_child(test_name) {
+        return;
+    }
     with_temp_jcode_home(|| {
         struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for RestoreEnv {
@@ -136,14 +141,22 @@ fn ssh_remote_subscribe_keeps_remote_only_id_and_filters_control_done() {
             crate::server::set_socket_path(socket.to_str().unwrap());
             #[allow(unused_mut)]
             let mut listener = crate::transport::Listener::bind(&socket).unwrap();
-            let mut connection = crate::tui::backend::RemoteConnection::connect_with_session(
+            let connecting = tokio::spawn(async { crate::tui::backend::RemoteConnection::connect_with_session(
                 Some("remote-only-session"), Some("ssh-client"), true, None, false,
                 Some("/remote/project"),
-            ).await.unwrap();
+            ).await.unwrap() });
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let crate::protocol::Request::Ping { id: ping_id } = serde_json::from_str(&line).unwrap() else {
+                panic!("SSH bootstrap must verify daemon readiness before Subscribe");
+            };
+            assert!(!connecting.is_finished());
+            writer.write_all(format!("{{\"type\":\"pong\",\"id\":{ping_id},\"native_ssh_protocol\":1}}\n").as_bytes()).await.unwrap();
+            let mut connection = connecting.await.unwrap();
+            line.clear();
             reader.read_line(&mut line).await.unwrap();
             let request: crate::protocol::Request = serde_json::from_str(&line).unwrap();
             let id = match request {
@@ -256,6 +269,7 @@ fn ssh_remote_history_is_authoritative_even_when_empty_or_server_version_differs
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),

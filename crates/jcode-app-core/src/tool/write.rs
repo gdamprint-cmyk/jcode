@@ -2,6 +2,7 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_core::eol::{normalize_line_endings, resolve_line_ending};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -75,12 +76,18 @@ impl Tool for WriteTool {
             None
         };
 
+        // The model emits LF. Write the file in the ending it already uses so a
+        // write does not turn the whole file into a diff; a new file takes the
+        // platform's ending.
+        let ending = resolve_line_ending(&path, old_content.as_deref());
+        let content = normalize_line_endings(&params.content, ending);
+
         // Write the file
-        tokio::fs::write(&path, &params.content).await?;
+        tokio::fs::write(&path, &content).await?;
         super::edit_stats::record(
             &ctx,
             old_content.as_deref().unwrap_or(""),
-            &params.content,
+            &content,
             existed && old_content.is_none(),
         )
         .await;
@@ -93,6 +100,8 @@ impl Tool for WriteTool {
             generate_diff_summary("", &params.content)
         };
         let detail = build_file_touch_preview(&diff);
+        let (added, removed) =
+            super::edit_stats::line_delta(old_content.as_deref().unwrap_or(""), &params.content);
 
         // Publish file touch event for swarm coordination
         Bus::global().publish(BusEvent::FileTouch(FileTouch {
@@ -109,6 +118,8 @@ impl Tool for WriteTool {
                 format!("created new file ({} lines)", line_count)
             }),
             detail,
+            added,
+            removed,
         }));
 
         let mut body = if existed {

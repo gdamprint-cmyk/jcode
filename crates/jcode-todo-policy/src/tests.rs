@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn background_dependencies_block_only_for_running_ids() {
+    let todo = TodoItem {
+        requires_user_auth: None,
+        waiting_reason: None,
+        waiting_on: vec!["task-a".into()],
+        ..Default::default()
+    };
+    assert!(!todo_waits_on_running_task(&todo, |_| false));
+    assert!(!todo_waits_on_running_task(&todo, |id| id == "other"));
+    assert!(todo_waits_on_running_task(&todo, |id| id == "task-a"));
+}
+
 fn intent_observation(state: Option<IntentUnderstanding>) -> GateObservation {
     GateObservation {
         kind: GateObservationKind::IntentUnderstanding,
@@ -571,6 +584,51 @@ fn real_user_prompts_are_not_detected_as_pokes() {
     assert!(!is_auto_poke_message(""));
 }
 
+/// A synthetic continuation is persisted as a user-role turn for the model, so
+/// the transcript needs an explicit display role; otherwise a reader sees the
+/// user as having said it. MEASURED 2026-11-12: 15 such entries across the 12
+/// newest journals carried no display_role.
+/// record: ~/.jcode/research/2026-11-12-user-message-attribution.md
+///
+/// SCOPE, stated because a narrower detector was measured and rejected: the
+/// classifier recognises the KNOWN producer markers only. It cannot prove a
+/// message is user-authored, because a user can type any marker. The negative
+/// controls below therefore assert only what must never fire (an unmarked prompt,
+/// whitespace); a user quoting a marker is a LIMIT of the detector, not a case
+/// this test claims is safe. Tagging is deliberately conservative: a false
+/// negative leaves the message looking like a user turn (the old behaviour),
+/// while a false positive would mislabel a real user prompt.
+///
+/// reference: marker constants under test are declared in this crate
+/// (crates/jcode-todo-policy/src/lib.rs); assertion style follows the sibling
+/// tests in crates/jcode-todo-policy/src/tests.rs; bool::then_some verified at
+/// https://doc.rust-lang.org/std/primitive.bool.html
+#[test]
+fn synthetic_continuations_are_classified_without_user_authorship() {
+    // Every known synthetic producer marker.
+    assert!(is_synthetic_user_message(
+        "[auto] Do more validation on the work below. Keep the todo up to date; do not reply or wait for the user."
+    ));
+    assert!(is_synthetic_user_message(
+        "[auto]\nDo more validation on the work below."
+    ));
+    assert!(is_synthetic_user_message(
+        "[automated follow-up - not a user message] Do more validation on the work below."
+    ));
+    assert!(is_synthetic_user_message(
+        "[SYSTEM: The previous turn was interrupted]"
+    ));
+    // The auto-poke family is synthetic too.
+    assert!(is_synthetic_user_message(
+        "You have 1 incomplete todo. Continue working, or update the todo tool.\nActionable todos:\n- capture: Capture input"
+    ));
+
+    // Negative control: an unmarked prompt is user-authored.
+    assert!(!is_synthetic_user_message("fix the login bug"));
+    assert!(!is_synthetic_user_message(""));
+    assert!(!is_synthetic_user_message("   \n\n  "));
+}
+
 #[test]
 fn final_handoff_preserves_limitations_and_legacy_transcript_classification() {
     assert!(TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.contains("limitations or blockers"));
@@ -596,10 +654,15 @@ fn todo(content: &str, status: &str, group: Option<&str>) -> TodoItem {
         priority: "high".to_string(),
         id: content.to_ascii_lowercase().replace(' ', "-"),
         group: group.map(str::to_string),
+        lane_after: None,
+        lane_owner: None,
         confidence: None,
         completion_confidence: None,
         confidence_history: Vec::new(),
         blocked_by: Vec::new(),
+        requires_user_auth: None,
+        waiting_reason: None,
+        waiting_on: Vec::new(),
         assigned_to: None,
         stage: None,
         details: None,
@@ -1094,5 +1157,27 @@ fn ungrouped_session_title_prefers_plan_intention_then_item_content() {
     assert_eq!(
         derive_session_title(&todos, &TodoPlan::default()).as_deref(),
         Some("Run targeted tests")
+    );
+}
+
+#[test]
+fn plan_title_beats_lane_name_and_intention() {
+    let todos = vec![todo("Fix it", "in_progress", Some("implementation"))];
+    let plan = TodoPlan {
+        title: Some("  Live default sync ".to_string()),
+        user_intention: Some("Make defaults apply immediately".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        derive_session_title(&todos, &plan).as_deref(),
+        Some("Live default sync")
+    );
+    let blank = TodoPlan {
+        title: Some("   ".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        derive_session_title(&todos, &blank).as_deref(),
+        Some("implementation")
     );
 }

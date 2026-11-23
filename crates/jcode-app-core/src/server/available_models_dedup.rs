@@ -26,6 +26,7 @@ pub(super) fn available_models_dedup_key(event: &ServerEvent) -> String {
         provider_model,
         available_models,
         available_model_routes,
+        available_reasoning_efforts: _,
     } = event
     else {
         return crate::protocol::encode_event(event);

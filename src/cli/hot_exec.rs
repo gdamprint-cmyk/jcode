@@ -33,7 +33,7 @@ pub fn execute_requested_action(run_result: &RunResult) -> Result<()> {
     if let Some(ref session_id) = run_result.hibernate_session {
         let mut cmd = super::hibernate_wait::waiter_command(session_id)?;
         crate::logging::info("Hibernating: exec into idle waiter");
-        let err = crate::platform::replace_process(&mut cmd);
+        let err = crate::platform::replace_process_reparented(&mut cmd);
         return Err(anyhow::anyhow!("Failed to exec hibernation waiter: {err}"));
     }
 
@@ -53,8 +53,11 @@ pub fn hot_restart(session_id: &str) -> Result<()> {
     if is_selfdev {
         cmd.arg("self-dev");
     }
-    cmd.arg("--resume").arg(session_id).current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    cmd.arg("--resume")
+        .arg(session_id)
+        .args(crate::tui::jarvis::reexec_args())
+        .current_dir(&cwd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
 
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
@@ -71,10 +74,11 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
             let mut cmd = ProcessCommand::new(&binary_path);
             cmd.arg("--resume")
                 .arg(session_id)
+                .args(crate::tui::jarvis::reexec_args())
                 .arg("--no-update")
                 .env_remove("JCODE_MIGRATE_BINARY")
                 .current_dir(cwd);
-            let err = crate::platform::replace_process(&mut cmd);
+            let err = crate::platform::replace_process_reparented(&mut cmd);
             return Err(anyhow::anyhow!("Failed to exec {:?}: {}", binary_path, err));
         } else {
             crate::logging::warn(&format!(
@@ -120,13 +124,14 @@ pub fn hot_reload(session_id: &str) -> Result<()> {
         }
         cmd.arg("--resume")
             .arg(session_id)
+            .args(crate::tui::jarvis::reexec_args())
             // The server has already completed its handoff before the client
             // re-execs. Let the replacement client paint and accept input from
             // its startup stub immediately; the authoritative History payload
             // will repopulate the transcript after reconnect.
             .env("JCODE_RELOAD_FAST_START", "1")
             .current_dir(&cwd);
-        let err = crate::platform::replace_process(&mut cmd);
+        let err = crate::platform::replace_process_reparented(&mut cmd);
 
         if err.kind() == std::io::ErrorKind::NotFound && attempt < 2 {
             crate::logging::warn(&format!(
@@ -187,9 +192,10 @@ pub fn hot_update(session_id: &str) -> Result<()> {
                     }
                     cmd.arg("--resume")
                         .arg(session_id)
+                        .args(crate::tui::jarvis::reexec_args())
                         .arg("--no-update")
                         .current_dir(&cwd);
-                    let err = crate::platform::replace_process(&mut cmd);
+                    let err = crate::platform::replace_process_reparented(&mut cmd);
                     return Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err));
                 }
                 Err(e) => {
@@ -226,9 +232,10 @@ pub fn hot_update(session_id: &str) -> Result<()> {
     }
     cmd.arg("--resume")
         .arg(session_id)
+        .args(crate::tui::jarvis::reexec_args())
         .arg("--no-update")
         .current_dir(&cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }
 
@@ -257,7 +264,10 @@ fn claim_update_fetch_slot() -> bool {
         return false;
     }
     // Touch before fetching so a spawn burst collapses to ~one fetch.
-    std::fs::write(&marker, b"").is_ok()
+    // A non-empty payload is required: an empty write never reaches the
+    // filesystem, so the marker mtime would not move and every spawn
+    // would run `git fetch` again.
+    crate::storage::touch_stamp(&marker).is_ok()
 }
 
 /// `None` means this local checkout has no tracking branch, not a failed check.
@@ -399,7 +409,7 @@ pub fn run_auto_update() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let err =
-        crate::platform::replace_process(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
+        crate::platform::replace_process_reparented(ProcessCommand::new(&exe).args(&args).arg("--no-update"));
 
     Err(anyhow::anyhow!(
         "Failed to exec new binary {:?}: {}",
@@ -410,9 +420,19 @@ pub fn run_auto_update() -> Result<()> {
 
 /// Explicit updates follow the configured channel for release and dev builds alike.
 /// Source rebuilds belong to self-dev and /rebuild, not the stable update path.
-pub fn run_update() -> Result<()> {
+pub fn run_update(channel: Option<&str>) -> Result<()> {
+    let explicit_channel = channel
+        .map(|value| {
+            crate::config::UpdateChannel::parse(value)
+                .ok_or_else(|| anyhow::anyhow!("Unknown update channel: {value}"))
+        })
+        .transpose()?;
+    if let Some(channel) = explicit_channel {
+        crate::config::Config::set_update_channel(channel)?;
+        super::output::print_centered(&format!("Update channel: {channel}"));
+    }
     super::output::print_centered("Checking GitHub for latest release...");
-    match update::check_for_update_blocking() {
+    match update::check_for_update_with_channel_blocking(explicit_channel) {
         Ok(Some(release)) => {
             super::output::print_centered(&format!(
                 "Downloading {} \u{2192} {}...",

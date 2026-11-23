@@ -1,3 +1,15 @@
+// reference: crates/jcode-app-core/src/server/debug_command_exec.rs:737-741 (read
+// 2026-11-15) - the debug `reload`'s child-process atomic landing, which is the
+// same mechanism this self-dev reload adopts: the TARGET's versioned binary runs
+// `<binary> server land <version> --json`, because the process that would wait for
+// the new daemon's identity is killed by its own reload.
+// reference: https://doc.rust-lang.org/std/process/struct.Command.html#method.output
+// (read 2026-11-15) - "Executes the command as a child process, waiting for it to
+// finish and collecting all of its output"; "Note that this method does not
+// return an error if the child runs and then exits unsuccessfully ... it still
+// returns Ok, and the outcome is reflected in the ExitStatus stored in the
+// returned Output". That is why the exit code must be read from
+// `outcome.status.success()`, not from a `?` on `output()`.
 use super::*;
 pub use jcode_selfdev_types::ReloadRecoveryDirective;
 
@@ -102,10 +114,17 @@ impl ReloadContext {
     ) -> String {
         let task_info = self.task_info_suffix();
         let turns_note = restored_turns
-            .map(|turns| format!(" Session restored with {} turns.", turns))
+            .map(|turns| format!("\nSession restored with {} turns.", turns))
             .unwrap_or_default();
         format!(
-            "Reload succeeded ({} → {}).{}{}{} Continue immediately from where you left off. Do not ask the user what to do next. Do not summarize the reload.",
+            "Reload complete. Resuming your task.\n\n\
+             Continue the user's latest request from the last unfinished step, using the restored conversation and todo list. \
+             The reload itself is complete, not the user's task. Do not stop to announce or summarize the reload, \
+             and do not ask what to do next unless genuinely blocked.\n\n\
+             Before retrying any interrupted tool call, check whether it already completed or is still running. \
+             Do not repeat completed work or duplicate running background tasks. \
+             Validate the new behavior when relevant, then finish the original request.\n\n\
+             Build: {} → {}.{}{}{}",
             self.version_before, self.version_after, task_info, background_task_note, turns_note
         )
     }
@@ -187,8 +206,9 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
             .join(", ");
 
         notes.push_str(&format!(
-            "\nPersisted background task(s) for this session are still running: {}. Do not rerun those commands. Check them first with the `bg` tool (`bg action=\"list\"`, `bg action=\"status\" task_id=...`, or `bg action=\"output\" task_id=...`).",
-            task_list
+            "\nPersisted background task(s) for this session are still running: {}. Do not rerun those commands.\n{}",
+            task_list,
+            crate::tool::BACKGROUND_WAIT_GUIDANCE
         ));
     }
 
@@ -278,6 +298,7 @@ impl SelfDevTool {
         execution_mode: ToolExecutionMode,
         working_dir: Option<&std::path::Path>,
     ) -> Result<ToolOutput> {
+        let test_mode = SelfDevTool::is_test_session();
         let repo_dir = resolve_selfdev_reload_repo_dir(working_dir)
             .ok_or_else(|| anyhow::anyhow!("Could not find jcode repository directory"))?;
 
@@ -289,7 +310,7 @@ impl SelfDevTool {
         // a local debug/selfdev checkout may not have target/release/jcode).
         // Skipping it lets the reload-signal/ack contract be exercised
         // deterministically regardless of which profile was built locally.
-        if !SelfDevTool::is_test_session() && !target_binary.exists() {
+        if !test_mode && !target_binary.exists() {
             return Ok(ToolOutput::new(
                 format!(
                     "No binary found at {}.\n\
@@ -300,7 +321,7 @@ impl SelfDevTool {
             ));
         }
 
-        let source = if SelfDevTool::is_test_session() {
+        let source = if test_mode {
             build::SourceState {
                 repo_scope: "test-repo-scope".to_string(),
                 worktree_scope: "test-worktree-scope".to_string(),
@@ -316,14 +337,17 @@ impl SelfDevTool {
         };
         let hash = source.version_label.clone();
         let version_before = jcode_build_meta::version().to_string();
-        let published = if SelfDevTool::is_test_session() {
+        // STAGE only: the build installs the immutable binary and records the
+        // landing target. The client channels move in the landing
+        // transaction, after the daemon is proven to run this build.
+        let published = if test_mode {
             None
         } else {
-            Some(build::publish_local_current_build_for_source(
+            Some(build::stage_local_current_build_for_source(
                 &repo_dir, &source,
             )?)
         };
-        let previous_shared_server_version = if SelfDevTool::is_test_session() {
+        let previous_shared_server_version = if test_mode {
             None
         } else {
             let published_build = published.as_ref().ok_or_else(|| {
@@ -335,27 +359,102 @@ impl SelfDevTool {
             build::read_shared_server_version()?
         };
 
-        // Update manifest - track what we're testing
-        let mut manifest = build::BuildManifest::load()?;
-        manifest.canary = Some(hash.clone());
-        manifest.canary_status = Some(build::CanaryStatus::Testing);
-        manifest.set_pending_activation(build::PendingActivation {
-            session_id: session_id.to_string(),
-            new_version: hash.clone(),
-            previous_current_version: published
-                .as_ref()
-                .and_then(|published| published.previous_current_version.clone()),
-            previous_shared_server_version,
-            source_fingerprint: Some(source.fingerprint.clone()),
-            requested_at: chrono::Utc::now(),
-        })?;
-        manifest.save()?;
+        // Synthetic builds must never publish activation state, even when
+        // JCODE_HOME is unset and storage resolves to the production home.
+        if !test_mode {
+            // Update manifest - track what we're testing
+            let mut manifest = build::BuildManifest::load()?;
+            manifest.canary = Some(hash.clone());
+            manifest.canary_status = Some(build::CanaryStatus::Testing);
+            manifest.set_pending_activation(build::PendingActivation {
+                session_id: session_id.to_string(),
+                new_version: hash.clone(),
+                previous_current_version: published
+                    .as_ref()
+                    .and_then(|published| published.previous_current_version.clone()),
+                previous_shared_server_version,
+                source_fingerprint: Some(source.fingerprint.clone()),
+                requested_at: chrono::Utc::now(),
+            })?;
+            manifest.save()?;
+        }
 
-        if !SelfDevTool::is_test_session()
-            && let Err(error) = build::update_shared_server_symlink(&hash)
-        {
-            let _ = build::rollback_pending_activation_for_session(session_id);
-            return Err(error);
+        // The floor for the daemon-identity freshness proof.
+        //
+        // MEASURED 2026-11-17: the daemon publishes its identity EXACTLY ONCE,
+        // at startup (crates/jcode-app-core/src/server.rs:2601). So an identity
+        // whose `started_at` is older than this moment describes the OLD
+        // daemon, and an identity newer than it describes the daemon this
+        // reload produced. The floor is captured BEFORE the reload signal is
+        // sent, so it is strictly older than the new daemon's publication.
+        //
+        // It is captured here rather than at the activation call because the
+        // activation happens AFTER the new daemon is up, and a floor taken
+        // then would accept the old daemon's identity.
+        let reload_handoff_floor = chrono::Utc::now();
+
+        // LAND the staged build as ONE crash-safe transaction through a CHILD
+        // process, instead of moving the daemon channel here and hoping the
+        // client channels follow later.
+        //
+        // The half-landing this replaces moved `shared-server` and wrote no
+        // journal, so a crash between that move and the client activation left
+        // the daemon channel AHEAD of `current` with nothing startup recovery
+        // could read: recovery reads only the landing journal.
+        //
+        // The process that would wait for the new daemon's identity and then
+        // move the client channels is THIS daemon, which the landing replaces -
+        // the same structural problem the debug `reload` had. A child process
+        // survives the exec and completes the transaction: journal, daemon
+        // channel, handoff, PROOF the daemon runs the target, then the client
+        // channels. A crash at any point leaves a journal the next daemon
+        // resolves at startup.
+        //
+        // `pending_activation` stays a NON-crash-safe record: its only readers
+        // are this reload's own error branches, the status display and the GC
+        // guard. The journal is what makes the state resolvable.
+        if !test_mode {
+            let published = published.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "published build metadata was missing after stage_local_current_build_for_source"
+                )
+            })?;
+            // The handoff is signalled from HERE, before the landing starts.
+            // The child transaction cannot signal it: the CLI's landing
+            // resolves the exec target from the shared-server channel and then
+            // waits for the daemon to publish an identity that proves it runs
+            // the target. Signalling only inside the tool (after the landing
+            // returned) would deadlock the landing until its whole identity
+            // timeout expired.
+            //
+            // `prefer_selfdev_binary=true` is the same choice the reload made
+            // before the split: the daemon must exec into this freshly staged
+            // build, not merely the newest binary on disk.
+            server::send_reload_signal(hash.clone(), Some(session_id.to_string()), true);
+            let mut landing = Self::landing_command(&published.versioned_path, &hash);
+            let outcome = tokio::task::spawn_blocking(move || landing.output())
+                .await
+                .map_err(|error| anyhow::anyhow!("landing task failed: {error:#}"))?
+                .map_err(|error| anyhow::anyhow!("landing process failed to run: {error}"))?;
+
+            if !outcome.status.success() {
+                // The landing rolled itself back, so the client channels stay
+                // on the previous build and the daemon channel is restored.
+                // Nothing here needs a rollback call: the transaction owns it.
+                let stdout = String::from_utf8_lossy(&outcome.stdout);
+                let stderr = String::from_utf8_lossy(&outcome.stderr);
+                let _ = build::rollback_pending_activation_for_session(session_id);
+                let mut manifest = build::BuildManifest::load()?;
+                manifest.canary_status = Some(build::CanaryStatus::Failed);
+                manifest.save()?;
+                return Err(anyhow::anyhow!(
+                    "Landing build {} failed and was rolled back ({}): {}{}",
+                    hash,
+                    outcome.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
         }
 
         // Save reload context for continuation after restart
@@ -372,12 +471,14 @@ impl SelfDevTool {
         ));
         if let Err(e) = reload_ctx.save() {
             crate::logging::error(&format!("Failed to save reload context: {}", e));
-            let _ = build::rollback_pending_activation_for_session(session_id);
             return Err(e);
         }
         crate::logging::info("Reload context saved successfully");
 
-        // Signal the server via in-process channel (replaces filesystem-based rebuild-signal)
+        // Signal the server via in-process channel (replaces filesystem-based rebuild-signal).
+        // In production the landing above already drove this signal; re-sending
+        // here keeps the test-session path (which skips the landing) on the same
+        // ack contract as before.
         let request_id =
             server::send_reload_signal(hash.clone(), Some(session_id.to_string()), true);
         crate::logging::info(&format!(
@@ -390,7 +491,6 @@ impl SelfDevTool {
         let ack = server::wait_for_reload_ack(&request_id, timeout)
             .await
             .map_err(|error| {
-                let _ = build::rollback_pending_activation_for_session(session_id);
                 anyhow::anyhow!(
                     "Timed out waiting for the server to begin reload after {}s: {}. The reload signal may not have been picked up; check that the connected server is running a build with unified self-dev reload support and try restarting the shared server.",
                     timeout.as_secs(),
@@ -408,7 +508,7 @@ impl SelfDevTool {
 
         match execution_mode {
             ToolExecutionMode::Direct => {
-                if SelfDevTool::is_test_session() {
+                if test_mode {
                     return Ok(ToolOutput::new(format!(
                         "Reload acknowledged for build {}. Server is restarting now.",
                         ack.hash
@@ -416,14 +516,37 @@ impl SelfDevTool {
                 }
                 match server::await_reload_handoff(&server::socket_path(), timeout).await {
                     server::ReloadWaitStatus::Ready => {
+                        // The daemon took the socket. The client channels were
+                        // already moved by the child landing, which PROVED this
+                        // daemon runs the target before moving them; re-derive
+                        // that proof from the daemon's published identity.
+                        //
+                        // Readiness alone is not proof: the socket can be
+                        // taken by a daemon that is still on the old build.
+                        //
+                        // The freshness floor is the moment BEFORE this reload
+                        // was requested. The daemon publishes its identity once,
+                        // at startup, so an identity older than the floor is the
+                        // old daemon's - the case where the reload was refused
+                        // (no exec target) and the old build kept serving.
+                        let identity = build::activate_clients_after_verified_daemon(
+                            &hash,
+                            Some(reload_handoff_floor),
+                            timeout,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "The replacement server took the socket for build {}, but it does not report running that build: {error:#}",
+                                ack.hash
+                            )
+                        })?;
                         let _ = build::complete_pending_activation_for_session(session_id);
                         Ok(ToolOutput::new(format!(
-                            "Reload completed successfully for build {}. Server reported ready.",
-                            ack.hash
+                            "Reload completed successfully for build {}. Server reported ready and runs that build (pid {}).",
+                            ack.hash, identity.pid
                         )))
                     }
                     server::ReloadWaitStatus::Failed(detail) => {
-                        let _ = build::rollback_pending_activation_for_session(session_id);
                         Err(anyhow::anyhow!(
                             "Reload was acknowledged for build {}, but the replacement server failed before becoming ready on {}: {}; recent_state={}",
                             ack.hash,
@@ -433,7 +556,6 @@ impl SelfDevTool {
                         ))
                     }
                     server::ReloadWaitStatus::Idle | server::ReloadWaitStatus::Waiting { .. } => {
-                        let _ = build::rollback_pending_activation_for_session(session_id);
                         Err(anyhow::anyhow!(
                             "Reload was acknowledged for build {}, but readiness could not be confirmed within {}s.",
                             ack.hash,
@@ -456,6 +578,30 @@ impl SelfDevTool {
                 )))
             }
         }
+    }
+}
+
+impl SelfDevTool {
+    /// Build the command that performs the atomic landing for a self-dev
+    /// reload.
+    ///
+    /// The TARGET's own versioned binary runs the landing, not the launcher and
+    /// not this process: only the target binary knows the `land` subcommand, and
+    /// this process is about to be replaced by the very landing it starts. The
+    /// version is passed EXPLICITLY so the transaction lands the build this
+    /// reload staged, not whatever `staged-version` happens to name.
+    fn landing_command(versioned_binary: &Path, version: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(versioned_binary);
+        command.arg("server").arg("land").arg(version).arg("--json");
+        command
+    }
+
+    #[cfg(test)]
+    pub(crate) fn landing_command_for_tests(
+        versioned_binary: &Path,
+        version: &str,
+    ) -> std::process::Command {
+        Self::landing_command(versioned_binary, version)
     }
 }
 

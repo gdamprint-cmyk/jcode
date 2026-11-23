@@ -1,11 +1,10 @@
 use super::*;
 
 fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    ENV_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    // The lock is shared with the other test module: `JCODE_HOME` is
+    // process-global, so two independent mutexes would let one module change
+    // the home under the other.
+    super::test_env_lock()
 }
 
 fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
@@ -203,9 +202,13 @@ fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
 
     let candidate = client_update_candidate(true).expect("expected selfdev candidate");
     assert_eq!(candidate.1, "current");
-    assert_eq!(
-        std::fs::canonicalize(candidate.0).expect("canonical candidate"),
-        std::fs::canonicalize(version_binary).expect("canonical version binary")
+    // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+    // reference: https://docs.rs/rustc-std-workspace-std/latest/std/fs/index.html
+    // (read 2026-11-16) - `canonicalize` resolves symlinks, so it cannot
+    // equate a Windows copy with the file it was copied from.
+    assert!(
+        same_binary_content(&candidate.0, &version_binary),
+        "the current channel must serve the installed version binary"
     );
 
     if let Some(prev_home) = prev_home {
@@ -239,9 +242,10 @@ fn update_launcher_symlink_stays_inside_sandbox_home() {
             .join("bin")
             .join(binary_name());
         assert_eq!(launcher, expected_launcher);
-        assert_eq!(
-            std::fs::canonicalize(&launcher).expect("canonical launcher"),
-            std::fs::canonicalize(version_binary).expect("canonical version binary")
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&launcher, &version_binary),
+            "the launcher must serve the installed version binary"
         );
     });
 }
@@ -401,10 +405,11 @@ fn shared_server_candidate_prefers_approved_channel_over_current() {
         let candidate =
             shared_server_update_candidate(true).expect("expected shared-server candidate");
         assert_eq!(candidate.1, "shared-server");
-        let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
-        let approved = std::fs::canonicalize(version_binary_path(approved_version).unwrap())
-            .expect("canonical approved");
-        assert_eq!(selected, approved);
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&candidate.0, &version_binary_path(approved_version).unwrap()),
+            "the shared-server channel must serve the approved version binary"
+        );
     });
 }
 
@@ -424,10 +429,11 @@ fn normal_shared_server_candidate_repairs_stale_shared_channel_to_stable() {
         let candidate =
             shared_server_update_candidate(false).expect("expected stable shared-server candidate");
         assert_eq!(candidate.1, "stable");
-        let selected = std::fs::canonicalize(candidate.0).expect("canonical selected");
-        let installed = std::fs::canonicalize(version_binary_path(installed_version).unwrap())
-            .expect("canonical installed");
-        assert_eq!(selected, installed);
+        // The channel entry is a COPY on Windows, so compare CONTENT, not paths.
+        assert!(
+            same_binary_content(&candidate.0, &version_binary_path(installed_version).unwrap()),
+            "the stable shared-server channel must serve the installed version binary"
+        );
     });
 }
 
@@ -608,13 +614,16 @@ fn simulate_stable_update_channel_swap(new_version: &str) {
 /// `server_update_candidate` in the server, which both go through
 /// `shared_server_update_candidate(false)`.
 fn daemon_reload_target_version() -> Option<String> {
-    let (candidate, _label) = shared_server_update_candidate(false)?;
-    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-    // versions/<version>/jcode -> <version>
-    canonical
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+    // The reload target is the version the daemon WOULD reload INTO, which is
+    // the version of the candidate that `shared_server_update_candidate(false)`
+    // selects - not the version the shared-server channel currently holds.
+    // Those differ exactly in the case this test pins: after `/update` the
+    // shared-server channel stays pinned to the old self-dev build while the
+    // selected candidate is the freshly installed release.
+    //
+    // `candidate_version` resolves the version through the CHANNEL MARKER of
+    // the selected candidate, which names the version on both platforms.
+    candidate_version(shared_server_update_candidate(false))
 }
 
 /// Reproduces the user-reported "/update gives the new client but a stale
@@ -699,8 +708,44 @@ fn update_advances_daemon_reload_target_when_shared_server_tracks_stable() {
     });
 }
 
+/// The version a channel candidate points at, resolved PLATFORM-NEUTRALLY.
+///
+/// The candidate comes with a LABEL naming the channel it was taken from
+/// ("shared-server", "stable" or "current"), and every one of those channels
+/// has a MARKER FILE naming the version it currently serves. The marker is
+/// written by the same machinery that moves the channel, so it names the
+/// version on BOTH platforms.
+///
+/// Reading the canonicalized path's PARENT instead only works on Unix: there
+/// the channel entry is a symlink into `versions/<v>/`. On Windows the channel
+/// entry is a COPY (`platform_support.rs` copies the file because Windows keeps
+/// a running executable open), so the parent is the channel directory name,
+/// not a version.
 fn candidate_version(candidate: Option<(PathBuf, &'static str)>) -> Option<String> {
-    let (candidate, _label) = candidate?;
+    let (candidate, label) = candidate?;
+    let marker = match label {
+        "shared-server" => read_shared_server_version(),
+        "stable" => read_stable_version(),
+        // The "current" label is ALSO used for the `current_exe()` fallback,
+        // which is not a channel at all. Only the real channel may be read
+        // from the marker; the fallback falls through to the path shape.
+        "current" => {
+            let channel = current_binary_path().ok();
+            match channel {
+                Some(channel) if channel == candidate => read_current_version(),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    };
+    if let Ok(Some(version)) = marker {
+        let version = version.trim().to_string();
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    // No usable marker (a channel that was moved without a marker write):
+    // fall back to the path shape, which is exact on Unix.
     let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
     canonical
         .parent()
@@ -770,6 +815,19 @@ fn selfdev_reload_target_diverges_from_update_probe_when_shared_server_pinned() 
     });
 }
 
+/// Set a file's mtime explicitly.
+///
+/// `File::set_modified` needs a writable handle on Windows (a read-only handle
+/// fails with ERROR_ACCESS_DENIED), so open with write access.
+fn set_file_mtime(path: &Path, mtime: std::time::SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for mtime")
+        .set_modified(mtime)
+        .expect("set mtime");
+}
+
 /// Write a distinct, real binary into `versions/<version>/jcode` with an
 /// explicit mtime so channel-repair mtime comparisons are deterministic
 /// (install_binary_at_version hard-links and would share an mtime).
@@ -778,11 +836,89 @@ fn write_versioned_binary(version: &str, mtime: std::time::SystemTime) -> PathBu
     std::fs::create_dir_all(&dir).expect("create version dir");
     let path = dir.join(binary_name());
     std::fs::write(&path, format!("bin {version}")).expect("write binary");
-    std::fs::File::open(&path)
-        .expect("open binary")
-        .set_modified(mtime)
-        .expect("set mtime");
+    set_file_mtime(&path, mtime);
     path
+}
+
+/// Write a real file directly at a CHANNEL path (`builds/<channel>/jcode`) with
+/// an explicit mtime.
+///
+/// On Windows the channel "symlink" is a real file copy (see
+/// `atomic_symlink_swap`), so the channel's own mtime is what the selection
+/// compares - writing the versioned binary alone would leave the channel with
+/// the copy time and make the comparison meaningless.
+fn write_channel_binary(channel: &str, mtime: std::time::SystemTime) -> PathBuf {
+    let dir = builds_dir().unwrap().join(channel);
+    std::fs::create_dir_all(&dir).expect("create channel dir");
+    let path = dir.join(binary_name());
+    std::fs::write(&path, format!("bin {channel}")).expect("write channel binary");
+    set_file_mtime(&path, mtime);
+    path
+}
+
+// reference: in-repo prior art - the sibling channel-selection tests in this file
+// (e.g. `normal_shared_server_candidate_repairs_stale_shared_channel_to_stable`).
+/// The reload loop's root cause, pinned as a regression test.
+///
+/// Field state (2026-11-07): `shared-server` was promoted to a fresh self-dev
+/// build, but a later local build advanced `current`, so the shared-server
+/// version marker no longer equalled the `stable`/`current` markers. The marker
+/// gate then REJECTED the approved channel and the normal-flavor candidate
+/// fell back to `stable` - here an ancient release (v0.84.0). The client spawned
+/// that old daemon, saw a server older than its own client, and asked for a
+/// reload; the reload exec'd into `shared-server`, the client reconnected, and
+/// the next client start spawned the old `stable` daemon again. Every cycle
+/// gracefully shut all sessions down.
+///
+/// The fix: an approved `shared-server` channel that is strictly newer than
+/// `stable` on disk must be preferred over the older `stable` fallback.
+#[test]
+fn normal_shared_server_candidate_prefers_newer_shared_channel_over_older_stable() {
+    use std::time::{Duration, SystemTime};
+    with_temp_jcode_home(|| {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // The ancient `stable` channel the marker gate used to fall back to.
+        write_channel_binary("stable", base);
+        // The approved, much newer `shared-server` channel.
+        write_channel_binary("shared-server", base + Duration::from_secs(60));
+        // A local build advanced `current` after the promotion, so the marker
+        // gate (shared marker vs stable/current markers) no longer matches.
+        write_channel_binary("current", base + Duration::from_secs(120));
+        std::fs::write(shared_server_version_file().unwrap(), "fresh-selfdev")
+            .expect("shared marker");
+        std::fs::write(stable_version_file().unwrap(), "ancient-stable").expect("stable marker");
+        std::fs::write(current_version_file().unwrap(), "fresh-current").expect("current marker");
+
+        let candidate =
+            shared_server_update_candidate(false).expect("expected a shared-server candidate");
+        assert_eq!(
+            candidate.1, "shared-server",
+            "the approved, newer shared-server channel must win over the older stable fallback"
+        );
+    });
+}
+
+/// A deliberately pinned OLD self-dev channel must stay pinned: it is not
+/// newer than `stable`, so the `stable` fallback stays correct.
+#[test]
+fn normal_shared_server_candidate_keeps_older_shared_channel_out() {
+    use std::time::{Duration, SystemTime};
+    with_temp_jcode_home(|| {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // The pinned channel is OLDER than stable, so stable must win.
+        write_channel_binary("shared-server", base);
+        write_channel_binary("stable", base + Duration::from_secs(60));
+        write_channel_binary("current", base + Duration::from_secs(120));
+        std::fs::write(shared_server_version_file().unwrap(), "old-selfdev").expect("shared marker");
+        std::fs::write(stable_version_file().unwrap(), "new-stable").expect("stable marker");
+        std::fs::write(current_version_file().unwrap(), "new-current").expect("current marker");
+
+        let candidate = shared_server_update_candidate(false).expect("expected a candidate");
+        assert_eq!(
+            candidate.1, "stable",
+            "an older pinned shared-server channel must not displace the newer stable"
+        );
+    });
 }
 
 #[test]

@@ -241,6 +241,7 @@ fn test_handle_server_event_history_with_interruption_queues_continuation() {
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -325,6 +326,7 @@ fn test_handle_server_event_history_uses_server_owned_reload_recovery_directive(
         reasoning_effort: None,
         service_tier: None,
         available_service_tiers: None,
+            available_reasoning_efforts: None,
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -411,6 +413,7 @@ fn test_handle_server_event_history_without_interruption_does_not_queue() {
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -482,6 +485,7 @@ fn test_handle_server_event_history_after_reload_reports_no_continuation_needed(
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -569,7 +573,7 @@ fn test_reload_persisted_background_tasks_note_mentions_running_task() {
 
     assert!(note.contains(&info.task_id));
     assert!(note.contains("Do not rerun those commands"));
-    assert!(note.contains("bg action=\"status\""));
+    assert!(note.contains("wait for completion rather than repeatedly polling"));
 
     cleanup_background_task_files(&info.task_id);
 }
@@ -618,7 +622,7 @@ fn test_finalize_reload_reconnect_mentions_persisted_background_task() {
     assert!(continuation.contains("Persisted background task(s)"));
     assert!(continuation.contains(&info.task_id));
     assert!(continuation.contains("Do not rerun those commands"));
-    assert!(continuation.contains("bg action=\"output\""));
+    assert!(continuation.contains("wait for completion rather than repeatedly polling"));
 
     cleanup_background_task_files(&info.task_id);
     cleanup_reload_context_file(&session_id);
@@ -792,6 +796,7 @@ fn test_handle_server_event_history_restores_side_panel_snapshot() {
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: side_panel.clone(),
@@ -856,6 +861,7 @@ fn test_handle_server_event_history_restores_active_resume_processing_state() {
             reasoning_effort: None,
             service_tier: None,
             available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: Some(crate::protocol::SessionActivitySnapshot {
                 is_processing: true,

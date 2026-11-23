@@ -1,42 +1,4 @@
 #[test]
-fn test_copy_badge_modifier_highlights_while_held() {
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_copy_test_app();
-
-    render_and_snap(&app, &mut terminal);
-
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode};
-
-    app.handle_key_event(KeyEvent::new_with_kind(
-        KeyCode::Modifier(ModifierKeyCode::LeftAlt),
-        KeyModifiers::ALT,
-        KeyEventKind::Press,
-    ));
-    assert!(app.copy_badge_ui().alt_active);
-
-    app.handle_key_event(KeyEvent::new_with_kind(
-        KeyCode::Modifier(ModifierKeyCode::LeftShift),
-        KeyModifiers::ALT | KeyModifiers::SHIFT,
-        KeyEventKind::Press,
-    ));
-    assert!(app.copy_badge_ui().shift_active);
-
-    app.handle_key_event(KeyEvent::new_with_kind(
-        KeyCode::Modifier(ModifierKeyCode::LeftShift),
-        KeyModifiers::ALT,
-        KeyEventKind::Release,
-    ));
-    assert!(!app.copy_badge_ui().shift_active);
-
-    app.handle_key_event(KeyEvent::new_with_kind(
-        KeyCode::Modifier(ModifierKeyCode::LeftAlt),
-        KeyModifiers::empty(),
-        KeyEventKind::Release,
-    ));
-    assert!(!app.copy_badge_ui().alt_active);
-}
-
-#[test]
 fn test_copy_badge_requires_prior_combo_progress() {
     let mut state = CopyBadgeUiState::default();
     let now = std::time::Instant::now();
@@ -713,6 +675,84 @@ fn test_repository_markdown_link_opens_in_focused_side_panel() {
 }
 
 #[test]
+fn test_rendered_markdown_link_labels_open_their_own_message_targets() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.set_centered(false);
+    app.diagram_pane_enabled = false;
+    app.push_display_message(DisplayMessage::assistant(
+        "First [guide](https://one.example/docs).",
+    ));
+    app.push_display_message(DisplayMessage::assistant(
+        "Second [**guide**](https://two.example/docs).",
+    ));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+    let screen = render_and_snap(&app, &mut terminal);
+    let rows: Vec<_> = screen.lines().collect();
+    for (prefix, expected) in [
+        ("First guide", "https://one.example/docs"),
+        ("Second guide", "https://two.example/docs"),
+    ] {
+        let row = rows
+            .iter()
+            .position(|row| row.contains(prefix))
+            .expect("rendered link label");
+        let col = rows[row].find("guide").unwrap();
+        assert_eq!(
+            crate::tui::ui::link_target_from_screen_with_state(col as u16, row as u16, &app)
+                .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            crate::tui::ui::link_target_from_screen_with_state((col - 2) as u16, row as u16, &app),
+            None
+        );
+    }
+}
+
+#[test]
+fn test_rendered_wrapped_markdown_link_label_is_clickable() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.set_centered(false);
+    app.diagram_pane_enabled = false;
+    app.push_display_message(DisplayMessage::assistant(
+        "Read [a long linked guide with several words and destination](https://wrapped.example).",
+    ));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(35, 30)).unwrap();
+    let screen = render_and_snap(&app, &mut terminal);
+    let rows: Vec<_> = screen.lines().collect();
+    let row = rows
+        .iter()
+        .position(|row| row.contains("destination"))
+        .expect("wrapped label tail");
+    let col = rows[row].find("destination").unwrap();
+    assert_eq!(
+        crate::tui::ui::link_target_from_screen_with_state(col as u16, row as u16, &app).as_deref(),
+        Some("https://wrapped.example")
+    );
+}
+
+#[test]
+fn test_side_pane_markdown_link_label_is_clickable() {
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    app.side_panel = test_side_panel_snapshot("links", "Links");
+    app.side_panel.pages[0].content = "Read [the guide](https://pane.example/docs).".to_string();
+    let lines = crate::tui::markdown::render_markdown(&app.side_panel.pages[0].content);
+    let row = lines
+        .iter()
+        .position(|line| line.to_string().contains("the guide"))
+        .unwrap();
+    crate::tui::ui::clear_copy_viewport_snapshot();
+    crate::tui::ui::record_side_pane_snapshot(&lines, 0, lines.len(), Rect::new(40, 2, 40, 10));
+    assert_eq!(
+        crate::tui::ui::link_target_from_screen_with_state(46, 2 + row as u16, &app).as_deref(),
+        Some("https://pane.example/docs")
+    );
+}
+
+#[test]
 fn test_repository_markdown_link_cannot_escape_working_directory() {
     let parent = tempfile::tempdir().unwrap();
     let repository = parent.path().join("repo");
@@ -1337,8 +1377,8 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
         "image label line must render in the live frame, got:\n{rendered}"
     );
     assert!(
-        rendered.contains("click to show image"),
-        "tool image must start collapsed: {rendered}"
+        !rendered.contains("click to show image"),
+        "tool image must be shown by default: {rendered}"
     );
     assert!(
         !rendered.contains("IIMG:"),
@@ -1357,7 +1397,7 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
         }
         // The transcript also shows the tool-call row ("read shot.png"); the
         // image label row is the one that carries the show/hide badge keys.
-        if !line.contains("shot.png") || !line.contains("show image") {
+        if !line.contains("shot.png") || !line.contains("1×1") {
             continue;
         }
         // Click the first cell of the label text (the hit-region is the whole
@@ -1407,7 +1447,7 @@ fn test_real_draw_click_on_body_anchored_image_label_cycles_level() {
     let expanded = render_and_snap(&app, &mut terminal);
     assert!(
         !expanded.contains("click to show image"),
-        "click should reveal the image: {expanded}"
+        "expanded image must stay visible: {expanded}"
     );
 }
 
@@ -1599,197 +1639,11 @@ fn test_click_on_inline_image_body_cycles_level() {
 
 /// Ctrl+wheel (how terminals report a trackpad pinch) over an inline image
 /// steps its size without wrapping, while Ctrl+wheel elsewhere still scrolls.
-#[test]
-fn test_ctrl_wheel_over_inline_image_zooms_without_wrapping() {
-    use crate::tui::ui::inline_image_ui::{
-        AllFit, ImageExpandLevel, InlineImageItem, build_section,
-    };
-    use jcode_tui_messages::PreparedChatFrame;
+#[path = "part_02/image_zoom.rs"]
+mod image_zoom;
 
-    let _render_lock = scroll_render_test_lock();
-    let mut app = create_test_app();
+include!("math_selection.rs");
+include!("badge_partial_selection.rs");
 
-    const IMAGE_ID: u64 = 0xB1AC;
-    let chat_width: u16 = 80;
-    let items = vec![InlineImageItem {
-        id: IMAGE_ID,
-        width: 320,
-        height: 200,
-        label: "pinch.png".to_string(),
-        uses_text_fallback: false,
-        collapsed_by_default: false,
-    }];
-    let section = build_section(&items, chat_width, 40, false, true, &AllFit);
-    let region = *section
-        .image_regions
-        .iter()
-        .find(|r| r.hash == IMAGE_ID)
-        .expect("section should carry the image region");
-    let prepared =
-        std::sync::Arc::new(PreparedChatFrame::from_single(std::sync::Arc::new(section)));
-    let visible_end = prepared.wrapped_plain_line_count();
-    let content_area = Rect::new(0, 0, chat_width, visible_end as u16 + 1);
-    crate::tui::ui::clear_copy_viewport_snapshot();
-    crate::tui::ui::record_copy_viewport_frame_snapshot_for_test(
-        prepared,
-        0,
-        visible_end,
-        content_area,
-        &vec![0u16; visible_end],
-    );
-
-    let row = content_area.y + region.abs_line_idx as u16 + 1;
-    let col = content_area.x + region.width / 2;
-    let wheel = |app: &mut App, kind: MouseEventKind, column: u16| {
-        app.handle_mouse_event(MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: KeyModifiers::CONTROL,
-        })
-    };
-
-    wheel(&mut app, MouseEventKind::ScrollUp, col);
-    assert_eq!(app.image_expand_level(IMAGE_ID), ImageExpandLevel::Large);
-    // Full has the same geometry as Large here, so zooming in further holds.
-    wheel(&mut app, MouseEventKind::ScrollUp, col);
-    assert_eq!(app.image_expand_level(IMAGE_ID), ImageExpandLevel::Large);
-    wheel(&mut app, MouseEventKind::ScrollDown, col);
-    assert_eq!(app.image_expand_level(IMAGE_ID), ImageExpandLevel::Fit);
-    wheel(&mut app, MouseEventKind::ScrollDown, col);
-    assert_eq!(app.image_expand_level(IMAGE_ID), ImageExpandLevel::Fit);
-
-    // Off the image, Ctrl+wheel falls through to chat scrolling.
-    wheel(&mut app, MouseEventKind::ScrollUp, chat_width - 2);
-    assert_eq!(app.image_expand_level(IMAGE_ID), ImageExpandLevel::Fit);
-}
-
-fn create_math_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
-    let mut app = create_test_app();
-    app.display_messages = vec![
-        DisplayMessage {
-            role: "user".to_string(),
-            content: "show latex".to_string(),
-            tool_calls: vec![],
-            duration_secs: None,
-            title: None,
-            tool_data: None,
-        },
-        DisplayMessage {
-            role: "assistant".to_string(),
-            content: "Euler $e^{i\\pi_{3}} + 1 = 0$ done.\n\n$$\n\\frac{\\partial L}{\\partial \\theta_{88}} = \\theta^\\top x\n$$".to_string(),
-            tool_calls: vec![],
-            duration_secs: None,
-            title: None,
-            tool_data: None,
-        },
-    ];
-    app.bump_display_messages_version();
-    app.scroll_offset = 0;
-    app.auto_scroll_paused = false;
-    app.is_processing = false;
-    app.streaming.streaming_text.clear();
-    app.status = ProcessingStatus::Idle;
-    app.session.short_name = Some("test".to_string());
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
-    (app, terminal)
-}
-
-#[test]
-fn test_copy_selection_select_all_copies_rendered_math_as_latex() {
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_math_copy_test_app();
-
-    let screen = render_and_snap(&app, &mut terminal);
-    // Sanity: the screen shows the Unicode approximation, not the source.
-    assert!(screen.contains("┌─ math"), "{screen}");
-    assert!(screen.contains('⊤'), "\\top should render as ⊤: {screen}");
-    assert!(!screen.contains("\\frac"), "{screen}");
-
-    app.handle_key(KeyCode::Char('y'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.select_all_in_copy_mode());
-    let selected = app
-        .current_copy_selection_text()
-        .expect("expected selected transcript text");
-    assert!(
-        selected.contains("Euler $e^{i\\pi_{3}} + 1 = 0$ done."),
-        "inline math should copy as LaTeX: {selected}"
-    );
-    assert!(
-        selected.contains("$$\n\\frac{\\partial L}{\\partial \\theta_{88}} = \\theta^\\top x\n$$"),
-        "display math should copy as LaTeX: {selected}"
-    );
-    assert!(!selected.contains('⊤'), "{selected}");
-
-    let range = app.normalized_copy_selection().expect("range");
-    let (chars, _) = crate::tui::ui::copy_selection_metrics(range).expect("metrics");
-    assert_eq!(chars, selected.chars().count());
-}
-
-#[test]
-fn test_copy_selection_partial_drag_over_inline_math_copies_whole_formula() {
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_math_copy_test_app();
-    render_and_snap(&app, &mut terminal);
-    app.handle_key(KeyCode::Char('y'), KeyModifiers::ALT)
-        .unwrap();
-
-    let layout = crate::tui::ui::last_layout_snapshot().expect("layout snapshot");
-    let (visible_start, visible_end) =
-        crate::tui::ui::copy_viewport_visible_range().expect("visible copy range");
-    let (line_idx, text) = (visible_start..visible_end)
-        .find_map(|abs| {
-            let text = crate::tui::ui::copy_viewport_line_text(abs).unwrap_or_default();
-            text.contains("Euler").then_some((abs, text))
-        })
-        .expect("prose line");
-    let euler_col = unicode_width::UnicodeWidthStr::width(&text[..text.find("Euler").unwrap()]);
-    // Drag from the start of "Euler" to two cells into the formula.
-    let start_col = euler_col;
-    let end_col = euler_col + "Euler ".len() + 2;
-    let row = layout.messages_area.y + (line_idx - visible_start) as u16;
-    let screen_x = |target: usize| {
-        (layout.messages_area.x..layout.messages_area.x + layout.messages_area.width)
-            .find(|&column| {
-                crate::tui::ui::copy_viewport_point_from_screen(column, row)
-                    .is_some_and(|p| p.abs_line == line_idx && p.column == target)
-            })
-            .expect("screen x")
-    };
-    let (sx, ex) = (screen_x(start_col), screen_x(end_col));
-    for (kind, column) in [
-        (MouseEventKind::Down(MouseButton::Left), sx),
-        (MouseEventKind::Drag(MouseButton::Left), ex),
-    ] {
-        app.handle_mouse_event(MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: KeyModifiers::empty(),
-        });
-    }
-    let selected = app.current_copy_selection_text().expect("selection");
-    assert_eq!(selected, "Euler $e^{i\\pi_{3}} + 1 = 0$");
-}
-
-#[test]
-fn test_unicode_math_copy_badge_copies_latex_to_clipboard() {
-    let _render_lock = scroll_render_test_lock();
-    let clipboard = CapturedClipboard::new();
-    let (mut app, mut terminal) = create_math_copy_test_app();
-    let screen = render_and_snap(&app, &mut terminal);
-    assert!(
-        screen.contains("⇧S]"),
-        "math frame should get a badge: {screen}"
-    );
-
-    app.handle_key(KeyCode::Char('S'), KeyModifiers::ALT)
-        .unwrap();
-    assert_eq!(app.status_notice(), Some("Copied math".to_string()));
-    assert_eq!(
-        clipboard.text().as_deref(),
-        Some("$$\n\\frac{\\partial L}{\\partial \\theta_{88}} = \\theta^\\top x\n$$")
-    );
-}
+#[path = "part_02_additional_tests.rs"]
+mod additional_test_copy_badge_modifier_highlights_while_held;

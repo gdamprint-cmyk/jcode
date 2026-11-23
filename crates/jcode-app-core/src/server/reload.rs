@@ -1,4 +1,3 @@
-use crate::agent::Agent;
 use crate::server::reload_recovery::ReloadRecoveryRole;
 use crate::server::{SwarmEvent, SwarmEventType, SwarmMember};
 use crate::tool::selfdev::ReloadContext;
@@ -7,9 +6,9 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::sync::{RwLock, broadcast, watch};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 
 const RELOAD_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -27,6 +26,72 @@ fn prepare_server_exec(cmd: &mut std::process::Command, socket_path: &std::path:
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    // A console's input mode belongs to the CONSOLE, not to a process, so a
+    // replacement that shares the daemon's console also shares its input mode.
+    // The daemon inherited the client's console, so the replacement inherited it
+    // too: closing the client's terminal window then killed the server along
+    // with it, and the client's TUI kept believing it owned the terminal.
+    // Detach the replacement from that console.
+    crate::platform::isolate_from_console(cmd);
+}
+
+/// Global flags the daemon was launched with that select its provider. The
+/// replacement must serve the same provider (managed cloud hosts start with
+/// `--provider jcode` when they have no model login of their own).
+fn inherited_serve_flags(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "serve" {
+            break;
+        }
+        match arg.as_str() {
+            "-p" | "--provider" | "-m" | "--model" => {
+                if let Some(value) = args.next() {
+                    out.push(arg);
+                    out.push(value);
+                }
+            }
+            _ if arg.starts_with("--provider=") || arg.starts_with("--model=") => out.push(arg),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod inherited_serve_flags_tests {
+    use super::inherited_serve_flags;
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn keeps_provider_and_model_before_serve_only() {
+        assert_eq!(
+            inherited_serve_flags(args(&[
+                "jcode",
+                "--provider",
+                "jcode",
+                "serve",
+                "--socket",
+                "/x"
+            ])),
+            args(&["--provider", "jcode"])
+        );
+        assert_eq!(
+            inherited_serve_flags(args(&[
+                "jcode",
+                "--no-update",
+                "--model=x",
+                "serve",
+                "--provider",
+                "y"
+            ])),
+            args(&["--model=x"])
+        );
+        assert!(inherited_serve_flags(args(&["jcode", "serve"])).is_empty());
+    }
 }
 
 async fn receive_reload_signal(
@@ -55,7 +120,7 @@ async fn receive_reload_signal(
 }
 
 pub(super) async fn await_reload_signal(
-    sessions: Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>,
+    sessions: crate::server::SessionAgents,
     swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
     shutdown_signals: Arc<RwLock<HashMap<String, InterruptSignal>>>,
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
@@ -110,6 +175,38 @@ pub(super) async fn await_reload_signal(
         {
             crate::logging::info(
                 "Server: JCODE_TEST_SESSION set, skipping process exec for reload test",
+            );
+            continue;
+        }
+
+        // Resolve the exec target BEFORE the graceful shutdown.
+        //
+        // The shutdown below closes every session; if there is then no valid
+        // exec target, the daemon would have killed its clients and stayed
+        // dead - the worst outcome. Resolving first lets a no-op reload abort
+        // while the daemon and its sessions are still alive.
+        //
+        // A missing target means either the candidate IS the running binary
+        // (a self-exec, refused by the guard) or the candidate is older than
+        // the running binary (downgrade refused). Both are no-ops, not kills.
+        let prefers_selfdev = signal.prefer_selfdev_binary;
+        let exec_target =
+            super::reload_exec_target(prefers_selfdev).filter(|(binary, _)| binary.exists());
+        if exec_target.is_none() {
+            crate::logging::warn(&format!(
+                "Server: reload request={} has no valid exec target (candidate is the running binary or an older candidate); keeping the daemon alive",
+                signal.request_id,
+            ));
+            crate::server::write_reload_state(
+                &signal.request_id,
+                &signal.hash,
+                crate::server::ReloadPhase::Failed,
+                Some("no reloadable binary found (self-exec or downgrade refused)".to_string()),
+            );
+            super::reload_trace::record_value(
+                &signal.request_id,
+                "exec_target_unavailable",
+                serde_json::json!({}),
             );
             continue;
         }
@@ -172,9 +269,7 @@ pub(super) async fn await_reload_signal(
             serde_json::json!({ "count": aborted }),
         );
 
-        let prefers_selfdev = signal.prefer_selfdev_binary;
-
-        if let Some((binary, label)) = super::reload_exec_target(prefers_selfdev) {
+        if let Some((binary, label)) = exec_target {
             if binary.exists() {
                 let socket = super::socket_path();
                 crate::logging::info(&format!(
@@ -196,6 +291,9 @@ pub(super) async fn await_reload_signal(
                     }),
                 );
                 let mut cmd = ProcessCommand::new(&binary);
+                if label == "managed-cloud" {
+                    cmd.args(inherited_serve_flags(std::env::args()));
+                }
                 cmd.arg("serve").arg("--socket").arg(socket.as_os_str());
                 // Auto provider detection is dominated by credential-file probes.
                 // The replacement process is the same trusted daemon with the same
@@ -227,6 +325,9 @@ pub(super) async fn await_reload_signal(
                     crate::server::ReloadPhase::Failed,
                     Some(format!("missing binary: {}", binary.display())),
                 );
+                // The binary vanished between resolution and exec: no exec
+                // happened, so the daemon must stay alive.
+                continue;
             }
         } else {
             crate::server::write_reload_state(
@@ -235,8 +336,92 @@ pub(super) async fn await_reload_signal(
                 crate::server::ReloadPhase::Failed,
                 Some("no reloadable binary found".to_string()),
             );
+            // No exec happened: killing the daemon here would strand every
+            // connected client with no replacement. Keep serving.
+            continue;
         }
+        // Only reached when an exec was actually attempted and failed
+        // (`replace_process` never returns on success).
         std::process::exit(42);
+    }
+}
+
+/// Swarm status can lag turn startup (or the member can be absent entirely).
+/// Union actual turn registrations with running members and the reload initiator,
+/// retaining known headless metadata even for members not marked running.
+fn reload_recovery_candidates<'a>(
+    members: impl IntoIterator<Item = (&'a str, &'a str, bool)>,
+    active_session_ids: Vec<String>,
+    triggering_session: Option<&str>,
+) -> Vec<(String, bool)> {
+    let members: HashMap<_, _> = members
+        .into_iter()
+        .map(|(id, status, headless)| (id, (status, headless)))
+        .collect();
+    let mut candidates: HashMap<String, bool> = members
+        .iter()
+        .filter(|(_, (status, _))| *status == "running")
+        .map(|(id, (_, headless))| ((*id).to_string(), *headless))
+        .collect();
+    for id in active_session_ids
+        .into_iter()
+        .chain(triggering_session.map(str::to_string))
+    {
+        let headless = members
+            .get(id.as_str())
+            .is_some_and(|(_, headless)| *headless);
+        candidates.entry(id).or_insert(headless);
+    }
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates
+}
+
+#[cfg(test)]
+mod recovery_candidate_tests {
+    use super::reload_recovery_candidates;
+    use crate::turn_cancel_registry::{active_session_ids, register_active_turn};
+    use jcode_agent_runtime::InterruptSignal;
+
+    #[test]
+    fn includes_registered_ready_and_absent_members_preserving_headless_metadata() {
+        let ready = "reload_candidates_ready";
+        let absent = "reload_candidates_absent";
+        let _ready_turn = register_active_turn(ready, InterruptSignal::new());
+        let _absent_turn = register_active_turn(absent, InterruptSignal::new());
+        let candidates = reload_recovery_candidates(
+            [(ready, "ready", true), ("idle", "ready", false)],
+            active_session_ids(),
+            Some(ready),
+        );
+        assert!(candidates.contains(&(ready.to_string(), true)));
+        assert!(candidates.contains(&(absent.to_string(), false)));
+        assert!(!candidates.iter().any(|(id, _)| id == "idle"));
+        assert_eq!(candidates.iter().filter(|(id, _)| id == ready).count(), 1);
+    }
+
+    #[test]
+    fn unions_running_active_and_triggering_sessions_in_sorted_unique_order() {
+        assert_eq!(
+            reload_recovery_candidates(
+                [("running", "running", true), ("trigger", "ready", true)],
+                vec![
+                    "running".to_string(),
+                    "active".to_string(),
+                    "active".to_string()
+                ],
+                Some("trigger"),
+            ),
+            vec![
+                ("active".to_string(), false),
+                ("running".to_string(), true),
+                ("trigger".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            reload_recovery_candidates([], Vec::new(), Some("unknown-trigger")),
+            vec![("unknown-trigger".to_string(), false)]
+        );
     }
 }
 
@@ -245,8 +430,9 @@ async fn persist_reload_recovery_intents(
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     triggering_session: Option<&str>,
 ) {
-    let mut candidates: Vec<(String, bool)> = {
+    let candidates = {
         let members = swarm_members.read().await;
+        let active_session_ids = crate::turn_cancel_registry::active_session_ids();
         let snapshot = members
             .iter()
             .map(|(session_id, member)| {
@@ -265,25 +451,17 @@ async fn persist_reload_recovery_intents(
             serde_json::json!({
                 "triggering_session": triggering_session,
                 "members": snapshot,
+                "active_session_ids": active_session_ids,
             }),
         );
-        members
-            .iter()
-            .filter(|(_, member)| member.status == "running")
-            .map(|(session_id, member)| (session_id.clone(), member.is_headless))
-            .collect()
+        reload_recovery_candidates(
+            members
+                .iter()
+                .map(|(id, member)| (id.as_str(), member.status.as_str(), member.is_headless)),
+            active_session_ids,
+            triggering_session,
+        )
     };
-
-    if let Some(triggering_session) = triggering_session
-        && !candidates
-            .iter()
-            .any(|(session_id, _)| session_id == triggering_session)
-    {
-        candidates.push((triggering_session.to_string(), false));
-    }
-
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-    candidates.dedup_by(|a, b| a.0 == b.0);
 
     for (session_id, is_headless) in candidates {
         let reload_ctx = ReloadContext::peek_for_session(&session_id).ok().flatten();

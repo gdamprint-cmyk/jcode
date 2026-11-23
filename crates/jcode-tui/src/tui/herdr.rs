@@ -1,11 +1,14 @@
 //! Native agent-state reporting for the herdr terminal multiplexer.
 //!
 //! When jcode runs inside a herdr pane (`HERDR_ENV=1`), it reports its state
-//! (`idle` / `working`), the command that resumes the current session, and
-//! releases the pane when the user quits. The interactive TUI never blocks a
-//! turn on a user decision, so `blocked` is not reported. See
-//! <https://herdr.dev/docs/add-herdr-support/>.
+//! (`idle` / `working` / `blocked`), the command that resumes the current
+//! session, and releases the pane when the user quits. `blocked` is reported
+//! while the client waits for a user decision (a keypress offer such as a
+//! provider fallback or a merge prompt); the turn itself has already ended at
+//! that point. See <https://herdr.dev/docs/add-herdr-support/>.
 //!
+//! reference: https://herdr.dev/docs/add-herdr-support/
+//! reference: https://github.com/1jehuang/jcode
 //! Reports go through `"$HERDR_BIN_PATH" pane report-agent ...` on a single
 //! background thread. Only the latest pending report is kept, every command
 //! has a short timeout, and failures are ignored so herdr can never slow down
@@ -22,6 +25,27 @@ const SOURCE: &str = "jcode";
 const AGENT: &str = "jcode";
 /// Upper bound on a single herdr CLI call.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wait before a failed report is retried. Without it a down herdr would spawn
+/// one CLI per frame; with it the pane still recovers within a second.
+const REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How often a live client re-asserts its agent in herdr's registry.
+///
+/// reference: https://herdr.dev/docs/add-herdr-support/ (herdr clears a pane's
+/// agent when the agent process exits without releasing the pane, so a client
+/// restarted in the same pane - which is what a server reload does - has to
+/// register itself again; the report that recreated the agent can still be
+/// undone by the cleanup of the previous process a second later).
+const REPORT_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Delay of the first re-assert. herdr notices a dead agent within a second
+/// or two, so the first re-assert has to happen after that window.
+const REPORT_REASSERT_DELAY: Duration = Duration::from_secs(5);
+/// How often the reporter checks whether the pane was handed over.
+///
+/// reference: https://herdr.dev/docs/add-herdr-support/ ("Herdr ignores
+/// reports whose number is not higher than the last one it accepted"), and
+/// D:\herdr-src\src\terminal\state.rs:1946 (`hook_report_is_newer`: a report is
+/// applied only when its seq is higher than the last accepted one).
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// herdr's resume argv limits.
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_BYTES: usize = 8 * 1024;
@@ -30,6 +54,8 @@ const MAX_RESUME_BYTES: usize = 8 * 1024;
 pub enum AgentState {
     Idle,
     Working,
+    /// The client is waiting for the user to decide something.
+    Blocked,
 }
 
 impl AgentState {
@@ -37,6 +63,15 @@ impl AgentState {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// Short explanation herdr shows next to a blocked agent.
+    fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Blocked => Some("waiting for your decision"),
+            _ => None,
         }
     }
 }
@@ -79,12 +114,17 @@ enum Job {
 struct Slot {
     pending: Option<Job>,
     released: bool,
+    /// Earliest time a pending report may be sent again.
+    retry_at: Option<Instant>,
 }
 
+// reference: https://herdr.dev/docs/add-herdr-support/ (report-agent protocol)
 struct Reporter {
     env: HerdrEnv,
     slot: Arc<(Mutex<Slot>, Condvar)>,
-    last_submitted: Mutex<Option<StateReport>>,
+    /// The last report herdr confirmed. Filled only after a successful
+    /// delivery, so an undelivered state is retried instead of suppressed.
+    last_delivered: Arc<Mutex<Option<StateReport>>>,
 }
 
 static REPORTER: OnceLock<Option<Reporter>> = OnceLock::new();
@@ -105,9 +145,21 @@ fn reporter() -> Option<&'static Reporter> {
             let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
             let worker_slot = Arc::clone(&slot);
             let worker_env = env.clone();
+            let last_delivered = Arc::new(Mutex::new(None));
+            let worker_delivered = Arc::clone(&last_delivered);
             let spawned = std::thread::Builder::new()
                 .name("herdr-reporter".into())
-                .spawn(move || worker_loop(worker_env, worker_slot));
+                .spawn(move || {
+                    worker_loop(
+                        worker_env,
+                        worker_slot,
+                        worker_delivered,
+                        Timing::production(),
+                        Arc::new(|env: &HerdrEnv, report: &StateReport| {
+                            send_report(env, report.clone())
+                        }),
+                    )
+                });
             if let Err(error) = spawned {
                 crate::logging::warn(&format!("herdr: failed to start reporter: {error}"));
                 return None;
@@ -115,7 +167,7 @@ fn reporter() -> Option<&'static Reporter> {
             Some(Reporter {
                 env,
                 slot,
-                last_submitted: Mutex::new(None),
+                last_delivered,
             })
         })
         .as_ref()
@@ -124,12 +176,20 @@ fn reporter() -> Option<&'static Reporter> {
 /// Report the current state and session. Cheap enough for every UI tick:
 /// outside herdr it returns immediately, and unchanged state is dropped
 /// without allocating. A newer report replaces one that has not been sent.
+///
+/// A process that already handed its pane over to a successor reports
+/// nothing: the successor owns the pane's state now, and a report from here
+/// would carry a higher sequence number than the successor's, so herdr would
+/// take it and make the pane look finished while the successor is working.
 pub fn sync(state: AgentState, session_id: Option<&str>) {
+    if crate::exec_supervisor::pane_handed_off() {
+        return;
+    }
     let Some(reporter) = reporter() else {
         return;
     };
     let report = {
-        let mut last = lock(&reporter.last_submitted);
+        let last = lock(&reporter.last_delivered);
         if last
             .as_ref()
             .is_some_and(|last| last.state == state && last.session_id.as_deref() == session_id)
@@ -142,7 +202,6 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
             resume_argv: session_id
                 .and_then(|id| resume_argv_for_session(id, |key| std::env::var(key).ok())),
         };
-        *last = Some(report.clone());
         report
     };
     let (slot, wake) = &*reporter.slot;
@@ -151,6 +210,9 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
         return;
     }
     slot.pending = Some(Job::Report(report));
+    // A freshly queued report is current content, so it does not wait for the
+    // retry delay of an earlier failed delivery.
+    slot.retry_at = None;
     wake.notify_one();
 }
 
@@ -173,8 +235,16 @@ pub fn release() {
     run_herdr(&reporter.env.bin, &release_args(&reporter.env.pane_id, seq));
 }
 
-fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
+fn worker_loop(
+    env: HerdrEnv,
+    slot: Arc<(Mutex<Slot>, Condvar)>,
+    delivered: Arc<Mutex<Option<StateReport>>>,
+    timing: Timing,
+    send: Arc<dyn Fn(&HerdrEnv, &StateReport) -> bool + Send + Sync>,
+) {
     let (lock_slot, wake) = &*slot;
+    let mut next_heartbeat = Instant::now() + timing.reassert_delay;
+    let mut sent_any = false;
     loop {
         let job = {
             let mut guard = lock(lock_slot);
@@ -182,39 +252,126 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
                 if guard.released {
                     return;
                 }
+                // A process that handed its pane over to a successor does not
+                // speak for the pane any more: the successor owns the agent
+                // state now. A report from here would carry a newer sequence
+                // number than the successor's, so herdr would take it and make
+                // the pane look finished while the successor is still working.
+                //
+                // reference: https://herdr.dev/docs/add-herdr-support/ ("Herdr
+                // ignores reports whose number is not higher than the last one
+                // it accepted, so late or out-of-order reports can't overwrite
+                // newer state") and D:\herdr-src\src\terminal\state.rs:1946
+                // (`hook_report_is_newer`).
+                //
+                // This is a poll, not an exit: the handover is undone when the
+                // successor could not be spawned, and this process keeps the
+                // pane in that case.
+                if crate::exec_supervisor::pane_handed_off() {
+                    guard.pending = None;
+                    guard.retry_at = None;
+                    guard = wake
+                        .wait_timeout(guard, HANDOFF_POLL_INTERVAL)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                    continue;
+                }
+                if let Some(retry_at) = guard.retry_at {
+                    let now = Instant::now();
+                    if retry_at > now {
+                        guard = wake
+                            .wait_timeout(guard, retry_at - now)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                        continue;
+                    }
+                    guard.retry_at = None;
+                }
                 if let Some(job) = guard.pending.take() {
                     break job;
                 }
-                guard = wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                // herdr drops the agent of a pane whose agent died without
+                // releasing it, so keep re-asserting the last delivered
+                // report even when nothing changed.
+                let now = Instant::now();
+                if now >= next_heartbeat {
+                    if let Some(report) = lock(&delivered).clone() {
+                        break Job::Report(report);
+                    }
+                    next_heartbeat = now + timing.heartbeat;
+                    continue;
+                }
+                guard = wake
+                    .wait_timeout(guard, next_heartbeat - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
         };
         match job {
             Job::Report(report) => {
-                send_report(&env, report);
+                if send(&env, &report) {
+                    *lock(&delivered) = Some(report);
+                } else {
+                    // The report never reached herdr: keep it pending so it is
+                    // retried instead of leaving the pane on a stale frame. A
+                    // newer report already queued by sync() wins over it.
+                    let mut guard = lock(lock_slot);
+                    if !guard.released && guard.pending.is_none() {
+                        guard.pending = Some(Job::Report(report));
+                        guard.retry_at = Some(Instant::now() + REPORT_RETRY_DELAY);
+                    }
+                }
             }
+        }
+        next_heartbeat = Instant::now()
+            + if sent_any {
+                timing.heartbeat
+            } else {
+                timing.reassert_delay
+            };
+        sent_any = true;
+    }
+}
+
+/// Timing of the reporter's re-assert loop. Production uses the constants
+/// above; tests use short delays.
+#[derive(Clone, Copy)]
+struct Timing {
+    heartbeat: Duration,
+    reassert_delay: Duration,
+}
+
+impl Timing {
+    fn production() -> Self {
+        Self {
+            heartbeat: REPORT_HEARTBEAT,
+            reassert_delay: REPORT_REASSERT_DELAY,
         }
     }
 }
 
-fn send_report(env: &HerdrEnv, mut report: StateReport) {
+/// Send one report. Returns whether herdr confirmed it.
+fn send_report(env: &HerdrEnv, mut report: StateReport) -> bool {
     if RESUME_UNSUPPORTED.load(Ordering::Relaxed) {
         report.resume_argv = None;
     }
     let status = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
     // Only a usage error on a report that carried a resume command means
     // "this herdr predates resume". Timeouts and other failures are retried
-    // naturally by the next state change and must not disable resume.
+    // by the worker and must not disable resume.
     if !(is_usage_error(status) && resume_command(&report).is_some()) {
-        return;
+        return status.is_some_and(|status| status.success());
     }
     report.resume_argv = None;
     let retry = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
-    if retry.is_some_and(|status| status.success()) {
+    let delivered = retry.is_some_and(|status| status.success());
+    if delivered {
         RESUME_UNSUPPORTED.store(true, Ordering::Relaxed);
         crate::logging::info(
             "herdr: this herdr rejects resume commands (needs 0.9.2+), reporting state only",
         );
     }
+    delivered
 }
 
 /// Exit code clap-based CLIs such as herdr use for argument/usage errors.
@@ -263,6 +420,10 @@ fn report_args(pane_id: &str, report: &StateReport, seq: u64) -> Vec<String> {
     .map(|s| s.to_string())
     .collect();
     args.push(seq.to_string());
+    if let Some(message) = report.state.message() {
+        args.push("--message".into());
+        args.push(message.to_string());
+    }
     if let Some(session_id) = report.session_id.as_deref() {
         args.push("--agent-session-id".into());
         args.push(session_id.to_string());
@@ -523,11 +684,234 @@ mod tests {
     }
 
     #[test]
+    /// The reporter must keep re-asserting its report even when the agent state
+    /// never changes: herdr drops a pane's agent when the agent process dies
+    /// without releasing the pane, which is what a server reload causes. A new
+    /// client in the same pane therefore has to re-register itself instead of
+    /// waiting for the next state change.
+    ///
+    /// reference: https://herdr.dev/docs/add-herdr-support/ (herdr's safety net
+    /// clears the agent and its resume command once the pane is back at its
+    /// idle shell prompt, a second or two after the agent died).
+    fn unchanged_report_is_reasserted_after_the_heartbeat() {
+        use std::sync::atomic::AtomicUsize;
+
+        let env = HerdrEnv {
+            bin: "herdr".into(),
+            pane_id: "p1".into(),
+        };
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        let delivered = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let timing = Timing {
+            heartbeat: Duration::from_millis(20),
+            reassert_delay: Duration::from_millis(20),
+        };
+        let worker_env = env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            worker_loop(
+                worker_env,
+                worker_slot,
+                worker_delivered,
+                timing,
+                Arc::new(move |_: &HerdrEnv, _: &StateReport| {
+                    calls_for_worker.fetch_add(1, Ordering::Relaxed) >= 0
+                }),
+            )
+        });
+
+        // First report: the client registers itself.
+        {
+            let mut guard = lock(&slot.0);
+            guard.pending = Some(Job::Report(StateReport {
+                state: AgentState::Idle,
+                session_id: Some("session_a".into()),
+                resume_argv: Some(vec![
+                    "jcode".into(),
+                    "--resume".into(),
+                    "session_a".into(),
+                ]),
+            }));
+            guard.retry_at = None;
+        }
+
+        // The state never changes again, but the agent must keep being reported.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::Relaxed) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sent = calls.load(Ordering::Relaxed);
+        lock(&slot.0).released = true;
+        let _ = worker.join();
+
+        assert!(
+            sent >= 3,
+            "unchanged report must be re-sent to re-register the agent, got {sent} sends"
+        );
+    }
+
+    #[test]
     fn seq_is_strictly_increasing() {
         let a = next_seq();
         let b = next_seq();
         let c = next_seq();
         assert!(a < b && b < c);
+    }
+
+    /// Serializes the tests that touch the process-global handover flag.
+    ///
+    /// The flag lives in `crate::exec_supervisor`, so two tests that set it
+    /// would otherwise race each other.
+    static HANDOVER_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A process that handed its pane over to a successor must stop speaking
+    /// for the pane: its report would carry a newer sequence number than the
+    /// live successor's, so herdr would take it and make the pane look
+    /// finished while the successor is still working.
+    ///
+    /// reference: https://herdr.dev/docs/add-herdr-support/ ("Herdr ignores
+    /// reports whose number is not higher than the last one it accepted, so
+    /// late or out-of-order reports can't overwrite newer state") and
+    /// D:\herdr-src\src\terminal\state.rs:1946 (`hook_report_is_newer`).
+    #[test]
+    fn a_handed_off_pane_is_not_reported_any_more() {
+        let _serial = lock(&HANDOVER_SERIAL);
+        // The flag is process-global, so this test owns it for its whole run.
+        crate::exec_supervisor::clear_pane_handoff();
+        let env = HerdrEnv {
+            bin: "herdr".into(),
+            pane_id: "p1".into(),
+        };
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        let delivered = Arc::new(Mutex::new(None));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let timing = Timing {
+            heartbeat: Duration::from_millis(20),
+            reassert_delay: Duration::from_millis(20),
+        };
+        let worker_env = env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            worker_loop(
+                worker_env,
+                worker_slot,
+                worker_delivered,
+                timing,
+                Arc::new(move |_: &HerdrEnv, _: &StateReport| {
+                    calls_for_worker.fetch_add(1, Ordering::Relaxed) >= 0
+                }),
+            )
+        });
+
+        // The client reports its state and herdr accepts it.
+        {
+            let mut guard = lock(&slot.0);
+            guard.pending = Some(Job::Report(StateReport {
+                state: AgentState::Working,
+                session_id: Some("session_a".into()),
+                resume_argv: None,
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::Relaxed) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the first report must go out");
+
+        // The pane is handed over to a successor: this process stops speaking
+        // for the pane, including the heartbeat that would re-assert its last
+        // (now stale) state.
+        crate::exec_supervisor::mark_pane_handed_off();
+        let before = calls.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        let after = calls.load(Ordering::Relaxed);
+        lock(&slot.0).released = true;
+        let _ = worker.join();
+        crate::exec_supervisor::clear_pane_handoff();
+
+        assert_eq!(
+            after, before,
+            "a handed-off pane must not be reported any more, got {} extra sends",
+            after - before
+        );
+    }
+
+    /// A pending report must not slip out after the handover.
+    ///
+    /// The handover is recorded before the successor is spawned, so a report
+    /// that was already queued when the exec started would otherwise go out
+    /// after the successor took the pane.
+    #[test]
+    fn a_pending_report_is_dropped_when_the_pane_is_handed_off() {
+        let _serial = lock(&HANDOVER_SERIAL);
+        crate::exec_supervisor::clear_pane_handoff();
+        let env = HerdrEnv {
+            bin: "herdr".into(),
+            pane_id: "p1".into(),
+        };
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        let delivered = Arc::new(Mutex::new(None));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_worker = Arc::clone(&calls);
+        let timing = Timing {
+            heartbeat: Duration::from_millis(20),
+            reassert_delay: Duration::from_millis(20),
+        };
+        let worker_env = env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker_delivered = Arc::clone(&delivered);
+        let worker = std::thread::spawn(move || {
+            worker_loop(
+                worker_env,
+                worker_slot,
+                worker_delivered,
+                timing,
+                Arc::new(move |_: &HerdrEnv, _: &StateReport| {
+                    calls_for_worker.fetch_add(1, Ordering::Relaxed) >= 0
+                }),
+            )
+        });
+
+        // The worker is parked on the heartbeat. Hand the pane over, then queue
+        // a report: it must not reach herdr.
+        crate::exec_supervisor::mark_pane_handed_off();
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let mut guard = lock(&slot.0);
+            guard.pending = Some(Job::Report(StateReport {
+                state: AgentState::Idle,
+                session_id: None,
+                resume_argv: None,
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let sent = calls.load(Ordering::Relaxed);
+        lock(&slot.0).released = true;
+        let _ = worker.join();
+        crate::exec_supervisor::clear_pane_handoff();
+
+        assert_eq!(sent, 0, "a report queued after the handover must not be sent");
+    }
+
+    /// The handover is undone when the successor could not be spawned: this
+    /// process keeps the pane and must keep reporting it.
+    #[test]
+    fn a_cleared_handover_restores_reporting() {
+        let _serial = lock(&HANDOVER_SERIAL);
+        crate::exec_supervisor::clear_pane_handoff();
+        assert!(!crate::exec_supervisor::pane_handed_off());
+        crate::exec_supervisor::mark_pane_handed_off();
+        assert!(crate::exec_supervisor::pane_handed_off());
+        crate::exec_supervisor::clear_pane_handoff();
+        assert!(
+            !crate::exec_supervisor::pane_handed_off(),
+            "a failed spawn must leave the pane with this process"
+        );
     }
 
     /// Fake herdr for `send_report` tests. Each call is logged; any call

@@ -1,0 +1,17 @@
+=== jcode daemon processes ===
+pid=4408 alive=True start=11/17/2026 21:25:07
+pid=5316 alive=True start=11/17/2026 01:41:48
+pid=10740 alive=True start=11/17/2026 21:25:06
+pid=14756 alive=True start=11/17/2026 21:25:07
+pid=21392 alive=True start=11/17/2026 21:25:07
+pid=21848 alive=True start=11/17/2026 21:36:26
+pid=22512 alive=True start=11/17/2026 18:40:13
+pid=24500 alive=True start=11/17/2026 21:29:54
+pid=26044 alive=True start=11/17/2026 21:25:06
+pid=29604 alive=True start=11/17/2026 21:25:06
+pid=35088 alive=True start=11/17/2026 21:25:07
+=== the identity file's pid ===
+{"pid":22512,"exe":"C:\\Users\\WorkShop1\\AppData\\Local\\jcode\\builds\\shared-server\\jcode.exe","git_hash":"bdb5fb2a5","version":"v0.99.731-dev (bdb5fb2a5, dirty)","started_at":"2026-11-17T13:40:17.696916600Z"}
+identity_pid=22512 alive=True
+=== elevated? ===
+elevated=True

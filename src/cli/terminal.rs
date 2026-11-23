@@ -350,12 +350,8 @@ fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTermina
     if inherited_terminal {
         init_tui_terminal_resume()
     } else {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init)).map_err(|payload| {
-            anyhow::anyhow!(
-                "failed to initialize terminal: {}",
-                panic_payload_to_string(payload.as_ref())
-            )
-        })
+        jcode_tui_style::init_terminal()
+            .map_err(|error| anyhow::anyhow!("failed to initialize terminal: {error}"))
     }
 }
 
@@ -411,7 +407,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         }
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -435,7 +431,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         };
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;
+            tui::write_focus_reporting_mode_to(&mut std::io::stdout())?;
         }
         if modes.mouse_capture {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
@@ -649,6 +645,18 @@ fn handle_termination_signal(sig: i32) -> ! {
     std::process::exit(128 + sig);
 }
 
+/// Another window took over this client's session
+/// (`display.resume_open_elsewhere`). Restore the terminal and exit cleanly:
+/// this is a handover, so the session must not be marked crashed.
+#[cfg(unix)]
+fn handle_replaced_signal() -> ! {
+    crate::tui::record_termination_started();
+    if signal_cleanup_terminal_modes_to(signal_cleanup_stream()) {
+        crate::tui::disable_keyboard_enhancement();
+    }
+    std::process::exit(0);
+}
+
 fn signal_cleanup_terminal_modes_to(mut writer: impl Write) -> bool {
     // The ownership check and the restore writes run under the kitty state
     // lock so an in-flight editor handoff cannot split them: the handoff
@@ -662,6 +670,14 @@ fn signal_cleanup_terminal_modes_to(mut writer: impl Write) -> bool {
         }
 
         let _ = crossterm::terminal::disable_raw_mode();
+        // On Windows crossterm's DisableMouseCapture reports
+        // is_ansi_code_supported() == false and takes the WinAPI path, so it
+        // never writes the VT mouse-tracking reset bytes. jcode armed those
+        // modes itself through sync_windows_vt_mouse_capture, so the reset has
+        // to be written here as well or the shell that inherits the pane keeps
+        // receiving mouse events.
+        #[cfg(windows)]
+        let _ = writer.write_all(WINDOWS_VT_MOUSE_DISABLE);
         let _ = crossterm::execute!(
             writer,
             crossterm::event::DisableBracketedPaste,
@@ -678,7 +694,7 @@ fn signal_cleanup_terminal_modes_to(mut writer: impl Write) -> bool {
 /// the TUI requires, where `setup_terminal` enabled every mode this cleanup
 /// disables. Writing to stderr would miss the terminal whenever stderr is
 /// redirected and leave the modes armed after jcode exits.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn signal_cleanup_stream() -> std::io::Stdout {
     std::io::stdout()
 }
@@ -786,9 +802,76 @@ pub fn spawn_session_signal_watchers() {
     spawn_one(libc::SIGTERM, SignalKind::terminate());
     spawn_one(libc::SIGINT, SignalKind::interrupt());
     spawn_one(libc::SIGQUIT, SignalKind::quit());
+
+    tokio::spawn(async move {
+        let kind = SignalKind::from_raw(crate::session_window::CLIENT_REPLACED_SIGNAL);
+        if let Ok(mut stream) = signal(kind)
+            && stream.recv().await.is_some()
+        {
+            crate::logging::info("Session opened in another window; closing this client");
+            handle_replaced_signal();
+        }
+    });
 }
 
-#[cfg(not(unix))]
+/// On Windows there is no Unix signal equivalent, so an abrupt termination
+/// (herdr closing the pane, console window close, logoff) skipped the
+/// terminal cleanup entirely: the process died without leaving the terminal
+/// and the shell inherited raw mode, the alternate screen, bracketed paste
+/// and the VT mouse tracking modes. The Win32 console control handler is the
+/// Windows counterpart of the Unix signal watcher and reuses the same cleanup
+/// path, so both platforms restore the same set of modes.
+#[cfg(windows)]
+pub fn spawn_session_signal_watchers() {
+    install_windows_console_ctrl_handler();
+}
+
+/// Register the Win32 console control handler that restores the terminal modes
+/// before an abrupt termination ends the process.
+///
+/// reference: https://learn.microsoft.com/en-us/windows/console/handlerc-routine
+///
+/// The handler runs on a foreign thread, so it cannot rely on the normal
+/// teardown (`TuiRuntimeGuard::finish`/`Drop`); it performs the restore
+/// itself and then exits.
+#[cfg(windows)]
+fn install_windows_console_ctrl_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(windows_console_ctrl_handler), 1);
+    }
+}
+
+/// The console control handler: restore the terminal modes, then exit.
+///
+/// `dw_ctrl_type` covers CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT,
+/// CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT. All of them mean the process is
+/// about to be terminated, so all of them need the same restore.
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_ctrl_handler(dw_ctrl_type: u32) -> i32 {
+    let _ = dw_ctrl_type;
+    // Record the termination before the cleanup runs, so an editor that
+    // reclaims the terminal in this window does not re-arm the modes.
+    crate::tui::record_termination_started();
+
+    if signal_cleanup_terminal_modes_to(signal_cleanup_stream()) {
+        crate::tui::disable_keyboard_enhancement();
+    }
+
+    if let Some(session_id) = get_current_session() {
+        print_session_resume_hint(&session_id);
+    }
+
+    // STATUS_CONTROL_C_EXIT is the conventional exit code for a process
+    // terminated through a console control event.
+    std::process::exit(WINDOWS_TERMINATION_EXIT_CODE as i32);
+}
+
+/// The exit code the Windows console control handler terminates with.
+#[cfg(windows)]
+const WINDOWS_TERMINATION_EXIT_CODE: u32 = 0xC000_013A;
+
+#[cfg(not(any(unix, windows)))]
 pub fn spawn_session_signal_watchers() {}
 
 #[cfg(test)]

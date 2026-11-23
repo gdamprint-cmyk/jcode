@@ -17,6 +17,9 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// The model must not activate this skill by itself; only an explicit user
+    /// invocation does. See [`SkillFrontmatter::disable_model_invocation`].
+    pub disable_model_invocation: bool,
     pub content: String,
     pub path: PathBuf,
     /// Normalized search text, built on first use. Normalizing every skill
@@ -31,6 +34,15 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<AllowedTools>,
+    /// When true the model must not load this skill on its own initiative; only
+    /// an explicit user invocation (the `/name` slash command) activates it.
+    ///
+    /// Ported from the agentskills.io convention that Hermes honours
+    /// (`disable-model-invocation: true` in SKILL.md frontmatter). Without this
+    /// the always-on catalog advertises the skill as auto-loadable, and the
+    /// model loads it unprompted — exactly what the flag forbids.
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,7 +55,18 @@ enum AllowedTools {
 /// Registry of available skills
 #[derive(Debug, Default, Clone)]
 pub struct SkillRegistry {
-    skills: HashMap<String, Skill>,
+    // Snapshots keep independent maps but share immutable skill definitions.
+    skills: HashMap<String, Arc<Skill>>,
+    // SKILL.md files that were found but could not be loaded, so reloads and
+    // listings can say why a skill is missing instead of omitting it silently.
+    load_errors: Vec<SkillLoadError>,
+}
+
+/// A `SKILL.md` that was discovered but rejected while loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillLoadError {
+    pub path: PathBuf,
+    pub error: String,
 }
 
 /// Maximum directory depth scanned under a Claude Code plugin root when
@@ -269,19 +292,19 @@ impl SkillRegistry {
             registry.load_plugin_skills_from_root(&plugins_root);
         }
 
+        // Later inserts win: plugins < shared agents < explicit jcode skills.
+        if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
+            && agents_skills.exists()
+        {
+            registry.load_from_dir(&agents_skills)?;
+        }
+
         // Load from ~/.jcode/skills/ (jcode's own global skills)
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let jcode_skills = jcode_dir.join("skills");
             if jcode_skills.exists() {
                 registry.load_from_dir(&jcode_skills)?;
             }
-        }
-
-        // Load from ~/.agents/skills/ (shared cross-tool `.agents` convention)
-        if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
-            && agents_skills.exists()
-        {
-            registry.load_from_dir(&agents_skills)?;
         }
 
         Ok(registry)
@@ -304,7 +327,14 @@ impl SkillRegistry {
     /// over same-named global skills, mirroring the historical load order
     /// (project dirs loaded last).
     pub fn merge_overlay(&mut self, overlay: Self) {
-        self.skills.extend(overlay.skills);
+        for skill in overlay.skills.into_values() {
+            self.insert_shared_skill(skill);
+        }
+        for failed in overlay.load_errors {
+            if !self.load_errors.contains(&failed) {
+                self.load_errors.push(failed);
+            }
+        }
     }
 
     /// Effective skills for a session: shared global skills plus the
@@ -331,22 +361,13 @@ impl SkillRegistry {
     }
 
     fn load_project_local_dirs(&mut self, working_dir: Option<&Path>) -> Result<()> {
-        // Load from ./.jcode/skills/ (project-local jcode skills)
-        let local_jcode = Self::project_local_dir(working_dir, ".jcode");
-        if local_jcode.exists() {
-            self.load_from_dir(&local_jcode)?;
-        }
-
-        // Load from ./.agents/skills/ (shared cross-tool `.agents` convention)
-        let local_agents = Self::project_local_dir(working_dir, ".agents");
-        if local_agents.exists() {
-            self.load_from_dir(&local_agents)?;
-        }
-
-        // Fallback: ./.claude/skills/ (project-local Claude skills for compatibility)
-        let local_claude = Self::project_local_dir(working_dir, ".claude");
-        if local_claude.exists() {
-            self.load_from_dir(&local_claude)?;
+        // Later inserts win within the project: .jcode > .agents > .claude.
+        // Every project source still overrides global skills.
+        for scope in [".claude", ".agents", ".jcode"] {
+            let dir = Self::project_local_dir(working_dir, scope);
+            if dir.exists() {
+                self.load_from_dir(&dir)?;
+            }
         }
 
         Ok(())
@@ -491,15 +512,41 @@ impl SkillRegistry {
 
             if path.is_dir() {
                 let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Ok(skill) = Self::parse_skill(&skill_file)
-                {
-                    self.skills.insert(skill.name.clone(), skill);
+                if skill_file.exists() {
+                    self.load_skill_file(&skill_file);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Parse one discovered `SKILL.md` and register it, or record why it was
+    /// rejected. Returns whether the skill loaded.
+    fn load_skill_file(&mut self, skill_file: &Path) -> bool {
+        match Self::parse_skill(skill_file) {
+            Ok(skill) => {
+                self.load_errors.retain(|failed| failed.path != skill_file);
+                self.insert_loaded_skill(skill);
+                true
+            }
+            Err(error) => {
+                self.load_errors.retain(|failed| failed.path != skill_file);
+                self.load_errors.push(SkillLoadError {
+                    path: skill_file.to_path_buf(),
+                    error: format!("{error:#}"),
+                });
+                false
+            }
+        }
+    }
+
+    /// `SKILL.md` files that were found but could not be loaded, sorted by
+    /// path for stable output.
+    pub fn load_errors(&self) -> Vec<&SkillLoadError> {
+        let mut errors: Vec<&SkillLoadError> = self.load_errors.iter().collect();
+        errors.sort_by(|a, b| a.path.cmp(&b.path));
+        errors
     }
 
     /// Parse a SKILL.md file
@@ -524,6 +571,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
         } = frontmatter;
 
         let allowed_tools = allowed_tools.map(|tools| match tools {
@@ -537,6 +585,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
             content: body,
             path: path.to_path_buf(),
             search_text: std::sync::OnceLock::new(),
@@ -559,14 +608,131 @@ impl SkillRegistry {
         let yaml = &rest[..end];
         let body = rest[end + 3..].trim().to_string();
 
-        let frontmatter: SkillFrontmatter = serde_yaml::from_str(yaml)?;
+        let frontmatter: SkillFrontmatter = match serde_yaml::from_str(yaml) {
+            Ok(frontmatter) => frontmatter,
+            // Skills written for other agents often carry a long unquoted
+            // `description:` containing `: ` (for example "deltas: b.args"),
+            // which strict YAML rejects as a nested mapping. Those tools read
+            // the field as plain text, so do the same rather than dropping
+            // the whole skill.
+            //
+            // Only a plain scalar that strict YAML could not read gets this
+            // treatment, and the required keys stay mandatory: frontmatter
+            // missing `name`/`description` must be an error, not a silent skip
+            // (issue #952). See `parse_frontmatter_lenient` for how the
+            // leniency boundary is kept narrow.
+            Err(strict_error) => Self::parse_frontmatter_lenient(yaml).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid skill frontmatter: {strict_error}. Quote values that contain ': ' \
+                     or use a block scalar (description: >-)"
+                )
+            })?,
+        };
 
         Ok((frontmatter, body))
     }
 
+    /// Fallback for frontmatter that is not valid YAML: read the top-level
+    /// `name`, `description` and `allowed-tools` keys as plain text and ignore
+    /// everything else. Returns `None` unless both required keys are present.
+    fn parse_frontmatter_lenient(yaml: &str) -> Option<SkillFrontmatter> {
+        fn top_level_key(line: &str) -> Option<(&str, &str)> {
+            if line.starts_with([' ', '\t', '#', '-']) {
+                return None;
+            }
+            let (key, rest) = line.split_once(':')?;
+            let valid = !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            (valid && (rest.is_empty() || rest.starts_with([' ', '\t']))).then_some((key, rest))
+        }
+        fn unquote(value: &str) -> String {
+            let value = value.trim();
+            for quote in ['"', '\''] {
+                if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+                    return value[1..value.len() - 1].to_string();
+                }
+            }
+            value.to_string()
+        }
+
+        let mut entries: Vec<(&str, Vec<&str>)> = Vec::new();
+        for line in yaml.lines() {
+            if let Some((key, rest)) = top_level_key(line) {
+                entries.push((key, vec![rest]));
+            } else if let Some((_, lines)) = entries.last_mut() {
+                lines.push(line);
+            }
+        }
+
+        // Leniency is scoped to the one shape it exists for: a plain scalar
+        // whose value contains `: `. Anything else strict YAML rejected must stay
+        // an error, so the required keys are read from the entry groups rather
+        // than by skipping whatever does not parse. In particular the
+        // reported-malformed fixture (`summary: Triggers: invalid yaml`, no
+        // `description`) still fails here and is reported, never silently loaded.
+        let has_colon_in_value = entries.iter().any(|(_, lines)| {
+            lines
+                .first()
+                .is_some_and(|line| line.trim().split_once(':').is_some_and(|(_, tail)| tail.contains(' ')))
+        });
+        if !has_colon_in_value {
+            return None;
+        }
+
+        let scalar = |key: &str| -> Option<String> {
+            let (_, lines) = entries.iter().find(|(entry, _)| *entry == key)?;
+            let first = lines[0].trim();
+            // Block scalar indicators (`>-`, `|`) carry no text of their own.
+            let head = if first.starts_with(['>', '|']) {
+                ""
+            } else {
+                first
+            };
+            let joined = std::iter::once(head)
+                .chain(lines[1..].iter().map(|line| line.trim()))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let value = unquote(&joined);
+            (!value.is_empty()).then_some(value)
+        };
+
+        let name = scalar("name")?;
+        let description = scalar("description")?;
+        let disable_model_invocation = scalar("disable-model-invocation")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let allowed_tools = entries
+            .iter()
+            .find(|(entry, _)| *entry == "allowed-tools")
+            .and_then(|(_, lines)| {
+                let inline = lines[0]
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']');
+                if !inline.is_empty() {
+                    return Some(AllowedTools::CommaDelimited(inline.to_string()));
+                }
+                let items: Vec<String> = lines[1..]
+                    .iter()
+                    .filter_map(|line| line.trim().strip_prefix('-'))
+                    .map(unquote)
+                    .filter(|item| !item.is_empty())
+                    .collect();
+                (!items.is_empty()).then_some(AllowedTools::Sequence(items))
+            });
+        Some(SkillFrontmatter {
+            name,
+            description,
+            allowed_tools,
+            disable_model_invocation,
+        })
+    }
+
     /// Get a skill by name
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.get(name)
+        self.skills.get(name).map(Arc::as_ref)
     }
 
     /// List all available skills.
@@ -579,7 +745,7 @@ impl SkillRegistry {
     /// system prompt with identical length but different bytes, silently busting
     /// the Anthropic strict-prefix KV cache mid-conversation.
     pub fn list(&self) -> Vec<&Skill> {
-        let mut skills: Vec<&Skill> = self.skills.values().collect();
+        let mut skills: Vec<&Skill> = self.skills.values().map(Arc::as_ref).collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
     }
@@ -592,7 +758,7 @@ impl SkillRegistry {
         if let Some(path) = path {
             if path.exists() {
                 let skill = Self::parse_skill(&path)?;
-                self.skills.insert(skill.name.clone(), skill);
+                self.skills.insert(skill.name.clone(), Arc::new(skill));
                 Ok(true)
             } else {
                 // Skill file was deleted
@@ -626,6 +792,7 @@ impl SkillRegistry {
             "reloaded all skills; the skills list in the system prompt may have changed",
         );
         self.skills.clear();
+        self.load_errors.clear();
 
         let mut count = 0;
 
@@ -635,19 +802,19 @@ impl SkillRegistry {
             count += self.load_plugin_skills_from_root(&plugins_root);
         }
 
+        // Keep the same precedence as load_global: plugins < agents < jcode.
+        if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
+            && agents_skills.exists()
+        {
+            count += self.load_from_dir_count(&agents_skills)?;
+        }
+
         // Load from ~/.jcode/skills/ (jcode's own global skills)
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let jcode_skills = jcode_dir.join("skills");
             if jcode_skills.exists() {
                 count += self.load_from_dir_count(&jcode_skills)?;
             }
-        }
-
-        // Load from ~/.agents/skills/ (shared cross-tool `.agents` convention)
-        if let Ok(agents_skills) = crate::storage::user_home_path(".agents/skills")
-            && agents_skills.exists()
-        {
-            count += self.load_from_dir_count(&agents_skills)?;
         }
 
         Ok(count)
@@ -666,16 +833,31 @@ impl SkillRegistry {
 
             if path.is_dir() {
                 let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Ok(skill) = Self::parse_skill(&skill_file)
-                {
-                    self.skills.insert(skill.name.clone(), skill);
+                if skill_file.exists() && self.load_skill_file(&skill_file) {
                     count += 1;
                 }
             }
         }
 
         Ok(count)
+    }
+
+    fn insert_loaded_skill(&mut self, skill: Skill) {
+        self.insert_shared_skill(Arc::new(skill));
+    }
+
+    fn insert_shared_skill(&mut self, skill: Arc<Skill>) {
+        if let Some(shadowed) = self.skills.get(&skill.name)
+            && shadowed.path != skill.path
+        {
+            crate::logging::warn(&format!(
+                "Skill '{}' from '{}' shadows '{}'",
+                skill.name,
+                skill.path.display(),
+                shadowed.path.display()
+            ));
+        }
+        self.skills.insert(skill.name.clone(), skill);
     }
 
     /// Parse `/skill-name` and `/skill-name prompt...` invocations.
@@ -993,6 +1175,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            disable_model_invocation: false,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: std::sync::OnceLock::from(build_skill_search_text(
@@ -1167,7 +1350,7 @@ mod tests {
         for name in names {
             reg_a
                 .skills
-                .insert(name.to_string(), test_skill(name, "d", "c"));
+                .insert(name.to_string(), test_skill(name, "d", "c").into());
         }
 
         // Build a second registry with the reverse insertion order to maximize
@@ -1176,7 +1359,7 @@ mod tests {
         for name in names.iter().rev() {
             reg_b
                 .skills
-                .insert(name.to_string(), test_skill(name, "d", "c"));
+                .insert(name.to_string(), test_skill(name, "d", "c").into());
         }
 
         let order_a: Vec<&str> = reg_a.list().iter().map(|s| s.name.as_str()).collect();
@@ -1249,7 +1432,12 @@ mod tests {
         write_skill_file(
             &skills_dir,
             "malformed",
-            "---\nname: malformed\ndescription: Triggers: invalid yaml\n---\n\nBroken.\n",
+            // Same fixture as the canonical test in `skill_tests.rs`: an
+            // unknown key whose value holds a colon, and no `description`.
+            // A description containing `: ` is NOT malformed - agentskills.io
+            // defines it as free text and upstream reads it leniently - so this
+            // copy must not use one as its "malformed" example.
+            "---\nname: malformed\nsummary: Triggers: invalid yaml\n---\n\nBroken.\n",
         );
 
         let mut registry = SkillRegistry::default();
@@ -1258,6 +1446,7 @@ mod tests {
             .expect("load skills while skipping malformed file");
         assert!(registry.contains("valid"));
         assert!(!registry.contains("malformed"));
+        assert_eq!(registry.load_errors().len(), 1);
 
         let mut counted_registry = SkillRegistry::default();
         let count = counted_registry
@@ -1288,7 +1477,7 @@ mod tests {
         let mut base = SkillRegistry::default();
         base.skills.insert(
             "session-skill".to_string(),
-            test_skill("session-skill", "global variant", "global body"),
+            test_skill("session-skill", "global variant", "global body").into(),
         );
         let effective = SkillRegistry::effective_for_working_dir(&base, Some(temp.path()));
         let skill = effective
@@ -1591,3 +1780,6 @@ mod tests {
         assert!(SkillRegistry::plugin_skill_dirs_under(&missing).is_empty());
     }
 }
+
+#[path = "skill_tests.rs"]
+mod upstream_tests;

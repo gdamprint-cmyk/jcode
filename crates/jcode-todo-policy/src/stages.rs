@@ -9,7 +9,23 @@
 //!   lane that runs in list order. Different lanes run in parallel. An
 //!   ungrouped todo is a lane of its own.
 
+// reference: ~/.jcode/research/2026-11-09-todo-name-collision.md (the measured
+//           defect, the fix and its behavioural control). The name-collision fix
+//           in `merge_worker_lane` extends this file's OWN prior art - the
+//           function already resolved colliding card IDs with
+//           `format!("{worker}:{id}")` (merge_worker_lane, stages.rs:294) but
+//           not colliding card NAMES, which is what the todo tool resolves a
+//           card by (`task_name()` reads `content`, todo_names.rs:35). No
+//           external implementation was consulted: searched the web for
+//           "rust disambiguate duplicate item names when merging two lists" and
+//           the repo for `unique_name`; the only relevant precedent is the
+//           in-repo ID-collision handling.
+
 use crate::TodoItem;
+
+#[cfg(test)]
+#[path = "lane_dependency_tests.rs"]
+mod lane_dependency_tests;
 
 /// One parallel lane inside a stage: indices into the original todo slice,
 /// in list order.
@@ -115,6 +131,84 @@ pub fn stage_layout(todos: &[&TodoItem]) -> Vec<TodoStage> {
     stages
 }
 
+/// Validate lane-wide prerequisites against phase order of first appearance,
+/// not numeric phase labels. Restricting edges to earlier phases prevents cycles.
+pub fn validate_lane_dependencies(todos: &[TodoItem]) -> Result<(), String> {
+    let refs: Vec<_> = todos.iter().collect();
+    let stages = stage_layout(&refs);
+    let mut positions = std::collections::HashMap::new();
+    for (phase, stage) in stages.iter().enumerate() {
+        for index in stage.item_indices() {
+            if positions.insert(todos[index].id.as_str(), phase).is_some() {
+                return Err(format!("duplicate todo id {:?}", todos[index].id));
+            }
+        }
+    }
+    for (phase, stage) in stages.iter().enumerate() {
+        for lane in &stage.lanes {
+            if let Some(owner) = todos[lane.items[0]].lane_owner.as_deref()
+                && !matches!(owner, "worker" | "self")
+            {
+                return Err(format!(
+                    "lane owner must be \"worker\" or \"self\", got {owner:?}"
+                ));
+            }
+            let expected = &todos[lane.items[0]].lane_after;
+            if lane.items.iter().any(|&i| &todos[i].lane_after != expected) {
+                return Err("lane_after must be consistent across every lane member".into());
+            }
+            let Some(dependencies) = expected else {
+                continue;
+            };
+            if dependencies.is_empty() {
+                return Err(
+                    "lane_after must be nonempty, or null for the default phase barrier".into(),
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for id in dependencies {
+                if id.trim().is_empty() || !seen.insert(id) {
+                    return Err("lane_after must contain unique nonempty todo IDs".into());
+                }
+                match positions.get(id.as_str()) {
+                    Some(&position) if position < phase => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "lane_after todo {id:?} must be in a strictly earlier phase"
+                        ));
+                    }
+                    None => return Err(format!("unknown lane_after todo {id:?}")),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether this todo's lane asked for a dedicated auto-spawned swarm worker.
+pub fn lane_requests_worker(todo: &TodoItem) -> bool {
+    todo.lane_owner.as_deref() == Some(crate::LANE_OWNER_WORKER)
+}
+
+/// Make `lane_owner` lane-wide: every member takes the value of the lane's
+/// first member that sets one, so adding an item to a worker lane keeps it a
+/// worker lane and a single-item edit flips the whole lane.
+pub fn normalize_lane_owners(todos: &mut [TodoItem]) {
+    let mut owners: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for todo in todos.iter() {
+        let entry = owners.entry(lane_id(todo)).or_insert(None);
+        if entry.is_none() {
+            *entry = todo.lane_owner.clone();
+        }
+    }
+    for todo in todos.iter_mut() {
+        let owner = owners.get(&lane_id(todo)).cloned().flatten();
+        // `self` is the default; store only the meaningful value.
+        todo.lane_owner = owner.filter(|owner| owner != "self");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +274,36 @@ pub fn lane_todos_for_worker(coordinator_todos: &[TodoItem], lane: &str) -> Vec<
         .map(|todo| TodoItem {
             assigned_to: None,
             blocked_by: Vec::new(),
+            waiting_reason: None,
+            waiting_on: Vec::new(),
+            ..todo.clone()
+        })
+        .collect()
+}
+
+/// Pin worker-authored todos to their assigned coordinator lane before local
+/// persistence. Only lane identity changes: task edits and session-local
+/// bookkeeping stay with the worker. A missing lane leaves the list alone.
+pub fn canonicalize_worker_lane(
+    coordinator_todos: &[TodoItem],
+    link: &LaneLink,
+    worker_todos: &[TodoItem],
+) -> Vec<TodoItem> {
+    let Some(template) = coordinator_todos
+        .iter()
+        .find(|todo| lane_id(todo) == link.lane)
+    else {
+        return worker_todos.to_vec();
+    };
+    worker_todos
+        .iter()
+        .map(|todo| TodoItem {
+            stage: template.stage,
+            group: template.group.clone(),
+            lane_after: template.lane_after.clone(),
+            // Inside a worker's own list the lane is the worker's: it must
+            // never re-dispatch it, so ownership stays coordinator-side.
+            lane_owner: None,
             ..todo.clone()
         })
         .collect()
@@ -211,10 +335,23 @@ pub fn merge_worker_lane(
             let mut item = todo.clone();
             item.stage = template.stage;
             item.group = template.group.clone();
+            item.lane_after = template.lane_after.clone();
+            item.lane_owner = template.lane_owner.clone();
             item.assigned_to = Some(link.worker.clone());
             if other_ids.contains(item.id.as_str()) {
                 item.id = format!("{}:{}", link.worker, item.id);
             }
+            // Background task IDs belong to the destination session, not the
+            // worker. New items get no references from the source session.
+            // The reason describes those IDs, so it travels with them.
+            (item.waiting_on, item.waiting_reason) = match coordinator_todos
+                .iter()
+                .find(|old| lane_id(old) == link.lane && old.id == item.id)
+            {
+                Some(old) => (old.waiting_on.clone(), old.waiting_reason.clone()),
+                // A newly introduced worker item cannot inherit another session's waits.
+                None => (Vec::new(), None),
+            };
             item
         })
         .collect();
@@ -235,7 +372,44 @@ pub fn merge_worker_lane(
             merged.push(todo.clone());
         }
     }
+    disambiguate_names(&mut merged);
     (merged != coordinator_todos).then_some(merged)
+}
+
+/// Keep card names unique across the merged board.
+///
+/// The todo tool resolves a card by its NAME, which is the card's `content`, and
+/// refuses to operate on a board that holds two cards with the same name
+/// (`duplicate todo name ...; names must be unique within the plan`,
+/// crates/jcode-app-core/src/tool/todo_names.rs). A worker's card is mirrored
+/// into the coordinator's board by name, so two workers that each create a card
+/// called `write-artifact` poison the coordinator's board: EVERY later todo
+/// update by the coordinator fails until one card is renamed. Merging already
+/// resolved colliding card IDs; names need the same treatment.
+fn disambiguate_names(todos: &mut [TodoItem]) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for todo in todos.iter_mut() {
+        if todo.content.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(todo.content.clone()) {
+            continue;
+        }
+        let owner = todo
+            .assigned_to
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .unwrap_or("todo")
+            .to_string();
+        let base = todo.content.clone();
+        let mut candidate = format!("{base} ({owner})");
+        let mut counter = 2;
+        while !seen.insert(candidate.clone()) {
+            candidate = format!("{base} ({owner} {counter})");
+            counter += 1;
+        }
+        todo.content = candidate;
+    }
 }
 
 #[cfg(test)]
@@ -297,12 +471,120 @@ mod lane_sync_tests {
         assert_eq!(merge_worker_lane(&coordinator, &link, &worker), None);
     }
 
+    // reference: ~/.jcode/research/2026-11-09-todo-name-collision.md - the
+    //           measured defect (two workers whose cards share a name poison the
+    //           coordinator's board) and the fix's behavioural control.
+    /// Two workers whose cards carry the SAME name must not poison the
+    /// coordinator's board. The todo tool resolves a card by its name (the
+    /// card's `content`) and refuses to operate on a board holding two cards
+    /// with the same name, so a collision between workers would break EVERY
+    /// later todo update by the coordinator.
+    #[test]
+    fn merge_disambiguates_names_colliding_across_workers() {
+        let mut coordinator = vec![
+            item("p1", "pending", Some(1), Some("parser")),
+            item("u1", "pending", Some(1), Some("ui")),
+        ];
+        let parser = LaneLink {
+            coordinator: "boss".into(),
+            worker: "fox".into(),
+            lane: "lane:1:parser".into(),
+        };
+        let ui = LaneLink {
+            coordinator: "boss".into(),
+            worker: "lynx".into(),
+            lane: "lane:1:ui".into(),
+        };
+        let mut fox = vec![item("p1", "pending", Some(1), Some("parser"))];
+        fox[0].content = "write-artifact".into();
+        let mut lynx = vec![item("u1", "pending", Some(1), Some("ui"))];
+        lynx[0].content = "write-artifact".into();
+
+        coordinator = merge_worker_lane(&coordinator, &parser, &fox).expect("parser lane merged");
+        coordinator = merge_worker_lane(&coordinator, &ui, &lynx).expect("ui lane merged");
+
+        let mut names: Vec<&str> = coordinator.iter().map(|todo| todo.content.as_str()).collect();
+        names.sort_unstable();
+        let mut unique = names.clone();
+        unique.dedup();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "merged board must hold unique card names, got {names:?}"
+        );
+        assert!(names.contains(&"write-artifact"), "first name is kept verbatim");
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("write-artifact (")),
+            "the colliding name is disambiguated, got {names:?}"
+        );
+    }
+
+    /// A merge that introduces no collision must not rename anything.
+    #[test]
+    fn merge_keeps_names_untouched_without_a_collision() {
+        let coordinator = vec![item("p1", "pending", Some(1), Some("parser"))];
+        let parser = LaneLink {
+            coordinator: "boss".into(),
+            worker: "fox".into(),
+            lane: "lane:1:parser".into(),
+        };
+        let mut fox = vec![item("p1", "pending", Some(1), Some("parser"))];
+        fox[0].content = "write-minimax-quota-artifact".into();
+        let merged = merge_worker_lane(&coordinator, &parser, &fox).expect("merged");
+        let names: Vec<&str> = merged.iter().map(|todo| todo.content.as_str()).collect();
+        assert!(names.contains(&"write-minimax-quota-artifact"), "got {names:?}");
+        assert!(!names.iter().any(|name| name.contains('(')), "got {names:?}");
+    }
+
     #[test]
     fn worker_is_seeded_with_exactly_its_lane() {
         let seeded = lane_todos_for_worker(&coordinator(), "lane:1:parser");
         let ids: Vec<&str> = seeded.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["p1", "p2"]);
         assert!(seeded.iter().all(|t| t.assigned_to.is_none()));
+    }
+
+    #[test]
+    fn canonical_worker_lane_preserves_unstaged_and_ungrouped_assignments() {
+        for group in [Some("parser"), None] {
+            let boss = vec![item("p1", "pending", None, group)];
+            let link = LaneLink {
+                lane: lane_id(&boss[0]),
+                ..link()
+            };
+            let worker = vec![item("p1", "completed", Some(9), Some("renamed"))];
+            let canonical = canonicalize_worker_lane(&boss, &link, &worker);
+            assert_eq!(canonical[0].stage, None);
+            assert_eq!(canonical[0].group.as_deref(), group);
+            assert_eq!(canonical[0].status, "completed");
+            assert_eq!(canonicalize_worker_lane(&[], &link, &worker), worker);
+        }
+    }
+
+    #[test]
+    fn session_local_dependencies_never_cross_lane_mirrors() {
+        let mut boss = coordinator();
+        boss[0].waiting_on = vec!["boss-task".into()];
+        let mut worker = lane_todos_for_worker(&boss, "lane:1:parser");
+        assert!(worker.iter().all(|todo| todo.waiting_on.is_empty()));
+        worker[0].waiting_on = vec!["worker-task".into()];
+        worker[0].status = "in_progress".into();
+        let mut added = item("new", "pending", Some(1), Some("parser"));
+        added.waiting_on = vec!["worker-new-task".into()];
+        worker.push(added);
+        let merged = merge_worker_lane(&boss, &link(), &worker).unwrap();
+        assert_eq!(merged[0].waiting_on, vec!["boss-task"]);
+        assert!(
+            merged
+                .iter()
+                .find(|todo| todo.id == "new")
+                .unwrap()
+                .waiting_on
+                .is_empty()
+        );
+        assert_eq!(worker[0].waiting_on, vec!["worker-task"]);
     }
 
     #[test]
@@ -365,8 +647,10 @@ pub fn default_phase(todos: &[TodoItem]) -> Option<u32> {
 /// Ensure the coordinator's todo list has a lane named `lane` in `phase` for a
 /// spawned worker, returning the updated list and the lane id. An existing
 /// lane with that group in that phase is adopted as is; otherwise one item is
-/// appended from `title` / `details`. Every spawned worker therefore owns
-/// exactly one lane, and that lane is all it syncs.
+/// appended, named `title` with `details` as its body. Todo names must be
+/// unique within a plan, so a `title` already in use gets a numeric suffix.
+/// Every spawned worker therefore owns exactly one lane, and that lane is all
+/// it syncs.
 pub fn ensure_spawn_lane(
     todos: &[TodoItem],
     lane: &str,
@@ -389,13 +673,16 @@ pub fn ensure_spawn_lane(
     }
     let mut todos = todos.to_vec();
     let title = title.trim();
+    let base = if title.is_empty() { lane } else { title };
+    let mut content = base.to_string();
+    let mut suffix = 2;
+    while todos.iter().any(|todo| todo.content == content) {
+        content = format!("{base} ({suffix})");
+        suffix += 1;
+    }
     todos.push(TodoItem {
         id: id_hint.to_string(),
-        content: if title.is_empty() {
-            lane.to_string()
-        } else {
-            title.to_string()
-        },
+        content,
         status: "pending".to_string(),
         priority: "high".to_string(),
         group: Some(lane.to_string()),
@@ -460,5 +747,75 @@ mod spawn_lane_tests {
         let (out, id) = ensure_spawn_lane(&todos, "fix", None, "Fix it", None, "s1");
         assert_eq!(id, "lane::fix");
         assert_eq!(out.last().unwrap().stage, None);
+    }
+
+    #[test]
+    fn two_lanes_with_the_same_title_get_distinct_card_names() {
+        // reference: crates/jcode-todo-policy/src/stages.rs:353 - disambiguate_names
+        // applies the same uniqueness rule on the merge path; the spawn path
+        // needed the equivalent treatment.
+        // Two probe workers spawned with the same opening prompt produce the
+        // same 60-character title. Without unique names the coordinator's board
+        // holds two identically named cards and every later todo update fails
+        // with "duplicate todo name".
+        let title = "You are a REAL swarm worker. Your only job: write the single";
+        let (first, _) = ensure_spawn_lane(&[], "probe-a", Some(1), title, None, "lane-1");
+        let (second, _) = ensure_spawn_lane(&first, "probe-b", Some(1), title, None, "lane-2");
+        let names: Vec<&str> = second.iter().map(|todo| todo.content.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|name| **name == title).count(),
+            1,
+            "the title must be used once: {names:?}"
+        );
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "names must be unique: {names:?}");
+    }
+
+    #[test]
+    fn a_third_lane_with_the_same_title_stays_unique() {
+        let title = "same title";
+        let (first, _) = ensure_spawn_lane(&[], "a", Some(1), title, None, "lane-1");
+        let (second, _) = ensure_spawn_lane(&first, "b", Some(1), title, None, "lane-2");
+        let (third, _) = ensure_spawn_lane(&second, "c", Some(1), title, None, "lane-3");
+        let names: Vec<&str> = third.iter().map(|todo| todo.content.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "names must be unique: {names:?}");
+    }
+
+    /// Regression test (#2151): the spawn call site passes the derived
+    /// label as the title. Verify that the title becomes the todo's
+    /// `content` and the prompt becomes `details`.
+    #[test]
+    fn spawn_lane_title_becomes_content_prompt_becomes_details() {
+        let todos: Vec<TodoItem> = vec![];
+        let title = "fix parser error";
+        let prompt = "Review the diff\nand fix the bug";
+        let (out, id) = ensure_spawn_lane(&todos, "fix parser", None, title, Some(prompt), "s1");
+        assert_eq!(id, "lane::fix parser");
+        let added = out.last().unwrap();
+        // content must be the derived label, NOT the prompt's first line.
+        assert_eq!(added.content, "fix parser error");
+        assert_ne!(added.content, "Review the diff");
+        // details carries the full prompt.
+        assert_eq!(
+            added.details.as_deref(),
+            Some("Review the diff\nand fix the bug")
+        );
+    }
+
+    /// A label reused in another phase, or equal to an existing todo's name,
+    /// must not create a duplicate name: the todo tool rejects those plans.
+    #[test]
+    fn spawn_lane_name_stays_unique_within_the_plan() {
+        let todos = vec![item("docs", "completed", Some(1), Some("docs"))];
+        let (out, id) = ensure_spawn_lane(&todos, "docs", Some(2), "docs", None, "s1");
+        assert_eq!(id, "lane:2:docs");
+        assert_eq!(out.last().unwrap().content, "docs (2)");
+        let (out, _) = ensure_spawn_lane(&out, "docs", Some(3), "docs", None, "s2");
+        assert_eq!(out.last().unwrap().content, "docs (3)");
     }
 }

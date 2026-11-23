@@ -23,6 +23,7 @@ pub fn waiter_command(session_id: &str) -> std::io::Result<std::process::Command
     }
     cmd.arg("--resume")
         .arg(session_id)
+        .args(crate::tui::jarvis::reexec_args())
         .env(WAIT_ENV, "1")
         .env("JCODE_RESUMING", "1")
         .current_dir(std::env::current_dir()?);
@@ -39,7 +40,7 @@ pub fn run() -> anyhow::Result<()> {
     cmd.args(args)
         .env_remove(WAIT_ENV)
         .env("JCODE_RELOAD_FAST_START", "1");
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
     Err(anyhow::anyhow!("failed to resume after hibernation: {err}"))
 }
 

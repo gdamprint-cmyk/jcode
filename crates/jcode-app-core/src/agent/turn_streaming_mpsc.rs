@@ -1,65 +1,32 @@
-use super::response_recovery::{MalformedToolCallInfo, TextToolRecovery};
+use super::response_recovery::MalformedToolCallInfo;
 use super::*;
 
-use super::streaming::{StreamUsageRecorder, find_wrap_marker_incremental};
+use super::streaming::StreamUsageRecorder;
 
-fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, bool) {
-    if tc.name == "selfdev" {
-        return ("Reload initiated. Process restarting...".to_string(), false);
-    }
-
-    let action = tc
-        .input
-        .get("action")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let is_wait_like = (tc.name == "bg" && action == "wait")
-        || (tc.name == "swarm" && matches!(action, "await_members" | "run_plan"));
-
-    if is_wait_like {
-        let input = serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".to_string());
-        return (
-            format!(
-                "[Tool '{}' wait interrupted by server reload after {:.1}s. The underlying operation may still be running. Resume the wait by rerunning the same tool call with input: {}]",
-                tc.name, elapsed_secs, input
-            ),
-            false,
-        );
-    }
-
-    (
-        format!(
-            "[Tool '{}' interrupted by server reload after {:.1}s]",
-            tc.name, elapsed_secs
-        ),
-        true,
-    )
-}
-
-/// Called only after automatic continuations have been exhausted.
-fn incomplete_turn_stop(stop_reason: Option<&str>) -> Option<ServerEvent> {
-    let reason = stop_reason?;
-    if Agent::should_continue_after_stop_reason(reason)
-        || Agent::is_stranded_tool_use_stop(Some(reason))
-    {
-        Some(ServerEvent::TurnStopped {
-            reason: crate::protocol::TurnStopReason::LimitReached,
-            message: format!(
-                "The provider stopped with {reason} after automatic continuation attempts were exhausted. Output may be incomplete."
-            ),
-            provider_stop_reason: Some(reason.to_string()),
-        })
-    } else {
-        None
-    }
-}
+#[path = "tool_handoff.rs"]
+mod tool_handoff;
+pub(super) use tool_handoff::execute_with_background;
+use tool_handoff::{
+    auto_background_allowed, incomplete_turn_stop, reload_interrupted_tool_result,
+    wait_for_tool_handoff,
+};
+#[path = "stream_request_preparation.rs"]
+mod stream_request_preparation;
 
 impl Agent {
     pub(super) async fn run_turn_streaming_mpsc(
         &mut self,
-        event_tx: mpsc::UnboundedSender<ServerEvent>,
+        raw_event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
-        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
+        // A new turn starts with no research lookup observed, so the
+        // research-first gate is rearmed for this turn.
+        crate::tool::research_gate::reset_research_state(&self.session.id);
+        // Holds streamed text back while no attached client is focused. Every
+        // other event flushes it first, and so does dropping this on return.
+        let event_tx =
+            crate::stream_batching::BatchingSender::new(raw_event_tx, self.session.id.clone());
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         self.ensure_session_lease()?;
         self.set_log_context();
         let usage_turn_id = self.model_usage_turn_id();
@@ -80,7 +47,9 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut consecutive_malformed_tool_rounds = 0u32;
-        let mut unparsed_tool_markup_nudges = 0u32;
+        // Bounded budget for re-issuing a request after a transient stream
+        // error. Reset whenever a request completes normally.
+        let mut stream_error_retries = 0u32;
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -106,51 +75,14 @@ impl Agent {
                     repaired
                 ));
             }
-            // Start provider transport setup before deriving and potentially
-            // compacting the request history. This is the first point where the
-            // stable request settings are available.
-            let mut tools = self.tool_definitions().await;
-            let mut split_prompt = self.build_system_prompt_split(None);
-            self.provider
-                .prewarm(&tools, &split_prompt.static_part)
-                .await;
-            let (messages, compaction_event) = self.messages_for_provider();
-            if let Some(event) = compaction_event {
-                // Reset cache tracker and tool lock on compaction since the message history changes
-                self.cache_tracker.reset();
-                self.kv_cache_monitor.reset();
-                self.locked_tools = None;
-                logging::info(&format!(
-                    "Context compacted ({}{})",
-                    event.trigger,
-                    event
-                        .pre_tokens
-                        .map(|t| format!(" {} tokens", t))
-                        .unwrap_or_default()
-                ));
-                let _ = event_tx.send(ServerEvent::Compaction {
-                    trigger: event.trigger.clone(),
-                    pre_tokens: event.pre_tokens,
-                    post_tokens: event.post_tokens,
-                    tokens_saved: event.tokens_saved,
-                    duration_ms: event.duration_ms,
-                    messages_dropped: event.messages_dropped,
-                    messages_compacted: event.messages_compacted,
-                    summary_chars: event.summary_chars,
-                    active_messages: event.active_messages,
-                });
-                // Compaction clears the tool lock, so rebuild the foreground
-                // request metadata rather than relying on the pre-compaction snapshot.
-                tools = self.tool_definitions().await;
-                split_prompt = self.build_system_prompt_split(None);
-            }
+            let (tools, split_prompt, messages) = self.prepare_stream_request(&event_tx).await;
 
             let messages: std::sync::Arc<[Message]> = messages.into();
             // Non-blocking memory: uses pending result from last turn, spawns check for next turn
             let memory_pending = self.build_memory_prompt_nonblocking_shared(
                 std::sync::Arc::clone(&messages),
                 Some(std::sync::Arc::new({
-                    let event_tx = event_tx.clone();
+                    let event_tx = event_tx.raw().clone();
                     move |event| {
                         let _ = event_tx.send(event);
                     }
@@ -264,7 +196,9 @@ impl Agent {
             );
             drop(system_signature_text);
             self.begin_kv_cache_monitor_request(&kv_request, &model_at_request_start);
-            let _ = event_tx.send(kv_request);
+            if let Err(error) = event_tx.send(kv_request) {
+                logging::debug(&format!("KV request event receiver disconnected: {error}"));
+            }
             // These vectors are only needed to build the cache telemetry event.
             // Explicitly release their deeply cloned transcript strings before
             // waiting for the provider stream.
@@ -283,7 +217,7 @@ impl Agent {
                 loop {
                     tokio::select! {
                         _ = keepalive.tick() => {
-                            send_stream_keepalive_mpsc(&event_tx);
+                            send_stream_keepalive_mpsc(event_tx.raw());
                         }
                         _ = self.graceful_shutdown.notified() => {
                             logging::info(
@@ -349,7 +283,6 @@ impl Agent {
             );
 
             let mut text_content = String::new();
-            let mut text_wrapped_detected = false;
             // Inline swarm worker output tap: publish a throttled tail of the
             // in-progress assistant text to the bus so a coordinator can render
             // a live inline gallery viewport.
@@ -401,12 +334,22 @@ impl Agent {
                 std::collections::HashMap::new();
 
             let mut retry_after_compaction = false;
+            let mut retry_after_stream_error = false;
             let mut keepalive = stream_keepalive_ticker();
             loop {
                 let next_event = std::pin::pin!(stream.next());
                 let event = tokio::select! {
                     _ = keepalive.tick() => {
-                        send_stream_keepalive_mpsc(&event_tx);
+                        send_stream_keepalive_mpsc(event_tx.raw());
+                        continue;
+                    }
+                    _ = async {
+                        match event_tx.deadline() {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        event_tx.flush();
                         continue;
                     }
                     _ = self.graceful_shutdown.notified() => {
@@ -492,6 +435,28 @@ impl Agent {
                             let _ = event_tx.send(self.take_recovery_compaction_event());
                             break;
                         }
+                        // A transport-level failure is transient by
+                        // definition: the request never produced an answer.
+                        // Re-issue it, bounded, instead of ending the turn.
+                        if super::response_recovery::is_transient_stream_error(&err_str)
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "mpsc".to_string()),
+                                    ("error", err_str.clone()),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
+                                ],
+                            );
+                            break;
+                        }
                         log_agent_provider_stream_lifecycle(
                             logging::LogLevel::Error,
                             self,
@@ -542,7 +507,7 @@ impl Agent {
                             // identical to a dead connection and the client stall
                             // guard would cancel a healthy stream (issue #451).
                             hidden_activity_last = Instant::now();
-                            send_stream_keepalive_mpsc(&event_tx);
+                            send_stream_keepalive_mpsc(event_tx.raw());
                         }
                         // Always capture reasoning text so it can be persisted as a
                         // history-only trace, regardless of provider replay support.
@@ -606,6 +571,16 @@ impl Agent {
                                 output,
                                 is_error,
                             }) => {
+                                if already_open
+                                    && provider == jcode_message_types::provider_native::PROVIDER_NATIVE_OPENAI
+                                {
+                                    // OpenAI only supplies action/query metadata in
+                                    // the final snapshot, after execution started.
+                                    let _ = event_tx.send(ServerEvent::ToolInput {
+                                        id: Some(id.clone()),
+                                        delta: input.to_string(),
+                                    });
+                                }
                                 if !already_open {
                                     // Result without a start (e.g. OpenAI items
                                     // arrive whole): open the row first.
@@ -657,23 +632,7 @@ impl Agent {
                                 self.publish_inline_tail();
                             }
                         }
-                        if !text_wrapped_detected {
-                            // Scan only the new delta (plus a short overlap for
-                            // markers straddling the boundary) instead of the
-                            // whole accumulated response on every token.
-                            if let Some(marker_idx) =
-                                find_wrap_marker_incremental(&text_content, text.len())
-                            {
-                                text_wrapped_detected = true;
-                                let clean_prefix =
-                                    text_content[..marker_idx].trim_end().to_string();
-                                let _ =
-                                    event_tx.send(ServerEvent::TextReplace { text: clean_prefix });
-                            } else {
-                                let _ =
-                                    event_tx.send(ServerEvent::TextDelta { text: text.clone() });
-                            }
-                        }
+                        let _ = event_tx.send(ServerEvent::TextDelta { text: text.clone() });
                         if self.is_graceful_shutdown() {
                             logging::info(
                                 "Graceful shutdown during streaming - checkpointing partial response",
@@ -852,6 +811,18 @@ impl Agent {
                         if cache_creation_input_tokens.is_some() {
                             usage_cache_creation = cache_creation_input_tokens;
                         }
+                        // Publish observed counters immediately, not only when
+                        // the response finishes. Do not manufacture a missing
+                        // input or output count from context/session totals.
+                        if let (Some(input), Some(output)) = (usage_input, usage_output) {
+                            let _ = event_tx.send(ServerEvent::TokenUsage {
+                                input,
+                                output,
+                                cache_read_input: usage_cache_read,
+                                cache_creation_input: usage_cache_creation,
+                                effective_budget: Some(self.effective_context_budget().await),
+                            });
+                        }
                         usage_recorder.observe(
                             provider.name(),
                             &provider.model(),
@@ -887,7 +858,17 @@ impl Agent {
                     StreamEvent::ServiceTier { tier, requested } => {
                         let _ = event_tx.send(ServerEvent::ServiceTierReported { requested, tier });
                     }
+                    StreamEvent::ResolvedModel { model } => {
+                        usage_recorder.resolve_model(model);
+                    }
                     StreamEvent::RetryRollback { attempt, max } => {
+                        // Preserve reported usage from the failed attempt, but
+                        // never let its model or counters bleed into the retry.
+                        usage_recorder.finish();
+                        usage_input = None;
+                        usage_output = None;
+                        usage_cache_read = None;
+                        usage_cache_creation = None;
                         // A transient transport fault hit mid-stream after partial
                         // output was already emitted; the provider is replaying the
                         // request from the top. Discard everything accumulated for
@@ -919,7 +900,6 @@ impl Agent {
                             // discarded partial from the live tail too.
                             self.inline_tail.clear_live();
                         }
-                        text_wrapped_detected = false;
                         tool_calls.clear();
                         current_tool = None;
                         streaming_tools.clear();
@@ -1023,10 +1003,13 @@ impl Agent {
                             execution_mode: ToolExecutionMode::AgentTurn,
                         };
                         crate::telemetry::record_tool_call();
-                        let tool_result = self
-                            .registry
-                            .execute(&tool_name, ToolCall::normalize_input_to_object(input), ctx)
-                            .await;
+                        let tool_result = super::turn_streaming_mpsc::execute_with_background(
+                            self.registry.clone(),
+                            tool_name.clone(),
+                            ToolCall::normalize_input_to_object(input),
+                            ctx,
+                        )
+                        .await;
                         if tool_result.is_err() {
                             crate::telemetry::record_tool_failure();
                         }
@@ -1090,6 +1073,28 @@ impl Agent {
                             let _ = event_tx.send(self.take_recovery_compaction_event());
                             break;
                         }
+                        // A transient stream error must not kill the turn: the
+                        // provider failed mid-stream, so the request never
+                        // produced an answer. Re-issue it, bounded.
+                        if super::response_recovery::is_transient_stream_error(&message)
+                            && stream_error_retries
+                                < super::response_recovery::MAX_STREAM_ERROR_RETRIES
+                        {
+                            stream_error_retries += 1;
+                            retry_after_stream_error = true;
+                            log_agent_provider_stream_lifecycle(
+                                logging::LogLevel::Warn,
+                                self,
+                                "stream_error_retry",
+                                api_start,
+                                vec![
+                                    ("mode", "mpsc".to_string()),
+                                    ("error", message.clone()),
+                                    ("stream_error_retries", stream_error_retries.to_string()),
+                                ],
+                            );
+                            break;
+                        }
                         log_agent_provider_stream_lifecycle(
                             logging::LogLevel::Error,
                             self,
@@ -1111,7 +1116,18 @@ impl Agent {
                 }
             }
 
+            // The stream is over, so no timer will flush what is still held.
+            event_tx.flush();
             usage_recorder.finish();
+            if retry_after_stream_error {
+                // The request failed mid-stream and produced no answer: drop
+                // the partial turn and re-issue the request from the same
+                // transcript.
+                continue;
+            }
+            // The request completed normally: the budget is refreshed so a
+            // later request in the same turn gets its own retries.
+            stream_error_retries = 0;
             if retry_after_compaction {
                 log_agent_provider_stream_lifecycle(
                     logging::LogLevel::Info,
@@ -1173,6 +1189,16 @@ impl Agent {
                     )
                     .saturating_add(output);
                 crate::session_metrics::record_token_usage(&self.session.id, total, output);
+                if usage_input.is_some() {
+                    crate::session_telemetry::save_context(
+                        &self.session,
+                        total.saturating_sub(output),
+                        Some(self.effective_context_budget().await),
+                        self.provider.name(),
+                        self.provider.active_resolved_credential(),
+                        self.provider.serving_oauth_account_label(),
+                    );
+                }
             }
 
             if usage_input.is_some()
@@ -1185,6 +1211,7 @@ impl Agent {
                     output: usage_output.unwrap_or(0),
                     cache_read_input: usage_cache_read,
                     cache_creation_input: usage_cache_creation,
+                    effective_budget: Some(self.effective_context_budget().await),
                 });
                 // Native compaction is applied and announced below, after
                 // usage. Attribute this response's cache refresh now using
@@ -1254,35 +1281,6 @@ impl Agent {
                     provider_oauth_account_label: oauth_account_label_after_stream,
                     reasoning_effort: self.provider.reasoning_effort(),
                 });
-            }
-
-            let had_tool_calls_before = !tool_calls.is_empty();
-            let text_tool_recovery =
-                self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
-
-            if !had_tool_calls_before && text_tool_recovery == TextToolRecovery::Recovered {
-                let _ = event_tx.send(ServerEvent::TextReplace {
-                    text: text_content.clone(),
-                });
-                // Markup envelopes can carry several calls, so announce each.
-                for tc in tool_calls
-                    .iter()
-                    .filter(|tc| tc.id.starts_with("fallback_text_call_"))
-                {
-                    let _ = event_tx.send(ServerEvent::ToolStart {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                    });
-                    tool_id_to_name.insert(tc.id.clone(), tc.name.clone());
-                    let _ = event_tx.send(ServerEvent::ToolInput {
-                        id: Some(tc.id.clone()),
-                        delta: tc.input.to_string(),
-                    });
-                    let _ = event_tx.send(ServerEvent::ToolExec {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                    });
-                }
             }
 
             // Add assistant message to history
@@ -1388,26 +1386,6 @@ impl Agent {
             // Injecting before tool_results would break the API requirement that
             // tool_use must be immediately followed by tool_result.
             if tool_calls.is_empty() {
-                // The model printed a tool call as markup we could not parse
-                // (issue #1702): say so visibly and ask it to re-issue the
-                // call natively instead of silently ending the turn.
-                if saw_message_end
-                    && !self.is_graceful_shutdown()
-                    && let Some(notice) = self.maybe_nudge_unparsed_tool_markup(
-                        &text_tool_recovery,
-                        stop_reason.as_deref(),
-                        &mut unparsed_tool_markup_nudges,
-                    )?
-                {
-                    let _ = event_tx.send(ServerEvent::SoftInterruptInjected {
-                        content: notice,
-                        display_role: Some("system".to_string()),
-                        point: "B".to_string(),
-                        tools_skipped: None,
-                        client_ids: Vec::new(),
-                    });
-                    continue;
-                }
                 if saw_message_end
                     && !self.is_graceful_shutdown()
                     && self.maybe_reconsider_fable_guardrail(
@@ -1524,6 +1502,11 @@ impl Agent {
 
             // Execute tools and add results
             let tool_count = tool_calls.len();
+            // Track tool calls so the memory pipeline can refresh on a
+            // tool-call cadence, not only when the user speaks. MEASURED
+            // 2026-11-04: the agent works for hours with no user message, and
+            // a recall gated on a user turn never arrives during that work.
+            crate::memory::note_tool_calls(&self.session.id, tool_count);
             let mut malformed_calls: Vec<MalformedToolCallInfo> = Vec::new();
             let mut executed_valid_call = false;
             let mut tool_results_dirty = false;
@@ -1649,25 +1632,31 @@ impl Agent {
                 }
                 let tool_start = Instant::now();
 
-                // Spawn tool in its own task so we can detach it to background on Alt+B
+                // Spawn independently so automatic and Alt+B handoffs keep it running.
                 let registry_clone = self.registry.clone();
                 let tool_name_for_spawn = tc.name.clone();
                 let tool_input_for_spawn = tc.input.clone();
-                let tool_handle = tokio::spawn(async move {
-                    registry_clone
-                        .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
-                        .await
-                });
+                let tool_handle =
+                    crate::runtime_activity::spawn_session(&self.session.id, async move {
+                        registry_clone
+                            .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
+                            .await
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session transfer in progress; tool not accepted")
+                    })?;
 
                 // Reset background signal before waiting
                 self.background_tool_signal.reset();
 
-                // Wait for tool completion OR background signal from user (Alt+B)
-                // OR graceful shutdown signal from server reload
+                // All tools share the same default foreground budget, including
+                // tools without their own background execution support.
                 let bg_signal = self.background_tool_signal.clone();
                 let shutdown_signal = self.graceful_shutdown.clone();
+                let foreground_budget = tool_handoff::foreground_budget();
                 let allow_reload_handoff = tc.name == "bash";
                 let tool_result;
+                let mut automatic_background = false;
                 let mut tool_handle = tool_handle;
                 let running_tool_guard =
                     crate::running_tool_registry::register(self.session_id(), &tc.id, &tc.name);
@@ -1679,12 +1668,8 @@ impl Agent {
                             Err(e) => Err(anyhow::anyhow!("Tool task panicked: {}", e)),
                         });
                     }
-                    _ = async {
-                        tokio::select! {
-                            _ = bg_signal.notified() => {}
-                            _ = shutdown_signal.notified() => {}
-                        }
-                    } => {
+                    automatic = wait_for_tool_handoff(&bg_signal, &shutdown_signal, auto_background_allowed(&tc.name, &tc.input) && !tool_handoff::is_sdk_callback(self.session_id(), &tc.name), foreground_budget) => {
+                        automatic_background = automatic;
                         if self.is_graceful_shutdown() && allow_reload_handoff {
                             tool_result = match tokio::time::timeout(
                                 Duration::from_millis(750),
@@ -1828,7 +1813,7 @@ impl Agent {
                     self.session.save()?;
                     return Ok(());
                 } else {
-                    // User pressed Alt+B — move tool to background
+                    // Foreground budget expired or user pressed Alt+B.
                     logging::info(&format!(
                         "Tool '{}' moved to background after {:.1}s",
                         tc.name,
@@ -1836,14 +1821,27 @@ impl Agent {
                     ));
 
                     let bg_info = crate::background::global()
-                        .adopt(&tc.name, &self.session.id, tool_handle)
+                        .adopt_with_options(
+                            &tc.name,
+                            tool_handoff::handoff_display_name(&tc.input),
+                            &self.session.id,
+                            true,
+                            false,
+                            tool_handle,
+                        )
                         .await;
 
+                    let reason = if automatic_background {
+                        tool_handoff::automatic_handoff_reason(foreground_budget)
+                    } else {
+                        "by the user".to_string()
+                    };
                     let bg_msg = format!(
-                        "Tool '{}' was moved to background by the user (task_id: {}). \
-                         Use the `bg` tool with action 'wait' to wait for completion/checkpoints, \
-                         or action 'status'/'output' to inspect it.",
-                        tc.name, bg_info.task_id
+                        "Tool '{}' was moved to background {} (task_id: {}).\n\n{}",
+                        tc.name,
+                        reason,
+                        bg_info.task_id,
+                        crate::tool::BACKGROUND_WAIT_GUIDANCE
                     );
 
                     let _ = event_tx.send(ServerEvent::ToolDone {

@@ -7,7 +7,7 @@
 
 use crate::{
     BuildManifest, builds_dir, read_current_version, read_shared_server_version,
-    read_stable_version,
+    read_stable_version, read_staged_version,
 };
 use anyhow::Result;
 use std::collections::HashSet;
@@ -49,6 +49,10 @@ fn protected_versions() -> HashSet<String> {
         read_current_version(),
         read_stable_version(),
         read_shared_server_version(),
+        // The STAGED build is the landing's target. It is not on any channel
+        // yet, so without this it would be the first version the GC removes -
+        // and the landing would then have nothing to land.
+        read_staged_version(),
     ]
     .into_iter()
     .flatten()
@@ -158,7 +162,10 @@ fn prune_due(dir: &Path) -> bool {
 }
 
 fn mark_pruned(dir: &Path) {
-    let _ = std::fs::write(dir.join(PRUNE_MARKER), b"");
+    // A non-empty payload is required: an empty write never reaches the
+    // filesystem, so the marker mtime would not move and the daily slot
+    // would never be consumed.
+    let _ = jcode_storage::touch_stamp(&dir.join(PRUNE_MARKER));
 }
 
 /// Core of [`prune_old_versions`], parameterized for unit tests.
@@ -216,17 +223,49 @@ pub fn prune_old_versions_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
+    use std::fs;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Set a DIRECTORY's mtime explicitly.
+    ///
+    /// The GC orders version directories by the DIRECTORY's mtime, so the
+    /// fixture must move the directory's own timestamp, not the binary's.
+    ///
+    /// On Unix a directory can be opened read-only and `futimens` still sets
+    /// its timestamps. On Windows a directory cannot be opened at all without
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, and `set_modified` then needs a handle
+    /// with write access - a plain `File::open` returns ERROR_ACCESS_DENIED.
+    ///
+    /// reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+    /// (read 2026-11-17) - `FILE_FLAG_BACKUP_SEMANTICS` is the documented way
+    /// to open a directory as a file handle; verified on this host by a probe
+    /// that opened a temp directory and moved its mtime back by one day.
+    fn set_dir_mtime(path: &Path, mtime: SystemTime) {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(path)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("set dir mtime");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("set dir mtime");
+        }
+    }
 
     fn make_version(dir: &Path, name: &str, age: Duration) {
         let version = dir.join(name);
         fs::create_dir_all(&version).unwrap();
         fs::write(version.join("jcode"), b"bin").unwrap();
-        File::open(&version)
-            .and_then(|file| file.set_modified(SystemTime::now() - age))
-            .unwrap();
+        set_dir_mtime(&version, SystemTime::now() - age);
     }
 
     #[test]
@@ -261,6 +300,48 @@ mod tests {
         assert_eq!(
             version_from_binary_path(Path::new("/h/target/selfdev/jcode")),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod stamp_marker_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn mark_pruned_advances_the_marker_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(PRUNE_MARKER);
+
+        mark_pruned(temp.path());
+        let first = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist after mark_pruned");
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        mark_pruned(temp.path());
+        let second = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("marker should exist after second mark_pruned");
+
+        assert!(
+            second > first,
+            "mark_pruned must advance the marker mtime, otherwise prune_due() \
+             always reports due and the daily slot is never consumed"
+        );
+    }
+
+    #[test]
+    fn prune_due_is_false_right_after_a_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(prune_due(temp.path()), "no marker means due");
+
+        mark_pruned(temp.path());
+        assert!(
+            !prune_due(temp.path()),
+            "a fresh marker must make the next pass not due"
         );
     }
 }

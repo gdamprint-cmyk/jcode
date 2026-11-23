@@ -4,6 +4,31 @@ use anyhow::anyhow;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
+#[tokio::test]
+async fn silent_background_task_still_publishes_started_activity() {
+    let mut events = Bus::global().subscribe();
+    BackgroundTaskManager::publish_task_started_activity(
+        "silent-start",
+        "bash",
+        Some("silent work"),
+        "silent-session",
+        false,
+    );
+    let activity = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(BusEvent::UiActivity(activity)) = events.recv().await {
+                if activity.session_id.as_deref() == Some("silent-session") {
+                    break activity;
+                }
+            }
+        }
+    })
+    .await
+    .expect("silent start must be published");
+    assert!(activity.message.contains("`silent-start`"));
+    assert!(activity.message.contains("`silent work`"));
+}
+
 struct SignalDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
 impl Drop for SignalDrop {
@@ -126,6 +151,86 @@ async fn spawn_with_notify_emits_started_ui_activity() -> Result<()> {
         "started UI activity event for task {} not received",
         info.task_id
     ))
+}
+
+#[tokio::test]
+async fn delivery_subscription_serializes_with_spawn_and_adopt_completion() -> Result<()> {
+    for adopted in [false, true] {
+        for _ in 0..8 {
+            let tmp = tempdir()?;
+            let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+            let mut events = Bus::global().subscribe();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let info = if adopted {
+                let handle = tokio::spawn(async move {
+                    finish_rx.await?;
+                    Ok(jcode_tool_types::ToolOutput::new("done"))
+                });
+                manager
+                    .adopt_with_options("bash", None, "delivery-race", false, false, handle)
+                    .await
+            } else {
+                manager
+                    .spawn_with_notify(
+                        "bash",
+                        None,
+                        "delivery-race",
+                        false,
+                        false,
+                        |_| async move {
+                            finish_rx.await?;
+                            Ok(TaskResult::completed(Some(0)))
+                        },
+                    )
+                    .await
+            };
+
+            // Queue the subscription before allowing completion. The shared lock
+            // makes this ordering deterministic, rather than relying on disk timing.
+            let guard = manager.progress_updates.lock().await;
+            let delivery = manager.update_delivery(&info.task_id, true, true);
+            tokio::pin!(delivery);
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(delivery.as_mut().poll(cx).is_pending())
+                })
+                .await
+            );
+            finish_tx.send(()).unwrap();
+            tokio::task::yield_now().await;
+            drop(guard);
+            let updated = delivery.await?.expect("task exists");
+            assert_eq!(updated.status, BackgroundTaskStatus::Running);
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(BusEvent::BackgroundTaskCompleted(event)) = events.recv().await
+                        && event.task_id == info.task_id
+                    {
+                        assert!(
+                            event.notify && event.wake,
+                            "accepted subscription must wake"
+                        );
+                        break;
+                    }
+                }
+            })
+            .await?;
+
+            // A late delivery or watchdog update must never resurrect Running.
+            let (delivery, _) = tokio::join!(
+                manager.update_delivery(&info.task_id, true, true),
+                manager.arm_stall_watchdog(&info.task_id, 30),
+            );
+            assert_eq!(delivery?.unwrap().status, BackgroundTaskStatus::Completed);
+            manager.disarm_stall_watchdog(&info.task_id).await;
+            assert_eq!(
+                manager.status(&info.task_id).await.unwrap().status,
+                BackgroundTaskStatus::Completed
+            );
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -614,6 +719,48 @@ async fn reconcile_marks_orphan_from_dead_process_failed() -> Result<()> {
     Ok(())
 }
 
+/// A PID that is alive right now but belongs to a different process.
+///
+/// Unix: PID 1 (init) is always alive. Windows has no PID 1, so enumerate the
+/// process snapshot (same ToolHelp pattern as platform_reparent_tests) and
+/// pick the first PID that passes the production liveness check.
+fn live_foreign_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        1
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            assert_ne!(snapshot, INVALID_HANDLE_VALUE, "process snapshot failed");
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let self_pid = std::process::id();
+            let mut found = None;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let pid = entry.th32ProcessID;
+                    if pid != self_pid && crate::platform::is_process_running(pid) {
+                        found = Some(pid);
+                        break;
+                    }
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            found.expect("expected at least one live foreign process")
+        }
+    }
+}
+
 #[tokio::test]
 async fn reconcile_leaves_non_orphans_alone() -> Result<()> {
     let tmp = tempdir()?;
@@ -629,9 +776,9 @@ async fn reconcile_leaves_non_orphans_alone() -> Result<()> {
     let legacy = running_status_fixture("keep2bbbb", "session-keep");
     write_status_fixture(&manager, &legacy).await;
 
-    // Owned by a live foreign process (PID 1 is always alive on Unix).
+    // Owned by a live foreign process (init on Unix, any other live PID on Windows).
     let mut foreign = running_status_fixture("keep3cccc", "session-keep");
-    foreign.owner_pid = Some(1);
+    foreign.owner_pid = Some(live_foreign_pid());
     foreign.owner_instance = Some("init-instance".to_string());
     write_status_fixture(&manager, &foreign).await;
 
@@ -900,5 +1047,39 @@ async fn disarm_stall_watchdog_clears_state() -> Result<()> {
     assert_eq!(status.stall_wake_seconds, None);
 
     manager.cancel(&info.task_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sweep_counts_tasks_and_skips_settled_files() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    assert_eq!(manager.sweep().await, 0);
+
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        Ok(jcode_tool_types::ToolOutput::new("unreachable"))
+    });
+    let info = manager.adopt("bash", "session-count", handle).await;
+    // Output files and unrelated files in the directory are not tasks.
+    std::fs::write(tmp.path().join("notes.txt"), "x")?;
+
+    assert_eq!(manager.sweep().await, manager.list().await.len());
+    assert_eq!(manager.sweep().await, 1);
+    // A running task is re-examined on every pass.
+    assert!(manager.settled.lock().await.is_empty());
+
+    manager.cancel(&info.task_id).await?;
+    assert_eq!(manager.sweep().await, 1);
+    assert_eq!(
+        manager.settled.lock().await.len(),
+        1,
+        "a finished task must not be read again"
+    );
+
+    // Cleaned-up files leave the cache instead of growing it forever.
+    std::fs::remove_file(&info.status_file)?;
+    assert_eq!(manager.sweep().await, 0);
+    assert!(manager.settled.lock().await.is_empty());
     Ok(())
 }

@@ -1,5 +1,13 @@
+// reference: no prior art, searched the web for an upstream jcode implementation of
+// the ambient scheduled-task spawn (websearch "jcode rust ambient runner
+// spawn_session_for_scheduled_item session is_debug github 1jehuang" returned
+// unrelated store-locator pages, no upstream source found). The behaviour under
+// test is this repository's own: every ambient parent session is created with
+// set_debug(true) (crates/jcode-app-core/src/ambient/runner.rs) and the session
+// picker hides a session by its own debug flag
+// (crates/jcode-tui/src/tui/session_picker/filter.rs).
 use super::{AmbientRunnerHandle, ambient_allowed};
-use crate::ambient::{AmbientStatus, Priority, ScheduleTarget, ScheduledItem};
+use crate::ambient::{AmbientState, AmbientStatus, Priority, ScheduleTarget, ScheduledItem};
 use crate::config::Config;
 use crate::message::{Message, Role, StreamEvent, ToolDefinition};
 use crate::provider::{EventStream, Provider};
@@ -263,6 +271,94 @@ async fn unsupported_visible_launch_falls_back_to_headless() {
     assert_visible_launch_error_falls_back(std::io::ErrorKind::Unsupported).await;
 }
 
+/// A terminal that opens but never runs `jcode ambient run-visible` must not
+/// block the cycle until the full timeout: the runner has to notice that the
+/// TUI never reported itself and fall back to headless.
+///
+/// reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+#[tokio::test]
+async fn visible_launch_without_a_starting_tui_falls_back_to_headless() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingTestProvider::default());
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+
+    let result = runner
+        .run_cycle_with_visible_launcher_and_timeouts(
+            &provider,
+            true,
+            || Ok(()),
+            Duration::from_millis(200),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a TUI that never starts should continue as a headless cycle");
+
+    assert!(
+        result.conversation.is_some(),
+        "headless fallback should capture an agent conversation"
+    );
+    assert!(
+        result.summary.contains("forced end after 2 attempts"),
+        "headless fallback should return the headless agent result"
+    );
+}
+
+/// A visible cycle whose TUI exits without writing a result is over: the
+/// runner must not wait for the timeout.
+#[tokio::test]
+async fn visible_cycle_ends_when_the_reported_tui_process_is_gone() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+
+    use crate::ambient::VisibleCycleContext;
+
+    // Use a real exited process, not a made-up PID: on Unix, `kill(0, 0)`
+    // signals the caller's whole process group, so PID 0 would be reported as
+    // running and would make this test meaningless.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a short-lived process");
+    let dead_pid = child.id();
+    let _ = child.wait();
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingTestProvider::default());
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+
+    let result = runner
+        .run_cycle_with_visible_launcher_and_timeouts(
+            &provider,
+            true,
+            // The launcher stands in for the terminal: the TUI reports its PID
+            // as soon as it starts. The runner clears any stale marker before
+            // launching, so the marker has to be written from here.
+            || {
+                VisibleCycleContext::write_start(dead_pid).expect("write start marker");
+                Ok(())
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a closed visible window should not fail the cycle");
+
+    assert!(
+        result.summary.contains("user closed window"),
+        "a TUI that exited without a result should end the cycle, got: {}",
+        result.summary
+    );
+    assert!(
+        VisibleCycleContext::read_start().is_none(),
+        "the start marker should be cleared when the cycle ends"
+    );
+}
+
 #[tokio::test]
 async fn missing_visible_launcher_falls_back_to_headless() {
     assert_visible_launch_error_falls_back(std::io::ErrorKind::NotFound).await;
@@ -330,6 +426,63 @@ async fn spawn_target_creates_one_child_session_and_runs_task() {
     }));
 }
 
+/// A scheduled child spawned from an UNLOADABLE parent must still be a debug
+/// session.
+///
+/// Every ambient parent is created with `set_debug(true)`
+/// (`ambient/runner.rs`, `run_cycle_with_visible_launcher_and_timeouts`), and
+/// the picker hides a session by its OWN debug flag
+/// (`crates/jcode-tui/src/tui/session_picker/filter.rs`). The fallback child
+/// therefore must not keep the `Session::create` default of `false`, or an
+/// ambient worker lands in the user's visible session list.
+#[tokio::test]
+async fn spawn_target_with_unloadable_parent_creates_a_hidden_child() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    // Pin the flag OFF: `Session::create` copies JCODE_TEST_SESSION into
+    // is_debug (session.rs:848), so with the flag on the fallback child would
+    // be a debug session anyway and the test could not tell the fix apart from
+    // the bug.
+    let _no_test_session = EnvVarGuard::unset("JCODE_TEST_SESSION");
+
+    let provider = StreamingTestProvider::default();
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Handled the task.".to_string()),
+        StreamEvent::MessageEnd { stop_reason: None },
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
+    let item = ScheduledItem {
+        id: "sched_spawn_missing_parent".to_string(),
+        scheduled_for: chrono::Utc::now(),
+        context: "Follow up later".to_string(),
+        priority: Priority::Normal,
+        target: ScheduleTarget::Spawn {
+            parent_session_id: "session_does_not_exist_ambient".to_string(),
+        },
+        created_by_session: "session_does_not_exist_ambient".to_string(),
+        created_at: chrono::Utc::now(),
+        working_dir: Some(temp.path().display().to_string()),
+        task_description: Some("Follow up later".to_string()),
+        relevant_files: vec!["src/lib.rs".to_string()],
+        git_branch: None,
+        additional_context: None,
+    };
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    let child_session_id = runner
+        .spawn_session_for_scheduled_item(&provider, &item, "session_does_not_exist_ambient")
+        .await
+        .expect("spawned scheduled task should succeed even without the parent");
+
+    let child = Session::load(&child_session_id).expect("load spawned child session");
+    assert!(
+        child.is_debug,
+        "an ambient child of a debug parent must stay hidden from the session picker"
+    );
+}
+
 /// A stopped ambient loop must be revivable without restarting the process.
 ///
 /// `stop()` sets the persisted status to `Disabled`. The loop task stays alive
@@ -346,8 +499,7 @@ async fn trigger_revives_a_disabled_ambient_status() {
     let _enabled = EnvVarGuard::unset("JCODE_AMBIENT_ENABLED");
     let path = Config::path().expect("config path");
     std::fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
-    std::fs::write(&path, "[ambient]\nenabled = true\n")
-        .expect("write ambient config");
+    std::fs::write(&path, "[ambient]\nenabled = true\n").expect("write ambient config");
     Config::invalidate_cache();
 
     let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
@@ -367,5 +519,149 @@ async fn trigger_revives_a_disabled_ambient_status() {
     assert!(
         matches!(runner.state().await.status, AmbientStatus::Idle),
         "trigger() must revive a Disabled ambient status so the loop can run again"
+    );
+}
+/// A `Running` status persisted by a process that died mid-cycle must not
+/// block the next process from running a cycle.
+///
+/// `AmbientManager::should_run()` treats `Running` as "a cycle is already in
+/// flight", so a leftover status survives the restart and the runner then
+/// logs "not time to run" on every wake without ever running a cycle again.
+/// Measured 2026-11-04 (the daemon restarted 81 seconds into a cycle).
+///
+/// The reset must be guarded: a genuinely live cycle (an ambient lock held by
+/// a live pid) must keep its `Running` status.
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+#[tokio::test]
+async fn run_loop_recovers_a_stale_running_status_left_by_a_dead_process() {
+    let _guard = crate::storage::lock_test_env();
+    let _cache = ResetConfigCache;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _enabled = EnvVarGuard::unset("JCODE_AMBIENT_ENABLED");
+    let path = Config::path().expect("config path");
+    std::fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
+    // `visible = false` keeps the cycle headless: the test drives the provider,
+    // not a spawned kitty window.
+    std::fs::write(
+        &path,
+        "[ambient]\nenabled = true\nvisible = false\npause_on_active_session = true\n",
+    )
+    .expect("write ambient config");
+    Config::invalidate_cache();
+
+    // Persist the state a dead process leaves behind.
+    let state_path = super::super::paths::state_path().expect("state path");
+    std::fs::create_dir_all(state_path.parent().expect("state parent"))
+        .expect("create ambient dir");
+    let stale = AmbientState {
+        status: AmbientStatus::Running {
+            detail: "running agent".to_string(),
+        },
+        last_run: None,
+        last_summary: None,
+        last_compactions: None,
+        last_memories_modified: None,
+        total_cycles: 0,
+    };
+    crate::storage::write_json(&state_path, &stale).expect("persist stale state");
+
+    let provider = StreamingTestProvider::default();
+    provider.queue_response(vec![
+        StreamEvent::TextDelta("Ambient cycle did some work.".to_string()),
+        StreamEvent::MessageEnd { stop_reason: None },
+    ]);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    assert!(
+        matches!(runner.state().await.status, AmbientStatus::Running { .. }),
+        "precondition: the runner must load the persisted Running status"
+    );
+
+    let task = tokio::spawn(runner.clone().run_loop(provider));
+
+    // The cycle must actually run, not merely have its status reset.
+    let ran_a_cycle = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if runner.state().await.total_cycles > 0 {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    task.abort();
+    let _ = task.await;
+
+    assert!(
+        matches!(ran_a_cycle, Ok(true)),
+        "a stale Running status must not prevent the loop from running a cycle"
+    );
+    assert!(
+        !matches!(runner.state().await.status, AmbientStatus::Running { .. }),
+        "the stale Running status must be cleared, not left behind"
+    );
+    let persisted = crate::storage::read_json::<AmbientState>(&state_path).expect("read state");
+    assert!(
+        !matches!(persisted.status, AmbientStatus::Running { .. }),
+        "the persisted status must not stay Running"
+    );
+}
+
+/// The negative control for the stale-status reset: a `Running` status whose
+/// ambient lock is held by a live pid belongs to a cycle that really is in
+/// flight, so the status must be left alone.
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+#[tokio::test]
+async fn run_loop_keeps_running_status_when_the_ambient_lock_is_live() {
+    let _guard = crate::storage::lock_test_env();
+    let _cache = ResetConfigCache;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _enabled = EnvVarGuard::unset("JCODE_AMBIENT_ENABLED");
+    let path = Config::path().expect("config path");
+    std::fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
+    std::fs::write(&path, "[ambient]\nenabled = true\nvisible = false\n")
+        .expect("write ambient config");
+    Config::invalidate_cache();
+
+    let state_path = super::super::paths::state_path().expect("state path");
+    std::fs::create_dir_all(state_path.parent().expect("state parent"))
+        .expect("create ambient dir");
+    let running = AmbientState {
+        status: AmbientStatus::Running {
+            detail: "running agent".to_string(),
+        },
+        last_run: None,
+        last_summary: None,
+        last_compactions: None,
+        last_memories_modified: None,
+        total_cycles: 0,
+    };
+    crate::storage::write_json(&state_path, &running).expect("persist running state");
+
+    // A lock held by this (live) process means a cycle is genuinely running.
+    let lock_path = super::super::paths::lock_path().expect("lock path");
+    std::fs::write(&lock_path, std::process::id().to_string()).expect("write ambient lock");
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingTestProvider::default());
+    let runner = AmbientRunnerHandle::new(Arc::new(crate::safety::SafetySystem::new()));
+    let task = tokio::spawn(runner.clone().run_loop(provider));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    task.abort();
+    let _ = task.await;
+
+    assert!(
+        matches!(runner.state().await.status, AmbientStatus::Running { .. }),
+        "a Running status guarded by a live lock must not be reset"
+    );
+    let persisted = crate::storage::read_json::<AmbientState>(&state_path).expect("read state");
+    assert!(
+        matches!(persisted.status, AmbientStatus::Running { .. }),
+        "the persisted status must stay Running while the lock is live"
     );
 }

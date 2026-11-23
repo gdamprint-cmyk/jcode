@@ -2,6 +2,216 @@ use super::ensure_swarm_prompt_edit_path;
 use super::parse_diff_mode_name;
 use super::parse_manual_subagent_spec;
 
+// reference: crates/jcode-config-types/src/lib.rs -
+// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
+// vocabulary these tests pin: trim + case-insensitive, both the "inherit"
+// and "coordinator" spellings.
+//
+// These tests deliberately avoid BOTH process-global dependencies, because the
+// full `jcode-tui --lib` suite runs them in parallel with other tests:
+//
+// 1. `dispatch_local_command` is gated on the global `JCODE_SSH_REMOTE` env
+//    var, which other tests in this crate set and restore. Under a parallel
+//    run the command can be swallowed by the SSH notice, so these tests call
+//    `handle_session_command` directly, exactly like the neighbouring
+//    `test_subagent_model_command_sets_and_resets_session_preference`.
+// 2. `Session::set_agent_model_override` WRITES a file under the current
+//    `JCODE_HOME`, which other tests swap out from under us (that produced
+//    `os error 5`). These tests set the in-memory `agent_model_overrides`
+//    field instead; `effective_agent_model` falls back to that field when the
+//    per-session metadata file does not exist, and the session id is unique
+//    per test app.
+
+/// The `/subagent-model` reset must accept EVERY spelling of the inherit
+/// sentinel, not just the exact lowercase literal. The sentinel vocabulary is
+/// owned by `AgentsConfig::is_swarm_inherit_sentinel`, which trims and compares
+/// case-insensitively, and also accepts the "coordinator" spelling.
+#[test]
+fn subagent_model_reset_accepts_every_sentinel_spelling() {
+    let mut app = crate::tui::app::tests::create_test_app();
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        "Inherit",
+        " inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        app.session.subagent_model = Some("gpt-5.3-codex".to_string());
+        assert!(
+            super::handle_session_command(&mut app, &format!("/subagent-model {sentinel}")),
+            "/subagent-model must be handled: {sentinel}"
+        );
+        assert_eq!(
+            app.session.subagent_model, None,
+            "{sentinel} must reset the pinned subagent model"
+        );
+    }
+}
+
+/// A concrete model name must still be PINNED, not treated as a sentinel.
+#[test]
+fn subagent_model_pins_a_concrete_model_name() {
+    let mut app = crate::tui::app::tests::create_test_app();
+    app.session.subagent_model = None;
+    assert!(super::handle_session_command(
+        &mut app,
+        "/subagent-model gpt-5.3-codex"
+    ));
+    assert_eq!(
+        app.session.subagent_model.as_deref(),
+        Some("gpt-5.3-codex")
+    );
+}
+
+/// The subagent model SUMMARY must treat every sentinel spelling as "inherit",
+/// not as a pinned model. A stored sentinel spelling is reachable: the server
+/// runtime command `/subagent-model inherit` used to store the literal string.
+#[test]
+fn subagent_model_summary_treats_every_sentinel_spelling_as_inherit() {
+    let mut app = crate::tui::app::tests::create_test_app();
+    let concrete = super::current_subagent_model_summary(&app);
+    assert!(
+        concrete.starts_with("inherit current"),
+        "with no pin the summary must say inherit, got {concrete}"
+    );
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        " Inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        app.session.subagent_model = Some(sentinel.to_string());
+        let summary = super::current_subagent_model_summary(&app);
+        assert!(
+            summary.starts_with("inherit current"),
+            "the sentinel {sentinel} must render as inherit, got {summary}"
+        );
+        assert!(
+            !summary.contains("fixed"),
+            "the sentinel {sentinel} must not render as a pinned model, got {summary}"
+        );
+    }
+
+    app.session.subagent_model = Some("gpt-5.3-codex".to_string());
+    let summary = super::current_subagent_model_summary(&app);
+    assert!(
+        summary.starts_with("fixed gpt-5.3-codex"),
+        "a concrete model must still render as pinned, got {summary}"
+    );
+}
+
+/// The review/judge overrides must treat every sentinel spelling as "no
+/// explicit override", exactly like the server-side spawn resolver does.
+#[test]
+fn review_and_judge_overrides_treat_every_sentinel_spelling_as_absent() {
+    let mut app = crate::tui::app::tests::create_test_app();
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        " Inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        app.session
+            .agent_model_overrides
+            .insert("review".to_string(), sentinel.to_string());
+        app.session
+            .agent_model_overrides
+            .insert("judge".to_string(), sentinel.to_string());
+        assert_eq!(
+            super::current_autoreview_model_override(&app),
+            None,
+            "review override must drop the sentinel {sentinel}"
+        );
+        assert_eq!(
+            super::current_autojudge_model_override(&app),
+            None,
+            "judge override must drop the sentinel {sentinel}"
+        );
+    }
+
+    app.session.agent_model_overrides.insert(
+        "review".to_string(),
+        "openai-api:session-worker".to_string(),
+    );
+    assert_eq!(
+        super::current_autoreview_model_override(&app).as_deref(),
+        Some("openai-api:session-worker"),
+        "a concrete review model must survive"
+    );
+}
+
+// reference: crates/jcode-config-types/src/lib.rs -
+// AgentsConfig::is_swarm_inherit_sentinel is the canonical sentinel
+// vocabulary this test pins: the status text must agree with the resolver.
+// A sentinel is NOT a model override, so it must not be printed as one.
+//
+// This test WRITES the config file, so it takes the shared state lock and
+// restores the original reviewer/judge models afterwards, exactly like the
+// neighbouring `with_clean_config` helper does for the colour palette.
+#[test]
+fn review_status_text_does_not_print_a_sentinel_as_an_override() {
+    let _lock = crate::storage::lock_test_env();
+    let original = {
+        let config = crate::config::Config::load();
+        (config.autoreview.model.clone(), config.autojudge.model.clone())
+    };
+    struct Restore(Option<String>, Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mut config = crate::config::Config::load();
+            config.autoreview.model = self.0.clone();
+            config.autojudge.model = self.1.clone();
+            let _ = config.save();
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = Restore(original.0.clone(), original.1.clone());
+
+    let app = crate::tui::app::tests::create_test_app();
+    for sentinel in [
+        "inherit",
+        "INHERIT",
+        " Inherit ",
+        "coordinator",
+        "Coordinator",
+    ] {
+        let mut config = crate::config::Config::load();
+        config.autoreview.model = Some(sentinel.to_string());
+        config.autojudge.model = Some(sentinel.to_string());
+        config.save().unwrap();
+        crate::config::Config::invalidate_cache();
+
+        let autoreview = super::autoreview_status_message(&app);
+        assert!(
+            !autoreview.contains("Reviewer model override:"),
+            "{sentinel} must not be printed as a reviewer override: {autoreview}"
+        );
+        let autojudge = super::autojudge_status_message(&app);
+        assert!(
+            !autojudge.contains("Judge model override:"),
+            "{sentinel} must not be printed as a judge override: {autojudge}"
+        );
+    }
+
+    // A concrete model IS an override and must still be printed as one.
+    let mut config = crate::config::Config::load();
+    config.autoreview.model = Some("openai-api:global-review".into());
+    config.autojudge.model = Some("openai-api:global-judge".into());
+    config.save().unwrap();
+    crate::config::Config::invalidate_cache();
+    assert!(
+        super::autoreview_status_message(&app).contains("Reviewer model override:"),
+        "a concrete reviewer model must be printed as an override"
+    );
+    assert!(
+        super::autojudge_status_message(&app).contains("Judge model override:"),
+        "a concrete judge model must be printed as an override"
+    );
+}
+
 #[test]
 fn parse_diff_mode_name_maps_known_aliases() {
     use crate::config::DiffDisplayMode;

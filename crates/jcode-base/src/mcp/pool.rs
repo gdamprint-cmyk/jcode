@@ -9,6 +9,8 @@
 //! requests to shared server processes. Request/response correlation by
 //! ID ensures no interference between sessions.
 
+// reference: https://docs.claude.com/en/docs/claude-code/mcp (read 2026-11-11) - Claude Code scopes an MCP server to `local`, `project` or `user`, and a project-scoped server is resolved per project directory rather than per daemon. Jcode's `per_project` flag mirrors that project scope.
+
 use super::client::{McpClient, McpHandle};
 use super::protocol::{McpConfig, McpServerConfig, McpToolDef};
 use anyhow::{Context, Result};
@@ -18,11 +20,28 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 const FAILED_CONNECT_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+/// Repeated failures (e.g. `mcp-remote` stuck waiting for OAuth) back off
+/// exponentially up to this cap instead of respawning `npx` every 30s.
+const MAX_FAILED_CONNECT_RETRY_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 struct FailedConnectRecord {
     message: String,
     failed_at: Instant,
+    failures: u32,
+}
+
+impl FailedConnectRecord {
+    fn cooldown(&self) -> Duration {
+        failed_connect_cooldown(self.failures)
+    }
+}
+
+fn failed_connect_cooldown(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(10);
+    FAILED_CONNECT_RETRY_COOLDOWN
+        .saturating_mul(1 << shift)
+        .min(MAX_FAILED_CONNECT_RETRY_COOLDOWN)
 }
 
 enum ConnectAttempt {
@@ -36,15 +55,62 @@ enum ConnectAttempt {
 /// Only one pool exists per jcode daemon. It owns the child processes
 /// and hands out cheap `McpHandle` clones to sessions.
 pub struct SharedMcpPool {
-    clients: Mutex<HashMap<String, McpClient>>,
-    handles: RwLock<HashMap<String, McpHandle>>,
+    clients: Mutex<HashMap<PoolKey, McpClient>>,
+    handles: RwLock<HashMap<PoolKey, McpHandle>>,
     config: RwLock<McpConfig>,
     /// Directory against which the pool's default config was resolved. Keep it
     /// stable across reloads because the daemon may serve sessions in many dirs.
     config_dir: Option<std::path::PathBuf>,
-    ref_counts: Mutex<HashMap<String, usize>>,
-    connecting: Mutex<HashMap<String, Arc<Notify>>>,
-    last_errors: RwLock<HashMap<String, FailedConnectRecord>>,
+    ref_counts: Mutex<HashMap<PoolKey, usize>>,
+    connecting: Mutex<HashMap<PoolKey, Arc<Notify>>>,
+    last_errors: RwLock<HashMap<PoolKey, FailedConnectRecord>>,
+}
+
+/// Identifies one pooled server process.
+///
+/// A plain server name addresses the single daemon-wide process. A server
+/// marked `per_project` gets one process per project directory, so the key
+/// carries that directory and the process can be started with it as its
+/// working directory.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PoolKey {
+    name: String,
+    /// `None` for a daemon-wide server, `Some(dir)` for a per-project one.
+    project_dir: Option<std::path::PathBuf>,
+}
+
+impl PoolKey {
+    fn global(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            project_dir: None,
+        }
+    }
+
+    /// The key a server resolves to for a given session directory.
+    fn for_dir(name: &str, config: &McpServerConfig, project_dir: Option<&std::path::Path>) -> Self {
+        if config.per_project {
+            Self {
+                name: name.to_string(),
+                project_dir: project_dir.map(std::path::Path::to_path_buf),
+            }
+        } else {
+            Self::global(name)
+        }
+    }
+
+    /// Whether this key addresses the process a session in `project_dir` may use.
+    ///
+    /// A daemon-wide server has one process that every session shares. A
+    /// per-project server only matches the session that runs in the very same
+    /// directory, so a session never receives another project's process.
+    fn matches_dir(&self, project_dir: Option<&std::path::Path>) -> bool {
+        match (&self.project_dir, project_dir) {
+            (None, _) => true,
+            (Some(mine), Some(theirs)) => mine == theirs,
+            (Some(_), None) => false,
+        }
+    }
 }
 
 impl SharedMcpPool {
@@ -84,6 +150,12 @@ impl SharedMcpPool {
             if !server_config.is_enabled() {
                 continue;
             }
+            // A per-project server needs a project directory to run in, so the
+            // daemon-wide pool cannot start it: the session that owns the
+            // project connects it on demand (see `connect_server`).
+            if server_config.per_project {
+                continue;
+            }
             // Non-shared servers are owned per-session (with the session cwd)
             // and must never be spawned in the daemon-global pool (issue #557).
             if !server_config.shared {
@@ -92,7 +164,8 @@ impl SharedMcpPool {
             let name = name.clone();
             let server_config = server_config.clone();
             connect_futures.push(async move {
-                let result = self.ensure_connected(name.clone(), server_config).await;
+                let key = PoolKey::global(&name);
+                let result = self.ensure_connected(key, server_config).await;
                 (name, result)
             });
         }
@@ -131,9 +204,19 @@ impl SharedMcpPool {
         (successes, failures)
     }
 
-    /// Connect to a specific server by name and config
-    pub async fn connect_server(&self, name: &str, config: &McpServerConfig) -> Result<()> {
-        self.ensure_connected(name.to_string(), config.clone())
+    /// Connect to a specific server by name and config.
+    ///
+    /// A server marked `per_project` is started in `project_dir` and keyed by
+    /// that directory, so every session in the same project shares one
+    /// process and a session in another project gets its own.
+    pub async fn connect_server(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        project_dir: Option<&std::path::Path>,
+    ) -> Result<()> {
+        let key = PoolKey::for_dir(name, config, project_dir);
+        self.ensure_connected(key, config.clone())
             .await
             .map(|_| ())
             .map_err(|error_msg| anyhow::anyhow!(error_msg))
@@ -144,21 +227,29 @@ impl SharedMcpPool {
     pub async fn disconnect_server(&self, name: &str) {
         {
             let mut handles = self.handles.write().await;
-            handles.remove(name);
+            handles.retain(|key, _| key.name != name);
         }
         {
             let mut clients = self.clients.lock().await;
-            if let Some(mut client) = clients.remove(name) {
-                client.shutdown().await;
+            let mut doomed: Vec<PoolKey> = Vec::new();
+            for (key, _) in clients.iter() {
+                if key.name == name {
+                    doomed.push(key.clone());
+                }
+            }
+            for key in doomed {
+                if let Some(mut client) = clients.remove(&key) {
+                    client.shutdown().await;
+                }
             }
         }
         {
             let mut refs = self.ref_counts.lock().await;
-            refs.remove(name);
+            refs.retain(|key, _| key.name != name);
         }
         {
             let mut errors = self.last_errors.write().await;
-            errors.remove(name);
+            errors.retain(|key, _| key.name != name);
         }
     }
 
@@ -186,17 +277,33 @@ impl SharedMcpPool {
 
     /// Get handles for all connected servers (for a new session).
     /// Increments reference counts.
-    pub async fn acquire_handles(&self, session_id: &str) -> HashMap<String, McpHandle> {
-        let handles = self.handles.read().await;
-        let result: HashMap<String, McpHandle> = handles
-            .iter()
-            .filter(|(_, handle)| !handle.is_closed())
-            .map(|(name, handle)| (name.clone(), handle.clone()))
-            .collect();
+    ///
+    /// `project_dir` selects which per-project process the session gets; a
+    /// session in project A never receives the handle of project B.
+    pub async fn acquire_handles(
+        &self,
+        session_id: &str,
+        project_dir: Option<&std::path::Path>,
+    ) -> HashMap<String, McpHandle> {
+        let mut acquired: Vec<PoolKey> = Vec::new();
+        let result: HashMap<String, McpHandle> = {
+            let handles = self.handles.read().await;
+            let mut result: HashMap<String, McpHandle> = HashMap::new();
+            for (key, handle) in handles.iter() {
+                if handle.is_closed() || !key.matches_dir(project_dir) {
+                    continue;
+                }
+                acquired.push(key.clone());
+                result.insert(key.name.clone(), handle.clone());
+            }
+            result
+        };
 
+        // Count the keys actually handed out: a per-project process is keyed by
+        // its project directory, so a global key would misattribute the count.
         let mut refs = self.ref_counts.lock().await;
-        for name in result.keys() {
-            *refs.entry(name.clone()).or_insert(0) += 1;
+        for key in acquired {
+            *refs.entry(key).or_insert(0) += 1;
         }
 
         if !result.is_empty() {
@@ -212,13 +319,21 @@ impl SharedMcpPool {
 
     /// Release handles when a session disconnects.
     /// Decrements reference counts.
-    pub async fn release_handles(&self, session_id: &str, server_names: &[String]) {
+    pub async fn release_handles(
+        &self,
+        session_id: &str,
+        server_names: &[String],
+        project_dir: Option<&std::path::Path>,
+    ) {
         let mut refs = self.ref_counts.lock().await;
-        for name in server_names {
-            if let Some(count) = refs.get_mut(name) {
+        // Decrement only the keys this session could have acquired: the
+        // daemon-wide key and the per-project key for its own directory.
+        for (key, count) in refs.iter_mut() {
+            if server_names.contains(&key.name) && key.matches_dir(project_dir) {
                 *count = count.saturating_sub(1);
             }
         }
+        refs.retain(|_, count| *count > 0);
 
         if !server_names.is_empty() {
             crate::logging::info(&format!(
@@ -233,9 +348,24 @@ impl SharedMcpPool {
     pub async fn get_handle(&self, name: &str) -> Option<McpHandle> {
         let handles = self.handles.read().await;
         handles
-            .get(name)
+            .get(&PoolKey::global(name))
             .filter(|handle| !handle.is_closed())
             .cloned()
+    }
+
+    /// Get a handle for a specific server, resolved for a session directory.
+    ///
+    /// For a `per_project` server this returns the process that runs in that
+    /// directory; for a daemon-wide server the single shared process.
+    pub async fn get_handle_for_dir(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        project_dir: Option<&std::path::Path>,
+    ) -> Option<McpHandle> {
+        let key = PoolKey::for_dir(name, config, project_dir);
+        let handles = self.handles.read().await;
+        handles.get(&key).filter(|handle| !handle.is_closed()).cloned()
     }
 
     /// Get all available tools from all connected servers
@@ -247,7 +377,7 @@ impl SharedMcpPool {
                 continue;
             }
             for tool in handle.tools() {
-                tools.push((server_name.clone(), tool));
+                tools.push((server_name.name.clone(), tool));
             }
         }
         tools
@@ -256,11 +386,14 @@ impl SharedMcpPool {
     /// Get list of connected server names
     pub async fn connected_servers(&self) -> Vec<String> {
         let handles = self.handles.read().await;
-        handles
+        let mut names: Vec<String> = handles
             .iter()
             .filter(|(_, handle)| !handle.is_closed())
-            .map(|(name, _)| name.clone())
-            .collect()
+            .map(|(key, _)| key.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Call a tool on a specific server
@@ -272,7 +405,7 @@ impl SharedMcpPool {
     ) -> Result<super::protocol::ToolCallResult> {
         let handles = self.handles.read().await;
         let handle = handles
-            .get(server)
+            .get(&PoolKey::global(server))
             .filter(|handle| !handle.is_closed())
             .with_context(|| format!("MCP server '{}' not connected", server))?;
         handle.call_tool(tool, arguments).await
@@ -298,55 +431,67 @@ impl SharedMcpPool {
 
     /// Get reference counts (for debugging)
     pub async fn ref_counts(&self) -> HashMap<String, usize> {
-        self.ref_counts.lock().await.clone()
+        self.ref_counts
+            .lock()
+            .await
+            .iter()
+            .map(|(key, count)| (key.name.clone(), *count))
+            .collect()
     }
 
-    async fn begin_connect(&self, name: &str) -> ConnectAttempt {
+    async fn begin_connect(&self, key: &PoolKey) -> ConnectAttempt {
         let mut connecting = self.connecting.lock().await;
-        if let Some(notify) = connecting.get(name) {
+        if let Some(notify) = connecting.get(key) {
             return ConnectAttempt::Wait(Arc::clone(notify));
         }
 
         {
             let mut handles = self.handles.write().await;
-            if handles.get(name).is_some_and(|handle| !handle.is_closed()) {
+            if handles.get(key).is_some_and(|handle| !handle.is_closed()) {
                 return ConnectAttempt::Connected;
             }
-            handles.remove(name);
+            handles.remove(key);
         }
         // Preserve reference counts held by existing sessions, but release the
         // dead transport before starting a fresh initialization handshake.
-        self.clients.lock().await.remove(name);
+        self.clients.lock().await.remove(key);
 
         let notify = Arc::new(Notify::new());
-        connecting.insert(name.to_string(), Arc::clone(&notify));
+        connecting.insert(key.clone(), Arc::clone(&notify));
         ConnectAttempt::Leader(notify)
     }
 
-    async fn finish_connect(&self, name: &str, notify: Arc<Notify>, result: Result<McpClient>) {
+    async fn finish_connect(
+        &self,
+        key: &PoolKey,
+        notify: Arc<Notify>,
+        result: Result<McpClient>,
+    ) {
         match result {
             Ok(client) => {
                 let handle = client.handle();
                 {
                     let mut handles = self.handles.write().await;
-                    handles.insert(name.to_string(), handle);
+                    handles.insert(key.clone(), handle);
                 }
                 {
                     let mut clients = self.clients.lock().await;
-                    clients.insert(name.to_string(), client);
+                    clients.insert(key.clone(), client);
                 }
                 {
                     let mut errors = self.last_errors.write().await;
-                    errors.remove(name);
+                    errors.remove(key);
                 }
             }
             Err(error) => {
                 let mut errors = self.last_errors.write().await;
+                let failures = errors.get(key).map_or(0, |r| r.failures) + 1;
                 errors.insert(
-                    name.to_string(),
+                    key.clone(),
                     FailedConnectRecord {
                         message: format!("{:#}", error),
                         failed_at: Instant::now(),
+                        failures,
                     },
                 );
             }
@@ -355,11 +500,11 @@ impl SharedMcpPool {
         {
             let mut connecting = self.connecting.lock().await;
             if connecting
-                .get(name)
+                .get(key)
                 .map(|current| Arc::ptr_eq(current, &notify))
                 .unwrap_or(false)
             {
-                connecting.remove(name);
+                connecting.remove(key);
             }
         }
 
@@ -368,17 +513,18 @@ impl SharedMcpPool {
 
     async fn ensure_connected(
         &self,
-        name: String,
+        key: PoolKey,
         config: McpServerConfig,
     ) -> std::result::Result<bool, String> {
-        if let Some(record) = self.recent_failure(&name).await {
-            let retry_after = FAILED_CONNECT_RETRY_COOLDOWN
+        if let Some(record) = self.recent_failure(&key).await {
+            let retry_after = record
+                .cooldown()
                 .saturating_sub(record.failed_at.elapsed())
                 .as_secs()
                 .max(1);
             crate::logging::info(&format!(
                 "MCP: Skipping reconnect to '{}' for {}s after recent failure",
-                name, retry_after
+                key.name, retry_after
             ));
             return Err(format!(
                 "{} (retry suppressed for ~{}s after recent failure)",
@@ -386,15 +532,15 @@ impl SharedMcpPool {
             ));
         }
 
-        match self.begin_connect(&name).await {
+        match self.begin_connect(&key).await {
             ConnectAttempt::Connected => Ok(false),
             ConnectAttempt::Wait(notify) => {
-                self.wait_for_connect(&name, &notify).await;
+                self.wait_for_connect(&key, &notify).await;
                 if self
                     .handles
                     .read()
                     .await
-                    .get(&name)
+                    .get(&key)
                     .is_some_and(|handle| !handle.is_closed())
                 {
                     Ok(false)
@@ -403,7 +549,7 @@ impl SharedMcpPool {
                         .last_errors
                         .read()
                         .await
-                        .get(&name)
+                        .get(&key)
                         .map(|record| record.message.clone())
                         .unwrap_or_else(|| {
                             "Connection attempt did not produce a handle".to_string()
@@ -412,18 +558,23 @@ impl SharedMcpPool {
                 }
             }
             ConnectAttempt::Leader(notify) => {
-                let result = McpClient::connect(name.clone(), &config).await;
+                // A per-project server must start in its project directory so
+                // it resolves that project (a git repo, a language-server
+                // index) instead of the daemon's working directory.
+                let working_dir = key.project_dir.as_deref();
+                let result = McpClient::connect_in_dir(key.name.clone(), &config, working_dir)
+                    .await;
                 let outcome = match &result {
                     Ok(_) => Ok(true),
                     Err(error) => Err(format!("{:#}", error)),
                 };
-                self.finish_connect(&name, notify, result).await;
+                self.finish_connect(&key, notify, result).await;
                 outcome
             }
         }
     }
 
-    async fn wait_for_connect(&self, name: &str, notify: &Arc<Notify>) {
+    async fn wait_for_connect(&self, key: &PoolKey, notify: &Arc<Notify>) {
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -433,19 +584,19 @@ impl SharedMcpPool {
             .connecting
             .lock()
             .await
-            .get(name)
+            .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, notify))
         {
             notified.await;
         }
     }
 
-    async fn recent_failure(&self, name: &str) -> Option<FailedConnectRecord> {
+    async fn recent_failure(&self, key: &PoolKey) -> Option<FailedConnectRecord> {
         if self
             .handles
             .read()
             .await
-            .get(name)
+            .get(key)
             .is_some_and(|handle| !handle.is_closed())
         {
             return None;
@@ -454,8 +605,8 @@ impl SharedMcpPool {
         self.last_errors
             .read()
             .await
-            .get(name)
-            .filter(|record| record.failed_at.elapsed() < FAILED_CONNECT_RETRY_COOLDOWN)
+            .get(key)
+            .filter(|record| record.failed_at.elapsed() < record.cooldown())
             .cloned()
     }
 }
@@ -481,7 +632,7 @@ pub fn get_shared_pool() -> Option<Arc<SharedMcpPool>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectAttempt, SharedMcpPool};
+    use super::{ConnectAttempt, PoolKey, SharedMcpPool};
     use crate::mcp::protocol::McpConfig;
     use std::sync::Arc;
 
@@ -535,9 +686,10 @@ mod tests {
     #[tokio::test]
     async fn begin_connect_deduplicates_concurrent_attempts() {
         let pool = Arc::new(SharedMcpPool::new(McpConfig::default()));
+        let key = PoolKey::global("demo");
 
-        let first = pool.begin_connect("demo").await;
-        let second = pool.begin_connect("demo").await;
+        let first = pool.begin_connect(&key).await;
+        let second = pool.begin_connect(&key).await;
 
         let first_notify = match first {
             ConnectAttempt::Leader(notify) => notify,
@@ -554,17 +706,18 @@ mod tests {
     #[tokio::test]
     async fn reconnect_waiter_observes_leader_completion_before_registration() {
         let pool = SharedMcpPool::new(McpConfig::default());
-        let ConnectAttempt::Leader(leader) = pool.begin_connect("early").await else {
+        let key = PoolKey::global("early");
+        let ConnectAttempt::Leader(leader) = pool.begin_connect(&key).await else {
             panic!("leader");
         };
-        let ConnectAttempt::Wait(waiter) = pool.begin_connect("early").await else {
+        let ConnectAttempt::Wait(waiter) = pool.begin_connect(&key).await else {
             panic!("waiter");
         };
-        pool.finish_connect("early", leader, Err(anyhow::anyhow!("fixture failure")))
+        pool.finish_connect(&key, leader, Err(anyhow::anyhow!("fixture failure")))
             .await;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            pool.wait_for_connect("early", &waiter),
+            pool.wait_for_connect(&key, &waiter),
         )
         .await
         .expect("an already-completed attempt must not wait for a lost notification");
@@ -589,6 +742,7 @@ mod tests {
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                per_project: false,
             },
         );
         let pool = SharedMcpPool::new(config);
@@ -598,6 +752,78 @@ mod tests {
         assert!(
             failures.is_empty(),
             "non-shared server must be skipped, got failures: {failures:?}"
+        );
+    }
+
+    fn per_project_config() -> crate::mcp::protocol::McpServerConfig {
+        crate::mcp::protocol::McpServerConfig {
+            command: "unused-fixture".to_string(),
+            args: vec![],
+            env: Default::default(),
+            shared: true,
+            transport: None,
+            url: None,
+            headers: std::collections::HashMap::new(),
+            enabled: None,
+            disabled: None,
+            timeout_secs: None,
+            per_project: true,
+        }
+    }
+
+    #[test]
+    fn per_project_server_keys_one_process_per_directory() {
+        // A per-project server must resolve to a different key for each
+        // project directory, so the pool starts one process per project
+        // instead of one for the whole daemon (wrong project) or one per
+        // session (N processes for the same project).
+        let config = per_project_config();
+        let first = PoolKey::for_dir("scoped", &config, Some(std::path::Path::new("/p/one")));
+        let second = PoolKey::for_dir("scoped", &config, Some(std::path::Path::new("/p/two")));
+        let first_again = PoolKey::for_dir("scoped", &config, Some(std::path::Path::new("/p/one")));
+
+        assert_ne!(first, second, "different projects need different processes");
+        assert_eq!(first, first_again, "the same project reuses one process");
+    }
+
+    #[test]
+    fn per_project_server_never_leaks_into_another_project() {
+        let config = per_project_config();
+        let key = PoolKey::for_dir("scoped", &config, Some(std::path::Path::new("/p/one")));
+
+        assert!(key.matches_dir(Some(std::path::Path::new("/p/one"))));
+        assert!(!key.matches_dir(Some(std::path::Path::new("/p/two"))));
+        assert!(!key.matches_dir(None));
+    }
+
+    #[test]
+    fn daemon_wide_server_stays_shared_across_projects() {
+        // A server without `per_project` keeps one process for the whole
+        // daemon, so every session in every project gets the same handle.
+        let mut config = per_project_config();
+        config.per_project = false;
+
+        let first = PoolKey::for_dir("plain", &config, Some(std::path::Path::new("/p/one")));
+        let second = PoolKey::for_dir("plain", &config, Some(std::path::Path::new("/p/two")));
+
+        assert_eq!(first, second);
+        assert!(first.matches_dir(Some(std::path::Path::new("/p/one"))));
+        assert!(first.matches_dir(Some(std::path::Path::new("/p/two"))));
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn failed_connect_cooldown_grows_and_caps() {
+        assert_eq!(failed_connect_cooldown(1), Duration::from_secs(30));
+        assert_eq!(failed_connect_cooldown(2), Duration::from_secs(60));
+        assert_eq!(failed_connect_cooldown(4), Duration::from_secs(240));
+        assert_eq!(
+            failed_connect_cooldown(50),
+            MAX_FAILED_CONNECT_RETRY_COOLDOWN
         );
     }
 }

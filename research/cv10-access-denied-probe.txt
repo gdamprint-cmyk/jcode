@@ -1,0 +1,7 @@
+elevated=True
+self_alive=True
+bogus_alive=False lasterr=87
+processes_total=516
+judged_alive=510
+judged_dead_but_running=4
+  lasterr=87 count=4

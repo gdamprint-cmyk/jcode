@@ -1089,21 +1089,68 @@ if ($DownloadMode -eq "tar") {
 
 Assert-JcodeBinaryCandidate -BinaryPath $DestBin -ExpectedVersion $Version | Out-Null
 
-$StableBin = Join-Path $StableDir "jcode.exe"
-Copy-Item -Path $DestBin -Destination $StableBin -Force
-Set-Content -Path (Join-Path $BuildsDir "stable-version") -Value $VersionNum
-Install-JcodeLauncher -SourcePath $StableBin -LauncherPath $LauncherPath | Out-Null
+# The installed binary lives at its immutable versioned location
+# (`builds/versions/<version>/jcode.exe`). Channels are NOT moved here.
+#
+# The channels are moved by the LANDING TRANSACTION, which the versioned
+# binary itself runs (`server land <version> --json`): it journals the
+# transaction, moves the daemon channel, hands the daemon off, PROVES the
+# daemon runs the target, and only then moves the client channels
+# (`current` and the launcher). The previous installer copied the binary onto
+# `stable` and the launcher and then reloaded the daemon as three independent
+# steps, which is how a daemon/client split was produced.
+#
+# A binary that predates the `land` subcommand cannot run the transaction, so
+# the legacy sequence is used for it - and ONLY for it.
+$SupportsLanding = $false
+try {
+    & $DestBin server land --help *> $null
+    $SupportsLanding = ($LASTEXITCODE -eq 0)
+} catch {
+    $SupportsLanding = $false
+}
+
+# A daemon channel PINNED to a self-dev build is a deliberate choice: that
+# build is meant to keep running. A release install must not silently destroy
+# it, and it must never move a client channel while leaving the daemon pinned.
+# So the pin is an EXPLICIT REFUSAL: the release stays installed at its
+# versioned path, no channel moves, and the user lands it by hand if they want
+# the pin replaced.
+$PinnedVersion = ""
+$PinnedVersionFile = Join-Path $BuildsDir "shared-server-version"
+if (Test-Path $PinnedVersionFile) {
+    $PinnedVersion = (Get-Content -Path $PinnedVersionFile -TotalCount 1 -ErrorAction SilentlyContinue | Out-String).Trim()
+}
+$IsPinned = ($PinnedVersion -ne "") -and -not ($PinnedVersion -match '^\d') -and -not ($PinnedVersion -like 'main-*')
+
+if ($IsPinned) {
+    Write-Err "The daemon channel is pinned to the self-dev build ${PinnedVersion}. jcode ${VersionNum} was installed at ${DestBin} but NO channel was moved, and the pin was preserved. Run `"${DestBin}`" server land ${VersionNum} explicitly if you want to replace the pin."
+}
+
+if ($SupportsLanding) {
+    Write-Info "Landing $VersionNum onto the whole ecosystem as one transaction..."
+    $LandOutput = & $DestBin server land $VersionNum --json 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Landing ${VersionNum} failed: $LandOutput. The installed build stays at $DestBin and no channel was moved; retry with `"$DestBin`" server land ${VersionNum}."
+    }
+    Write-Info "Landed ${VersionNum}: the daemon and every client now run it."
+} else {
+    Write-Warn "This build predates the atomic landing transaction; falling back to the legacy channel move."
+    $LegacyStableBin = Join-Path $StableDir "jcode.exe"
+    Copy-Item -Path $DestBin -Destination $LegacyStableBin -Force
+    Set-Content -Path (Join-Path $BuildsDir "stable-version") -Value $VersionNum
+    Install-JcodeLauncher -SourcePath $LegacyStableBin -LauncherPath $LauncherPath | Out-Null
+}
 } finally {
     Get-Item -LiteralPath $TempDir -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Gracefully reload any running background server onto the freshly installed
-# binary (issue #291). `server reload` only reloads a genuinely-older daemon,
-# hands its live sessions to the new process, and is a no-op when nothing is
-# running, so it is safe to call unconditionally. Best-effort: never fail the
-# install over it.
-if ($env:JCODE_SKIP_SERVER_RELOAD -ne "1") {
+# The daemon handoff already happened inside the landing transaction, so no
+# separate `server reload` is issued here: a reload would be a second, unjournaled
+# channel move (issue #291). It is still issued for a legacy build that could
+# not run the transaction. Best-effort: never fail the install over it.
+if ($env:JCODE_SKIP_SERVER_RELOAD -ne "1" -and -not $SupportsLanding) {
     try {
         & $LauncherPath server reload 2>$null | Out-Null
     } catch {

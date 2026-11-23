@@ -76,13 +76,8 @@ const DEFAULT_MODEL: &str = "anthropic/claude-opus-5.5";
 
 /// Which model should replace the placeholder default, if any. Pure so it can
 /// be tested without a network catalog.
-fn select_promoted_default(current: &str, catalog: &[&str]) -> Option<String> {
-    if current != DEFAULT_MODEL {
-        return None;
-    }
-    jcode_base::auth::lifecycle::preferred_model_for_provider("openrouter", catalog)
-        .filter(|best| best != DEFAULT_MODEL)
-}
+mod default_selection;
+use default_selection::select_promoted_default;
 
 /// Soft refresh TTL for the model catalog.
 ///
@@ -493,37 +488,9 @@ impl ProviderAuth {
     }
 }
 
-fn add_cache_breakpoint(messages: &mut [Message]) -> bool {
-    let mut cache_index = None;
-    for (idx, msg) in messages.iter().enumerate().rev() {
-        if let Role::User = msg.role
-            && msg
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text { .. }))
-        {
-            cache_index = Some(idx);
-            break;
-        }
-    }
-
-    let Some(idx) = cache_index else {
-        return false;
-    };
-
-    let msg = &mut messages[idx];
-    for block in msg.content.iter_mut().rev() {
-        if let ContentBlock::Text { cache_control, .. } = block {
-            if cache_control.is_none() {
-                *cache_control = Some(CacheControl::ephemeral(None));
-            }
-            return true;
-        }
-    }
-
-    false
-}
-
+#[path = "lib_cache_breakpoints.rs"]
+mod cache_breakpoints;
+use cache_breakpoints::*;
 fn models_fingerprint(models: &[ModelInfo]) -> String {
     serde_json::to_string(models).unwrap_or_default()
 }
@@ -905,7 +872,16 @@ impl OpenRouterProvider {
                 "xhigh" => "high",
                 other => other,
             };
-            if effort == "none" {
+            if effort == "none" && !self.openai_none_opt_in() {
+                // The dedicated `deepseek` profile has no explicit opt-in, so
+                // it keeps the historical behaviour. A profile that set
+                // `supports_reasoning_effort = true` does reach this branch
+                // (the explicit override wins here too) and must be able to
+                // disable thinking: measured 2026-11-12/14, the Nous endpoint
+                // honours `none` - the whole `completion_tokens_details`
+                // block and `message.reasoning_content` are ABSENT (not a
+                // zero token count), 11/11 runs in that series and 64 more
+                // raw-confirmed later.
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
@@ -916,7 +892,17 @@ impl OpenRouterProvider {
             } else {
                 effort
             };
-            if effort == "none" {
+            if effort == "none" && !self.openai_none_opt_in() {
+                // OpenAI treats `none` as "no reasoning", but a model that
+                // never reasons tolerates its absence better than its
+                // presence, so the heuristic (model-family) detection keeps
+                // dropping it. A profile that explicitly opts in via
+                // `supports_reasoning_effort = true` does want it on the wire:
+                // measured 2026-11-12/14, the Nous endpoint honours `none`:
+                // the `completion_tokens_details` block and
+                // `message.reasoning_content` are ABSENT (not a zero token
+                // count), 11/11 runs in that series vs 552..3999 reasoning
+                // tokens without the field.
                 return false;
             }
             request["reasoning_effort"] = serde_json::json!(effort);
@@ -934,6 +920,18 @@ impl OpenRouterProvider {
 
     fn profile_supports_reasoning_effort(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
+    }
+
+    /// Did the user explicitly opt this profile into `/effort` via
+    /// `supports_reasoning_effort = true` in config.toml?
+    ///
+    /// That flag is a deliberate statement that the endpoint honours the
+    /// OpenAI `reasoning_effort` vocabulary, including `none`, so it must not
+    /// be overridden by the model-name heuristic. Only the on direction counts:
+    /// `Some(false)` means "no effort at all", which `available_efforts`
+    /// already reports as an empty ladder.
+    fn openai_none_opt_in(&self) -> bool {
+        self.reasoning_effort_support == Some(true)
     }
 
     fn profile_supports_openai_reasoning_effort(profile_id: Option<&str>) -> bool {
@@ -1010,6 +1008,7 @@ impl OpenRouterProvider {
     fn model_is_openai_reasoning_family(model: &str) -> bool {
         let model = model.trim().to_ascii_lowercase();
         model.starts_with("gpt-5")
+            || model == "gpt-6.1-sol"
             || model.contains("codex")
             || model.starts_with("o1")
             || model.starts_with("o3")
@@ -1083,6 +1082,12 @@ impl OpenRouterProvider {
                 self.profile_id.as_deref(),
                 self.send_openrouter_headers,
             )
+            // A profile that explicitly declared itself as not supporting
+            // reasoning levels still reaches the swarm sentinel: swarm is a
+            // Jcode orchestration mode, not a wire-level effort, so it must not
+            // be gated behind provider effort support. Without this,
+            // `/effort swarm` is refused before the ladder is even consulted.
+            || self.reasoning_effort_support == Some(false)
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
@@ -1396,6 +1401,25 @@ impl OpenRouterProvider {
         }
 
         "OpenRouter".to_string()
+    }
+
+    /// The OpenAI-compatible profile this runtime instance actually serves.
+    ///
+    /// Read from the instance's own `profile_id`, never from
+    /// `JCODE_OPENROUTER_CACHE_NAMESPACE`: a named profile's constructor sets
+    /// that variable process-wide, so another session's model switch can leave
+    /// it pointing at a profile this runtime does not serve.
+    // reference: no prior art, searched this repo for an instance-scoped
+    // profile resolver (crates/jcode-base/src/provider/mod.rs
+    // openai_compatible_profile_owning_model) and the Rust trait-object dispatch
+    // guidance at https://siddharthqs.com/design-patterns-in-rust (dynamic
+    // dispatch through a trait object; avoid global mutable state).
+    pub fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        self.profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile_id| !profile_id.is_empty())
+            .map(str::to_string)
     }
 
     pub fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
@@ -1877,9 +1901,9 @@ impl OpenRouterProvider {
                 })
             }),
             supports_provider_features: false,
-            // The proxy's `/models` shape is not a documented catalog; keep the
-            // curated list so `/model` works offline and before first request.
-            supports_model_catalog: false,
+            // The official CLI discovers releases through GET /v1/models.
+            // Static models remain only an offline/pre-discovery fallback.
+            supports_model_catalog: true,
             profile_id: Some("grok-build".to_string()),
             builtin_azure: false,
             reasoning_effort_support: Some(false),
@@ -2728,6 +2752,10 @@ impl OpenRouterProvider {
 
     /// Force refresh the models cache from API
     pub async fn refresh_models(&self) -> Result<Vec<ModelInfo>> {
+        if !self.supports_model_catalog {
+            return Ok(Vec::new());
+        }
+
         fetch_models_from_api(
             self.client.clone(),
             self.api_base.clone(),
@@ -2994,50 +3022,5 @@ mod profile_catalog_backoff_tests;
 mod muse_native_tests;
 
 #[cfg(test)]
-mod placeholder_default_tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_default_is_current_flagship() {
-        assert_eq!(DEFAULT_MODEL, "anthropic/claude-opus-5.5");
-    }
-
-    #[test]
-    fn placeholder_default_promotes_to_newest_flagship() {
-        let catalog = [
-            "anthropic/claude-sonnet-4",
-            "anthropic/claude-haiku-4.5",
-            "anthropic/claude-opus-4.6",
-            "anthropic/claude-opus-5.5",
-            "anthropic/claude-opus-5.6",
-            "openai/gpt-5.5",
-            "deepseek/deepseek-v4-pro",
-        ];
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &catalog).as_deref(),
-            Some("anthropic/claude-opus-5.6")
-        );
-    }
-
-    #[test]
-    fn placeholder_default_never_overrides_a_chosen_model() {
-        let catalog = ["anthropic/claude-sonnet-4", "anthropic/claude-opus-5.5"];
-        assert_eq!(
-            select_promoted_default("deepseek/deepseek-v4-pro", &catalog),
-            None
-        );
-    }
-
-    #[test]
-    fn placeholder_default_stays_when_catalog_has_nothing_better() {
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &["deepseek/deepseek-v4-pro"]),
-            None
-        );
-        assert_eq!(select_promoted_default(DEFAULT_MODEL, &[]), None);
-        assert_eq!(
-            select_promoted_default(DEFAULT_MODEL, &[DEFAULT_MODEL]),
-            None
-        );
-    }
-}
+#[path = "placeholder_default_tests.rs"]
+mod placeholder_default_tests;

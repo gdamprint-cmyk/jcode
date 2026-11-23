@@ -12,6 +12,17 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
     };
 
     match crate::tui::ui::tools_ui::canonical_tool_name(name) {
+        // Unlike an optional technical summary, the source is the codemode
+        // card's body. Keep it on insertion and subsequent snapshot compaction
+        // so completed calls and restored history render the same preview.
+        "codemode" => obj(vec![(
+            "code",
+            input
+                .get("code")
+                .filter(|value| value.is_string())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )]),
         "bash" => obj(vec![(
             "command",
             input
@@ -108,14 +119,18 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
                 .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
                 .unwrap_or(serde_json::Value::Null),
         )]),
-        "websearch" | "codesearch" | "session_search" | "conversation_search" => obj(vec![(
-            "query",
-            input
-                .get("query")
-                .and_then(|v| v.as_str())
-                .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
-                .unwrap_or(serde_json::Value::Null),
-        )]),
+        "websearch" | "web_search" | "codesearch" | "session_search" | "conversation_search" => {
+            obj(vec![(
+                "query",
+                input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        serde_json::Value::String(crate::util::truncate_str(s, 200).to_string())
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+            )])
+        }
         "open" => obj(vec![
             (
                 "action",
@@ -435,6 +450,50 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
                 .unwrap_or(serde_json::Value::Null);
             obj(vec![("tool_calls", tool_calls)])
         }
+        // MCP calls: the row identity lives in `server`/`tool` (and the
+        // essence in `intent`/`query`). Without this arm the generic fallback
+        // kept only `action`, so a completed or restored MCP row lost the
+        // concrete tool name entirely and rendered as bare `mcp · <intent>`.
+        "mcp" | "mcp_call" => obj(vec![
+            (
+                "server",
+                input
+                    .get("server")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "tool",
+                input
+                    .get("tool")
+                    .or_else(|| input.get("tool_name"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "intent",
+                input
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "query",
+                input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "action",
+                input
+                    .get("action")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        ]),
         // Generic fallback: keep the action field (when present) so
         // action-shaped tool rows still render a summary after reload.
         _ => obj(vec![(
@@ -499,6 +558,32 @@ pub(super) fn infer_spawned_session_startup_hints(
 mod tests {
     use super::*;
 
+    #[test]
+    fn codemode_preview_survives_transcript_compaction_and_restore() {
+        let _guard = crate::tui::ui::render_state_test_lock();
+        let code = "const value = 1\n  return value";
+        let mut message = tool_message(
+            "codemode",
+            serde_json::json!({
+                "code": code, "intent": "Inspect project", "accept_large_output": false,
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        compact_display_messages_for_storage(std::slice::from_mut(&mut message));
+        let tool = message.tool_data.as_ref().unwrap();
+        assert_eq!(tool.input, serde_json::json!({"code": code}));
+        assert_eq!(tool.intent.as_deref(), Some("Inspect project"));
+        let lines =
+            crate::tui::ui::render_tool_message(&message, 100, crate::config::DiffDisplayMode::Off);
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("const value = 1"), "{text}");
+        assert!(text.contains("  return value"), "{text}");
+    }
+
     fn tool_message(name: &str, input: serde_json::Value) -> DisplayMessage {
         DisplayMessage {
             role: "tool".to_string(),
@@ -514,6 +599,56 @@ mod tests {
                 thought_signature: None,
             }),
         }
+    }
+
+    #[test]
+    fn compaction_keeps_mcp_identity_for_the_row_name() {
+        let mut message = tool_message(
+            "mcp",
+            serde_json::json!({
+                "action": "call",
+                "server": "cgrep",
+                "tool": "cgrep_agent_locate",
+                "arguments": { "query": "mcp label" },
+                "intent": "find the label",
+                "unrelated": "dropped"
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.as_ref().expect("tool data");
+        assert_eq!(tool.input.get("server").and_then(|v| v.as_str()), Some("cgrep"));
+        assert_eq!(
+            tool.input.get("tool").and_then(|v| v.as_str()),
+            Some("cgrep_agent_locate")
+        );
+        assert_eq!(
+            tool.input.get("intent").and_then(|v| v.as_str()),
+            Some("find the label")
+        );
+        assert!(
+            tool.input.get("unrelated").is_none(),
+            "unrelated input must still be dropped: {}",
+            tool.input
+        );
+        // Compaction runs on every push AND on restore, so a second pass must
+        // not add anything: otherwise a row would grow each reload.
+        let once = message
+            .tool_data
+            .as_ref()
+            .expect("tool data")
+            .input
+            .clone();
+        compact_display_message_tool_data(&mut message);
+        let twice = message
+            .tool_data
+            .as_ref()
+            .expect("tool data")
+            .input
+            .clone();
+        assert_eq!(
+            twice, once,
+            "compaction must be idempotent: {once} vs {twice}"
+        );
     }
 
     #[test]

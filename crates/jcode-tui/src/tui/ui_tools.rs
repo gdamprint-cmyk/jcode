@@ -1,8 +1,68 @@
 use crate::message::ToolCall;
+#[path = "ui_tools_browser_summary.rs"]
+mod browser_summary;
+use browser_summary::browser_summary;
 
 use super::{dim_color, rgb, tool_color, truncate_line_preserving_suffix_to_width};
 use ratatui::prelude::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Source is a dedicated body, independent of the optional technical summary.
+/// Bound visual rows, not source lines: agents frequently submit one long line.
+pub(super) fn codemode_preview(tool: &ToolCall, width: usize) -> Vec<Line<'static>> {
+    if canonical_tool_name(&tool.name) != "codemode" {
+        return Vec::new();
+    }
+    let Some(code) = tool.input.get("code").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    if code.trim().is_empty() || width == 0 {
+        return Vec::new();
+    }
+    const MAX_ROWS: usize = 6;
+    let indent = width.saturating_sub(1).min(4);
+    let inner_width = width.saturating_sub(indent).max(1);
+    let mut rows = Vec::new();
+    let mut source = code.lines().peekable();
+    while let Some(line) = source.next() {
+        let source_line = Line::from(super::markdown::highlight_line(
+            &line.replace('\t', "    "),
+            Some("js"),
+        ));
+        let wrapped = super::markdown::wrap_lines(vec![source_line], inner_width);
+        let available = MAX_ROWS.saturating_sub(rows.len());
+        let continued = wrapped.len() > available;
+        for mut row in wrapped.into_iter().take(available) {
+            row = super::truncate_line_with_ellipsis_to_width(&row, inner_width);
+            row.spans.insert(0, Span::raw(" ".repeat(indent)));
+            rows.push(row);
+        }
+        if rows.len() == MAX_ROWS {
+            let remaining = source.count();
+            let label = if continued {
+                Some("… code continues".to_string())
+            } else if remaining > 0 {
+                Some(format!(
+                    "… {remaining} more line{}",
+                    if remaining == 1 { "" } else { "s" }
+                ))
+            } else {
+                None
+            };
+            if let Some(label) = label {
+                rows.push(super::truncate_line_with_ellipsis_to_width(
+                    &Line::from(vec![
+                        Span::raw(" ".repeat(indent)),
+                        Span::styled(label, Style::default().fg(dim_color())),
+                    ]),
+                    width,
+                ));
+            }
+            break;
+        }
+    }
+    rows
+}
 
 pub(super) use jcode_tui_tool_display::parse_tool_failure;
 pub(crate) use jcode_tui_tool_display::{
@@ -155,71 +215,12 @@ pub(super) use batch::parse_batch_sub_outputs;
 pub(crate) use batch::{batch_subcall_intent, batch_subcall_params};
 pub(super) use batch::{parse_batch_completion_counts, parse_batch_sub_outputs_by_index};
 
-pub(super) fn summarize_unified_patch_input(patch_text: &str) -> String {
-    let lines = patch_text.lines().count();
-    let mut files: Vec<String> = Vec::new();
-
-    for line in patch_text.lines() {
-        let Some(rest) = line
-            .strip_prefix("--- ")
-            .or_else(|| line.strip_prefix("+++ "))
-        else {
-            continue;
-        };
-
-        let without_tab_suffix = rest.split('\t').next().unwrap_or(rest);
-        let path_token = without_tab_suffix.split_whitespace().next().unwrap_or("");
-        let path = path_token
-            .strip_prefix("a/")
-            .or(path_token.strip_prefix("b/"))
-            .unwrap_or(path_token);
-
-        if path.is_empty() || path == "/dev/null" {
-            continue;
-        }
-        if !files.iter().any(|f| f == path) {
-            files.push(path.to_string());
-        }
-    }
-
-    if files.len() == 1 {
-        format!("{} ({} lines)", files[0], lines)
-    } else if !files.is_empty() {
-        format!("{} files ({} lines)", files.len(), lines)
-    } else {
-        format!("({} lines)", lines)
-    }
-}
-
-pub(super) fn summarize_apply_patch_input(patch_text: &str) -> String {
-    let lines = patch_text.lines().count();
-    let mut files: Vec<String> = Vec::new();
-
-    for line in patch_text.lines() {
-        let trimmed = line.trim();
-        let path = trimmed
-            .strip_prefix("*** Add File: ")
-            .or_else(|| trimmed.strip_prefix("*** Update File: "))
-            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
-            .map(str::trim)
-            .unwrap_or("");
-
-        if path.is_empty() {
-            continue;
-        }
-        if !files.iter().any(|f| f == path) {
-            files.push(path.to_string());
-        }
-    }
-
-    if files.len() == 1 {
-        format!("{} ({} lines)", files[0], lines)
-    } else if !files.is_empty() {
-        format!("{} files ({} lines)", files.len(), lines)
-    } else {
-        format!("({} lines)", lines)
-    }
-}
+#[path = "ui_tools/patch_summary.rs"]
+mod patch_summary;
+pub(crate) use patch_summary::{
+    extract_apply_patch_primary_file, extract_unified_patch_primary_file,
+};
+pub(super) use patch_summary::{summarize_apply_patch_input, summarize_unified_patch_input};
 
 fn parse_agentgrep_smart_subject_relation(
     input: &serde_json::Value,
@@ -256,48 +257,6 @@ fn parse_agentgrep_smart_subject_relation(
     }
 
     (subject, relation)
-}
-
-pub(crate) fn extract_apply_patch_primary_file(patch_text: &str) -> Option<String> {
-    for line in patch_text.lines() {
-        let trimmed = line.trim();
-        let path = trimmed
-            .strip_prefix("*** Add File: ")
-            .or_else(|| trimmed.strip_prefix("*** Update File: "))
-            .or_else(|| trimmed.strip_prefix("*** Delete File: "))
-            .map(str::trim)
-            .unwrap_or("");
-
-        if !path.is_empty() {
-            return Some(path.to_string());
-        }
-    }
-
-    None
-}
-
-pub(crate) fn extract_unified_patch_primary_file(patch_text: &str) -> Option<String> {
-    for line in patch_text.lines() {
-        let Some(rest) = line
-            .strip_prefix("+++ ")
-            .or_else(|| line.strip_prefix("--- "))
-        else {
-            continue;
-        };
-
-        let without_tab_suffix = rest.split('\t').next().unwrap_or(rest);
-        let path_token = without_tab_suffix.split_whitespace().next().unwrap_or("");
-        let path = path_token
-            .strip_prefix("a/")
-            .or(path_token.strip_prefix("b/"))
-            .unwrap_or(path_token);
-
-        if !path.is_empty() && path != "/dev/null" {
-            return Some(path.to_string());
-        }
-    }
-
-    None
 }
 
 fn display_prefix_by_width(s: &str, max_width: usize) -> &str {
@@ -533,151 +492,6 @@ fn browser_target_summary(
     }
 }
 
-fn browser_summary(tool: &ToolCall, max_width: Option<usize>) -> String {
-    let bounded = |preferred: usize| max_width.unwrap_or(preferred);
-    let action = tool
-        .input
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("browser");
-
-    let summary = match action {
-        "open" | "new_tab" => {
-            let label = action.replace('_', " ");
-            let url = tool.input.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.is_empty() {
-                label
-            } else {
-                format!("{} {}", label, truncate_url_display(url, bounded(44)))
-            }
-        }
-        "snapshot" | "interactables" | "screenshot" => {
-            if let Some(target) = browser_target_summary(tool, max_width, true) {
-                format!("{} {}", action, target)
-            } else {
-                action.to_string()
-            }
-        }
-        "get_content" => {
-            let format_name = tool
-                .input
-                .get("format")
-                .and_then(|v| v.as_str())
-                .unwrap_or("text");
-            if let Some(target) = browser_target_summary(tool, max_width, true) {
-                format!("content {} {}", format_name, target)
-            } else {
-                format!("content {}", format_name)
-            }
-        }
-        "click" | "wait" | "hover" | "select" => {
-            if let Some(target) = browser_target_summary(tool, max_width, action != "select") {
-                format!("{} {}", action, target)
-            } else {
-                action.to_string()
-            }
-        }
-        "type" => {
-            let chars = tool
-                .input
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(|text| text.chars().count());
-            match (browser_target_summary(tool, max_width, false), chars) {
-                (Some(target), Some(chars)) => format!("type {} ({} chars)", target, chars),
-                (Some(target), None) => format!("type {}", target),
-                (None, Some(chars)) => format!("type ({} chars)", chars),
-                (None, None) => "type".to_string(),
-            }
-        }
-        "fill_form" => {
-            let count = tool
-                .input
-                .get("fields")
-                .and_then(|v| v.as_array())
-                .map(|fields| fields.len())
-                .unwrap_or(0);
-            format!("fill {} field{}", count, if count == 1 { "" } else { "s" })
-        }
-        "upload" => {
-            let path = tool
-                .input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let target = browser_target_summary(tool, max_width, false);
-            let file = if path.is_empty() {
-                None
-            } else {
-                Some(truncate_path_display(path, bounded(28)))
-            };
-            match (target, file) {
-                (Some(target), Some(file)) => format!("upload {} ← {}", target, file),
-                (Some(target), None) => format!("upload {}", target),
-                (None, Some(file)) => format!("upload {}", file),
-                (None, None) => "upload".to_string(),
-            }
-        }
-        "eval" => {
-            let script = tool
-                .input
-                .get("script")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if script.is_empty() {
-                "eval".to_string()
-            } else {
-                format!("eval {}", truncate_middle_display(script, bounded(42)))
-            }
-        }
-        "scroll" => {
-            if let Some(position) = tool.input.get("position").and_then(|v| v.as_str()) {
-                format!("scroll {}", position)
-            } else if let Some(scroll_to) = tool.input.get("scroll_to") {
-                let x = scroll_to.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let y = scroll_to.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                format!("scroll to {:.0},{:.0}", x, y)
-            } else {
-                let x = tool.input.get("x").and_then(|v| v.as_f64());
-                let y = tool.input.get("y").and_then(|v| v.as_f64());
-                match (x, y) {
-                    (Some(x), Some(y)) => format!("scroll {:.0},{:.0}", x, y),
-                    _ => "scroll".to_string(),
-                }
-            }
-        }
-        "press" => {
-            let key = tool.input.get("key").and_then(|v| v.as_str());
-            match (key, browser_target_summary(tool, max_width, false)) {
-                (Some(key), Some(target)) => format!("press {} on {}", key, target),
-                (Some(key), None) => format!("press {}", key),
-                (None, Some(target)) => format!("press {}", target),
-                (None, None) => "press".to_string(),
-            }
-        }
-        "provider_command" => tool
-            .input
-            .get("provider_action")
-            .and_then(|v| v.as_str())
-            .map(|value| format!("provider {}", truncate_middle_display(value, bounded(36))))
-            .unwrap_or_else(|| "provider".to_string()),
-        "status" | "setup" | "list_tabs" | "get_active_tab" | "list_frames" => {
-            action.replace('_', " ")
-        }
-        "select_tab" => tool
-            .input
-            .get("tab_id")
-            .and_then(|v| v.as_i64())
-            .map(|tab_id| format!("select tab {}", tab_id))
-            .unwrap_or_else(|| "select tab".to_string()),
-        _ => action.replace('_', " "),
-    };
-
-    max_width
-        .map(|width| truncate_end_display(summary.as_str(), width))
-        .unwrap_or(summary)
-}
-
 fn truncate_path_with_suffix(path: &str, suffix: &str, max_width: usize) -> String {
     let full = format!("{}{}", path, suffix);
     if UnicodeWidthStr::width(full.as_str()) <= max_width {
@@ -859,11 +673,14 @@ fn truncate_identifier_display(value: &str, max_width: usize) -> String {
 }
 
 pub(super) fn batch_subcall_index(id: &str) -> Option<usize> {
-    id.strip_prefix("batch-")?
-        .split('-')
-        .next()?
-        .parse::<usize>()
-        .ok()
+    let index = id.strip_prefix("batch-")?.split('-').next()?;
+    match index.parse::<usize>() {
+        Ok(index) => Some(index),
+        Err(error) => {
+            crate::logging::debug(&format!("Invalid batch subcall index: {error}"));
+            None
+        }
+    }
 }
 
 pub(super) fn is_memory_store_tool(tc: &ToolCall) -> bool {
@@ -1236,21 +1053,43 @@ pub(super) fn get_tool_summary_with_budget(
                 .unwrap_or_default();
             format!("{} {}", action, target).trim().to_string()
         }
-        "mcp" => {
-            let action = tool
+        // Deterministic MCP label: the tool name identifies the call, so it is
+        // read by name and never depends on argument order. `server` stays out of
+        // the prefix because the tool name already carries it.
+        "mcp" | "mcp_call" => {
+            let tool_name = tool
                 .input
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .get("tool")
+                .or_else(|| tool.input.get("tool_name"))
+                .and_then(|v| v.as_str());
             let server = tool
                 .input
                 .get("server")
                 .or_else(|| tool.input.get("server_name"))
                 .and_then(|v| v.as_str());
-            if let Some(s) = server {
-                format!("{} {}", action, s)
+            let label = match (server, tool_name) {
+                (Some(server), Some(tool_name)) => mcp_display_tool_name(server, tool_name),
+                (_, Some(tool_name)) => mcp_display_tool_name_from_dispatch(tool_name)
+                    .unwrap_or_else(|| tool_name.trim_start_matches("mcp__").to_string()),
+                (Some(server), None) => format!("{} / tool", server),
+                (None, None) => tool
+                    .input
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp")
+                    .to_string(),
+            };
+            // The call's own intent is the short essence: it is already in the
+            // transcript, so showing it costs no model call. A bare query is the
+            // fallback for calls the model sent without an intent.
+            // `bounded` falls back to a default when max_width is None, which
+            // would let a row exceed the width the caller reserved. Cap it.
+            let budget = |preferred: usize| max_width.unwrap_or(preferred).min(preferred);
+            let essence = mcp_essence(&tool.input, budget(24));
+            if essence.is_empty() {
+                truncate_middle_display(&label, budget(64))
             } else {
-                action.to_string()
+                truncate_middle_display(&format!("{label} · {essence}"), budget(88))
             }
         }
         "todo" => {
@@ -1581,13 +1420,18 @@ pub(super) fn get_tool_summary_with_budget(
                 .unwrap_or("debug_socket");
             truncate_middle_display(cmd, bounded(40))
         }
-        name if name.starts_with("mcp__") => tool
-            .input
-            .as_object()
-            .and_then(|obj| obj.iter().find(|(_, v)| v.is_string()))
-            .and_then(|(_, v)| v.as_str())
-            .map(|s| truncate_middle_display(s, bounded(40)))
-            .unwrap_or_default(),
+        name if name.starts_with("mcp__") => {
+            let label = mcp_dispatch_name_display(name, bounded(64));
+            // Same rule as the `mcp` arm: the call's own intent is the short
+            // essence, so a dispatch-named call carries it too.
+            let budget = |preferred: usize| max_width.unwrap_or(preferred).min(preferred);
+            let essence = mcp_essence(&tool.input, budget(24));
+            if essence.is_empty() {
+                label
+            } else {
+                truncate_middle_display(&format!("{label} · {essence}"), budget(88))
+            }
+        }
         // Generic fallback: most action-shaped tools (ambient tools, future
         // additions) at least carry an "action" field. Showing it beats an
         // empty summary, which reads like the row failed to render.
@@ -1598,6 +1442,90 @@ pub(super) fn get_tool_summary_with_budget(
             .map(|action| action.to_string())
             .unwrap_or_default(),
     }
+}
+
+/// Human-readable MCP tool label for a `(server, tool)` pair. Reuses the
+/// dispatch-name normalizer so the row and the registry agree on identity.
+fn mcp_display_tool_name(server: &str, tool: &str) -> String {
+    let dispatch = crate::mcp::dispatch_name(server, tool);
+    mcp_display_tool_name_from_dispatch(&dispatch)
+        .unwrap_or_else(|| dispatch.trim_start_matches("mcp__").to_string())
+}
+
+/// `mcp__<server>__<tool>` -> `server / tool`. Returns `None` for names whose
+/// tool half was truncated to a hash suffix, where a split would be misleading.
+fn mcp_display_tool_name_from_dispatch(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{} / {tool}", server.replace('_', "-")))
+}
+
+/// Always-visible name of a tool row.
+///
+/// MCP names carry no tool identity on their own (`mcp`, or a hashed
+/// `mcp__server__tool`), and `display.tool_call_details` defaults to false, in
+/// which mode the technical summary is dropped entirely. Without this the row
+/// reads only "mcp · <intent>" and the concrete tool is invisible.
+pub(super) fn resolve_row_display_name(tool: &ToolCall) -> String {
+    let resolved = resolve_display_tool_name(&tool.name).to_string();
+    // Only MCP spellings carry (server, tool). Other tools have their own
+    // `tool` field with a different meaning - `integration_tools` uses it for a
+    // product name - so keying off the field alone would mislabel their rows.
+    let is_mcp = tool.name == "mcp"
+        || tool.name == "mcp_call"
+        || tool.name.starts_with("mcp__");
+    if !is_mcp {
+        return resolved;
+    }
+    let tool_name = tool
+        .input
+        .get("tool")
+        .or_else(|| tool.input.get("tool_name"))
+        .and_then(|v| v.as_str());
+    let server = tool
+        .input
+        .get("server")
+        .or_else(|| tool.input.get("server_name"))
+        .and_then(|v| v.as_str());
+    let label = match (server, tool_name) {
+        (Some(server), Some(tool_name)) => Some(mcp_display_tool_name(server, tool_name)),
+        (_, Some(tool_name)) => Some(
+            mcp_display_tool_name_from_dispatch(tool_name)
+                .unwrap_or_else(|| tool_name.trim_start_matches("mcp__").to_string()),
+        ),
+        _ => None,
+    };
+    match label {
+        Some(label) => format!("{}: {label}", resolved),
+        None => resolved,
+    }
+}
+
+/// Short essence of an MCP call, taken from the call itself: `intent` first,
+/// then the first few words of `query`. Truncated to `budget` cells, so a long
+/// intent degrades to a prefix instead of pushing the tool name off the row.
+fn mcp_essence(input: &serde_json::Value, budget: usize) -> String {
+    let raw = input
+        .get("intent")
+        .or_else(|| input.get("query"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let words: Vec<&str> = raw.split_whitespace().take(4).collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    truncate_middle_display(&words.join(" "), budget)
+}
+
+/// Row prefix for a dispatch-named MCP call. Falls back to the trimmed
+/// dispatch name so a truncated/hash-suffixed tool still shows its identity.
+fn mcp_dispatch_name_display(name: &str, budget: usize) -> String {
+    let label = mcp_display_tool_name_from_dispatch(name)
+        .unwrap_or_else(|| name.trim_start_matches("mcp__").to_string());
+    truncate_middle_display(&label, budget)
 }
 
 /// Keep timing and token usage together as one compact metadata group.

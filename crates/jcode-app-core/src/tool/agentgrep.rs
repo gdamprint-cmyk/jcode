@@ -241,15 +241,15 @@ impl Tool for AgentGrepTool {
                 "mode": {
                     "type": "string",
                     "enum": ["grep", "find", "outline", "trace"],
-                    "description": "Mode: grep (default), find (file names), outline (one file), trace (relationship DSL)."
+                    "description": "grep (default), find (file names), outline (one file), trace (relationship DSL)."
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search query. Required for grep (literal unless regex=true); optional ranking terms for find."
+                    "description": "Required for grep (literal unless regex=true); optional ranking terms for find."
                 },
                 "file": {
                     "type": "string",
-                    "description": "Single file to inspect. Required for outline."
+                    "description": "Required for outline."
                 },
                 "terms": {
                     "type": "array",
@@ -258,31 +258,31 @@ impl Tool for AgentGrepTool {
                 },
                 "regex": {
                     "type": "boolean",
-                    "description": "In grep mode, treat query as a regex. Defaults to false (literal)."
+                    "description": "grep: treat query as a regex."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search, relative to the workspace. Omit to search the whole workspace."
+                    "description": "Directory or file, relative to the workspace. Default: whole workspace."
                 },
                 "glob": {
                     "type": "string",
-                    "description": "Optional file glob filter such as **/*.rs. Omit to search everything."
+                    "description": "File glob filter, e.g. **/*.rs."
                 },
                 "type": {
                     "type": "string",
-                    "description": "Optional ripgrep file type filter, such as rs, py, js, ts, or md."
+                    "description": "ripgrep file type, e.g. rs, py, md."
                 },
                 "max_files": {
                     "type": "integer",
-                    "description": "Maximum number of files to return for find/trace-style modes."
+                    "description": "Max files for find/trace."
                 },
                 "max_regions": {
                     "type": "integer",
-                    "description": "Maximum number of matching regions to return."
+                    "description": "Max matching regions."
                 },
                 "paths_only": {
                     "type": "boolean",
-                    "description": "Return only matching paths instead of match excerpts where supported."
+                    "description": "Return paths, not excerpts."
                 }
             }
         })
@@ -334,7 +334,7 @@ async fn await_or_background_search(
                     Some(display_name.clone()),
                     &session_id,
                     true,
-                    false,
+                    true,
                     // Transfer, do not cancel: the background manager becomes
                     // the sole owner, including while adoption is awaiting.
                     owner
@@ -344,22 +344,24 @@ async fn await_or_background_search(
                 )
                 .await;
             Ok(ToolOutput::new(format!(
-                    "Search is still running after 5s and is continuing in background.\n\n\
+                "Search is still running after 5s and is continuing in background.\n\n\
                      Task ID: {}\n\
                      Name: {}\n\n\
-                     Use `bg` with action=\"wait\" and task_id=\"{}\" to wait for completion, or action=\"output\" to inspect its output.",
-                    info.task_id, display_name, info.task_id,
-                ))
-                .with_title(display_name.clone())
-                .with_metadata(json!({
-                    "background": true,
-                    "task_id": info.task_id,
-                    "display_name": display_name,
-                    "output_file": info.output_file.to_string_lossy(),
-                    "status_file": info.status_file.to_string_lossy(),
-                    "timeout_promoted": true,
-                    "foreground_timeout_ms": foreground_budget.as_millis(),
-                })))
+                     {}",
+                info.task_id,
+                display_name,
+                super::BACKGROUND_WAIT_GUIDANCE,
+            ))
+            .with_title(display_name.clone())
+            .with_metadata(json!({
+                "background": true,
+                "task_id": info.task_id,
+                "display_name": display_name,
+                "output_file": info.output_file.to_string_lossy(),
+                "status_file": info.status_file.to_string_lossy(),
+                "timeout_promoted": true,
+                "foreground_timeout_ms": foreground_budget.as_millis(),
+            })))
         }
     }
 }
@@ -503,6 +505,33 @@ fn exact_search_file_path(ctx: &ToolContext, path: Option<&str>) -> Option<Strin
         .map(|name| name.to_string_lossy().into_owned())
 }
 
+/// Match a search-result path against the exact file the caller asked for.
+///
+/// The result paths are RELATIVE to the search root (the agentgrep crate's
+/// `display_path`, e.g. `.\util.rs`), while the caller's request is reduced
+/// to the bare FILE NAME. Comparing the two strings directly never matches
+/// for a nested file, so a file-scoped search silently dropped every file and
+/// reported zero matches.
+///
+/// The comparison is on the NORMALISED RELATIVE path, not on the file name:
+/// the root handed to ripgrep is the parent directory of the requested file
+/// and the glob is the bare name, and that glob is recursive - a directory
+/// holding `a.rs` and `sub/a.rs` matches both. Matching on the name alone
+/// would let the unrelated `sub/a.rs` through; matching the relative path
+/// keeps exactly the requested file.
+fn path_matches_exact_file(result_path: &str, exact_file: &str) -> bool {
+    fn normalize(path: &str) -> String {
+        let trimmed = path.trim();
+        let without_prefix = trimmed
+            .strip_prefix("./")
+            .or_else(|| trimmed.strip_prefix(".\\"))
+            .unwrap_or(trimmed);
+        without_prefix.replace('/', "\\")
+    }
+
+    normalize(result_path) == normalize(exact_file)
+}
+
 fn filter_grep_result_to_exact_file(
     mut result: GrepResult,
     exact_file: Option<&str>,
@@ -511,7 +540,9 @@ fn filter_grep_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.total_files = result.files.len();
     result.total_matches = result.files.iter().map(|file| file.matches.len()).sum();
     result
@@ -525,7 +556,9 @@ fn filter_find_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result
 }
 
@@ -537,7 +570,9 @@ fn filter_smart_result_to_exact_file(
         return result;
     };
 
-    result.files.retain(|file| file.path == exact_file);
+    result
+        .files
+        .retain(|file| path_matches_exact_file(&file.path, exact_file));
     result.summary.total_files = result.files.len();
     result.summary.total_regions = result.files.iter().map(|file| file.regions.len()).sum();
     result.summary.best_file = result.files.first().map(|file| file.path.clone());
@@ -568,3 +603,7 @@ fn is_match_all_glob(glob: &str) -> bool {
 #[cfg(test)]
 #[path = "agentgrep_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agentgrep_scope_tests.rs"]
+mod scope_tests;

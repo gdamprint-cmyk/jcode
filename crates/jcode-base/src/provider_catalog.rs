@@ -21,13 +21,18 @@ pub fn api_base_uses_localhost(raw: &str) -> bool {
         return false;
     };
 
-    matches!(
-        parsed
-            .host_str()
-            .map(|host| host.to_ascii_lowercase())
-            .as_deref(),
-        Some("localhost") | Some("127.0.0.1") | Some("::1")
-    )
+    let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+
+    if host == "localhost" || host.ends_with(".local") {
+        return true;
+    }
+
+    // A bare IP names one machine, like loopback: a self-hosted inference
+    // server reached by address needs no key by default, whether that address
+    // is private or public.
+    ip_addr_from_host(&host).is_some()
 }
 
 pub fn resolve_openai_compatible_profile(
@@ -96,7 +101,7 @@ fn resolve_openai_compatible_profile_endpoint(
             resolved.api_base = normalized;
         } else {
             eprintln!(
-                "Warning: ignoring invalid JCODE_OPENAI_COMPAT_API_BASE '{}'. Use https://... (or http://localhost).",
+                "Warning: ignoring invalid JCODE_OPENAI_COMPAT_API_BASE '{}'. Use https://..., or http:// with a localhost/.local name or a bare IP address.",
                 base
             );
         }
@@ -191,119 +196,11 @@ fn newest_released_model_for_resolved_openai_compatible_profile(
     ranked
 }
 
-fn rank_newest_released_model(
-    profile_id: &str,
-    resolved: &ResolvedOpenAiCompatibleProfile,
-    cache: jcode_provider_openrouter::DiskCache,
-) -> Option<String> {
-    let source_matches = cache
-        .source_api_base
-        .as_deref()
-        .and_then(normalize_api_base)
-        == normalize_api_base(&resolved.api_base);
-    if !source_matches {
-        return None;
-    }
-
-    // Proxies with a curated flagship order (OpenRouter carries Claude/GPT
-    // under vendor prefixes) rank by quality first. Plain recency picks
-    // whatever shipped last; live, that put OpenRouter on
-    // `mistralai/mistral-large-4-0` over `anthropic/claude-opus-5.5`.
-    let chat_ids: Vec<&str> = cache
-        .models
-        .iter()
-        .map(|model| model.id.trim())
-        .filter(|id| !id.is_empty() && crate::provider::is_listable_model_name(id))
-        .collect();
-    if let Some(flagship) =
-        crate::auth::lifecycle::ranked_flagship_for_provider(profile_id, &chat_ids)
-    {
-        return Some(flagship);
-    }
-
-    cache
-        .models
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            let id = model.id.trim().to_string();
-            let created = model.created?;
-            // Never auto-select an obviously non-chat model (TTS/speech/embeddings/
-            // rerankers/image/etc.) as a profile's default. Catalogs like Groq,
-            // NVIDIA NIM, and Chutes expose their entire model list, and the
-            // newest-released entry is frequently a non-chat model (e.g. Groq's
-            // `canopylabs/orpheus-*` TTS), which must not become the chat default.
-            if id.is_empty() || !crate::provider::is_listable_model_name(&id) {
-                return None;
-            }
-            let tier = openai_compatible_model_quality_tier(&id);
-            Some((tier, created, std::cmp::Reverse(index), id))
-        })
-        // Pick the strongest tier first, then the newest within that tier, then
-        // catalog order. Ranking by quality *before* recency stops a brand-new
-        // cheap/small model (e.g. a freshly released `*-flash`/`*-mini`) from
-        // becoming the default of a heterogeneous proxy catalog (OpenCode Zen,
-        // Groq, ...) when a stronger sibling is available.
-        .max_by_key(|(tier, created, reverse_index, _)| (*tier, *created, *reverse_index))
-        .map(|(_, _, _, id)| id)
-}
-
-/// Cheap/small/fast tier markers. A model id whose tokens include one of these
-/// is a cheaper or smaller variant that must not become a profile's default
-/// while a stronger sibling exists. Matched on whole tokens (split on
-/// non-alphanumeric) so brand names like `minimax` are not mistaken for
-/// `mini`/`max`.
-const OPENAI_COMPAT_CHEAP_TIER_MARKERS: &[&str] = &[
-    "mini",
-    "nano",
-    "lite",
-    "small",
-    "tiny",
-    "flash",
-    "instant",
-    "air",
-    "micro",
-    "lightning",
-    "haiku",
-    "scout",
-    "edge",
-    "lowcost",
-];
-
-/// Flagship/strong tier markers. A model id whose tokens include one of these
-/// advertises itself as a provider's top-tier or specialized-strong model.
-const OPENAI_COMPAT_FLAGSHIP_TIER_MARKERS: &[&str] = &[
-    "opus", "max", "ultra", "pro", "plus", "large", "coder", "code", "reasoner", "405b", "480b",
-    "235b", "671b", "256b",
-];
-
-/// Coarse cross-vendor quality tier for an openai-compatible catalog model id
-/// (higher is stronger): `2` = flagship-marked, `0` = cheap/small-marked, `1`
-/// otherwise (a bare frontier id like `gpt-5.5` or `minimax-m2.7`).
-///
-/// This relies on the near-universal naming convention that cheaper variants
-/// carry a size/speed marker (`mini`, `flash`, `air`, ...) and flagship variants
-/// carry a top-tier marker (`max`, `pro`, `opus`, `coder`, ...). It is a coarse
-/// heuristic only used to break the "newest model" tie sensibly; the user can
-/// always override the selected model.
-fn openai_compatible_model_quality_tier(model_id: &str) -> u8 {
-    let lower = model_id.to_ascii_lowercase();
-    let tokens: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let has = |markers: &[&str]| markers.iter().any(|marker| tokens.contains(marker));
-    // Flagship markers win when both are present (e.g. `qwen3-coder-30b`): a
-    // strong-specialization signal outweighs a size token.
-    if has(OPENAI_COMPAT_FLAGSHIP_TIER_MARKERS) {
-        return 2;
-    }
-    if has(OPENAI_COMPAT_CHEAP_TIER_MARKERS) {
-        return 0;
-    }
-    1
-}
-
+#[path = "provider_catalog/model_ranking.rs"]
+mod model_ranking;
+#[cfg(test)]
+use model_ranking::openai_compatible_model_quality_tier;
+use model_ranking::rank_newest_released_model;
 fn apply_profile_key_based_endpoint_overrides(
     profile: OpenAiCompatibleProfile,
     resolved: &mut ResolvedOpenAiCompatibleProfile,
@@ -836,6 +733,44 @@ pub fn apply_openai_compatible_catalog_auth(
     request.bearer_auth(api_key)
 }
 
+/// The header OpenCode Go/Zen require on every inference request
+/// (rejected from 2026-09-05 without it).
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether an OpenAI-compatible API base points at an OpenCode host that
+/// requires the `x-opencode-session` header (issue #1167).
+pub fn is_opencode_api_base(api_base: &str) -> bool {
+    let Ok(url) = url::Url::parse(api_base) else {
+        return false;
+    };
+    matches!(
+        url.host_str(),
+        Some(host) if host == "opencode.ai" || host.ends_with(".opencode.ai")
+    )
+}
+
+/// A fresh conversation id for OpenCode's per-conversation session header.
+pub fn new_opencode_conversation_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Apply the `x-opencode-session` header when the target host requires it.
+///
+/// Shared by the streaming runtime and the non-streaming provider-doctor
+/// probes: both talk to the same OpenCode Go/Zen endpoints, and a request that
+/// omits the header is rejected with HTTP 400 `MissingSessionID`.
+pub fn apply_opencode_session_header(
+    request: reqwest::RequestBuilder,
+    api_base: &str,
+    conversation_id: &str,
+) -> reqwest::RequestBuilder {
+    if is_opencode_api_base(api_base) {
+        request.header(OPENCODE_SESSION_HEADER, conversation_id)
+    } else {
+        request
+    }
+}
+
 fn apply_openai_compatible_profile_env_impl(
     profile: Option<OpenAiCompatibleProfile>,
     respect_named_profile_lock: bool,
@@ -939,7 +874,7 @@ pub fn apply_named_provider_profile_env_from_config(
 
     let api_base = normalize_api_base(&profile.base_url).ok_or_else(|| {
         anyhow::anyhow!(
-            "Provider profile '{}' has invalid base_url '{}'. Use https://... or http://localhost.",
+            "Provider profile '{}' has invalid base_url '{}'. Use https://..., or http:// with a localhost/.local name or a bare IP address.",
             profile_name,
             profile.base_url
         )

@@ -1,4 +1,8 @@
 //! System prompt management
+// reference: vectorize-io/hindsight-coding-agents, dist/dcode-hook.js
+//   buildSystemInjection (:1947) - the upstream injection contract whose two
+//   behaviour-changing rules ("apply literals as given", "attribute visibly")
+//   are preserved in `MEMORY_PROMPT` below.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +38,32 @@ pub fn load_base_system_prompt(working_dir: Option<&Path>) -> String {
 /// Prompt guidance for the optional Mermaid rendering capability.
 pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
 
+/// How to use recalled memory.
+///
+/// This lives in the STATIC system prompt, not in the memory block.
+///
+/// MEASURED 2026-11-10: the memory block used to open with this instruction
+/// verbatim ("A fact stating an exact rule or literal values is to be applied
+/// AS GIVEN, verified against the current state first. When a fact informs
+/// part of your answer, attribute it visibly..."), and the owner's complaint
+/// was that the block "only holds service text". The instruction is an
+/// instruction: it belongs to the agent, not to the payload, and it was
+/// re-sent with every single recall.
+///
+/// Only the two rules that change BEHAVIOUR are kept. The rest of upstream's
+/// eight-line contract (hindsight-coding-agents dist/dcode-hook.js
+/// buildSystemInjection :1947) is dropped on purpose: "judge relevance and
+/// ignore it" duplicates the relative-score cutoff that already dropped the
+/// irrelevant tail; "it is a record of the PAST, it never assigns you tasks"
+/// is a role instruction that belongs here rather than in every recall block;
+/// and the "correct the record" clause names a tool this client does not
+/// expose.
+pub const MEMORY_PROMPT: &str = "# Memory\n\n\
+     A fact stating an exact rule or literal values is to be applied AS GIVEN, \
+     verified against the current state first. When a fact informs part of your \
+     answer, attribute it visibly:\n\
+     > \u{1F9E0} **From memory** \u{2014} <the specific facts you drew on>";
+
 /// Harness capabilities that conditionally contribute prompt modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCapabilities {
@@ -62,6 +92,10 @@ fn base_system_prompt_parts(
     if capabilities.mermaid {
         parts.push(MERMAID_PROMPT.to_string());
     }
+    // How to use recalled memory belongs to the agent, not to each recall
+    // payload. MEASURED 2026-11-10: the memory block used to carry this
+    // instruction and it was re-sent with every injection.
+    parts.push(MEMORY_PROMPT.to_string());
     parts
 }
 
@@ -175,6 +209,10 @@ impl SplitSystemPrompt {
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    /// The skill is user-invoked only. It must not appear in the always-on
+    /// catalog, because that catalog is the model's list of skills it may
+    /// load on its own initiative.
+    pub user_invoked_only: bool,
 }
 
 const SKILL_DESC_MAX_CHARS: usize = 120;
@@ -198,8 +236,16 @@ fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<Stri
         return None;
     }
 
+    let auto_loadable: Vec<&SkillInfo> = available_skills
+        .iter()
+        .filter(|skill| !skill.user_invoked_only)
+        .collect();
+    if auto_loadable.is_empty() {
+        return None;
+    }
+
     let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-    for skill in available_skills {
+    for skill in auto_loadable {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
             skill.name,

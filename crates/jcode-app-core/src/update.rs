@@ -1,3 +1,10 @@
+// reference: in-repo prior art - crates/jcode-build-support/src/landing.rs
+// (read 2026-11-15), the crash-safe landing transaction (journal, single-writer
+// lock, daemon handoff, daemon proof, client activation last), and
+// crates/jcode-app-core/src/server/debug_command_exec.rs (read 2026-11-15), the
+// debug reload that lands a build by running the TARGET's own versioned binary
+// as `server land <version> --json`. The update paths here use the same
+// mechanism instead of moving the channels inline.
 use crate::build;
 use crate::storage;
 use anyhow::{Context, Result};
@@ -239,6 +246,15 @@ pub fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
     Ok(release)
 }
 
+#[path = "update_preview.rs"]
+mod update_preview;
+#[path = "update_stable.rs"]
+mod update_stable;
+pub use update_preview::{check_for_update_with_channel_blocking, fetch_latest_preview_blocking};
+use update_preview::{
+    prepare_preview_update_blocking, prepare_stable_update_blocking, preview_number,
+};
+
 fn github_api_request(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -290,7 +306,15 @@ fn platform_asset(release: &GitHubRelease) -> Result<&GitHubAsset> {
     release
         .assets
         .iter()
-        .find(|a| a.name.starts_with(asset_name))
+        .find(|a| {
+            if preview_number(&release.tag_name).is_some() {
+                (a.name == asset_name || a.name == format!("{asset_name}.tar.gz"))
+                    && a._size > 0
+                    && !a.browser_download_url.is_empty()
+            } else {
+                a.name.starts_with(asset_name)
+            }
+        })
         .ok_or_else(|| anyhow::anyhow!("No asset found for platform: {}", asset_name))
 }
 
@@ -305,6 +329,9 @@ fn verify_asset_checksum_if_available(
     bytes: &[u8],
 ) -> Result<()> {
     let Some(checksum_asset) = checksum_asset(release) else {
+        if preview_number(&release.tag_name).is_some() {
+            anyhow::bail!("Preview release is missing SHA256SUMS");
+        }
         crate::logging::info(&format!(
             "Release {} does not include SHA256SUMS; skipping checksum verification",
             release.tag_name
@@ -347,18 +374,23 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     let channel_version = format!("main-{}", latest_sha);
     build::install_binary_at_version(&path, &channel_version)
         .context("Failed to install built binary")?;
-    // Carry the long-lived daemon's reload target forward too, but only when it
-    // was tracking stable. A deliberately-promoted self-dev shared-server build
-    // is left untouched so the update never silently wipes it out.
-    if let Err(error) = build::advance_shared_server_if_tracking_stable(&channel_version) {
-        crate::logging::warn(&format!(
-            "update: failed to advance shared-server channel to {}: {}",
-            channel_version, error
-        ));
-    }
-    build::update_stable_symlink(&channel_version)?;
-    build::update_current_symlink(&channel_version)?;
-    build::update_launcher_symlink_to_current()?;
+
+    // LAND the build as ONE transaction. The main channel is a development
+    // channel of the very source tree the user develops, so it may land over a
+    // pinned self-dev daemon: the landing moves the daemon channel AND the
+    // client channels together, so there is no split either way.
+    //
+    // The landing is run by the TARGET's own versioned binary
+    // (`server land <version> --json`), exactly like the debug reload path:
+    // the child journals the transaction, hands the daemon off, PROVES the
+    // daemon runs the target and only then moves the client channels. This
+    // path never moves a channel itself.
+    let outcome = build::land_release_version(&channel_version, true, &mut |version| {
+        build::land_installed_version(version)
+    })?;
+    crate::logging::info(&format!(
+        "Main channel: landed {channel_version} ({outcome:?})"
+    ));
 
     metadata.installed_version = Some(channel_version.clone());
     metadata.installed_from = Some("source".to_string());
@@ -368,15 +400,8 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
+fn prepare_release_update(release: GitHubRelease) -> Result<PreparedUpdate> {
     let current_version = jcode_build_meta::version();
-    let release = fetch_latest_release_blocking()?;
-
-    if !release_is_update(&release)? {
-        return Ok(PreparedUpdate::None {
-            current: current_version.to_string(),
-        });
-    }
 
     let Ok(asset) = platform_asset(&release) else {
         return Ok(PreparedUpdate::None {
@@ -480,6 +505,7 @@ pub fn prepare_update_blocking() -> Result<PreparedUpdate> {
     match channel {
         crate::config::UpdateChannel::Main => prepare_main_update_blocking(),
         crate::config::UpdateChannel::Stable => prepare_stable_update_blocking(),
+        crate::config::UpdateChannel::Preview => prepare_preview_update_blocking(),
     }
 }
 
@@ -588,29 +614,7 @@ pub fn spawn_background_session_update(session_id: String) {
 }
 
 pub fn check_for_update_blocking() -> Result<Option<GitHubRelease>> {
-    let channel = crate::config::config().features.update_channel;
-    match channel {
-        crate::config::UpdateChannel::Main => check_for_main_update_blocking(),
-        crate::config::UpdateChannel::Stable => check_for_stable_update_blocking(),
-    }
-}
-
-fn check_for_stable_update_blocking() -> Result<Option<GitHubRelease>> {
-    let release = fetch_latest_release_blocking()?;
-
-    if release_is_update(&release)? {
-        let asset_name = get_asset_name();
-        let has_asset = release
-            .assets
-            .iter()
-            .any(|a| a.name.starts_with(asset_name));
-
-        if has_asset {
-            return Ok(Some(release));
-        }
-    }
-
-    Ok(None)
+    check_for_update_with_channel_blocking(None)
 }
 
 /// Check for updates on the main branch (cutting edge channel).
@@ -664,16 +668,9 @@ fn check_for_main_update_blocking() -> Result<Option<GitHubRelease>> {
         crate::logging::info("Main channel: cargo not found, falling back to latest release");
     }
 
-    // Fallback: use latest stable release if available
-    if let Ok(release) = fetch_latest_release_blocking() {
-        let asset_name = get_asset_name();
-        let has_asset = release
-            .assets
-            .iter()
-            .any(|a| a.name.starts_with(asset_name));
-        if has_asset && release_is_update(&release)? {
-            return Ok(Some(release));
-        }
+    // Fallback: newest installable stable release, if any.
+    if let Ok(Some(release)) = update_stable::find_stable_update_blocking() {
+        return Ok(Some(release));
     }
 
     Ok(None)
@@ -967,17 +964,123 @@ fn log_download_retry_short(attempt: usize, downloaded: u64, total: u64) {
     ));
 }
 
+/// Install a `.tar.gz` release archive into `builds/versions/<version>/`.
+///
+/// This branch of the updater installs the release DIRECTLY: it creates
+/// `builds/versions/<version>/` and copies the binary in, so it never goes
+/// through `install_binary_at_version` and would leave NO durable publication
+/// proof. The publication is therefore recorded in the append-only ledger
+/// explicitly, or the tarball release path - the one the real release
+/// artifacts use - stays unprovable once the version GC removes the directory.
+///
+/// Returns the path of the installed binary.
+///
+/// reference: crates/jcode-build-support/src/lib.rs:378
+/// `install_binary_at_version` - the sibling path that DOES record its row
+/// automatically, and the reason this branch has to record its own.
+/// reference: crates/jcode-build-support/src/lib.rs:251 `record_publication`.
+/// reference: https://docs.rs/tar/latest/tar/struct.Archive.html (read
+/// 2026-11-16) - `Archive::entries` "Construct an iterator over the entries
+/// in this archive" and the note that "entries are processed out of sequence
+/// ... the contents read for each entry may be corrupted"; `Entry::unpack`
+/// extracts one entry to the given path.
+fn install_tarball_release(bytes: &[u8], version: &str, extract_dir: &Path) -> Result<PathBuf> {
+    let cursor = std::io::Cursor::new(bytes);
+    let gz = flate2::read::GzDecoder::new(cursor);
+    let mut archive = tar::Archive::new(gz);
+    if extract_dir.exists() {
+        let _ = fs::remove_dir_all(extract_dir);
+    }
+    fs::create_dir_all(extract_dir).context("Failed to create archive extraction dir")?;
+    let mut extracted_binary: Option<PathBuf> = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.into_owned();
+        if entry_path.components().count() != 1 {
+            continue;
+        }
+        let file_name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if file_name.is_empty() || file_name.ends_with(".tar.gz") {
+            continue;
+        }
+        let dest = extract_dir.join(&file_name);
+        entry.unpack(&dest)?;
+        if file_name.starts_with("jcode") && !file_name.ends_with(".bin") {
+            extracted_binary = Some(dest);
+        }
+    }
+    let Some(extracted_binary) = extracted_binary else {
+        anyhow::bail!("Could not find jcode binary inside tar.gz archive");
+    };
+    crate::platform::set_permissions_executable(&extracted_binary)?;
+
+    let dest_dir = build::builds_dir()?.join("versions").join(version);
+    fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
+    let mut installed_files = Vec::new();
+    for entry in fs::read_dir(extract_dir).context("Failed to read extracted archive")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        let dest_name = if name_string == get_asset_name()
+            || name_string == format!("{}.exe", get_asset_name())
+        {
+            build::binary_name().to_string()
+        } else {
+            name_string.to_string()
+        };
+        let dest = dest_dir.join(dest_name);
+        if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+        fs::copy(entry.path(), &dest)
+            .with_context(|| format!("Failed to install {}", dest.display()))?;
+        if dest
+            .file_name()
+            .is_some_and(|name| name == build::binary_name())
+            || dest.extension().is_some_and(|ext| ext == "bin")
+        {
+            crate::platform::set_permissions_executable(&dest)?;
+        }
+        installed_files.push(dest);
+    }
+    // Give every installed file the same mtime. The wrapper script and the
+    // `.bin` payload otherwise land with whatever sub-second skew the copy
+    // loop produced, and any code comparing binary freshness by mtime then
+    // sees two "different age" files for one logical install.
+    let install_stamp = SystemTime::now();
+    for path in &installed_files {
+        if let Ok(file) = fs::File::options().write(true).open(path) {
+            let _ = file.set_modified(install_stamp);
+        }
+    }
+    let _ = fs::remove_dir_all(extract_dir);
+
+    if let Err(err) = build::record_publication(&build::PublicationRecord {
+        version: version.to_string(),
+        source_fingerprint: String::new(),
+        published_at: chrono::Utc::now(),
+        validated: false,
+    }) {
+        eprintln!(
+            "warning: could not record the installation of {version} in the durable ledger: {err}"
+        );
+    }
+
+    Ok(dest_dir.join(build::binary_name()))
+}
+
 pub fn download_and_install_blocking_with_progress(
     release: &GitHubRelease,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf> {
     let started = Instant::now();
-    let asset_name = get_asset_name();
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name.starts_with(asset_name))
-        .ok_or_else(|| anyhow::anyhow!("No asset found for platform: {}", asset_name))?;
+    let asset = platform_asset(release)?;
 
     let download_url = asset.browser_download_url.clone();
 
@@ -1008,84 +1111,11 @@ pub fn download_and_install_blocking_with_progress(
 
     let mut installed_version_dir: Option<PathBuf> = None;
     if asset.name.ends_with(".tar.gz") {
-        let cursor = std::io::Cursor::new(&bytes);
-        let gz = flate2::read::GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(gz);
-        let extract_dir = temp_path.with_extension("extract");
-        if extract_dir.exists() {
-            let _ = fs::remove_dir_all(&extract_dir);
-        }
-        fs::create_dir_all(&extract_dir).context("Failed to create archive extraction dir")?;
-        let mut extracted_binary: Option<PathBuf> = None;
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.into_owned();
-            if entry_path.components().count() != 1 {
-                continue;
-            }
-            let file_name = entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if file_name.is_empty() || file_name.ends_with(".tar.gz") {
-                continue;
-            }
-            let dest = extract_dir.join(&file_name);
-            entry.unpack(&dest)?;
-            if file_name.starts_with("jcode") && !file_name.ends_with(".bin") {
-                extracted_binary = Some(dest);
-            }
-        }
-        let Some(extracted_binary) = extracted_binary else {
-            anyhow::bail!("Could not find jcode binary inside tar.gz archive");
-        };
-        crate::platform::set_permissions_executable(&extracted_binary)?;
-
-        let version = release.tag_name.trim_start_matches('v');
-        let dest_dir = build::builds_dir()?.join("versions").join(version);
-        fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
-        let mut installed_files = Vec::new();
-        for entry in fs::read_dir(&extract_dir).context("Failed to read extracted archive")? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_string = name.to_string_lossy();
-            let dest_name = if name_string == get_asset_name()
-                || name_string == format!("{}.exe", get_asset_name())
-            {
-                build::binary_name().to_string()
-            } else {
-                name_string.to_string()
-            };
-            let dest = dest_dir.join(dest_name);
-            if dest.exists() {
-                fs::remove_file(&dest)?;
-            }
-            fs::copy(entry.path(), &dest)
-                .with_context(|| format!("Failed to install {}", dest.display()))?;
-            if dest
-                .file_name()
-                .is_some_and(|name| name == build::binary_name())
-                || dest.extension().is_some_and(|ext| ext == "bin")
-            {
-                crate::platform::set_permissions_executable(&dest)?;
-            }
-            installed_files.push(dest);
-        }
-        // Give every installed file the same mtime. The wrapper script and the
-        // `.bin` payload otherwise land with whatever sub-second skew the copy
-        // loop produced, and any code comparing binary freshness by mtime then
-        // sees two "different age" files for one logical install.
-        let install_stamp = SystemTime::now();
-        for path in &installed_files {
-            if let Ok(file) = fs::File::options().write(true).open(path) {
-                let _ = file.set_modified(install_stamp);
-            }
-        }
-        let _ = fs::remove_dir_all(&extract_dir);
-        installed_version_dir = Some(dest_dir.join(build::binary_name()));
+        installed_version_dir = Some(install_tarball_release(
+            &bytes,
+            release.tag_name.trim_start_matches('v'),
+            &temp_path.with_extension("extract"),
+        )?);
     } else {
         fs::write(&temp_path, &bytes).context("Failed to write temp file")?;
     }
@@ -1105,15 +1135,28 @@ pub fn download_and_install_blocking_with_progress(
     // Termux's glibc loader (mirrors scripts/install.sh). Fail before advancing
     // any channel symlinks so we never switch to a binary that cannot exec.
     patch_termux_interpreter_if_needed(&versioned_path)?;
-    if let Err(error) = build::advance_shared_server_if_tracking_stable(version) {
-        crate::logging::warn(&format!(
-            "update: failed to advance shared-server channel to {}: {}",
-            version, error
-        ));
-    }
-    build::update_stable_symlink(version)?;
-    build::update_current_symlink(version)?;
-    build::update_launcher_symlink_to_current()?;
+
+    // LAND the release as ONE transaction, instead of moving the daemon
+    // channel, the `stable` channel, the `current` channel and the launcher
+    // as four independent filesystem operations.
+    //
+    // That old sequence was the defect: a crash between "the daemon channel
+    // moved" and "the client channels moved" left the daemon on the new
+    // release and every client on the old one, permanently. The landing
+    // transaction journals the whole thing, hands the daemon off, PROVES the
+    // daemon runs the new release, and only then moves the client channels.
+    //
+    // The landing is run by the TARGET's own versioned binary
+    // (`server land <version> --json`), so this path never moves a channel
+    // itself.
+    //
+    // A pinned self-dev daemon is REFUSED here (the pin exists to keep that
+    // build running): the release stays installed, no channel moves, and the
+    // user can land it explicitly with `jcode server land <version>`.
+    let outcome = build::land_release_version(version, false, &mut |version| {
+        build::land_installed_version(version)
+    })?;
+    crate::logging::info(&format!("update: landed {version} ({outcome:?})"));
 
     metadata.installed_version = Some(release.tag_name.clone());
     metadata.installed_from = Some(asset.browser_download_url.clone());

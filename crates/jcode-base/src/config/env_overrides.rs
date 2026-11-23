@@ -7,6 +7,14 @@ impl Config {
         reason = "Environment override parsing is intentionally explicit and grouped by config area"
     )]
     pub(crate) fn apply_env_overrides(&mut self) {
+        if let Ok(endpoint) = std::env::var("JCODE_JARVIS_SPEECH_ENDPOINT") {
+            // Preserve an explicitly empty value so endpoint validation fails
+            // rather than silently changing the selected voice to eSpeak.
+            self.jarvis.speech.endpoint = Some(endpoint);
+        }
+        if let Ok(value) = std::env::var("JCODE_BROWSER_HANDOFF") {
+            self.tools.browser_handoff = value == "1" || value.eq_ignore_ascii_case("true");
+        }
         // Server/operator behavior
         if let Ok(v) = std::env::var("JCODE_WAKE_MODE")
             && let Some(parsed) = WakeMode::parse(&v)
@@ -292,6 +300,16 @@ impl Config {
                 self.display.resume_project_scope = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_RESUME_TIME") {
+            if let Some(parsed) = super::ResumeTimeMode::parse(&v) {
+                self.display.resume_time = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_RESUME_OPEN_ELSEWHERE") {
+            if let Some(parsed) = super::ResumeOpenElsewhere::parse(&v) {
+                self.display.resume_open_elsewhere = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_PERFORMANCE") {
             let trimmed = v.trim().to_lowercase();
             if matches!(trimmed.as_str(), "auto" | "full" | "reduced" | "minimal") {
@@ -353,7 +371,51 @@ impl Config {
         }
 
         // Features
-        if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
+        //
+        // reference: ~/.jcode/research/2026-11-04-hindsight-memory-backend-and-refresh.md
+        // reference: no prior art, searched the jcode repo and the Hindsight docs for an existing
+        // provider-scoped enable flag; the global JCODE_MEMORY_ENABLED switch has no per-backend
+        // equivalent, so the split below is the smallest change that keeps the two backends apart.
+        //
+        // MEASURED 2026-11-05: this host sets `JCODE_MEMORY_ENABLED=false` in
+        // the user environment. That flag was written for the JEV backend,
+        // whose recall costs a model call per query and was therefore turned
+        // off for cost. The Hindsight backend makes NO model call (local
+        // pgvector + BM25 + graph + a local cross-encoder), so the same flag
+        // must not disable it.
+        //
+        // `JCODE_HINDSIGHT_MEMORY_ENABLED` was already present in the
+        // environment but referenced by NO code path, so it had no effect at
+        // all. It is now the explicit switch for the Hindsight backend and it
+        // is read INDEPENDENTLY of `JCODE_MEMORY_ENABLED`, so that:
+        //
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=true`  -> memory runs;
+        //   * `JCODE_HINDSIGHT_MEMORY_ENABLED=false` -> memory is off;
+        //   * unset / unparseable                   -> memory runs.
+        //
+        // The unset case means "enabled" on purpose. Falling back to the
+        // global flag would re-open the exact bug this branch fixes: the
+        // global flag is a JEV-cost switch, and a user who set it to false
+        // for that reason never asked for the local backend to be silenced.
+        // The only way to turn the Hindsight backend off is to say so.
+        let hindsight_selected = self
+            .agents
+            .memory_provider
+            .eq_ignore_ascii_case("hindsight");
+        if hindsight_selected {
+            match std::env::var("JCODE_HINDSIGHT_MEMORY_ENABLED") {
+                Ok(hindsight_value) => {
+                    if let Some(hindsight_enabled) = parse_env_bool(&hindsight_value) {
+                        self.features.memory = hindsight_enabled;
+                    } else {
+                        self.features.memory = true;
+                    }
+                }
+                Err(_) => {
+                    self.features.memory = true;
+                }
+            }
+        } else if let Ok(v) = std::env::var("JCODE_MEMORY_ENABLED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.memory = parsed;
             }
@@ -430,11 +492,6 @@ impl Config {
                 self.agents.swarm_spawn_mode = parsed;
             }
         }
-        if let Ok(v) = std::env::var("JCODE_SWARM_STRIP_LAYOUT") {
-            if let Some(parsed) = SwarmStripLayout::parse(&v) {
-                self.agents.swarm_strip_layout = parsed;
-            }
-        }
         if let Ok(v) = std::env::var("JCODE_SWARM_MAX_CONCURRENT_AGENTS") {
             if let Ok(parsed) = v.trim().parse::<usize>() {
                 self.agents.swarm_max_concurrent_agents = parsed;
@@ -452,11 +509,20 @@ impl Config {
                 _ => {}
             }
         }
-        if let Ok(v) = std::env::var("JCODE_MEMORY_JEV_PROVIDER") {
-            self.agents.memory_jev_provider = v.trim().to_ascii_lowercase();
+        if let Ok(v) = std::env::var("JCODE_MEMORY_PROVIDER") {
+            self.agents.memory_provider = v.trim().to_ascii_lowercase();
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_HINDSIGHT_LIMIT") {
+            if let Ok(limit) = v.trim().parse::<usize>() {
+                self.agents.memory_hindsight_limit = limit;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_REFRESH_TOOL_CALLS") {
+            if let Ok(calls) = v.trim().parse::<usize>() {
+                self.agents.memory_refresh_tool_calls = calls;
+            }
         }
         for (key, target) in [
-            ("JCODE_MEMORY_JEV_MODEL", &mut self.agents.memory_jev_model),
             (
                 "JCODE_BROWSER_JEV_MODEL",
                 &mut self.agents.browser_jev_model,
@@ -475,11 +541,6 @@ impl Config {
             } else {
                 Some(trimmed.to_string())
             };
-        }
-        if let Ok(v) = std::env::var("JCODE_MEMORY_SIDECAR_ENABLED") {
-            if let Some(parsed) = parse_env_bool(&v) {
-                self.agents.memory_sidecar_enabled = parsed;
-            }
         }
         if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BACKEND") {
             let trimmed = v.trim();

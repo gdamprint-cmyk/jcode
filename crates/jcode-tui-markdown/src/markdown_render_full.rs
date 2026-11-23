@@ -18,6 +18,41 @@ pub fn thread_render_count() -> u64 {
 }
 
 pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
+    render_markdown_with_options(text, max_width, config_snapshot().show_link_urls, None)
+}
+
+/// Render markdown with a foreground override for prose only.
+///
+/// The override is local to this render. Code, links, images, and diagram
+/// placeholders retain their semantic styles, while prose keeps its modifiers.
+pub fn render_markdown_with_width_and_prose_color(
+    text: &str,
+    max_width: Option<usize>,
+    prose_color: Color,
+) -> Vec<Line<'static>> {
+    render_markdown_with_options(
+        text,
+        max_width,
+        config_snapshot().show_link_urls,
+        Some(prose_color),
+    )
+}
+
+#[cfg(test)]
+fn render_markdown_with_link_urls(
+    text: &str,
+    max_width: Option<usize>,
+    show_link_urls: bool,
+) -> Vec<Line<'static>> {
+    render_markdown_with_options(text, max_width, show_link_urls, None)
+}
+
+fn render_markdown_with_options(
+    text: &str,
+    max_width: Option<usize>,
+    show_link_urls: bool,
+    prose_color: Option<Color>,
+) -> Vec<Line<'static>> {
     let render_start = Instant::now();
     let text = jcode_render_core::normalize_latex_math(text);
     let text = escape_currency_dollars(&text);
@@ -120,7 +155,13 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
                     let heading_spans: Vec<Span<'static>> = current_spans
                         .drain(..)
                         .map(|s| {
-                            let mut style = Style::default().fg(color).bold();
+                            let mut style = if prose_color.is_some() {
+                                // Text events already carry the prose override. Keep
+                                // semantic code/link/image styles inside headings.
+                                s.style.bold()
+                            } else {
+                                Style::default().fg(color).bold()
+                            };
                             if underline {
                                 style = style.underlined();
                             }
@@ -233,6 +274,7 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
             }
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link_targets.pop()
+                    && show_link_urls
                     && !url.is_empty()
                 {
                     current_spans.push(Span::styled(
@@ -673,6 +715,9 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
                             (false, false) => Style::default().fg(text_color()),
                         }
                     };
+                    if let Some(color) = prose_color {
+                        style = style.fg(color);
+                    }
                     style = apply_inline_decorations(style, strike, !link_targets.is_empty());
                     ensure_blockquote_prefix(&mut current_spans, blockquote_depth);
                     current_spans.push(Span::styled(text.to_string(), style));
@@ -1077,4 +1122,40 @@ pub fn render_markdown_with_width(text: &str, max_width: Option<usize>) -> Vec<L
     }
 
     lines
+}
+
+#[cfg(test)]
+mod link_url_tests {
+    use super::*;
+
+    #[test]
+    fn full_link_urls_are_opt_in_and_preserve_labels() {
+        let markdown = "[docs](https://example.com) and [empty]()";
+        for enabled in [false, true] {
+            let lines = render_markdown_with_link_urls(markdown, Some(120), enabled);
+            let text = lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expected = if enabled {
+                "docs (https://example.com) and empty"
+            } else {
+                "docs and empty"
+            };
+            assert_eq!(text.trim(), expected);
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.content == "docs"
+                    && span.style.fg == Some(link_fg())
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED)
+            }));
+        }
+        assert!(!MarkdownConfigSnapshot::default().show_link_urls);
+        let default_lines = render_markdown_with_width(markdown, Some(120));
+        assert!(
+            !default_lines
+                .iter()
+                .any(|line| line.to_string().contains("https://"))
+        );
+    }
 }

@@ -8,6 +8,7 @@ use super::client_comm::{
 };
 use super::client_comm_swarms::{handle_comm_list_swarms, handle_comm_set_swarm_label};
 use super::client_writer::write_direct_event;
+use super::client_writer_task::ClientWriter;
 use super::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
 use super::comm_control::{
     handle_comm_assign_next, handle_comm_assign_role, handle_comm_assign_task,
@@ -34,7 +35,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 pub(super) fn parse_swarm_spawn_mode(
     id: u64,
@@ -245,7 +246,7 @@ pub(super) struct LightweightControlContext<'a> {
 
 pub(super) async fn handle_lightweight_control_request(
     request: Request,
-    writer: Arc<Mutex<crate::transport::WriteHalf>>,
+    writer: ClientWriter,
     context: LightweightControlContext<'_>,
 ) -> Result<()> {
     let LightweightControlContext {
@@ -272,7 +273,9 @@ pub(super) async fn handle_lightweight_control_request(
     if let Request::UpgradeRuntime { id, ref candidate } = request {
         return super::runtime_upgrade::handle(id, candidate, &writer, sessions).await;
     }
-    let _request_activity = crate::runtime_activity::global().try_enter()?;
+    // Ping only snapshots connection presence. Reserving mutation admission here
+    // races the next group-transfer RPC even after the caller receives Pong.
+    // It must also remain available while a transfer owns exclusive admission.
     if let Request::Ping { id } = request {
         let event = super::session_connections::connection_presence_pong(
             id,
@@ -284,10 +287,18 @@ pub(super) async fn handle_lightweight_control_request(
         return Ok(());
     }
 
+    // Comm requests name their owning session. Scope admission to it so a
+    // long-lived request (await_members can hold for an hour) only blocks
+    // transfers of that session, not every /cloud move on the runtime.
+    let gate = crate::runtime_activity::global();
+    let _request_activity = match comm_request_session_id(&request) {
+        Some(session) if !session.trim().is_empty() => gate.try_enter_session(session)?,
+        _ => gate.try_enter()?,
+    };
     write_direct_event(&writer, &ServerEvent::Ack { id: request.id() }).await?;
 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let writer_clone = Arc::clone(&writer);
+    let writer_clone = writer.clone();
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             if let Err(error) = write_direct_event(&writer_clone, &event).await {
@@ -330,6 +341,19 @@ pub(super) async fn handle_lightweight_control_request(
             super::provider_control::handle_invalidate_anthropic_usage(
                 id,
                 account_label,
+                &client_event_tx,
+            )
+            .await;
+        }
+        Request::NotifyAuthChanged {
+            id, provider, auth, ..
+        } => {
+            super::provider_control::handle_unbound_notify_auth_changed(
+                id,
+                provider,
+                auth,
+                provider_template,
+                sessions,
                 &client_event_tx,
             )
             .await;
@@ -619,6 +643,7 @@ pub(super) async fn handle_lightweight_control_request(
         Request::CommSpawn {
             id,
             session_id: req_session_id,
+            lane_id,
             working_dir,
             initial_message,
             request_nonce,
@@ -634,6 +659,7 @@ pub(super) async fn handle_lightweight_control_request(
             handle_comm_spawn(
                 id,
                 req_session_id,
+                lane_id,
                 working_dir,
                 initial_message,
                 request_nonce,
@@ -1064,7 +1090,7 @@ mod lightweight_swarm_member_tests {
 
     fn empty_state() -> (SessionAgents, Members, Swarms) {
         (
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::server::session_manager::SessionManager::new()),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
         )

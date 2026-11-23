@@ -227,6 +227,18 @@ impl App {
             self.session
                 .effective_agent_model(agent_model_target_slug(target), None)
         };
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. Normalise every spelling of the
+        // sentinel to the canonical "inherit" so the picker, the saved-spec
+        // comparison and the server-side resolver all agree.
+        let configured = configured.map(|value| {
+            if crate::config::AgentsConfig::is_swarm_inherit_sentinel(&value) {
+                "inherit".to_string()
+            } else {
+                value
+            }
+        });
         let inherit_summary = agent_model_default_summary(target, self);
         self.open_model_picker();
         let load_started = std::time::Instant::now();
@@ -346,7 +358,13 @@ impl App {
                 target,
                 clear_override: false,
             };
-            inherit.is_current = configured.as_deref() == Some("inherit");
+            // reference: crates/jcode-config-types/src/lib.rs -
+            // AgentsConfig::is_swarm_inherit_sentinel is the single source of
+            // truth for the sentinel vocabulary: any spelling of the sentinel
+            // marks the "inherit coordinator" row as the current one.
+            inherit.is_current = configured
+                .as_deref()
+                .is_some_and(crate::config::AgentsConfig::is_swarm_inherit_sentinel);
             picker.entries.insert(1, inherit);
             for entry in &mut picker.entries {
                 for option in &mut entry.options {

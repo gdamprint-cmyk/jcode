@@ -179,7 +179,31 @@ pub fn reload_process_alive(pid: u32) -> bool {
         matches!(err.raw_os_error(), Some(libc::EPERM))
     }
 
-    #[cfg(not(unix))]
+    // MEASURED 2026-11-17: this arm used to `let _ = pid; true`, so on Windows
+    // EVERY non-zero pid counted as alive - a stale or bogus reload pid could
+    // never be reported as dead, and inspect_reload_wait_status would return
+    // Waiting forever instead of Failed. Ask the OS instead. Same Win32 path as
+    // jcode-base's platform::is_process_running; the windows-sys features are
+    // already enabled for this crate (Cargo.toml:144).
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE as u32
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -204,6 +228,37 @@ pub async fn inspect_reload_wait_status(
             ReloadPhase::SocketReady => ReloadWaitStatus::Ready,
             ReloadPhase::Failed => ReloadWaitStatus::Failed(state.detail),
             ReloadPhase::Starting => {
+                // A live socket wins over the marker's pid.
+                //
+                // MEASURED 2026-11-22: on Windows `replace_process` is
+                // `spawn` + `exit(0)` (`jcode-base/src/platform.rs:664`), NOT an
+                // exec, so the pid does not survive the handoff: the old daemon
+                // dies while the replacement, which has a NEW pid, takes the
+                // socket. `CreateProcessW` "Creates a new process and its primary
+                // thread" and "The process is assigned a process identifier"
+                // (Microsoft Learn, processthreadsapiCreateProcessW), so there is
+                // no Windows equivalent of preserving the image's pid.
+                //
+                // The replacement then cleared the marker as foreign/stale on
+                // startup (`server.rs:2099`) and, finding nothing at the
+                // socket-ready publish point, never advanced it to `SocketReady`.
+                // The marker therefore stayed `Starting` with a DEAD pid, and this
+                // branch reported `Failed("reload process 20944 exited before
+                // becoming ready")` while the replacement was already serving
+                // (log 2026-11-22 08:00:10.035). A landing that trusted that answer
+                // rolled back and left the client channels on the old build.
+                //
+                // The socket is the observable the caller actually waits for, so
+                // it must be asked first: a live listener means the handoff
+                // landed, whatever pid the marker remembers.
+                if is_server_ready(socket_path).await || has_live_listener(socket_path).await {
+                    crate::logging::info(&format!(
+                        "inspect_reload_wait_status: socket {} is live while marker phase is Starting (pid={}); reporting ready",
+                        socket_path.display(),
+                        state.pid
+                    ));
+                    return ReloadWaitStatus::Ready;
+                }
                 if reload_process_alive(state.pid) {
                     ReloadWaitStatus::Waiting {
                         pid: Some(state.pid),

@@ -154,6 +154,10 @@ pub fn running_in_test_harness() -> bool {
         if env_truthy("JCODE_ALLOW_BROWSER_IN_TESTS") {
             return false;
         }
+        // Hosted runners can relocate test binaries outside Cargo's deps directory.
+        if cfg!(test) {
+            return true;
+        }
         std::env::current_exe()
             .ok()
             .map(|exe| is_test_harness_path(&exe.to_string_lossy()))
@@ -161,25 +165,8 @@ pub fn running_in_test_harness() -> bool {
     })
 }
 
-fn is_test_harness_path(path: &str) -> bool {
-    let path = path.replace('\\', "/");
-    // Preserve detection for the default target tree, including custom runners.
-    if path.contains("/target/") && path.contains("/deps/") {
-        return true;
-    }
-    let mut components = path.rsplit('/');
-    let Some(filename) = components.next() else {
-        return false;
-    };
-    if components.next() != Some("deps") {
-        return false;
-    }
-    let stem = filename.strip_suffix(".exe").unwrap_or(filename);
-    let Some((name, hash)) = stem.rsplit_once('-') else {
-        return false;
-    };
-    !name.is_empty() && hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
+mod test_harness;
+use test_harness::is_test_harness_path;
 
 fn env_truthy(key: &str) -> bool {
     std::env::var(key)
@@ -219,7 +206,7 @@ fn log_auth_status_snapshot(event: &str, status: &AuthStatus) {
         "all",
         &[
             ("jcode", auth_state_label(status.jcode)),
-            ("claude", auth_state_label(status.anthropic.state)),
+            ("claude", auth_state_label(status.anthropic.oauth_state)),
             ("openai", auth_state_label(status.openai)),
             ("openrouter", auth_state_label(status.openrouter)),
             ("azure", auth_state_label(status.azure)),
@@ -846,7 +833,6 @@ impl AuthStatus {
         Self::invalidate_cached_status();
         crate::auth::copilot::invalidate_github_token_cache();
         crate::provider::pricing::invalidate_auth_pricing_memos();
-        crate::memory_rerank::clear_failure_backoff();
         crate::logging::auth_event("auth_status_cache_invalidated", "all", &[]);
     }
 
@@ -1006,11 +992,13 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
     if let Ok(creds) = claude::load_credentials() {
         let now_ms = chrono::Utc::now().timestamp_millis();
         anthropic.has_oauth = true;
-        if creds.expires_at > now_ms {
-            anthropic.state = AuthState::Available;
-        } else {
-            anthropic.state = AuthState::Expired;
-        }
+        anthropic.state = refreshable_token_state(
+            "claude",
+            Ok((
+                creds.access_token.is_empty() || creds.expires_at <= now_ms,
+                creds.refresh_token,
+            )),
+        );
         // Record the OAuth credential's own state before the API key below can
         // mask an expired (or absent) OAuth login in the combined `state`.
         anthropic.oauth_state = anthropic.state;

@@ -1,3 +1,8 @@
+// reference: no prior art, searched upstream 1jehuang/jcode master
+//   crates/jcode-app-core/src/server/swarm_persistence.rs (fetched 2026-11-16) -
+//   upstream `recover_member_status` has the same "no headless process survives
+//   a restart" rule and marks an idle headless worker dead, so upstream has no
+//   restore-the-idle-worker mechanism to copy.
 use super::{SwarmMember, SwarmTaskProgress, VersionedPlan};
 use crate::protocol::ServerEvent;
 use crate::storage;
@@ -96,44 +101,50 @@ pub(super) struct LoadedSwarmRuntimeState {
     pub swarms_by_id: HashMap<String, HashSet<String>>,
 }
 
-/// Recovery note on an idle headless worker that a server restart stopped.
-/// No headless process survives a restart (issue #1651).
+/// Recovery note on an idle headless worker that a server restart stopped and
+/// that cannot be restored (its session file is gone).
+///
+/// No headless process survives a restart (issue #1651), but a headless
+/// worker whose session file still exists IS restorable: `worker_revive`
+/// rebuilds its agent from disk on demand. So this note marks only the
+/// genuinely unrecoverable case.
 pub(super) const IDLE_WORKER_NOT_RESTORED_NOTE: &str =
     "idle worker not restored after server restart";
-/// Suffix appended once the worker's owner has been told it was stopped, so
-/// the notice is delivered exactly once even across further restarts.
+/// Suffix appended only after the owner's model-facing interrupt was accepted.
+/// Persisting it suppresses reconnect/restart duplicates. Delivery precedes
+/// acknowledgement, so a crash in between may repeat a notice rather than lose it.
 pub(super) const OWNER_NOTIFIED_NOTE: &str = "owner notified";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSwarmState {
-    swarm_id: String,
+pub struct PersistedSwarmState {
+    pub swarm_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan: Option<PersistedVersionedPlan>,
+    pub plan: Option<PersistedVersionedPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    coordinator_session_id: Option<String>,
+    pub coordinator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    members: Vec<PersistedSwarmMember>,
-    updated_at_unix_ms: u64,
+    pub members: Vec<PersistedSwarmMember>,
+    pub updated_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedVersionedPlan {
-    items: Vec<crate::plan::PlanItem>,
-    version: u64,
-    participants: Vec<String>,
+pub struct PersistedVersionedPlan {
+    pub items: Vec<crate::plan::PlanItem>,
+    pub version: u64,
+    pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    task_progress: HashMap<String, SwarmTaskProgress>,
+    pub task_progress: HashMap<String, SwarmTaskProgress>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSwarmMember {
+pub struct PersistedSwarmMember {
     #[serde(flatten)]
-    record: SwarmMemberRecord,
+    pub record: SwarmMemberRecord,
     /// Wall-clock time when the member entered its current terminal status.
     /// Legacy snapshots omit this; their snapshot timestamp becomes the
     /// conservative migration fallback so reports are not discarded eagerly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_since_unix_ms: Option<u64>,
+    pub terminal_since_unix_ms: Option<u64>,
 }
 
 fn now_unix_ms() -> u64 {
@@ -215,7 +226,7 @@ fn migrate_legacy_state() {
     }
 }
 
-fn state_path(swarm_id: &str) -> PathBuf {
+pub(super) fn state_path(swarm_id: &str) -> PathBuf {
     let sanitized: String = swarm_id
         .chars()
         .map(|ch| {
@@ -280,7 +291,10 @@ fn remove_snapshot_files(swarm_id: &str) -> bool {
     removed
 }
 
-fn from_persisted_plan(mut plan: PersistedVersionedPlan, updated_at_unix_ms: u64) -> VersionedPlan {
+pub(super) fn from_persisted_plan(
+    mut plan: PersistedVersionedPlan,
+    updated_at_unix_ms: u64,
+) -> VersionedPlan {
     for item in &mut plan.items {
         if item.status == "running" {
             item.status = "running_stale".to_string();
@@ -323,6 +337,48 @@ fn to_persisted_member(member: &SwarmMember, snapshot_unix_ms: u64) -> Persisted
     }
 }
 
+pub(super) fn transfer_snapshot(runtime: &super::state::SwarmRuntime) -> PersistedSwarmState {
+    let updated_at_unix_ms = now_unix_ms();
+    PersistedSwarmState {
+        swarm_id: runtime.swarm_id.clone(),
+        plan: runtime.plan.as_ref().map(to_persisted_plan),
+        coordinator_session_id: runtime.coordinator_session_id.clone(),
+        members: runtime
+            .members
+            .iter()
+            .map(|member| to_persisted_member(member, updated_at_unix_ms))
+            .collect(),
+        updated_at_unix_ms,
+    }
+}
+
+pub(super) fn write_transfer_snapshot(snapshot: &PersistedSwarmState) -> anyhow::Result<()> {
+    let file_lock = swarm_file_lock(&snapshot.swarm_id);
+    let _guard = file_lock.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(existing) = read_transfer_snapshot(&snapshot.swarm_id)? {
+        anyhow::ensure!(
+            existing.swarm_id == snapshot.swarm_id,
+            "swarm persistence path collision"
+        );
+    }
+    storage::write_json_fast(&state_path(&snapshot.swarm_id), snapshot)
+}
+
+pub(super) fn read_transfer_snapshot(
+    swarm_id: &str,
+) -> anyhow::Result<Option<PersistedSwarmState>> {
+    let path = state_path(swarm_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let snapshot: PersistedSwarmState = storage::read_json(&path)?;
+    anyhow::ensure!(
+        snapshot.swarm_id == swarm_id,
+        "swarm persistence path collision for {swarm_id}"
+    );
+    Ok(Some(snapshot))
+}
+
 fn append_recovery_detail(detail: Option<String>, note: &str) -> Option<String> {
     match detail {
         Some(existing) if !existing.trim().is_empty() => Some(format!("{} ({})", existing, note)),
@@ -334,6 +390,7 @@ fn recover_member_status(
     status: SwarmLifecycleStatus,
     detail: Option<String>,
     is_headless: bool,
+    session_id: &str,
 ) -> (SwarmLifecycleStatus, Option<String>) {
     if status == SwarmLifecycleStatus::Running {
         return (
@@ -348,6 +405,19 @@ fn recover_member_status(
     // that can never enter terminal-member GC. This previously resurrected
     // hundreds of detached historical clients as ready on every reload.
     if status == SwarmLifecycleStatus::Ready {
+        // A headless worker IS restorable: `worker_revive::live_or_revived_agent`
+        // rebuilds its agent from the persisted session on demand, and
+        // `comm_control::task_agent_session` already hands work to a revived
+        // worker. Marking it dead here made the server tell its owner "spawn a
+        // replacement", which threw away a usable worker and its transcript.
+        //
+        // MEASURED 2026-11-16: 29 such notices in one day; every one of them
+        // asked a coordinator to re-spawn a worker that was still on disk.
+        //
+        // Only a worker whose session file is GONE is genuinely unrestorable.
+        if is_headless && crate::session::session_exists(session_id) {
+            return (SwarmLifecycleStatus::Ready, detail);
+        }
         return (
             SwarmLifecycleStatus::Stopped,
             append_recovery_detail(
@@ -387,7 +457,7 @@ fn recovered_member_event_tx() -> mpsc::UnboundedSender<ServerEvent> {
     tx
 }
 
-fn from_persisted_member(
+pub(super) fn from_persisted_member(
     member: PersistedSwarmMember,
     snapshot_updated_at_unix_ms: u64,
     loaded_at_unix_ms: u64,
@@ -397,7 +467,12 @@ fn from_persisted_member(
     let original_status = record.status.as_str();
     let was_terminal_before_recovery =
         super::swarm::member_status_is_terminal(original_status.as_ref());
-    let (status, detail) = recover_member_status(record.status, record.detail, record.is_headless);
+    let (status, detail) = recover_member_status(
+        record.status,
+        record.detail,
+        record.is_headless,
+        &record.session_id,
+    );
     let status_text = status.as_str();
     let terminal_since_unix_ms = super::swarm::member_status_is_terminal(status_text.as_ref())
         .then(|| {
@@ -446,7 +521,9 @@ fn hydrate_member_todos(member: &mut SwarmMember) {
     let completed = todos.iter().filter(|t| t.status == "completed").count() as u32;
     member.todo_progress = Some((completed, todos.len() as u32));
     member.todo_items = super::background_tasks::compact_todo_items(&todos);
-    member.runtime.todo_statuses = todos.iter().map(|todo| todo.status.clone()).collect();
+    let (statuses, blocked_reason) = super::background_tasks::todo_runtime_projection(&todos);
+    member.runtime.todo_statuses = statuses;
+    member.runtime.todo_blocked_reason = blocked_reason;
 }
 
 pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {

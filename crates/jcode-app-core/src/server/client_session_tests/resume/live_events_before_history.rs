@@ -1,5 +1,14 @@
 #[tokio::test]
 async fn handle_resume_session_registers_live_events_before_history_replay() -> Result<()> {
+    restored_resume_with_history_backpressure(false).await
+}
+
+#[tokio::test]
+async fn restored_resume_finishes_when_recovery_turn_owns_agent() -> Result<()> {
+    restored_resume_with_history_backpressure(true).await
+}
+
+async fn restored_resume_with_history_backpressure(recovery_turn: bool) -> Result<()> {
     let _guard = crate::storage::lock_test_env();
     let (_runtime, prev_runtime) = setup_runtime_dir()?;
 
@@ -22,10 +31,9 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         Vec::new(),
     )));
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        temp_session_id.to_string(),
-        Arc::clone(&agent),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(temp_session_id.to_string(), Arc::clone(&agent))]),
+    ));
     let shutdown_signals = Arc::new(RwLock::new(HashMap::<String, InterruptSignal>::new()));
     let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
     let now = Instant::now();
@@ -93,7 +101,6 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
 
     let mut client_selfdev = false;
     let mut client_session_id = temp_session_id.to_string();
-    let writer_guard = writer.lock().await;
 
     let resume_task = tokio::spawn({
         let agent = Arc::clone(&agent);
@@ -112,7 +119,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         let swarm_plans = Arc::clone(&swarm_plans);
         let swarm_coordinators = Arc::clone(&swarm_coordinators);
         let client_count = Arc::clone(&client_count);
-        let writer = Arc::clone(&writer);
+        let writer = writer.clone();
         let client_event_tx = client_event_tx.clone();
         let mcp_pool = Arc::clone(&mcp_pool);
         let event_history = Arc::clone(&event_history);
@@ -155,6 +162,7 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
                 &event_counter,
                 &swarm_event_tx,
                 false,
+                false,
             )
             .await
         }
@@ -183,11 +191,27 @@ async fn handle_resume_session_registers_live_events_before_history_replay() -> 
         "resume should still be blocked on history replay while writer is locked"
     );
 
-    drop(writer_guard);
-
-    resume_task
-        .await
+    // Simulate a recovered/background turn taking the published agent while
+    // History is held by outbound backpressure. The inbound subscribe handler
+    // must still finish so the same connection can read Escape/messages.
+    let recovery_guard = if recovery_turn {
+        Some(
+            tokio::time::timeout(std::time::Duration::from_secs(5), agent.lock())
+                .await
+                .map_err(|_| anyhow!("history preparation must release the agent"))?,
+        )
+    } else {
+        None
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), resume_task).await;
+    assert!(
+        result.is_ok(),
+        "restored subscribe must finish without waiting for the recovery turn"
+    );
+    result
+        .unwrap()
         .map_err(|e| anyhow!("resume task join: {e}"))??;
+    drop(recovery_guard);
 
     let events = collect_events_until_done(&mut client_event_rx, 46).await;
     assert!(

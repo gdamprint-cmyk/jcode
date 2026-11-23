@@ -1,3 +1,12 @@
+// reference: https://github.com/1jehuang/jcode/blob/master/crates/jcode-app-core/src/server/debug_command_exec.rs (read 2026-11-15) - the upstream `reload` debug command, which moves the daemon channel and the canary channel and then only sends a reload signal; that is the half-landing this change removes.
+// reference: crates/jcode-build-support/src/landing.rs (read 2026-11-15) - the
+// landing transaction, its journal, its single-writer lock and its crash
+// recovery;
+// src/cli/commands.rs run_server_land_command (read 2026-11-15) - the CLI
+// landing, which runs the transaction and rolls it back on failure;
+// ~/.jcode/harbor/harbor_land.py (read 2026-11-15) - the carrier invokes the
+// TARGET's versioned binary (`server land <label> --json`) rather than the
+// launcher, because only the target binary knows the `land` subcommand.
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::debug_jobs::{DebugJob, maybe_start_async_debug_job};
@@ -12,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 
 #[derive(Clone)]
 pub(super) struct DebugInterruptContext {
@@ -633,10 +642,15 @@ pub(super) async fn execute_debug_command(
 
     if trimmed == "trigger_extraction" {
         let agent = agent.lock().await;
+        // MEASURED 2026-11-11 (Jev removal, 4950764e1): local sidecar extraction
+        // is gone; retention is Hindsight's retain pipeline. The command stays so
+        // scripts keep working, and it reports the ownership change explicitly.
         let count = agent.extract_session_memories().await;
         let payload = serde_json::json!({
             "extracted": count,
             "message_count": agent.message_count(),
+            "owner": "hindsight",
+            "note": "retention is Hindsight-owned; local extraction is a no-op",
         });
         return Ok(serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()));
     }
@@ -681,10 +695,11 @@ pub(super) async fn execute_debug_command(
 
         let source = crate::build::current_source_state(&repo_dir)?;
         let hash = source.version_label.clone();
-        let published = crate::build::publish_local_current_build_for_source(&repo_dir, &source)?;
+        // STAGE only: the build installs the immutable binary and records the
+        // landing target. NO channel moves here - a build must never leave a
+        // client attached to a daemon running a different build.
+        let published = crate::build::stage_local_current_build_for_source(&repo_dir, &source)?;
         crate::build::smoke_test_server_binary(&published.versioned_path)?;
-        crate::build::update_shared_server_symlink(&hash)?;
-        crate::build::update_canary_symlink(&hash)?;
 
         let mut manifest = crate::build::BuildManifest::load()?;
         manifest.canary = Some(hash.clone());
@@ -695,20 +710,102 @@ pub(super) async fn execute_debug_command(
         let info_path = jcode_dir.join("reload-info");
         std::fs::write(&info_path, format!("reload:{}", hash))?;
 
-        let _request_id = super::send_reload_signal(hash.clone(), None, false);
+        // An automatic landing must never move the ecosystem BACKWARD. The CLI
+        // skips this guard for an EXPLICIT version (a deliberate rollback), so
+        // the automatic caller has to apply it itself.
+        crate::build::guard_landing_target_is_not_a_downgrade(&hash)?;
+        // LAND the build as ONE transaction, driven by a CHILD process.
+        //
+        // This command runs INSIDE the daemon, and the landing replaces the
+        // daemon process. The transaction therefore cannot be completed HERE:
+        // the process that would have to wait for the new daemon's identity
+        // and only then move the client channels is killed by its own landing.
+        //
+        // Moving `shared-server` here and returning - which is what this code
+        // used to do - left the daemon channel on the new build while `current`
+        // and the launcher stayed on the old one: a half-landing, which the
+        // startup recovery could not close because no landing journal was ever
+        // written.
+        //
+        // A child process runs the SAME atomic landing the CLI and the Harbor
+        // carrier run (`<versioned binary> server land <version> --json`): it
+        // takes the single-writer lock, journals the transaction, moves the
+        // daemon channel, hands the daemon off, PROVES the daemon runs the
+        // target, and only then moves the client channels. If the daemon dies
+        // mid-transaction, the journal lets the NEXT daemon resolve it at
+        // startup (forward when it runs the target, rollback otherwise).
+        let mut landing = debug_landing_command(&published.versioned_path, &hash);
+        let outcome = tokio::task::spawn_blocking(move || landing.output())
+            .await
+            .map_err(|error| anyhow::anyhow!("landing task failed: {error:#}"))?
+            .map_err(|error| anyhow::anyhow!("landing process failed to run: {error}"))?;
 
+        if !outcome.status.success() {
+            let stdout = String::from_utf8_lossy(&outcome.stdout);
+            let stderr = String::from_utf8_lossy(&outcome.stderr);
+            // The landing rolled itself back: the client channels stay on the
+            // previous build. Record that the canary did not pass.
+            if let Ok(mut manifest) = crate::build::BuildManifest::load() {
+                manifest.canary_status = Some(crate::build::CanaryStatus::Failed);
+                let _ = manifest.save();
+            }
+            return Err(anyhow::anyhow!(
+                "Landing {} failed ({}): {}{}",
+                hash,
+                outcome.status,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        // The landing PROVED the daemon runs the target before it moved the
+        // client channels, so the canary passed.
+        if let Ok(mut manifest) = crate::build::BuildManifest::load() {
+            manifest.canary_status = Some(crate::build::CanaryStatus::Passed);
+            let _ = manifest.save();
+        }
+        // The canary channel is a CLIENT-side channel too: it is the fallback a
+        // self-dev session resolves when no `current` channel exists. Point it
+        // at the landed build, so every channel names the same build. This runs
+        // only AFTER a successful landing, so a rolled-back landing leaves the
+        // canary channel untouched together with the other client channels.
+        if let Err(error) = crate::build::update_canary_symlink(&hash) {
+            crate::logging::warn(&format!(
+                "debug reload: could not point the canary channel at {hash}: {error:#}"
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
         return Ok(format!(
-            "Reload signal sent for build {}. Server will restart.",
-            hash
+            "Landed build {}. The daemon channel, the client channels and the running daemon now run the same build. {}",
+            hash,
+            stdout.trim()
         ));
     }
 
     Err(anyhow::anyhow!("Unknown debug command '{}'", trimmed))
 }
 
+/// Build the command that performs the atomic landing for the debug `reload`.
+///
+/// The TARGET's own versioned binary runs the landing, not the launcher and
+/// not this process: only the target binary knows the `land` subcommand, and
+/// the launcher may still be an older build that predates it.
+///
+/// The version is passed EXPLICITLY on purpose. `jcode server land` without a
+/// version lands the staged build, which is what the CLI's automatic path
+/// does; here the caller has just staged a specific build and wants THAT one
+/// landed. The downgrade guard is applied by the caller before this point,
+/// because the CLI skips it for an explicit version.
+fn debug_landing_command(versioned_binary: &std::path::Path, version: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(versioned_binary);
+    command.arg("server").arg("land").arg(version).arg("--json");
+    command
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DebugInterruptContext, execute_debug_command};
+    use super::{DebugInterruptContext, debug_landing_command, execute_debug_command};
     use crate::agent::Agent;
     use crate::provider::{EventStream, Provider};
     use crate::tool::Registry;
@@ -860,6 +957,18 @@ mod tests {
         let _test_session = EnvGuard::set("JCODE_TEST_SESSION", "1");
         let _debug_control = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
 
+        let repo = tempfile::tempdir().expect("repo fixture");
+        std::fs::create_dir(repo.path().join(".git")).expect("git marker");
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = \"jcode\"\n",
+        )
+        .expect("manifest");
+        let _repo = EnvGuard::set(
+            "JCODE_REPO_DIR",
+            repo.path().to_str().expect("UTF-8 fixture"),
+        );
+
         let mut reload_rx = crate::server::subscribe_reload_signal_for_tests();
 
         let provider: Arc<dyn Provider> = Arc::new(TestProvider);
@@ -914,6 +1023,76 @@ mod tests {
             output.contains("Reload acknowledged") || output.contains("Server is restarting now"),
             "expected reload acknowledgement output, got: {}",
             output
+        );
+    }
+
+    /// The debug `reload` must land the build ATOMICALLY, not move the daemon
+    /// channel on its own.
+    ///
+    /// The half-landing this replaces moved `shared-server` and returned: the
+    /// daemon channel ran the new build while `current` and the launcher stayed
+    /// on the old one, and no landing journal was written, so the startup
+    /// recovery could not close the split.
+    ///
+    /// The command the debug path builds must therefore be the ATOMIC landing
+    /// (`server land <version>`) and it must run the TARGET's own versioned
+    /// binary - the launcher may be an older build that does not know the
+    /// `land` subcommand at all.
+    #[test]
+    fn debug_reload_lands_atomically_through_the_target_binary() {
+        let command = debug_landing_command(
+            std::path::Path::new("/tmp/builds/versions/abc123-dirty-def456/jcode.exe"),
+            "abc123-dirty-def456",
+        );
+        let program = command.get_program().to_string_lossy().to_string();
+        let program_path = std::path::PathBuf::from(&program);
+        assert_eq!(
+            program_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some("abc123-dirty-def456"),
+            "the landing must run the TARGET's versioned binary, got: {program}"
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["server", "land", "abc123-dirty-def456", "--json"],
+            "the debug reload must run the atomic landing, not a promote+reload pair"
+        );
+    }
+
+    /// The self-dev reload must land the build ATOMICALLY through the TARGET's
+    /// own versioned binary, the same shape the debug reload uses.
+    ///
+    /// A bare channel move (the old half-landing) writes no journal, and startup
+    /// recovery reads only the landing journal - so the command MUST be the
+    /// atomic landing (`server land <version>`), not a promote+reload pair and
+    /// not the launcher.
+    #[test]
+    fn selfdev_reload_lands_atomically_through_the_target_binary() {
+        let binary =
+            std::path::PathBuf::from("/tmp/builds/versions/abc123-dirty-def456/jcode.exe");
+        let command = crate::tool::selfdev::SelfDevTool::landing_command_for_tests(
+            &binary,
+            "abc123-dirty-def456",
+        );
+        assert_eq!(
+            command.get_program(),
+            binary.as_os_str(),
+            "the landing must run the TARGET's versioned binary"
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["server", "land", "abc123-dirty-def456", "--json"],
+            "the selfdev reload must run the atomic landing"
         );
     }
 
