@@ -1284,17 +1284,28 @@ fn handle_server_event_inner(
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
-            // Stream-idle failures follow an accepted request. The provider
-            // owns transport retries and fallback already. A network probe
-            // cannot fix these and must not restart that entire retry budget.
+            // Stream-idle failures follow an accepted request, so the model may
+            // still be working or the request may already be committed. Retrying
+            // is not guaranteed safe, but a stall of this kind has repeatedly
+            // cleared on a fresh request after a network drop, so hold the turn
+            // for the network and retry it instead of ending it.
             let lower_message = message.to_ascii_lowercase();
             let is_stream_idle_timeout = lower_message
                 .contains("stream read timeout: no data received")
+                || lower_message.contains("upstream idle")
                 || lower_message.contains("timed out waiting for next websocket activity")
                 || lower_message.contains("did not complete within");
+            if is_stream_idle_timeout
+                && app.schedule_pending_remote_network_wait_with_force(&message, true)
+            {
+                return false;
+            }
             if is_stream_idle_timeout {
+                // No pending turn to hold (a headless/ambient session or an
+                // already-settled turn). Say what happened instead of silently
+                // dropping the user's prompt.
                 app.pause_exhausted_auto_resume(
-                    "Stopped automatic retries: the provider stream stalled after the request was accepted. Your message is back in the input box. Retry manually, reduce the conversation with /compact, or choose another route with /model.".to_string(),
+                    "The provider stream stalled after the request was accepted, and this session had no held turn to retry. Your message is back in the input box. Retry manually, reduce the conversation with /compact, or choose another route with /model.".to_string(),
                     "Paused: provider stream stopped responding",
                 );
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
@@ -1304,7 +1315,14 @@ fn handle_server_event_inner(
             // returns. Keep these separate from accepted but stalled streams.
             let is_connectivity_error =
                 crate::tui::app::commands::is_auto_poke_connectivity_error(&message)
-                    || crate::network_retry::classify_message(&message).is_some();
+                    || crate::network_retry::classify_message(&message).is_some()
+                    // The gateway's own request wrapper. Its underlying cause may
+                    // be a provider rejection rather than a network fault, so the
+                    // shared transport classifier cannot see it; hold the turn and
+                    // let the wait-and-resend path retry it, which is what a
+                    // dropped connection needs and harmless for a transient one.
+                    || lower_message.contains("openai-compatible chat request failed")
+                    || lower_message.contains("failed to send openai-compatible chat request");
             if is_connectivity_error
                 && app.schedule_pending_remote_network_wait_with_force(&message, true)
             {

@@ -68,6 +68,20 @@ fn classify_text(text: &str) -> Option<String> {
         // protocol error detected".
         "client error (sendrequest)",
         "http2 error",
+        // An upstream stall after the request was accepted. The gateway stops
+        // emitting and the stream reads as idle, so the failure is a dead
+        // connection, not a provider rejection: it recovers on a fresh request.
+        // Real shapes: "upstream idle for 60000ms without data" and the
+        // OpenAI-compatible stream wrapper "Stream read timeout: no data
+        // received for 180 seconds".
+        "upstream idle",
+        "no data received",
+        // A disaggregated-inference gateway losing its prefill instance mid
+        // request. The decode side reports it as a transfer failure with no
+        // network vocabulary at all: "KVTransferError ... Losing connection
+        // with prefill instance". Measured 2026-11-23 (session_tigress).
+        "losing connection with prefill instance",
+        "kvtransfererror",
     ];
     if network_markers.iter().any(|marker| text.contains(marker)) {
         return Some("the network connection appears to have dropped".to_string());
@@ -235,6 +249,14 @@ mod tests {
              client error (Connect): tls handshake eof",
             // Body cut off mid-stream.
             "error decoding response body: request or response body error: operation timed out",
+            // Upstream stall shapes observed on this host. They carried no
+            // timeout/reset wording, so the turn ended with no retry and no
+            // network wait until the user poked it.
+            "upstream idle for 60000ms without data",
+            "Stream read timeout: no data received for 180 seconds",
+            // Decode side losing its prefill instance mid request (session_tigress).
+            "KVTransferError(bootstrap_room=3147489392983313834, \
+             remote_endpoint=10.254.147.145:8998): Losing connection with prefill instance",
         ];
         for error in real_errors {
             assert!(
