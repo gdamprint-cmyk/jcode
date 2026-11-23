@@ -21,8 +21,14 @@ fn default_watch_wake() -> bool {
     true
 }
 
+// MEASURED 2026-11-23 (session_wyvern_1795401042775): a long pip cache parse
+// published 5 progress events in 5 minutes, and each one made `bg wait`
+// return a full task card into the turn, so the model read N near-identical
+// "Background task emitted a progress event" results instead of one finish.
+// Progress is not a reason to interrupt the caller: the stall watchdog still
+// wakes on a quiet task, and `bg status` still shows live progress.
 fn default_wait_return_on_progress() -> bool {
-    true
+    false
 }
 
 // reference: feature commit b861f370a "feat(bg): stall watchdog wakes the agent
@@ -616,7 +622,7 @@ impl Tool for BgTool {
                 "wake": { "type": "boolean", "description": "delivery: default true." },
                 "stall_wake_seconds": { "type": "integer", "description": "Wake after N quiet secs (min 30, reset on activity); wait default half max_wait_seconds." },
                 "max_wait_seconds": { "type": "integer", "description": "wait: default 60, cap 3600, 0 checks without blocking." },
-                "return_on_progress": { "type": "boolean", "description": "wait: also return on first progress event. Default true." },
+                "return_on_progress": { "type": "boolean", "description": "wait: also return on each progress event. Default false; completion and stalls always return." },
                 "wait_mode": { "type": "string", "enum": ["any", "all", "first_failure"], "description": "Multi-task wait. Default any." },
                 "tail_lines": { "type": "integer", "description": "Last N lines for output/tail/wait preview." },
                 "include_output_preview": { "type": "boolean", "description": "wait: include recent output. Failed tasks always do." }
@@ -1076,6 +1082,11 @@ mod tests {
         assert_eq!(both, HashSet::from(["running", "failed"]));
         assert!(parse_status_filter(Some(&json!("all"))).is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn wait_does_not_return_on_progress_by_default() {
+        assert!(!default_wait_return_on_progress());
     }
 
     #[test]
