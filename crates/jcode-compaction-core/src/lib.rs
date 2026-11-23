@@ -30,14 +30,32 @@ pub const EMERGENCY_TOOL_RESULT_MAX_CHARS: usize = 4000;
 /// huge raw image in the recent tail.
 pub const EMERGENCY_IMAGE_MAX_CHARS: usize = 1024;
 
-/// Approximate maximum request body size (in base64 characters) we aim to keep
-/// the transcript under when recovering from a provider "request too large" /
-/// 413 payload error. Anthropic rejects requests whose serialized body exceeds
-/// roughly 32 MB; this distinct failure mode is driven almost entirely by inline
-/// base64 images, which the normal token-budget accounting deliberately
-/// undercounts (see `IMAGE_TOKEN_COST`). We target a conservative budget well
-/// under the hard provider cap so a single retry reliably fits.
-pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 12 * 1024 * 1024;
+/// Approximate maximum size (in serialized JSON characters) of a whole request
+/// body that jcode will put on the wire.
+///
+/// Providers differ: the first-party Claude API allows 128 MB per request
+/// (https://docs.claude.com/en/api/errors, "Request size limits"), but
+/// OpenAI-compatible aggregators reject a much smaller body. Nous Research's
+/// `inference-api.nousresearch.com` answers `413 Request in excess of 10MB` for
+/// the whole request body, measured over system prompt + tool catalog +
+/// messages, not per image. Inline base64 images dominate that body and the
+/// token-budget accounting deliberately undercounts them (see
+/// `IMAGE_TOKEN_COST`), so the request path needs its own byte budget.
+///
+/// 8 MiB leaves ~2 MiB of headroom under the 10 MB ceiling for the non-image
+/// parts of the body, which measured ~1.1 MiB for the session that tripped it.
+pub const REQUEST_BODY_CHAR_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Budget for inline image payload when recovering from a provider "request
+/// too large" / 413 error: the largest total image payload a retried request may
+/// carry.
+///
+/// This must stay clearly below [`REQUEST_BODY_CHAR_BUDGET`] so the system
+/// prompt, tool catalog and text transcript still fit alongside the images. It
+/// used to be 12 MiB, which is *above* the 10 MB the gateway allows, so the
+/// recovery compared images against a number the request could never satisfy
+/// and returned without stripping anything.
+pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 6 * 1024 * 1024;
 
 /// Approximate chars per token for estimation
 pub const CHARS_PER_TOKEN: usize = 4;

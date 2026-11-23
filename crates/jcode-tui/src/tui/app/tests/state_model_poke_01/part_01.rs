@@ -31,8 +31,8 @@ fn test_strip_oversized_images_drops_oldest_first() {
     let mut app = create_test_app();
     app.session.replace_messages(Vec::new());
 
-    let big = "a".repeat(8 * 1024 * 1024); // 8 MiB base64 image each
-    for _ in 0..3 {
+    let big = "a".repeat(2 * 1024 * 1024); // 2 MiB base64 image each
+    for _ in 0..6 {
         app.session.add_message(
             Role::User,
             vec![ContentBlock::Image {
@@ -42,11 +42,11 @@ fn test_strip_oversized_images_drops_oldest_first() {
         );
     }
 
-    // 24 MiB of images, budget 12 MiB → drop the two oldest, keep the newest.
+    // 12 MiB of images, recovery budget 6 MiB → drop the three oldest, keep the three newest.
     let stripped = app
         .session
         .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-    assert_eq!(stripped, 2);
+    assert_eq!(stripped, 3);
     assert!(matches!(
         app.session.messages[0].content[0],
         ContentBlock::Text { .. }
@@ -57,6 +57,18 @@ fn test_strip_oversized_images_drops_oldest_first() {
     ));
     assert!(matches!(
         app.session.messages[2].content[0],
+        ContentBlock::Text { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[3].content[0],
+        ContentBlock::Image { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[4].content[0],
+        ContentBlock::Image { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[5].content[0],
         ContentBlock::Image { .. }
     ));
 }

@@ -423,6 +423,12 @@ impl MultiProvider {
         self.cross_provider_pool_prompt(provider, provider, reason.to_owned(), chars, tokens)
     }
 
+    /// Serialized size of the tool catalog as it travels on the wire: the per-tool
+    /// payload plus the array's own brackets and commas.
+    fn tool_catalog_chars(tools: &[ToolDefinition]) -> usize {
+        tools.iter().map(ToolDefinition::prompt_chars).sum::<usize>() + tools.len() + 1
+    }
+
     /// Retry only before the stream is accepted, never replay partial output.
     async fn complete_with_auto_reset(
         &self,
@@ -499,6 +505,25 @@ impl MultiProvider {
         // whole turn is rejected (#381). Only clones when a clamp is required.
         let clamped_messages = image_clamp::clamp_outbound_images(messages);
         let messages: &[Message] = clamped_messages.as_deref().unwrap_or(messages);
+
+        // The provider weighs the whole request body, not each image. Aggregators
+        // such as Nous `inference-api.nousresearch.com` reject a body above 10 MB
+        // with `413 Request in excess of 10MB`, which no per-image clamp can see:
+        // 24 screenshots of ~0.42 MiB each all pass the per-image caps and still
+        // overflow the body (#1713). Drop the oldest images before the request is
+        // sent so the turn does not die on a size rejection.
+        let (system_chars, tools_chars) = match mode {
+            CompletionMode::Unified { system } => (system.len(), Self::tool_catalog_chars(tools)),
+            CompletionMode::Split {
+                system_static,
+                system_dynamic,
+            } => (
+                system_static.len() + system_dynamic.len(),
+                Self::tool_catalog_chars(tools),
+            ),
+        };
+        let body_clamped = image_clamp::clamp_outbound_request_body(messages, system_chars, tools_chars);
+        let messages: &[Message] = body_clamped.as_deref().unwrap_or(messages);
 
         // Deferred definitions are only meaningful to providers with native
         // deferred loading. Never let them reach a provider that would send

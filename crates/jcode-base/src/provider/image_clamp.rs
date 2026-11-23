@@ -1,3 +1,10 @@
+// reference: request-body byte ceilings are provider policy, not a library API.
+//   Anthropic Messages API: 128 MB max request size, 413 request_too_large
+//   (https://docs.claude.com/en/api/errors, "Request size limits").
+//   Nous Research inference-api.nousresearch.com: measured 413
+//   "Request in excess of 10MB. That's too big." on 2026-11-23; no public
+//   page states the limit, the value comes from the observed gateway response
+//   and the request-body character counts in the session log.
 //! Clamp outbound image dimensions before sending a request to a provider.
 //!
 //! Anthropic's Messages API enforces a per-image pixel cap that depends on how
@@ -33,8 +40,17 @@
 //! cap (e.g. a large, high-detail PNG). When that happens we re-encode the
 //! image as JPEG and progressively downscale it until its base64 payload fits
 //! within budget.
+//!
+//! Per-image limits are not the whole story. The provider weighs the **entire**
+//! request body, and aggregators reject it far below Anthropic's own ceiling:
+//! Nous Research's `inference-api.nousresearch.com` answers
+//! `413 Request in excess of 10MB` for a body whose images were each well under
+//! every per-image cap. [`clamp_outbound_request_body`] therefore drops the
+//! oldest inline images until the whole estimated body fits the budget in
+//! `jcode-compaction-core`.
 
 use base64::Engine as _;
+use jcode_compaction_core::REQUEST_BODY_CHAR_BUDGET;
 use jcode_message_types::{ContentBlock, Message};
 
 use crate::image_normalize::{normalize_image_bytes, sniff_provider_media_type};
@@ -130,6 +146,118 @@ const IMAGE_BASE64_BYTE_LIMIT: usize = 10 * 1024 * 1024;
 /// Target base64 size we re-encode oversized images down to. Kept a little
 /// under the hard limit so we always land safely inside the cap.
 const IMAGE_BASE64_BYTE_TARGET: usize = 9 * 1024 * 1024;
+
+/// Serialized size of a single content block, matching how the request body is
+/// measured. Used to price an image against the text marker replacing it.
+fn message_block_chars(block: &ContentBlock) -> usize {
+    serde_json::to_vec(block).map(|bytes| bytes.len()).unwrap_or(0)
+}
+
+/// Text marker left where an inline image was dropped.
+fn image_omission_marker(media_type: &str, original_len: usize) -> String {
+    format!(
+        "[Older image omitted to keep the request body under the provider size limit: media_type={media_type}, original_base64_chars={original_len}. Rely on adjacent tool text, screenshots saved to disk, or take a new screenshot if visual details are needed.]"
+    )
+}
+
+/// Estimated serialized size of the whole request body: messages plus system
+/// prompt plus tool catalog.
+///
+/// Message sizes come from `Message::serialized_json_bytes`, which counts the
+/// exact JSON without re-serializing shared payloads; the small constant covers
+/// the per-message envelope keys and the request's own top-level fields.
+fn estimate_request_body_chars(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> usize {
+    messages
+        .iter()
+        .map(|message| message.serialized_json_bytes() + 64)
+        .sum::<usize>()
+        + system_chars
+        + tools_chars
+}
+
+/// Return true when the request body is likely over the provider's byte
+/// ceiling, so the caller should drop images before sending.
+pub(crate) fn request_body_exceeds_budget(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> bool {
+    estimate_request_body_chars(messages, system_chars, tools_chars) > REQUEST_BODY_CHAR_BUDGET
+}
+
+/// Build a request-safe copy of `messages` whose estimated body fits the
+/// provider byte budget, replacing the oldest inline images with short text
+/// markers until it does.
+///
+/// The provider weighs the whole body (system prompt + tool catalog + messages),
+/// not individual images. A transcript of 24 screenshots can therefore be
+/// rejected with `413 Request in excess of 10MB` even though every image passes
+/// the per-image caps in [`clamp_outbound_images`] (#1713).
+///
+/// Returns `None` when the request already fits, so the common path never
+/// clones history. The newest images survive: they are the ones the model just
+/// asked for.
+pub(crate) fn clamp_outbound_request_body(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> Option<Vec<Message>> {
+    if !request_body_exceeds_budget(messages, system_chars, tools_chars) {
+        return None;
+    }
+    if !messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+    {
+        return None;
+    }
+
+    let mut clamped = messages.to_vec();
+    // The marker that replaces an image is itself a few hundred bytes, so the
+    // loop cannot simply re-check the whole body after each swap: the marker weight
+    // would count against the budget it is trying to satisfy. Track the body size
+    // incrementally, charging each replaced image only its marker's weight.
+    let mut body_chars = estimate_request_body_chars(messages, system_chars, tools_chars);
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    for (mi, message) in clamped.iter().enumerate() {
+        for (bi, block) in message.content.iter().enumerate() {
+            if matches!(block, ContentBlock::Image { .. }) {
+                order.push((mi, bi));
+            }
+        }
+    }
+
+    for (mi, bi) in order {
+        if body_chars <= REQUEST_BODY_CHAR_BUDGET {
+            break;
+        }
+        let block = &mut clamped[mi].content[bi];
+        if let ContentBlock::Image { media_type, data } = block {
+            let media_type = media_type.clone();
+            let original_len = data.len();
+            let marker = image_omission_marker(&media_type, original_len);
+            let image_chars = message_block_chars(block);
+            let marker_chars = message_block_chars(&ContentBlock::Text {
+                text: marker.clone(),
+                cache_control: None,
+            });
+            body_chars = body_chars
+                .saturating_sub(image_chars)
+                .saturating_add(marker_chars);
+            *block = ContentBlock::Text {
+                text: marker,
+                cache_control: None,
+            };
+        }
+    }
+
+    Some(clamped)
+}
 
 /// Inspect `messages` and, if any `ContentBlock::Image` exceeds the per-image
 /// edge limit implied by the total image count, or the per-image base64 byte
@@ -932,5 +1060,52 @@ mod tests {
             &out[0].content[0],
             ContentBlock::Text { text, .. } if text.starts_with("[Image omitted: image/png")
         ));
+    }
+
+    /// The regression that caused the 413: a transcript whose images are each
+    /// well under the per-image caps still overflows the whole body. The clamp
+    /// must drop the oldest images until the estimated body fits.
+    #[test]
+    fn request_body_clamp_drops_oldest_images_when_body_overflows() {
+        // 24 screenshots of 300 KiB each: each is far below the per-image cap,
+        // and their ~7 MiB total still fits the body budget on its own. The
+        // system prompt and tool catalog push the whole body past the ceiling,
+        // which is exactly the shape that produced the 413 (#1713).
+        let screenshot = "A".repeat(300 * 1024);
+        let messages: Vec<Message> = (0..24).map(|_| image_message(screenshot.clone())).collect();
+        let system = "s".repeat(71 * 1024);
+        let tools = 2 * 1024 * 1024;
+
+        // Images alone still fit; the body is what overflows.
+        assert!(!request_body_exceeds_budget(&messages, 0, 0));
+        assert!(request_body_exceeds_budget(&messages, system.len(), tools));
+
+        let clamped = clamp_outbound_request_body(&messages, system.len(), tools)
+            .expect("an over-budget body must be clamped");
+        assert!(!request_body_exceeds_budget(&clamped, system.len(), tools));
+        assert!(clamped.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        }));
+        assert!(matches!(clamped[0].content[0], ContentBlock::Text { .. }));
+        if let ContentBlock::Text { text, .. } = &clamped[0].content[0] {
+            assert!(text.contains("under the provider size limit"));
+        }
+        // The persisted history is untouched: this is a request snapshot.
+        assert!(matches!(messages[0].content[0], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn request_body_clamp_noop_when_body_fits() {
+        let messages = vec![image_message("A".repeat(4096))];
+        assert!(clamp_outbound_request_body(&messages, 16, 16).is_none());
+    }
+
+    #[test]
+    fn request_body_clamp_noop_without_images() {
+        let messages = vec![Message::user("a long prompt".repeat(4096).as_str())];
+        assert!(clamp_outbound_request_body(&messages, 1 << 20, 1 << 20).is_none());
     }
 }
