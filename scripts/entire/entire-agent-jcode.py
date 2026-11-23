@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------
-# synced from the standalone working tree (uncommitted image externalization), 2026-11-23
 # Ported into the jcode repository from the Entire external-agent adapter.
 # source: https://github.com/entireio/external-agents/blob/main/agents/entire-agent-hermes/
 # source repo: entire-agent-jcode @ 88fd2c7
@@ -38,10 +37,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
-import secrets
 import sys
 from pathlib import Path
 
@@ -359,165 +356,6 @@ _TRUNCATION_MARKER = "\n[... truncated by entire-agent-jcode ...]"
 # reference: https://github.com/entireio/entire-brain/blob/main/internal/cli/history.go
 _TRUNCATION_MARKER_B64 = "[... truncated by entire-agent-jcode ...]"
 
-# ---------------------------------------------------------------------------
-# Adapter-local image externalization
-# ---------------------------------------------------------------------------
-# An oversized image used to be TRUNCATED: _shrink_etf_line cut the base64 on a
-# quad boundary and flagged the block "truncated": true. The cut is a valid
-# base64 prefix, so the line survived the Brain's scanner but the picture was
-# destroyed and nothing anywhere held the rest.
-#
-# Instead the raw bytes are written to the adapter's own asset store and the
-# base64 is replaced by upstream's placeholder format, so the image survives and
-# the line shrinks.
-#
-# The format mirrors upstream's own so the two interoperate if upstream ever
-# gains a jcode codec:
-#   reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/transcript/imageextract/imageextract.go
-#   reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/checkpoint/persistent.go
-#
-# The upstream CLI cannot store these blobs itself: it rejects assets returned
-# by an external agent (cmd/entire/cli/checkpoint/compact_agent.go:102-105) and
-# its image codecs cover only Claude Code, Codex and Pi
-# (cmd/entire/cli/transcript/imageextract/imageextract.go:106-110).
-_ASSET_PLACEHOLDER_PREFIX = "entire-asset:assets/"
-# The placeholder must stay low-entropy: upstream's redaction pass flags any
-# [A-Za-z0-9+_=-]{10,} run whose Shannon entropy is >= 4.5 bits/char. A hex run
-# has at most 4 bits/char (16 symbols), so the id run stays well under it.
-# reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/transcript/imageextract/imageextract_test.go
-_ASSET_ID_BYTES = 16
-_ASSET_MANIFEST_NAME = "manifest.json"
-_ASSETS_DIR_NAME = "assets"
-# The shortest base64 value worth externalizing. Below this the payload is
-# never a real image and costs nothing inline. The value also exceeds the
-# 32-char hex run in a placeholder, so an externalized value can never be a
-# substring of a placeholder.
-# reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/transcript/imageextract/imageextract.go
-_MIN_EXTERNALIZED_BASE64_LEN = 64
-
-# Media type -> file extension. Mirrors upstream's extForMedia.
-_MEDIA_EXTENSIONS = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/gif": "gif",
-    "image/webp": "webp",
-    "image/bmp": "bmp",
-    "image/tiff": "tiff",
-    "image/svg+xml": "svg",
-}
-
-
-def _asset_extension(media_type: str) -> str:
-    """The file extension for a media type."""
-    if not isinstance(media_type, str):
-        return "bin"
-    return _MEDIA_EXTENSIONS.get(media_type.strip().lower(), "bin")
-
-
-def _new_asset_name(media_type: str) -> str:
-    """A fresh asset name, unique per call.
-
-    Upstream uses 16 random bytes as hex, so the name is unguessable and the
-    same bytes in two checkpoints dedupe by content in git. The hex counter
-    suffix guarantees termination even if the random source degenerates.
-    reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/transcript/imageextract/imageextract.go
-    """
-    return f"img-{secrets.token_hex(_ASSET_ID_BYTES)}.{_asset_extension(media_type)}"
-
-
-def _assets_dir(session_id: str) -> Path:
-    """Where the externalized assets of a session live.
-
-    Inside the agent session directory, next to the ETF sidecar: the CLI's
-    session-store containment check requires the session reference to resolve
-    inside that directory.
-    """
-    return _sessions_dir() / _SIDECAR_DIR / _ASSETS_DIR_NAME / session_id
-
-
-def _asset_manifest_path(session_id: str) -> Path:
-    return _assets_dir(session_id) / _ASSET_MANIFEST_NAME
-
-
-def _externalize_image(session_id: str, media_type: str, encoded: str) -> tuple[str, dict] | None:
-    """Write an image's bytes to the asset store and return its placeholder.
-
-    Returns (placeholder, manifest_entry) or None when the payload is not a
-    decodable image (in which case the caller must leave it inline and let the
-    existing trimming handle it).
-    """
-    if len(encoded) < _MIN_EXTERNALIZED_BASE64_LEN:
-        return None
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except Exception:
-        # Not decodable base64: leave it inline rather than storing garbage.
-        return None
-    if not raw:
-        return None
-    name = _new_asset_name(media_type)
-    directory = _assets_dir(session_id)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / name).write_bytes(raw)
-    except Exception:
-        # The asset could not be stored: leave the payload inline so the
-        # existing trimming still applies. Losing the line is worse.
-        return None
-    entry = {
-        "name": name,
-        "media_type": media_type,
-        "size": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-    }
-    return _ASSET_PLACEHOLDER_PREFIX + name, entry
-
-
-def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
-    """Write the manifest that indexes a session's externalized assets.
-
-    The shape mirrors upstream's own assets/manifest.json, so a reader can tell
-    which placeholders are externalized and what each blob should hash to.
-    reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/checkpoint/persistent.go
-    """
-    if not entries:
-        return
-    manifest = {"version": 1, "assets": entries}
-    path = _asset_manifest_path(session_id)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001 - report, do not crash the hook
-        sys.stderr.write(f"[entire-agent-jcode] write asset manifest: {exc}\n")
-
-
-def _reinject_assets(session_id: str, transcript: bytes) -> bytes:
-    """Restore externalized images into a transcript.
-
-    Best-effort: a placeholder whose asset is missing is left in place, so a
-    missing blob degrades to a visible placeholder rather than to an error.
-    """
-    prefix = _ASSET_PLACEHOLDER_PREFIX.encode("ascii")
-    if prefix not in transcript:
-        return transcript
-    directory = _assets_dir(session_id)
-    out = transcript
-    while True:
-        start = out.find(prefix)
-        if start == -1:
-            break
-        end = out.find(b'"', start)
-        if end == -1:
-            break
-        name = out[start + len(prefix):end].decode("utf-8", "replace")
-        try:
-            raw = (directory / name).read_bytes()
-        except OSError:
-            break
-        encoded = base64.b64encode(raw).decode("ascii")
-        out = out[:start] + encoded.encode("ascii") + out[end:]
-    return out
-
 
 def _truncate_bytes(text: str, limit: int) -> str:
     """Cut text to at most limit bytes without splitting a UTF-8 character."""
@@ -699,27 +537,21 @@ def _etf_lines(data: dict) -> list[dict]:
     return lines
 
 
-def _etf_jsonl(data: dict, session_id: str | None = None) -> bytes:
+def _etf_jsonl(data: dict) -> bytes:
     """The ETF v1 transcript of a Jcode session document, as JSONL bytes.
 
     Every line is kept under ``_MAX_LINE_BYTES`` so that the Brain's line
     scanner never rejects it. A line that is still too long after the tool
     result was truncated has its text blocks trimmed.
-
-    An oversized IMAGE is externalized to the asset store rather than trimmed,
-    so the picture survives; the session's manifest records what was stored.
     """
     out = bytearray()
-    assets: list[dict] = []
     for line in _etf_lines(data):
         encoded = _encode_etf_line(line)
         if len(encoded) > _MAX_LINE_BYTES:
-            line = _shrink_etf_line(line, len(encoded), session_id, assets)
+            line = _shrink_etf_line(line, len(encoded))
             encoded = _encode_etf_line(line)
         out += encoded
         out += b"\n"
-    if session_id is not None and assets:
-        _write_asset_manifest(session_id, assets)
     return bytes(out)
 
 
@@ -730,8 +562,7 @@ def _encode_etf_line(line: dict) -> bytes:
 
 
 # reference: https://github.com/entireio/entire-brain/blob/main/internal/cli/history.go
-def _shrink_etf_line(line: dict, encoded_len: int, session_id: str | None = None,
-                     assets: list[dict] | None = None) -> dict:
+def _shrink_etf_line(line: dict, encoded_len: int) -> dict:
     """Trim an ETF line that is over the Brain line budget.
 
     # reference: https://github.com/entireio/entire-brain/blob/main/internal/cli/history.go
@@ -745,10 +576,6 @@ def _shrink_etf_line(line: dict, encoded_len: int, session_id: str | None = None
     budget is wrong whenever a part carries bytes that were not accounted
     for, and the result is a line that is still over the limit (the Brain
     then drops the whole session) or a payload that was cut to nothing.
-
-    An IMAGE payload is never cut: it is externalized to the asset store
-    instead (see _externalize_image), so the picture survives. The cut path
-    stays for every other payload, which is what it was always for.
 
     reference: https://github.com/entireio/entire-brain/blob/main/internal/cli/history.go
     """
@@ -785,32 +612,6 @@ def _shrink_etf_line(line: dict, encoded_len: int, session_id: str | None = None
         for key in target["path"][:-1]:
             holder = holder[key]
         holder[target["path"][-1]] = value
-
-    # An IMAGE payload is externalized BEFORE anything is measured, so the
-    # picture is never cut. The placeholder is tiny, so the line shrinks
-    # instead of being trimmed.
-    if session_id is not None and assets is not None:
-        for target in list(targets):
-            if not target["payload"]:
-                continue
-            block = target["block"]
-            if block.get("type") != "image":
-                continue
-            media_type = block.get("media_type")
-            if not isinstance(media_type, str):
-                source = block.get("source")
-                media_type = source.get("media_type") if isinstance(source, dict) else None
-            result = _externalize_image(session_id, media_type, _read(target))
-            if result is None:
-                continue
-            placeholder, entry = result
-            _write(target, placeholder)
-            assets.append(entry)
-            # The block is no longer a truncation candidate: its payload is a
-            # placeholder now, and the "truncated" flag would be a lie.
-            target["size"] = len(placeholder.encode("utf-8"))
-            target["externalized"] = True
-            targets.remove(target)
 
     marker_len = len(_TRUNCATION_MARKER.encode("utf-8"))
     b64_marker_len = len(_TRUNCATION_MARKER_B64.encode("utf-8"))
@@ -898,7 +699,7 @@ _SIDECAR_DIR = ".entire"
 
 
 # reference: https://raw.githubusercontent.com/entireio/cli/main/transcript/README.md
-def _session_transcript_bytes(path: Path, session_id: str | None = None) -> bytes | None:
+def _session_transcript_bytes(path: Path) -> bytes | None:
     """The transcript bytes for a session path.
 
     A Jcode session is one JSON document, so it is converted into ETF v1
@@ -909,10 +710,6 @@ def _session_transcript_bytes(path: Path, session_id: str | None = None) -> byte
     JSONL used to pass through unchanged and was written into the checkpoint
     as the session's transcript.
 
-    session_id enables image externalization: the session id names the asset
-    store the externalized images are written to. It is derived from the path
-    when the caller does not pass it.
-
     Returns None for a file that cannot be read as well.
     """
     try:
@@ -921,9 +718,7 @@ def _session_transcript_bytes(path: Path, session_id: str | None = None) -> byte
         return None
     document = _read_session_document_bytes(raw)
     if document is not None:
-        if session_id is None:
-            session_id = path.stem
-        return _etf_jsonl(document, session_id)
+        return _etf_jsonl(document)
     if _is_etf_v1_jsonl(raw):
         return raw
     return None

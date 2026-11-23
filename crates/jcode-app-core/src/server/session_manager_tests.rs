@@ -143,25 +143,48 @@ async fn publication_never_overwrites_even_after_removal() -> Result<()> {
         &original
     ));
     let removed = manager.remove("target").await.unwrap();
+    // Removal retires the owner tombstone, so a replacement may restore.
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
+    manager
+        .register_new("target".into(), Arc::clone(&replacement))
+        .await?;
+    assert!(Arc::ptr_eq(
+        manager.read().await.get("target").unwrap(),
+        &replacement
+    ));
     assert!(manager.reserve("target").await.ensure_vacant().is_err());
-    assert!(
-        manager
-            .register_new("target".into(), Arc::clone(&replacement))
-            .await
-            .is_err()
-    );
-    // A retiring owner must block restoration before its factory can persist.
-    assert!(
-        manager
-            .get_or_start("target", || async {
-                panic!("retained owner must block restoration")
-            })
-            .await
-            .is_err()
-    );
     drop(original);
     drop(removed);
-    manager.register_new("target".into(), replacement).await?;
+    // The replacement is still published, so the slot stays occupied.
+    assert!(manager.reserve("target").await.ensure_vacant().is_err());
+    let retired = manager.remove("target").await.unwrap();
+    // Retiring the entry retires the tombstone: the live handle no longer bans.
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
+    drop(replacement);
+    drop(retired);
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
+    Ok(())
+}
+
+/// A disconnected session's orphan handle must not ban its own restore: the
+/// tombstone is retired with the registry entry, so the slot is vacant again
+/// even while a detached handle is still alive.
+#[tokio::test]
+async fn removal_retires_tombstone_so_orphan_resume_is_allowed() -> Result<()> {
+    let _env_lock = crate::storage::lock_test_env();
+    let _home = TestHome::new();
+    let manager = SessionManager::new();
+    let runtime = agent("target").await;
+    manager
+        .register_new("target".into(), Arc::clone(&runtime))
+        .await?;
+    assert!(manager.reserve("target").await.ensure_vacant().is_err());
+    let removed = manager.remove("target").await.unwrap();
+    // The old handle is still alive here; the slot must already be vacant.
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
+    drop(runtime);
+    drop(removed);
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
     Ok(())
 }
 
@@ -275,8 +298,10 @@ async fn observer_is_available_while_runtime_is_busy_and_retires_with_entry() ->
     );
     assert!(manager.remove_if_same("target", &runtime).await);
     assert!(manager.turn_observer("target").is_none());
-    assert!(manager.reserve("target").await.ensure_vacant().is_err());
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
     drop(busy);
+    drop(runtime);
+    assert!(manager.reserve("target").await.ensure_vacant().is_ok());
     Ok(())
 }
 
