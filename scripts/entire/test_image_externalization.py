@@ -303,6 +303,51 @@ def test_undecodable_payload_is_left_inline():
               out["content"][-1]["data"] == payload)
 
 
+def test_repeated_conversion_is_idempotent_and_leaves_no_orphan():
+    """A second conversion of the same session must not grow the asset store.
+
+    MEASURED 2026-11-24 (scratch/repro_manifest_loss.py): the name used to be
+    fresh random per call, so each materialization wrote a SECOND blob for the
+    SAME bytes and referenced only that one; the earlier blob stayed on disk
+    with no manifest entry. The store grew by N files per pass and the manifest
+    misreported it.
+    """
+    with TempHome() as root:
+        raw = _image_bytes(400_000)
+        payload = base64.b64encode(raw).decode("ascii")
+        session_id = "session_repeat_test"
+        document = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "x" * 600_000},
+                {"type": "image", "media_type": "image/png", "data": payload},
+            ]},
+        ]}
+        first = adapter._etf_jsonl(document, session_id)
+        assets_dir = adapter._assets_dir(session_id)
+        after_first = sorted(p.name for p in assets_dir.iterdir() if p.name != adapter._ASSET_MANIFEST_NAME)
+        first_manifest = json.loads(adapter._asset_manifest_path(session_id).read_text(encoding="utf-8"))
+
+        second = adapter._etf_jsonl(document, session_id)
+        after_second = sorted(p.name for p in assets_dir.iterdir() if p.name != adapter._ASSET_MANIFEST_NAME)
+        second_manifest = json.loads(adapter._asset_manifest_path(session_id).read_text(encoding="utf-8"))
+
+        check("same placeholder across conversions",
+              first.split(b'"data":"')[1] == second.split(b'"data":"')[1])
+        check("asset store does not grow on re-conversion",
+              after_first == after_second,
+              f"{after_first} -> {after_second}")
+        check("manifest keeps every stored asset",
+              {a["name"] for a in first_manifest["assets"]}
+              <= {a["name"] for a in second_manifest["assets"]},
+              f"lost={sorted({a['name'] for a in first_manifest['assets']} - {a['name'] for a in second_manifest['assets']})}")
+        referenced = {a["name"] for a in second_manifest["assets"]}
+        on_disk = set(after_second)
+        check("no blob is unreferenced (no orphan)",
+              on_disk <= referenced, f"orphans={sorted(on_disk - referenced)}")
+        check("no reference is missing its blob (no dangling)",
+              referenced <= on_disk, f"dangling={sorted(referenced - on_disk)}")
+
+
 def main():
     test_oversized_image_is_externalized_not_truncated()
     test_manifest_is_written()
@@ -313,6 +358,7 @@ def main():
     test_negative_control_the_old_path_destroyed_the_image()
     test_small_image_is_not_externalized()
     test_undecodable_payload_is_left_inline()
+    test_repeated_conversion_is_idempotent_and_leaves_no_orphan()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

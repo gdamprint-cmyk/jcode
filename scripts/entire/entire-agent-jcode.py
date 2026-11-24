@@ -414,13 +414,31 @@ def _asset_extension(media_type: str) -> str:
     return _MEDIA_EXTENSIONS.get(media_type.strip().lower(), "bin")
 
 
+def _asset_name_for(media_type: str, raw: bytes) -> str:
+    """The asset name for a byte string: STABLE PER CONTENT.
+
+    MEASURED 2026-11-24 (reproduced in scratch/repro_manifest_loss.py): the
+    previous implementation named every call with fresh randomness, so each
+    re-conversion of a session wrote a NEW blob for the SAME bytes. A session
+    with N images therefore grew by N files on every materialization, and the
+    second pass left the first blob unreferenced (see _write_asset_manifest).
+
+    Upstream can afford random ids because its asset store is a GIT object
+    store: identical bytes are one object no matter how many names point at
+    them (imageextract.go's package comment: "git dedupes identical blobs
+    across checkpoints by content"). This adapter's store is plain FILES on
+    disk, where a duplicate name is a duplicate copy. Content addressing is the
+    same property adapted to a filesystem: one name per byte string means the
+    store stays bounded and a re-conversion is a no-op.
+    """
+    return f"img-{hashlib.sha256(raw).hexdigest()}.{_asset_extension(media_type)}"
+
+
 def _new_asset_name(media_type: str) -> str:
     """A fresh asset name, unique per call.
 
-    Upstream uses 16 random bytes as hex, so the name is unguessable and the
-    same bytes in two checkpoints dedupe by content in git. The hex counter
-    suffix guarantees termination even if the random source degenerates.
-    reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/transcript/imageextract/imageextract.go
+    Kept for a caller that needs distinct names for identical bytes; the
+    transcript path uses _asset_name_for, whose stability is the point.
     """
     return f"img-{secrets.token_hex(_ASSET_ID_BYTES)}.{_asset_extension(media_type)}"
 
@@ -455,7 +473,7 @@ def _externalize_image(session_id: str, media_type: str, encoded: str) -> tuple[
         return None
     if not raw:
         return None
-    name = _new_asset_name(media_type)
+    name = _asset_name_for(media_type, raw)
     directory = _assets_dir(session_id)
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -479,11 +497,30 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
     The shape mirrors upstream's own assets/manifest.json, so a reader can tell
     which placeholders are externalized and what each blob should hash to.
     reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/checkpoint/persistent.go
+
+    Existing entries are PRESERVED, merged by name.
+    MEASURED 2026-11-24: this function replaced the whole file with the entries
+    of THIS call, so a second conversion of the same session dropped every
+    earlier entry while its blob stayed on disk - a payload the reader cannot
+    resolve and a manifest that misreported the store.
     """
     if not entries:
         return
-    manifest = {"version": 1, "assets": entries}
     path = _asset_manifest_path(session_id)
+    merged: dict[str, dict] = {}
+    try:
+        if path.exists():
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            for item in previous.get("assets") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    merged[item["name"]] = item
+    except Exception:  # noqa: BLE001 - a corrupt manifest is rebuilt, not fatal
+        merged = {}
+    for entry in entries:
+        name = entry.get("name")
+        if name:
+            merged[name] = entry
+    manifest = {"version": 1, "assets": list(merged.values())}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
