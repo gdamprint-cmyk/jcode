@@ -706,7 +706,6 @@ impl Drop for ProcessGroupKillGuard {
 fn build_shell_command(cmd_str: &str) -> TokioCommand {
     #[cfg(windows)]
     {
-        let mut cmd = TokioCommand::new("cmd.exe");
         // cmd.exe does not use the standard C runtime argument-decoding rules.
         // Passing the command through `arg` makes Rust escape nested quotes for
         // CommandLineToArgvW, which can corrupt commands such as:
@@ -727,7 +726,11 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         // reference: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
         //
         // `isolate_from_console` takes a std Command, so the shell is built as one,
-        // flagged, and handed back to tokio via the standard conversion.
+        // flagged, and handed back to tokio via the standard conversion. The trait
+        // providing `raw_arg` on std's Command is `std::os::windows::process::CommandExt`
+        // (tokio's own Command has an inherent `raw_arg`, which is why the block compiled
+        // before it moved onto std's type). Without this import rustc reports E0599.
+        use std::os::windows::process::CommandExt;
         let mut std_cmd = std::process::Command::new("cmd.exe");
         std_cmd
             .args(["/D", "/S", "/C"])
