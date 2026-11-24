@@ -10,10 +10,10 @@
     "session-end"
   ],
   "commands": {
-    "session-start": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' session-start",
-    "turn-start": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' turn-start",
-    "turn-end": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' turn-end",
-    "session-end": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' session-end"
+    "session-start": "python 'C:\\Users\\WorkShop1\\proj\\jcode-src\\scripts\\entire\\entire-agent-jcode-hook.py' session-start",
+    "turn-start": "python 'C:\\Users\\WorkShop1\\proj\\jcode-src\\scripts\\entire\\entire-agent-jcode-hook.py' turn-start",
+    "turn-end": "python 'C:\\Users\\WorkShop1\\proj\\jcode-src\\scripts\\entire\\entire-agent-jcode-hook.py' turn-end",
+    "session-end": "python 'C:\\Users\\WorkShop1\\proj\\jcode-src\\scripts\\entire\\entire-agent-jcode-hook.py' session-end"
   },
   "jcode_config": "C:\\Users\\WorkShop1\\.jcode\\config.toml",
   "global_scope": false
