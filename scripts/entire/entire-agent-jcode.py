@@ -547,6 +547,27 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - report, do not crash the hook
         sys.stderr.write(f"[entire-agent-jcode] write asset manifest: {exc}\n")
+        # D2, MEASURED 2026-11-24 by an independent review lane
+        # (~/.jcode/scratch/r6b/review.md): on this path the blobs of THIS call
+        # were already written and are now unreferenced, so every later
+        # conversion re-writes them (stable content-addressed names) and never
+        # repairs the manifest - a permanent orphan, which is exactly what the
+        # acceptance test's `no blob is unreferenced` check forbids. Remove those
+        # blobs here; if removal fails, name them on stderr so the leak is
+        # visible rather than silent.
+        directory = _assets_dir(session_id)
+        for entry in entries:
+            name = entry.get("name")
+            if not name:
+                continue
+            try:
+                blob = directory / name
+                if blob.is_file():
+                    blob.unlink()
+            except OSError as rm_exc:
+                sys.stderr.write(
+                    f"[entire-agent-jcode] asset {name} is UNREFERENCED after a "
+                    f"failed manifest write: {rm_exc}\n")
 
 
 def _reinject_assets(session_id: str, transcript: bytes) -> bytes:
