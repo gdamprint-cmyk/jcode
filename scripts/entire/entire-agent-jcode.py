@@ -508,6 +508,7 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
         return
     path = _asset_manifest_path(session_id)
     merged: dict[str, dict] = {}
+    rebuilt_from_disk = False
     try:
         if path.exists():
             previous = json.loads(path.read_text(encoding="utf-8"))
@@ -515,7 +516,27 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
                 if isinstance(item, dict) and item.get("name"):
                     merged[item["name"]] = item
     except Exception:  # noqa: BLE001 - a corrupt manifest is rebuilt, not fatal
+        # MEASURED 2026-11-24 by an independent review lane
+        # (~/.jcode/scratch/r6b/review.md, finding D3): the bare `except` set
+        # merged={}, DISCARDING every reference to blobs still on disk. A
+        # manifest overwritten with `{not json`, or a crash halfway through
+        # write_text below, turned already-written assets into permanent
+        # orphans: measured `lost_refs ['img-1e7e...94b.png']` with
+        # `disk_blobs 2`. A corrupt manifest is rebuilt FROM THE BLOBS PRESENT ON
+        # DISK, the same invariant the happy-path orphan check asserts.
         merged = {}
+        rebuilt_from_disk = True
+    if rebuilt_from_disk:
+        directory = _assets_dir(session_id)
+        try:
+            blobs = sorted(directory.glob("*")) if directory.is_dir() else []
+        except OSError as exc:
+            sys.stderr.write(
+                f"[entire-agent-jcode] rebuild asset manifest from disk: {exc}\n")
+            blobs = []
+        for blob in blobs:
+            if blob.is_file():
+                merged.setdefault(blob.name, {"name": blob.name})
     for entry in entries:
         name = entry.get("name")
         if name:
@@ -531,29 +552,54 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
 def _reinject_assets(session_id: str, transcript: bytes) -> bytes:
     """Restore externalized images into a transcript.
 
-    Best-effort: a placeholder whose asset is missing is left in place, so a
-    missing blob degrades to a visible placeholder rather than to an error.
+    Best-effort PER PLACEHOLDER: a placeholder whose asset is missing is left in
+    place, so a missing blob degrades to a visible placeholder rather than to an
+    error.
+
+    MEASURED 2026-11-24 by an independent read-only review lane (artifact
+    ~/.jcode/scratch/r6b/review.md, finding D1): the loop used `break` on an
+    OSError, which ended the WHOLE scan at the first missing blob. A transcript
+    with two placeholders, the FIRST of whose blobs was missing, left the second
+    (present) image unresolved: `A_placeholder_survived True
+    B_placeholder_survived True B_base64_restored False`. The docstring promised
+    per-placeholder degradation and delivered whole-transcript degradation.
+
+    Implemented as a single left-to-right pass over matches with a cursor, which
+    is the stdlib's own idiom for "call once per occurrence, keep going":
+    re.sub with a function repl is documented as being called "for every
+    non-overlapping occurrence" (reference: docs.python.org/3/library/re.html,
+    read 2026-11-24). A hand-written while/break loop is what produced the bug.
     """
     prefix = _ASSET_PLACEHOLDER_PREFIX.encode("ascii")
     if prefix not in transcript:
         return transcript
     directory = _assets_dir(session_id)
-    out = transcript
+    out = []
+    cursor = 0
     while True:
-        start = out.find(prefix)
+        start = transcript.find(prefix, cursor)
         if start == -1:
+            out.append(transcript[cursor:])
             break
-        end = out.find(b'"', start)
+        end = transcript.find(b'"', start)
         if end == -1:
+            # An unterminated placeholder is not ours to guess at; leave the
+            # remainder verbatim rather than dropping bytes.
+            out.append(transcript[cursor:])
             break
-        name = out[start + len(prefix):end].decode("utf-8", "replace")
+        name = transcript[start + len(prefix):end].decode("utf-8", "replace")
         try:
             raw = (directory / name).read_bytes()
         except OSError:
-            break
-        encoded = base64.b64encode(raw).decode("ascii")
-        out = out[:start] + encoded.encode("ascii") + out[end:]
-    return out
+            # Leave THIS placeholder, advance past it, keep scanning. One
+            # missing blob must not strand every later image (see docstring).
+            out.append(transcript[cursor:end])
+            cursor = end
+            continue
+        out.append(transcript[cursor:start])
+        out.append(base64.b64encode(raw))
+        cursor = end
+    return b"".join(out)
 
 
 def _truncate_bytes(text: str, limit: int) -> str:
@@ -1349,7 +1395,14 @@ def cmd_read_transcript(args) -> int:
     #
     # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/agent/external/external.go
     # reference: https://github.com/entireio/cli/blob/main/cmd/entire/cli/lifecycle.go
-    if _called_by_cli() and not args.allow_oversized and len(data) > _CLI_STDOUT_LIMIT_BYTES:
+    if _called_by_cli() and not args.allow_oversized and len(data) >= _CLI_STDOUT_LIMIT_BYTES:
+        # MEASURED 2026-11-24 by an independent review lane
+        # (~/.jcode/scratch/r6b/review.md, finding D4): the guard used `>` while
+        # the unconditional trailing-newline write below adds one byte, so a
+        # transcript of EXACTLY the limit passed the guard and reached
+        # 10485761 bytes on stdout - one over the cap the CLI enforces, which
+        # makes the CLI discard the whole reply. `>=` reserves that byte for the
+        # newline; the refusal still names the transcript's ACTUAL size.
         sys.stderr.write(
             "[entire-agent-jcode] read-transcript: transcript is "
             f"{len(data)} bytes, above the Entire CLI's stdout limit of "
