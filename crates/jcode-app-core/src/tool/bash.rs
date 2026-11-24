@@ -663,6 +663,14 @@ fn configure_non_interactive(command: &mut TokioCommand) {
     }
 }
 
+#[cfg(windows)]
+fn configure_non_interactive(command: &mut TokioCommand) {
+    // stdin is null on both platforms so a command that reads it gets EOF at once
+    // instead of hanging the turn. `CREATE_NEW_PROCESS_GROUP`, the Windows half of
+    // the setsid() above, is set in build_shell_command.
+    command.stdin(Stdio::null());
+}
+
 #[cfg(not(windows))]
 fn configure_tool_scratch(command: &mut TokioCommand) {
     if let Some(dir) = tool_scratch_dir() {
@@ -709,9 +717,23 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
         // full command in the outer quotes expected by cmd so its inner quotes
         // reach child programs intact. `/D` disables AutoRun hooks and `/S`
         // selects the documented quote handling used with this form.
-        cmd.args(["/D", "/S", "/C"])
+        // No console window, chosen HERE rather than inherited. Microsoft Learn
+        // "Process Creation Flags": CREATE_NO_WINDOW gives a console application a
+        // console with no window and descendants inherit it; the flag is IGNORED if
+        // combined with DETACHED_PROCESS or CREATE_NEW_CONSOLE. The daemon was already
+        // spawned this way (crates/jcode-base/src/platform.rs:isolate_from_console), so
+        // a plain `cmd.exe` child stayed invisible only by INHERITANCE: any spawn whose
+        // parent later differs would flash a console. Set it explicitly.
+        // reference: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+        //
+        // `isolate_from_console` takes a std Command, so the shell is built as one,
+        // flagged, and handed back to tokio via the standard conversion.
+        let mut std_cmd = std::process::Command::new("cmd.exe");
+        std_cmd
+            .args(["/D", "/S", "/C"])
             .raw_arg(format!("\"{cmd_str}\""));
-        cmd
+        crate::platform::isolate_from_console(&mut std_cmd);
+        TokioCommand::from(std_cmd)
     }
     #[cfg(not(windows))]
     {
@@ -963,6 +985,7 @@ impl BashTool {
         let timeout_duration = Duration::from_millis(timeout_ms);
 
         let mut command = build_shell_command(&params.command);
+        configure_non_interactive(&mut command);
         command.envs(cloud_command_environment(ctx.working_dir.as_deref())?);
         command.envs(crate::session_env::session_env(&ctx.session_id));
         command
@@ -1277,8 +1300,9 @@ impl BashTool {
 					cmd.envs(cloud_environment);
 					cmd.envs(session_environment);
 					cmd.env("JCODE_SESSION_ID", &session_id_env);
-					// build_shell_command runs the child in its own session
-					// (setsid), so it is already its own process group leader.
+					// build_shell_command gives the child its own process group on both
+					// platforms (CREATE_NEW_PROCESS_GROUP on Windows, setsid elsewhere),
+					// so a group/tree kill reaches the whole subtree.
                     cmd.kill_on_drop(true);
                     configure_background_command_stdio(&mut cmd);
                     if let Some(ref dir) = working_dir {
@@ -1327,7 +1351,18 @@ impl BashTool {
 	                                }
 	                                #[cfg(not(unix))]
 	                                {
-	                                    let _ = child.start_kill();
+	                                    // A Windows `start_kill` ends the SHELL only: a
+	                                    // cmd.exe that launched a compiler, a test runner or
+	                                    // a server leaves that descendant alive, and that is
+	                                    // exactly the orphan shape this host measured. The
+	                                    // tree kill already exists for this purpose
+	                                    // (platform::signal_detached_process_group runs
+	                                    // taskkill /T /F, with a TerminateProcess fallback).
+	                                    if let Some(pid) = child.id() {
+	                                        let _ = crate::platform::signal_detached_process_group(pid, 0);
+	                                    } else {
+	                                        let _ = child.start_kill();
+	                                    }
 	                                }
 	                                break;
 	                            }

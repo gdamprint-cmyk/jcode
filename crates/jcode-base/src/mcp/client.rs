@@ -231,8 +231,22 @@ impl McpClient {
             .kill_on_drop(true);
         // Own process group so shutdown also stops `npx` wrapper descendants
         // (node), which otherwise outlive the wrapper and keep running.
+        //
+        // Windows gets the equivalent flag, and the SAME one that keeps the child
+        // windowless: CREATE_NO_WINDOW gives a console application a console with no
+        // window and descendants inherit it. reference: Microsoft Learn "Process
+        // Creation Flags" - the flag is ignored if combined with DETACHED_PROCESS or
+        // CREATE_NEW_CONSOLE, so this must not be added to `spawn_detached`, whose
+        // callers WANT no console at all.
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
         if let Some(dir) = working_dir {
             command.current_dir(dir);
         }
