@@ -31,8 +31,8 @@ fn test_strip_oversized_images_drops_oldest_first() {
     let mut app = create_test_app();
     app.session.replace_messages(Vec::new());
 
-    let big = "a".repeat(8 * 1024 * 1024); // 8 MiB base64 image each
-    for _ in 0..3 {
+    let big = "a".repeat(2 * 1024 * 1024); // 2 MiB base64 image each
+    for _ in 0..6 {
         app.session.add_message(
             Role::User,
             vec![ContentBlock::Image {
@@ -42,11 +42,11 @@ fn test_strip_oversized_images_drops_oldest_first() {
         );
     }
 
-    // 24 MiB of images, budget 12 MiB → drop the two oldest, keep the newest.
+    // 12 MiB of images, recovery budget 6 MiB → drop the three oldest, keep the three newest.
     let stripped = app
         .session
         .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-    assert_eq!(stripped, 2);
+    assert_eq!(stripped, 3);
     assert!(matches!(
         app.session.messages[0].content[0],
         ContentBlock::Text { .. }
@@ -57,6 +57,18 @@ fn test_strip_oversized_images_drops_oldest_first() {
     ));
     assert!(matches!(
         app.session.messages[2].content[0],
+        ContentBlock::Text { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[3].content[0],
+        ContentBlock::Image { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[4].content[0],
+        ContentBlock::Image { .. }
+    ));
+    assert!(matches!(
+        app.session.messages[5].content[0],
         ContentBlock::Image { .. }
     ));
 }
@@ -163,6 +175,29 @@ fn test_rewind_lists_visible_messages_when_initial_session_context_is_hidden() {
     assert!(last.content.contains("Conversation history:"));
     assert!(last.content.contains("1 👤 User - msg-1"));
     assert!(last.content.contains("2 👤 User - msg-2"));
+    assert_eq!(last.title.as_deref(), Some("Rewind"));
+    let rows: Vec<String> =
+        crate::tui::ui::render_system_message(last, 100, crate::config::DiffDisplayMode::default())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+    let first = rows
+        .iter()
+        .position(|row| row.contains("1 👤 User - msg-1"))
+        .expect("first entry visible");
+    let second = rows
+        .iter()
+        .position(|row| row.contains("2 👤 User - msg-2"))
+        .expect("second entry visible");
+    assert!(
+        first < second,
+        "rewind entries must occupy separate ordered rows: {rows:?}"
+    );
     assert!(!last.content.contains("Session Context"));
     assert!(!last.content.contains("No messages in conversation"));
 }
@@ -712,11 +747,9 @@ fn test_ctrl_l_terminal_clear_adds_spacer_and_keeps_everything() {
     crate::tui::ui::set_last_chat_viewport_height(0);
 }
 
-/// The Ctrl+L spacer is a screen-state artifact, not transcript content: as
-/// soon as a real message arrives it is dropped, so no blank block is ever
-/// embedded in the scrollback history.
+/// New content keeps the Ctrl+L boundary so the cleared view does not reset.
 #[test]
-fn test_ctrl_l_spacer_dropped_when_new_content_arrives() {
+fn test_ctrl_l_spacer_retained_when_new_content_arrives() {
     let mut app = create_test_app();
     app.display_messages = vec![DisplayMessage::system("old chat".to_string())];
     app.bump_display_messages_version();
@@ -736,8 +769,8 @@ fn test_ctrl_l_spacer_dropped_when_new_content_arrives() {
         .collect();
     assert_eq!(
         roles,
-        vec!["system", "user"],
-        "spacer must be dropped when real content arrives (no blank block in history)"
+        vec!["system", "spacer", "user"],
+        "the clear boundary survives new content"
     );
 
     crate::tui::ui::set_last_chat_viewport_height(0);
@@ -884,6 +917,8 @@ fn test_resize_resets_diagram_and_side_panel_diagram_view_to_fit() {
 
 #[test]
 fn test_side_panel_visibility_change_resets_diagram_fit_context() {
+    let _lock = crate::storage::lock_test_env();
+    let _provider_env = ProviderEnvGuard::clear();
     let _render_lock = scroll_render_test_lock();
     let mut app = create_test_app();
     app.diagram_mode = crate::config::DiagramDisplayMode::Pinned;
@@ -1244,7 +1279,7 @@ fn test_workspace_info_widget_appears_in_visual_debug_frame_when_enabled() {
 #[test]
 fn test_mouse_scroll_over_diff_pane_scrolls_side_panel_without_changing_focus() {
     let _render_lock = scroll_render_test_lock();
-    let mut app = create_test_app();
+    let (mut app, _) = make_edit_badge_test_app(30);
     app.diff_mode = crate::config::DiffDisplayMode::File;
     app.diff_pane_scroll = 5;
     app.diff_pane_focus = false;
@@ -1272,7 +1307,7 @@ fn test_mouse_scroll_over_diff_pane_scrolls_side_panel_without_changing_focus() 
 #[test]
 fn test_mouse_scroll_animation_preserves_side_pane_scroll_sensitivity() {
     let _render_lock = scroll_render_test_lock();
-    let mut app = create_test_app();
+    let (mut app, _) = make_edit_badge_test_app(30);
     app.diff_mode = crate::config::DiffDisplayMode::File;
     app.diff_pane_scroll = 5;
     app.diff_pane_auto_scroll = true;
@@ -1353,32 +1388,103 @@ fn test_mouse_scroll_over_tool_side_panel_scrolls_shared_right_pane_without_chan
 }
 
 #[test]
-fn test_side_pane_scroll_by_clamps_to_rendered_extent() {
-    let _render_lock = scroll_render_test_lock();
+fn test_payload_too_large_with_images_under_budget_drops_all_images() {
+    use crate::message::ContentBlock;
     let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+    // Auto-poke must be armed so the assertion proves this path keeps it alive.
+    app.auto_poke_incomplete_todos = true;
+    app.auto_poke_default_on = true;
 
-    // Simulate a rendered frame: 30 content lines in a 20-line viewport.
-    crate::tui::ui::set_pinned_pane_total_lines(30);
-    crate::tui::ui::set_last_diff_pane_max_scroll(10);
-    crate::tui::ui::set_last_diff_pane_effective_scroll(10);
+    // The measured humpback 413: the gateway ceiling counts the WHOLE body, so
+    // images can each be far under `PAYLOAD_IMAGE_CHAR_BUDGET` (a total, not a
+    // per-image cap) and `strip_oversized_images` still removes nothing. The old
+    // code then wrote "no inline images could be dropped" and disarmed auto-poke,
+    // stranding an unattended session on `/fix`.
+    let image = "a".repeat(1024 * 1024); // 1 MiB base64 each
+    for _ in 0..4 {
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: image.clone(),
+            }],
+        );
+    }
 
-    // Follow-bottom sentinel resolves to the on-screen position before moving.
-    app.diff_pane_scroll = usize::MAX;
-    assert!(app.side_pane_scroll_by(-3));
-    assert_eq!(app.diff_pane_scroll, 7);
-    assert!(!app.diff_pane_auto_scroll);
+    app.handle_turn_error(
+        "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large\n  \
+         response: {\"status\":413,\"message\":\"Request in excess of 10MB. That's too big.\"}",
+    );
 
-    // Downward motion clamps at the rendered max instead of accumulating
-    // phantom offset past the bottom.
-    app.diff_pane_scroll = 9;
-    assert!(app.side_pane_scroll_by(3));
-    assert_eq!(app.diff_pane_scroll, 10);
-    assert!(!app.side_pane_scroll_by(3), "already at the bottom");
-    assert_eq!(app.diff_pane_scroll, 10);
-
-    // A stale stored offset beyond the rendered extent snaps back so the very
-    // next upward scroll moves the visible view immediately.
-    app.diff_pane_scroll = 25;
-    assert!(app.side_pane_scroll_by(-3));
-    assert_eq!(app.diff_pane_scroll, 7);
+    // 4 MiB of images is under the 6 MiB total budget, so the per-image strip
+    // must NOT be what saved us: every image had to go.
+    assert_eq!(
+        app.session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.content[0], ContentBlock::Image { .. }))
+            .count(),
+        0,
+        "a body-size 413 with images under the budget must drop every inline image"
+    );
+    assert!(
+        app.session
+            .messages
+            .iter()
+            .all(|message| matches!(message.content[0], ContentBlock::Text { .. })),
+        "dropped images must survive as text notes, not vanish"
+    );
+    assert!(
+        app.auto_poke_incomplete_todos,
+        "a 413 that can be retried must not disarm the follow-up"
+    );
+    assert!(app.auto_poke_default_on);
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|message| message.content.contains("Dropped all inline images")),
+        "the session must be told that every image was dropped"
+    );
+    assert!(
+        !app
+            .display_messages
+            .iter()
+            .any(|message| message.content.contains("no inline images could be dropped")),
+        "the session must not be told to run /fix for a retryable body-size rejection"
+    );
 }
+
+#[test]
+fn test_payload_too_large_without_images_still_stops_auto_poke_when_recovery_fails() {
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+    app.auto_poke_incomplete_todos = true;
+    app.auto_poke_default_on = true;
+    app.session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "a long text-only transcript".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    app.handle_turn_error(
+        "OpenAI-compatible chat request failed\n  status: 413 Payload Too Large",
+    );
+
+    // Negative control: a single short text message cannot be compacted, so the
+    // failure is genuinely unrecoverable here and auto-poke must be disarmed.
+    assert!(!app.auto_poke_incomplete_todos);
+    assert!(!app.auto_poke_default_on);
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|message| message.role == "error"
+                && message.content.contains("auto-recovery could not shrink it")),
+        "the user must be told that recovery was attempted and failed"
+    );
+}
+
+#[path = "part_01/side_pane_extent.rs"]
+mod side_pane_extent;

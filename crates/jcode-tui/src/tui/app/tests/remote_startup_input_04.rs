@@ -16,6 +16,75 @@ fn test_handle_server_event_updates_status_detail() {
 }
 
 #[test]
+fn test_overload_status_detail_is_durable_and_deduplicated() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    let detail = "OpenAI reported server overload. Retrying request.";
+    let initial_len = app.display_messages.len();
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::StatusDetail {
+            detail: detail.into(),
+        },
+        &mut remote,
+    );
+    assert_eq!(app.display_messages.len(), initial_len + 1);
+    let notice = app.display_messages.last().unwrap();
+    assert_eq!(notice.role, "system");
+    assert_eq!(notice.content, detail);
+
+    // The local stream path uses the same helper. Ordinary status replacement
+    // must neither remove the notice nor defeat replay deduplication.
+    app.apply_status_detail("reusing websocket".into());
+    app.apply_status_detail(detail.into());
+    app.handle_server_event(
+        crate::protocol::ServerEvent::StatusDetail {
+            detail: detail.into(),
+        },
+        &mut remote,
+    );
+    assert_eq!(app.display_messages.len(), initial_len + 1);
+    app.apply_status_detail("connected".into());
+    assert_eq!(app.status_detail.as_deref(), Some("connected"));
+    assert_eq!(app.display_messages.last().unwrap().content, detail);
+
+    // A later failed retry with no committed assistant output must not roll
+    // back the overload notice. Both stream paths use this rollback helper.
+    app.rollback_streaming_attempt();
+    app.handle_server_event(
+        crate::protocol::ServerEvent::RetryRollback { attempt: 2, max: 3 },
+        &mut remote,
+    );
+    assert_eq!(app.display_messages.len(), initial_len + 1);
+    assert_eq!(app.display_messages.last().unwrap().content, detail);
+
+    // A later user turn can report a fresh overload without losing old history.
+    app.push_display_message(DisplayMessage::user("next turn"));
+    app.apply_status_detail(detail.into());
+    assert_eq!(app.display_messages.len(), initial_len + 3);
+    assert_eq!(app.display_messages.last().unwrap().content, detail);
+}
+
+#[test]
+fn test_overload_status_detail_requires_exact_prefix() {
+    let mut app = create_test_app();
+    let initial_len = app.display_messages.len();
+    for detail in [
+        "reusing websocket",
+        "connecting",
+        " OpenAI reported server overload",
+        "openai reported server overload",
+        "Retry: OpenAI reported server overload",
+    ] {
+        app.apply_status_detail(detail.into());
+        assert_eq!(app.status_detail.as_deref(), Some(detail));
+        assert_eq!(app.display_messages.len(), initial_len);
+    }
+}
+
+#[test]
 fn test_handle_server_event_transcript_replace_updates_input() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -39,6 +108,29 @@ fn test_handle_server_event_transcript_replace_updates_input() {
         app.status_notice(),
         Some("Transcript replaced input".to_string())
     );
+}
+
+#[test]
+fn test_transcript_replacement_starts_new_typing_undo_step() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    for c in ['d', 'o', 'g'] {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty()).unwrap();
+    }
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Transcript {
+            text: "cat".to_string(),
+            mode: crate::protocol::TranscriptMode::Replace,
+        },
+        &mut remote,
+    );
+    app.handle_key(KeyCode::Char('s'), KeyModifiers::empty()).unwrap();
+    assert_eq!(app.input(), "cats");
+    app.undo_input_change();
+    assert_eq!(app.input(), "cat");
 }
 
 #[test]

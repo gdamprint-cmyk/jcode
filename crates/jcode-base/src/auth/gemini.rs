@@ -86,10 +86,10 @@ pub fn save_api_key(key: &str) -> Result<()> {
     if key.is_empty() {
         anyhow::bail!("Gemini API key cannot be empty");
     }
-    crate::provider_catalog::save_env_value_to_env_file(
-        GEMINI_API_KEY_ENV_VARS[0],
+    crate::provider_catalog::save_named_api_key(
         GEMINI_API_KEY_ENV_FILE,
-        Some(key),
+        GEMINI_API_KEY_ENV_VARS[0],
+        key,
     )?;
     super::AuthStatus::invalidate_cache();
     Ok(())
@@ -363,7 +363,7 @@ pub async fn login(no_browser: bool) -> Result<GeminiTokens> {
 
         eprintln!("\nOpening browser for Gemini login...\n");
         eprintln!("If the browser didn't open, visit:\n{}\n", auth_url);
-        if let Some(qr) = crate::login_qr::indented_section(
+        if let Some(qr) = crate::auth::login_ui::qr_section(
             &auth_url,
             "Scan this QR on another device if this machine has no browser:",
             "    ",
@@ -372,7 +372,7 @@ pub async fn login(no_browser: bool) -> Result<GeminiTokens> {
             eprintln!("{qr}\n");
         }
 
-        let browser_opened = open::that(&auth_url).is_ok();
+        let browser_opened = crate::companion_client::open_url(&auth_url);
         if browser_opened {
             eprintln!(
                 "Waiting up to 300s for automatic callback on {}",
@@ -430,7 +430,7 @@ async fn manual_login(
     let auth_url = build_manual_auth_url(GEMINI_MANUAL_REDIRECT_URI, challenge, state)?;
     eprintln!("\nManual Gemini auth required.\n");
     eprintln!("Open this URL in your browser:\n\n{}\n", auth_url);
-    if let Some(qr) = crate::login_qr::indented_section(
+    if let Some(qr) = crate::auth::login_ui::qr_section(
         &auth_url,
         "Scan this QR on another device if needed:",
         "    ",
@@ -439,12 +439,12 @@ async fn manual_login(
         eprintln!("{qr}\n");
     }
     if !crate::auth::browser_suppressed(no_browser) {
-        let _ = open::that(&auth_url);
+        let _ = crate::companion_client::open_url(&auth_url);
     }
     eprintln!("After approving access, Google will show an authorization code. Paste it below.\n");
     eprint!("Authorization code: ");
     io::stdout().flush()?;
-    let code = crate::secret_input::read_secret_line()?;
+    let code = crate::auth::login_ui::read_secret_line()?;
     if code.trim().is_empty() {
         anyhow::bail!("No authorization code provided.");
     }
@@ -505,14 +505,14 @@ pub async fn exchange_callback_code(
     Ok(tokens)
 }
 
-async fn exchange_authorization_code(
+fn authorization_code_request(
+    client: &reqwest::Client,
+    client_id: String,
+    client_secret: String,
     code: &str,
     verifier: Option<&str>,
     redirect_uri: &str,
-) -> Result<GeminiTokens> {
-    let client_id = gemini_client_id();
-    let client_secret = gemini_client_secret();
-    let client = crate::provider::shared_http_client();
+) -> reqwest::RequestBuilder {
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
         ("client_id", client_id),
@@ -523,12 +523,30 @@ async fn exchange_authorization_code(
     if let Some(verifier) = verifier {
         form.push(("code_verifier", verifier.to_string()));
     }
-    let resp = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&form)
-        .send()
-        .await
-        .context("Failed to exchange Gemini authorization code")?;
+    let request = client.post(GOOGLE_TOKEN_URL).form(&form);
+    // reqwest serializes the form eagerly. Release its owned source strings
+    // before the request can wait on network I/O.
+    drop(form);
+    request
+}
+
+async fn exchange_authorization_code(
+    code: &str,
+    verifier: Option<&str>,
+    redirect_uri: &str,
+) -> Result<GeminiTokens> {
+    let client = crate::provider::shared_http_client();
+    let resp = authorization_code_request(
+        &client,
+        gemini_client_id(),
+        gemini_client_secret(),
+        code,
+        verifier,
+        redirect_uri,
+    )
+    .send()
+    .await
+    .context("Failed to exchange Gemini authorization code")?;
 
     if !resp.status().is_success() {
         let body = crate::util::http_error_body(resp, "HTTP error").await;
@@ -684,3 +702,47 @@ fn parse_command_spec(raw: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 #[path = "gemini_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod authorization_code_request_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_exchange_survives_source_release() {
+        for verifier in [None, Some("verifier +/&=")] {
+            let builder = {
+                let client = reqwest::Client::new();
+                let code = String::from(" \tcode +/&=\n");
+                let redirect = String::from("http://localhost/callback?x=1&y=2");
+                let verifier = verifier.map(str::to_owned);
+                authorization_code_request(
+                    &client,
+                    "test-client +".to_owned(),
+                    "test-secret &=+".to_owned(),
+                    &code,
+                    verifier.as_deref(),
+                    &redirect,
+                )
+            };
+            // Build only after the helper's form and all caller inputs are gone.
+            // No request is sent and no credentials or environment are read.
+            let request = builder.build().unwrap();
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.url().as_str(), GOOGLE_TOKEN_URL);
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                "application/x-www-form-urlencoded"
+            );
+            let mut expected = String::from(
+                "grant_type=authorization_code&client_id=test-client+%2B&client_secret=test-secret+%26%3D%2B&code=code+%2B%2F%26%3D&redirect_uri=http%3A%2F%2Flocalhost%2Fcallback%3Fx%3D1%26y%3D2",
+            );
+            if verifier.is_some() {
+                expected.push_str("&code_verifier=verifier+%2B%2F%26%3D");
+            }
+            assert_eq!(
+                request.body().unwrap().as_bytes().unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+}

@@ -5,6 +5,20 @@ pub fn render_markdown_lazy(
     max_width: Option<usize>,
     visible_range: std::ops::Range<usize>,
 ) -> Vec<Line<'static>> {
+    render_markdown_lazy_with_link_urls(
+        text,
+        max_width,
+        visible_range,
+        config_snapshot().show_link_urls,
+    )
+}
+
+fn render_markdown_lazy_with_link_urls(
+    text: &str,
+    max_width: Option<usize>,
+    visible_range: std::ops::Range<usize>,
+    show_link_urls: bool,
+) -> Vec<Line<'static>> {
     let text = jcode_render_core::normalize_latex_math(text);
     let text = escape_currency_dollars(&text);
     let text = preserve_line_oriented_softbreaks(&text);
@@ -14,6 +28,7 @@ pub fn render_markdown_lazy(
     let deferred_mermaid_mode = deferred_mermaid_render_context_enabled();
     let spacing_mode = effective_markdown_spacing_mode();
     let latex_mode = config_snapshot().latex_rendering;
+    let mut latex_hint_shown = false;
     let mut centered_blocks = CenteredStructuredBlockState::default();
 
     // Style stack for nested formatting
@@ -203,6 +218,7 @@ pub fn render_markdown_lazy(
             }
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link_targets.pop()
+                    && show_link_urls
                     && !url.is_empty()
                 {
                     current_spans.push(Span::styled(
@@ -560,6 +576,7 @@ pub fn render_markdown_lazy(
                     }
                 } else {
                     let block_start = lines.len();
+                    let mut toolchain_fallback = false;
                     let rendered = match latex_mode {
                         LatexRenderingMode::None => raw_math_display_lines(&math),
                         LatexRenderingMode::Unicode => math_display_lines(&math),
@@ -570,13 +587,18 @@ pub fn render_markdown_lazy(
                         {
                             // Strip Markdown container indentation before the
                             // graphical renderer sees the TeX source.
-                            latex_image_lines(math.trim(), true, max_width)
-                                .unwrap_or_else(|| math_display_lines(&math))
+                            latex_image_lines(math.trim(), true, max_width).unwrap_or_else(|| {
+                                toolchain_fallback = true;
+                                math_display_lines(&math)
+                            })
                         }
                         LatexRenderingMode::Image => math_display_lines(&math),
                     };
                     for line in rendered {
                         lines.push(with_blockquote_prefix(line, blockquote_depth));
+                    }
+                    if toolchain_fallback {
+                        push_latex_install_hint_if_needed(&mut lines, &mut latex_hint_shown);
                     }
                     record_centered_independent_block(
                         &mut centered_blocks,
@@ -959,4 +981,39 @@ pub fn render_markdown_lazy(
     }
 
     lines
+}
+
+#[cfg(test)]
+mod link_url_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_link_urls_are_opt_in_and_preserve_labels() {
+        let markdown = "[docs](https://example.com) and [empty]()";
+        for enabled in [false, true] {
+            let lines = render_markdown_lazy_with_link_urls(markdown, Some(120), 0..100, enabled);
+            let text = lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expected = if enabled {
+                "docs (https://example.com) and empty"
+            } else {
+                "docs and empty"
+            };
+            assert_eq!(text.trim(), expected);
+            assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.content == "docs"
+                    && span.style.fg == Some(link_fg())
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED)
+            }));
+        }
+        let default_lines = render_markdown_lazy(markdown, Some(120), 0..100);
+        assert!(
+            !default_lines
+                .iter()
+                .any(|line| line.to_string().contains("https://"))
+        );
+    }
 }

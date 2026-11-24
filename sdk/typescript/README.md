@@ -59,7 +59,7 @@ daemon* socket, which is a different thing.)
 **Embed jcode as an agent engine** (`launch`). Starts a private instance with
 its own state, sessions, and sockets. It cannot see or disturb the jcode the
 user runs in their terminal, and `close()` shuts it down. This is the default
-for applications.
+for applications. Private instances never auto-update: they run the jcode binary that launched them.
 
 ```ts
 const client = await JcodeClient.launch({ workingDir: process.cwd() });
@@ -111,6 +111,30 @@ console.log("\ntools:", turn.toolCalls.map((call) => call.name));
 console.log("tokens:", turn.usage);
 client.close();
 ```
+
+### Headless hosts and applets
+
+The `applet` tool creates UI documents, but a successful tool call does not
+confirm that a client rendered them. A custom chat UI, terminal integration,
+or chat bridge must render `applet_state` snapshots itself to display applets.
+If your host does not implement an applet renderer, disable the tool when
+starting the instance so the agent can use text or Markdown instead:
+
+```ts
+const client = await JcodeClient.launch({
+  workingDir: process.cwd(),
+  env: { JCODE_DISABLED_TOOLS: "applet" },
+});
+```
+
+`JCODE_DISABLED_TOOLS` is a comma-separated list that replaces the configured
+disabled-tool list. Include any other tools you already disable in that value.
+For `connect()`, configure the daemon that serves the sessions before starting
+it, not just the SDK client process. The environment of a running daemon is
+not changed by starting another client.
+
+This is a host-side workaround, not automatic renderer-capability detection.
+See [issue #1858](https://github.com/1jehuang/jcode/issues/1858).
 
 ### Full system prompt override
 
@@ -197,6 +221,26 @@ For manual dispatch, send a wire-level `configure_tools` request via
 `client.request`, consume `tool_call` events, and call
 `client.submitToolResult(sessionId, callId, result)`. Do not manually answer calls
 that already have an `execute` callback.
+
+### Web search
+
+The built-in `websearch` tool uses the model provider's own server-side search
+when the provider supports it (Anthropic first-party API, OpenAI API or ChatGPT
+login on non-codex models). Otherwise it scrapes locally with the configured
+engines. It needs no SDK code:
+
+- Provider searches stream as ordinary tool rows named `web_search`:
+  `tool_start`, `tool_input_delta` (`{"query": ...}`), `tool_exec`, then
+  `tool_done` with the result titles and URLs as `output`. No `tool_call` is
+  sent, because the provider already ran the search. They also appear in
+  `getHistory`.
+- `enabled` and `disabled` govern provider search too. A session without
+  `websearch` never gets provider search.
+- A `custom` tool named `websearch` replaces search entirely. It is called
+  through your callback and is never swapped for provider search.
+- Set `websearch.prefer_native = false` in `config.toml`, or
+  `JCODE_WEBSEARCH_PREFER_NATIVE=0` in `launch({ env })`, to always search
+  locally (unless `websearch.engine = "native"` is set explicitly).
 
 ### Assistant messages and final answers
 
@@ -342,6 +386,7 @@ discovery pass only.
 | `clear(id)` / `rewind(id, index)` | Edit history |
 | `respondToPermission(id, requestId, decision)` | Answer a permission prompt |
 | `listModels(id)` / `setModel(id, model)` | List and choose the session's model |
+| `setContextCap(id, maxContextTokens)` | Set a context budget override, or pass `null`/`0` to clear it. Returns the effective budget |
 | `getRuntimeInfo(id)` | Provider, model route, protocol, capability, and health metadata |
 | `setApiKey(provider, key)` / `clearApiKey(provider)` | Atomically provision or remove owner-only API-key files |
 | `readFile(id, path, maxBytes?)` | Read bounded UTF-8 text under the session root |
@@ -353,6 +398,9 @@ discovery pass only.
 | `renameSession(id, title?)` | Set a session title, or clear it |
 | `rewindUndo(id)` | Restore what the last `rewind` removed |
 | `cancelSoftInterrupts(id)` | Retract queued soft interrupts |
+| `softInterruptWithId(id, content, { clientId, images?, urgent? })` | Queue a mid-turn message you can track and retract |
+| `cancelSoftInterruptsById(id, clientIds)` / `cancelSoftInterrupt(id, clientId)` | Retract specific queued messages, with an exact "too late?" answer |
+| `backgroundTool(id)` / `backgroundToolResult(id)` | Move the running tool call to the background, optionally reporting what moved |
 | `ping()` | Liveness |
 
 ## Models
@@ -415,6 +463,39 @@ await client.rewind(id, 4);
 await client.rewindUndo(id);                          // rewind is reversible
 await client.cancelSoftInterrupts(id);                // retract what is queued
 ```
+
+## Messages sent mid-turn
+
+A message sent while the agent is working joins the running turn at the next
+safe point. Give it a `clientId` to follow it from there (needs the
+`soft_interrupt_ids` capability):
+
+```ts
+await client.softInterruptWithId(id, "also update the changelog", { clientId: "m-42" });
+
+client.on("event", (frame) => {
+  if (frame.ev === "soft_interrupt_injected" && frame.client_ids.includes("m-42")) {
+    // The model has it now. Everything it writes from here on was written
+    // having seen the message, so the next text answers it.
+  }
+  if (frame.ev === "turn_done" && frame.pending_soft_interrupts) {
+    // Messages still queued when the turn ended. They were never seen.
+  }
+});
+
+// Take it back while it is still queued. `false` means it was already delivered.
+const retracted = await client.cancelSoftInterrupt(id, "m-42");
+```
+
+`soft_interrupt_injected` arrives after the last `tool_done` of the batch and
+before the model's first output that sees the message. Several queued messages
+are delivered together as one user message, so `client_ids` can list more than
+one id. Retraction is decided against delivery atomically: an id is never
+reported both cancelled and delivered. `session_status` after attaching carries
+`pending_soft_interrupts` so a reconnecting client can reconcile its own queue.
+
+`backgroundToolResult(id)` moves the running tool to the background so a
+queued message can be read sooner, and reports `{ moved, toolCallId, toolName }`.
 
 ## Instance lifecycle
 
@@ -590,3 +671,12 @@ npm run check   # typecheck + build + tests (mock harness, no daemon needed)
 `test/schema-parity.test.ts` reads the Rust enums directly, and
 `crates/jcode-harness-api`'s `typescript_sdk_lists_every_variant` test reads
 this package. Adding a variant on either side without the other fails CI.
+
+## Preview releases
+
+Install the opt-in SDK prerelease with `npm install @1jehuang/jcode-sdk@preview`.
+The `latest` npm tag remains stable. Each runtime preview publishes a matching
+SDK prerelease and six platform runtime packages, pinned to the same SDK version.
+For example, runtime `v1.0.0-preview.30` with SDK base version `1.2.0` produces
+SDK `1.2.0-preview.30`. The Rust SDK remains source-only in `crates/jcode-sdk`
+and can be pinned to the runtime preview's Git tag.

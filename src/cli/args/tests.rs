@@ -2,6 +2,89 @@ use super::*;
 use crate::cli::provider_init::ProviderChoice;
 
 #[test]
+fn jarvis_is_explicitly_opt_in_and_supports_resume() {
+    assert!(!Args::try_parse_from(["jcode"]).unwrap().jarvis);
+    let args = Args::try_parse_from(["jcode", "--jarvis", "--resume", "voice-session"]).unwrap();
+    assert!(args.jarvis);
+    assert_eq!(args.resume.as_deref(), Some("voice-session"));
+}
+
+#[test]
+fn continuous_jarvis_and_screen_feed_are_separate_opt_ins() {
+    let ordinary = Args::try_parse_from(["jcode"]).unwrap();
+    assert!(!ordinary.jarvis_always_on && !ordinary.jarvis_screen);
+    let voice = Args::try_parse_from(["jcode", "--jarvis-always-on"]).unwrap();
+    assert!(voice.jarvis_always_on && !voice.jarvis_screen);
+    let both = Args::try_parse_from(["jcode", "--jarvis-always-on", "--jarvis-screen"]).unwrap();
+    assert!(both.jarvis_always_on && both.jarvis_screen);
+}
+
+#[test]
+fn cloud_move_selection_defaults_to_swarm_and_independent_sessions_are_explicit() {
+    let args = Args::try_parse_from(["jcode", "cloud", "move"]).unwrap();
+    assert!(
+        matches!(args.command, Some(Command::Cloud(CloudCommand::Move {
+        include_sessions, session_only: false, ..
+    })) if include_sessions.is_empty())
+    );
+
+    let args = Args::try_parse_from([
+        "jcode",
+        "cloud",
+        "move",
+        "--include-session",
+        "first",
+        "--include-session",
+        "second",
+        "--dry-run",
+    ])
+    .unwrap();
+    assert!(
+        matches!(args.command, Some(Command::Cloud(CloudCommand::Move {
+        include_sessions, session_only: false, dry_run: true, ..
+    })) if include_sessions == ["first", "second"])
+    );
+
+    let args = Args::try_parse_from(["jcode", "cloud", "move", "--session-only"]).unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Command::Cloud(CloudCommand::Move {
+            session_only: true,
+            ..
+        }))
+    ));
+    assert!(
+        Args::try_parse_from([
+            "jcode",
+            "cloud",
+            "move",
+            "--session-only",
+            "--include-session",
+            "other"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn update_channel_cli_is_explicit_and_limited_to_preview_and_stable() {
+    for channel in ["preview", "stable"] {
+        let args = Args::try_parse_from(["jcode", "update", "--channel", channel]).unwrap();
+        assert!(
+            matches!(args.command, Some(Command::Update { channel: Some(value) }) if value == channel)
+        );
+    }
+    let args = Args::try_parse_from(["jcode", "update"]).unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Command::Update { channel: None })
+    ));
+    for channel in ["main", "nightly", "unknown"] {
+        assert!(Args::try_parse_from(["jcode", "update", "--channel", channel]).is_err());
+    }
+}
+
+#[test]
 fn credential_import_cli_requires_stdin_and_preserves_explicit_provider() {
     for provider in ["openai", "claude"] {
         let args = Args::try_parse_from([
@@ -119,6 +202,58 @@ fn server_promote_parses_default_and_explicit_version() {
         explicit.command,
         Some(Command::Server {
             action: ServerCommand::Promote {
+                version: Some(ref version),
+                json: false,
+            }
+        }) if version == "abc1234-dirty-deadbeef"
+    ));
+}
+
+#[test]
+fn server_build_parses_the_json_flag() {
+    // The deterministic build takes no version argument: it always builds the
+    // CURRENT tree, and the carrier owns the retry decision.
+    let default = Args::try_parse_from(["jcode", "server", "build", "--json"])
+        .expect("server build should parse");
+    assert!(matches!(
+        default.command,
+        Some(Command::Server {
+            action: ServerCommand::Build { json: true }
+        })
+    ));
+
+    let plain = Args::try_parse_from(["jcode", "server", "build"])
+        .expect("server build without --json should parse");
+    assert!(matches!(
+        plain.command,
+        Some(Command::Server {
+            action: ServerCommand::Build { json: false }
+        })
+    ));
+}
+
+#[test]
+fn server_land_parses_default_and_explicit_version() {
+    // The landing defaults to the STAGED build (the newest built, not yet
+    // landed), and accepts an explicit installed version label.
+    let current = Args::try_parse_from(["jcode", "server", "land", "--json"])
+        .expect("server land should default to the staged build");
+    assert!(matches!(
+        current.command,
+        Some(Command::Server {
+            action: ServerCommand::Land {
+                version: None,
+                json: true,
+            }
+        })
+    ));
+
+    let explicit = Args::try_parse_from(["jcode", "server", "land", "abc1234-dirty-deadbeef"])
+        .expect("server land should accept an installed version label");
+    assert!(matches!(
+        explicit.command,
+        Some(Command::Server {
+            action: ServerCommand::Land {
                 version: Some(ref version),
                 json: false,
             }
@@ -461,6 +596,37 @@ fn cloud_sessions_subcommands_parse() {
 }
 
 #[test]
+fn cloud_return_preserves_local_auth_only_when_explicit() {
+    for explicit in [false, true] {
+        let mut argv = vec![
+            "jcode",
+            "cloud",
+            "return",
+            "--session",
+            "old-cloud-session",
+            "--refs-only",
+        ];
+        if explicit {
+            argv.push("--keep-local-auth");
+        }
+        let args = Args::try_parse_from(argv).unwrap();
+        match args.command {
+            Some(Command::Cloud(CloudCommand::Return {
+                session,
+                refs_only,
+                keep_local_auth,
+                ..
+            })) => {
+                assert_eq!(session.as_deref(), Some("old-cloud-session"));
+                assert!(refs_only);
+                assert_eq!(keep_local_auth, explicit);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn login_no_browser_flag_parses() {
     let args = Args::try_parse_from(["jcode", "login", "--no-browser"]).unwrap();
     match args.command {
@@ -473,23 +639,28 @@ fn login_no_browser_flag_parses() {
             auth_code,
             json,
             complete,
-            google_access_tier,
+            google,
             api_base,
             api_key,
             api_key_env,
             no_validate,
             flow_id,
             cancel,
+            device_code,
         }) => {
             assert!(provider.is_none());
             assert!(account.is_none());
             assert!(no_browser);
+            assert!(!device_code);
             assert!(!print_auth_url);
             assert!(callback_url.is_none());
             assert!(auth_code.is_none());
             assert!(!json);
             assert!(!complete);
-            assert!(google_access_tier.is_none());
+            assert!(google.google_access_tier.is_none());
+            assert!(google.google_services.is_none());
+            assert!(!google.setup);
+            assert!(google.google_client_json.is_none());
             assert!(api_base.is_none());
             assert!(api_key.is_none());
             assert!(api_key_env.is_none());
@@ -646,7 +817,7 @@ fn login_scriptable_flags_parse() {
             callback_url,
             auth_code,
             complete,
-            google_access_tier,
+            google,
             ..
         }) => {
             assert!(print_auth_url);
@@ -654,7 +825,7 @@ fn login_scriptable_flags_parse() {
             assert!(callback_url.is_none());
             assert!(auth_code.is_none());
             assert!(!complete);
-            assert!(google_access_tier.is_none());
+            assert!(google.google_access_tier.is_none());
         }
         other => panic!("unexpected command: {:?}", other),
     }
@@ -694,12 +865,34 @@ fn login_scriptable_flags_parse() {
     .unwrap();
     match args.command {
         Some(Command::Login {
-            complete,
-            google_access_tier,
-            ..
+            complete, google, ..
         }) => {
             assert!(complete);
-            assert_eq!(google_access_tier, Some(GoogleAccessTierArg::Readonly));
+            assert_eq!(
+                google.google_access_tier,
+                Some(GoogleAccessTierArg::Readonly)
+            );
+        }
+        other => panic!("unexpected command: {:?}", other),
+    }
+
+    let args = Args::try_parse_from([
+        "jcode",
+        "login",
+        "--provider",
+        "google",
+        "--google-services",
+        "gmail,calendar",
+        "--setup",
+        "--google-client-json",
+        "auto",
+    ])
+    .unwrap();
+    match args.command {
+        Some(Command::Login { google, .. }) => {
+            assert_eq!(google.google_services.as_deref(), Some("gmail,calendar"));
+            assert!(google.setup);
+            assert_eq!(google.google_client_json.as_deref(), Some("auto"));
         }
         other => panic!("unexpected command: {:?}", other),
     }
@@ -1044,3 +1237,6 @@ fn api_stdio_accepts_alias_and_daemon_socket_but_not_api_socket() {
         );
     }
 }
+
+#[path = "tests_additional_tests.rs"]
+mod additional_cloud_lifecycle_commands_parse_their_contracts;

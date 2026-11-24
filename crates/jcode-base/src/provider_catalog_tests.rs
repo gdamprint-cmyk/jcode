@@ -1,82 +1,5 @@
 use super::*;
 
-#[test]
-fn conifer_static_fallback_preserves_catalog_except_unverified_together_alias() {
-    let profile = openai_compatible_profile_by_id("conifer").expect("Conifer profile");
-    let models = openai_compatible_profile_static_models(profile);
-
-    assert_eq!(models.len(), 95);
-    assert_eq!(models.first().map(String::as_str), Some("claude-fable-5"));
-    assert_eq!(models.last().map(String::as_str), Some("gemma-3-27b"));
-    assert!(models.iter().any(|model| model == "gpt-5.6-sol"));
-    assert!(models.iter().any(|model| model == "nemotron-3-ultra"));
-    assert!(
-        !models
-            .iter()
-            .any(|model| model == "nemotron-3-ultra-together")
-    );
-    assert_eq!(
-        openai_compatible_profile_context_limit("conifer", "nemotron-3-ultra-together"),
-        None,
-        "an undocumented Together route must not inherit DeepInfra's window"
-    );
-}
-
-#[test]
-fn conifer_context_limits_match_public_catalog_snapshot() {
-    // Exact observations from /v1/catalog, 2026-09-16. Source/hash and refresh
-    // policy are documented in docs/CONIFER_PROVIDER.md (issue #1274).
-    let expected = [
-        ("grok-4.6", 500_000),
-        ("grok-4.5", 500_000),
-        ("grok-4.3", 1_000_000),
-        ("seed-2.0-pro", 256_000),
-        ("seed-2.0-code", 256_000),
-        ("seed-2.0-mini", 256_000),
-        ("step-3.7-flash", 262_144),
-        ("step-3.7-flash-novita", 262_144),
-        ("hy3", 262_144),
-        ("hy3-tencent", 262_144),
-        ("hy3-novita", 262_144),
-        ("ling-3.0-flash", 131_072),
-        ("inkling", 524_288),
-        ("inkling-small", 524_288),
-        ("nemotron-3-ultra", 262_144),
-        ("nemotron-3-super-120b", 262_144),
-        ("nemotron-3.5-lightning", 262_144),
-        ("mistral-large-latest", 256_000),
-        ("mistral-medium-latest", 256_000),
-        ("mistral-small-latest", 256_000),
-        ("command-a-cohere", 256_000),
-        ("llama-4-maverick", 1_048_576),
-        ("llama-4-scout", 327_680),
-        ("gemma-4-31b", 128_000),
-    ];
-    let limits = openai_compatible_profile_static_context_limits(CONIFER_PROFILE);
-    for (model, limit) in expected {
-        assert_eq!(limits.get(model), Some(&limit), "{model}");
-        assert_eq!(
-            openai_compatible_profile_context_limit(" CONIFER ", &model.to_uppercase()),
-            Some(limit),
-            "{model}"
-        );
-        assert_eq!(
-            openai_compatible_profile_context_limit("openrouter", model),
-            jcode_provider_core::models::open_weight_family_context_limit(model),
-            "Conifer metadata must not leak into other profiles: {model}"
-        );
-    }
-    assert_eq!(
-        openai_compatible_profile_context_limit("conifer", "grok-4.6-unknown"),
-        None
-    );
-    assert_eq!(
-        openai_compatible_profile_context_limit("conifer", "kimi-k3"),
-        jcode_provider_core::models::open_weight_family_context_limit("kimi-k3"),
-        "existing shared family fallback must remain intact"
-    );
-}
-
 struct EnvGuard {
     vars: Vec<(String, Option<String>)>,
 }
@@ -250,6 +173,7 @@ fn resolved_named_profile_suggests_newest_cached_live_release() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_700_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "newer-model".to_string(),
@@ -257,6 +181,7 @@ fn resolved_named_profile_suggests_newest_cached_live_release() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_800_000_000),
+                ..Default::default()
             },
         ],
         Some(CEREBRAS_PROFILE.api_base),
@@ -287,6 +212,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_700_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "newer-chat-model".to_string(),
@@ -294,6 +220,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_800_000_000),
+                ..Default::default()
             },
             // Newest of all, but a non-chat (TTS) model that must be skipped.
             jcode_provider_openrouter::ModelInfo {
@@ -302,6 +229,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_900_000_000),
+                ..Default::default()
             },
             jcode_provider_openrouter::ModelInfo {
                 id: "whisper-large-v3".to_string(),
@@ -309,6 +237,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
                 context_length: None,
                 pricing: Default::default(),
                 created: Some(1_950_000_000),
+                ..Default::default()
             },
         ],
         Some(CEREBRAS_PROFILE.api_base),
@@ -324,7 +253,7 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
 }
 
 #[test]
-fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
+fn minimax_token_plan_keys_resolve_to_international_endpoint() {
     let _lock = crate::storage::lock_test_env();
     let _guard = EnvGuard::save(&["JCODE_HOME", "MINIMAX_API_KEY", "OPENAI_API_KEY"]);
     let home = tempfile::tempdir().expect("temporary JCODE_HOME");
@@ -343,13 +272,16 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
         MINIMAX_PROFILE,
         Some("sk-cp-test-token"),
     );
-    assert_eq!(china.api_base, MINIMAX_CHINA_API_BASE);
-    assert_eq!(china.setup_url, MINIMAX_CHINA_SETUP_URL);
+    assert_eq!(china.api_base, "https://api.minimax.io/v1");
+    assert_eq!(
+        china.setup_url,
+        "https://platform.minimax.io/docs/guides/text-generation"
+    );
 
     crate::env::set_var("OPENAI_API_KEY", "sk-cp-legacy-token");
     let legacy = resolve_openai_compatible_profile(MINIMAX_PROFILE);
     assert_eq!(legacy.api_key_env, "OPENAI_API_KEY");
-    assert_eq!(legacy.api_base, MINIMAX_CHINA_API_BASE);
+    assert_eq!(legacy.api_base, "https://api.minimax.io/v1");
 }
 
 #[test]
@@ -363,6 +295,21 @@ fn auth_issue_lan_openai_compatible_bases_are_valid_for_local_model_servers() {
         Some("http://hsv.local:11434/v1")
     );
     assert_eq!(normalize_api_base("http://example.com/v1"), None);
+    // Any IP literal is valid over plaintext http, private or public.
+    assert_eq!(
+        normalize_api_base("http://203.0.113.10:8000/v1").as_deref(),
+        Some("http://203.0.113.10:8000/v1")
+    );
+    assert_eq!(
+        normalize_api_base("http://[2001:db8::1]:8000/v1").as_deref(),
+        Some("http://[2001:db8::1]:8000/v1")
+    );
+    // A bare IP is a direct endpoint on one machine, so it needs no key by
+    // default, like loopback.
+    assert!(api_base_uses_localhost("http://127.0.0.1:11434/v1"));
+    assert!(api_base_uses_localhost("http://10.15.15.53:8080/v1"));
+    assert!(api_base_uses_localhost("http://203.0.113.10:8080/v1"));
+    assert!(!api_base_uses_localhost("https://api.openai.com/v1"));
 }
 
 #[test]
@@ -1145,6 +1092,7 @@ fn newest_release_picker_prefers_strongest_tier_over_newest_cheap() {
         context_length: None,
         pricing: Default::default(),
         created: Some(created),
+        ..Default::default()
     };
 
     // A heterogeneous proxy catalog (like OpenCode Zen): the NEWEST model is a
@@ -1167,6 +1115,55 @@ fn newest_release_picker_prefers_strongest_tier_over_newest_cheap() {
     );
 }
 
+/// The default-model ranking is memoized per catalog content (each provider
+/// fork resolves it). A rewritten catalog must take effect immediately, even
+/// within the same second, and repeated calls must keep returning the answer.
+#[test]
+fn newest_release_picker_memo_follows_catalog_changes() {
+    use jcode_provider_openrouter::ModelInfo;
+    let _lock = crate::storage::lock_test_env();
+    let _env = EnvGuard::save(&["JCODE_HOME"]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mk = |id: &str, created: u64| ModelInfo {
+        id: id.to_string(),
+        name: String::new(),
+        context_length: None,
+        pricing: Default::default(),
+        created: Some(created),
+        ..Default::default()
+    };
+    let save = |models: &[ModelInfo]| {
+        jcode_provider_openrouter::save_disk_cache_with_source_for_namespace(
+            "deepseek",
+            models,
+            Some("https://api.deepseek.com"),
+        )
+    };
+
+    save(&[
+        mk("deepseek-v3", 1_700_000_000),
+        mk("deepseek-v4", 1_900_000_000),
+    ]);
+    for _ in 0..3 {
+        assert_eq!(
+            newest_released_model_for_openai_compatible_profile("deepseek").as_deref(),
+            Some("deepseek-v4")
+        );
+    }
+
+    save(&[
+        mk("deepseek-v4", 1_900_000_000),
+        mk("deepseek-v5", 1_950_000_000),
+    ]);
+    assert_eq!(
+        newest_released_model_for_openai_compatible_profile("deepseek").as_deref(),
+        Some("deepseek-v5"),
+        "a newer catalog must not be answered from the old memo entry"
+    );
+}
+
 #[test]
 fn newest_release_picker_uses_recency_within_a_tier() {
     use jcode_provider_openrouter::ModelInfo;
@@ -1181,6 +1178,7 @@ fn newest_release_picker_uses_recency_within_a_tier() {
         context_length: None,
         pricing: Default::default(),
         created: Some(created),
+        ..Default::default()
     };
 
     // All same (bare frontier) tier: recency decides.
@@ -1350,3 +1348,6 @@ fn novita_static_models_are_available_before_live_catalog_refresh() {
         assert!(models.iter().any(|candidate| candidate == model));
     }
 }
+
+#[path = "provider_catalog_tests_additional_tests.rs"]
+mod additional_conifer_static_fallback_preserves_catalog_except_unverified_together_alias;

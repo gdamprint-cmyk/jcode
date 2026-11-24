@@ -376,6 +376,107 @@ mod tests {
         assert_eq!(out["required"], json!(["action"]));
     }
 
+    #[test]
+    fn gemini_prunes_required_without_properties_in_array_items() {
+        // The original todo.add schema rejected every Antigravity Gemini turn.
+        for properties in [None, Some(json!({}))] {
+            let mut item = json!({
+                "type": "object",
+                "required": ["content", "status", "priority", "id", "confidence"],
+                "additionalProperties": true
+            });
+            if let Some(properties) = properties {
+                item["properties"] = properties;
+            }
+            let schema = json!({
+                "type": "object",
+                "properties": { "add": { "type": "array", "items": item } }
+            });
+            let errors = must_not_contain_unsupported_constructs(&schema, &registry::GEMINI);
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|e| e.message.contains("`required` names"))
+                    .count(),
+                5,
+                "{errors:?}"
+            );
+            let out = dialect::apply(&schema, &registry::GEMINI);
+            assert!(out["properties"]["add"]["items"].get("required").is_none());
+            assert!(must_not_contain_unsupported_constructs(&out, &registry::GEMINI).is_empty());
+            assert_eq!(dialect::apply(&out, &registry::GEMINI), out);
+        }
+    }
+
+    /// #768: a JSON Schema union `type` (`["array", "null"]`) has no proto
+    /// spelling in Gemini's `Schema`, whose `type` is a single enum with
+    /// nullability carried by a separate `nullable` boolean. The whole request
+    /// is rejected while parsing the payload ("Unknown name \"type\" ... Proto
+    /// field is not repeating, cannot start list"), which took down every
+    /// Antigravity Gemini turn that carried the `todo` tool.
+    ///
+    /// reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/v1/Schema
+    #[test]
+    fn issue_768_union_type_is_rewritten_as_nullable_for_gemini() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "lane_dependencies": {
+                    "type": ["array", "null"],
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "minLength": 1 }
+                }
+            }
+        });
+        let out = dialect::apply(&schema, &registry::GEMINI);
+        assert_eq!(out["properties"]["lane_dependencies"]["type"], json!("array"));
+        assert_eq!(out["properties"]["lane_dependencies"]["nullable"], json!(true));
+        // The rest of the constraint survives untouched.
+        assert_eq!(out["properties"]["lane_dependencies"]["minItems"], json!(1));
+        assert_eq!(
+            out["properties"]["lane_dependencies"]["items"]["type"],
+            json!("string")
+        );
+        // No union `type` survives anywhere in the normalized schema.
+        assert_eq!(dialect::apply(&out, &registry::GEMINI), out);
+    }
+
+    /// A union with more than one non-null member has no faithful single-type
+    /// spelling, so it is left alone rather than silently narrowed.
+    #[test]
+    fn a_union_without_a_single_non_null_member_is_left_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "either": { "type": ["string", "integer", "null"] },
+                "neither": { "type": ["string", "integer"] }
+            }
+        });
+        let out = dialect::apply(&schema, &registry::GEMINI);
+        assert_eq!(
+            out["properties"]["either"]["type"],
+            json!(["string", "integer", "null"])
+        );
+        assert_eq!(
+            out["properties"]["neither"]["type"],
+            json!(["string", "integer"])
+        );
+    }
+
+    /// The union rewrite is Gemini-specific: a dialect that accepts a list
+    /// `type` must keep it.
+    #[test]
+    fn a_dialect_that_accepts_union_types_keeps_them() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "deps": { "type": ["array", "null"] } }
+        });
+        let out = dialect::apply(&schema, &registry::ANTHROPIC);
+        assert_eq!(out["properties"]["deps"]["type"], json!(["array", "null"]));
+        assert!(out["properties"]["deps"].get("nullable").is_none());
+    }
+
     /// The regression that made #754 a bug in the first place: a top-level-only
     /// filter left the nested copy in place.
     #[test]

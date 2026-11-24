@@ -5,6 +5,8 @@
 // so it can be exercised without wrangler by passing mocks.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 
 import worker from "../src/worker.js";
 
@@ -135,10 +137,12 @@ function makeDb(plan = {}) {
           return {
             async run() {
               executed.push({ sql, values });
+              if (plan.beforeRun) plan.beforeRun(sql, values);
               if (plan.failInserts && /^INSERT/i.test(sql.trim())) {
                 throw new Error(plan.failureMessage || "generic transient error");
               }
-              return { meta: { changes: /^DELETE/i.test(sql.trim()) ? 0 : 1, size_after: sizeAfter } };
+              return { meta: { changes: /^DELETE/i.test(sql.trim()) ? (plan.deleteChanges ?? 0)
+                : /^UPDATE/i.test(sql.trim()) ? (plan.updateChanges ?? 1) : 1, size_after: sizeAfter } };
             },
             async all() {
               executed.push({ sql, values });
@@ -227,6 +231,7 @@ function makeDb(plan = {}) {
                 "milestone_elapsed_ms", "event_id", "session_id",
                 "schema_version", "build_channel", "is_git_checkout", "is_ci",
                 "ran_from_cargo", "account_id", "tier", "model_start",
+                "from_version",
               ].map((name) => ({ name })),
             };
           }
@@ -389,6 +394,28 @@ test("prompt_submitted is accepted and marks meaningful daily activity", async (
   assert.ok(rollup, "prompt event should update daily activity");
   assert.equal(rollup.values[2], 1, "prompt activity should be meaningful");
   assert.equal(rollup.values[4], 1, "release prompt activity should be meaningful release activity");
+});
+
+test("bulk families go to DB_BULK while rollups and other events stay in DB", async () => {
+  const db = makeDb();
+  const bulk = makeDb();
+  const env = { DB: db, DB_BULK: bulk };
+  const response = await worker.fetch(
+    postRequest(makeBody({
+      event: "prompt_submitted", event_id: "prompt-bulk-1", session_id: "s", turn_index: 1,
+      build_channel: "release",
+    })),
+    env,
+    makeCtx(),
+  );
+  assert.equal(response.status, 200);
+  assert.ok(bulk.executed.some(({ sql }) => /INSERT OR IGNORE INTO events/.test(sql)), "raw row in bulk");
+  assert.ok(!db.executed.some(({ sql }) => /INSERT OR IGNORE INTO events/.test(sql)), "no raw row in main");
+  assert.ok(db.executed.some(({ sql }) => /INSERT INTO daily_active_users/.test(sql)), "rollup in main");
+  assert.ok(!bulk.executed.some(({ sql }) => /daily_active_users/.test(sql)), "no rollup in bulk");
+
+  await worker.fetch(postRequest(makeBody({ event: "onboarding_step", event_id: "ob-1" })), env, makeCtx());
+  assert.ok(db.executed.some(({ sql, values }) => /INTO events/.test(sql) && values.includes("onboarding_step")));
 });
 
 test("telemetry_opt_out is accepted and persists only coarse metadata", async () => {
@@ -628,6 +655,233 @@ test("D1 failure without firehose binding still returns 500", async () => {
   assert.equal(response.status, 500);
 });
 
+test("bulk size pressure prunes bulk independently of main cooldown", async () => {
+  const db = makeDb({ sizeAfter: 8_100_000_000 });
+  const bulk = makeDb({ sizeAfter: 8_200_000_000 });
+  const env = { DB: db, DB_BULK: bulk };
+  const mainCtx = makeCtx();
+  await worker.fetch(postRequest(makeBody()), env, mainCtx);
+  await Promise.all(mainCtx.waited);
+  const mainDeletes = db.executed.filter(({ sql }) => /DELETE FROM events/.test(sql)).length;
+  assert.ok(mainDeletes > 0);
+
+  const bulkCtx = makeCtx();
+  await worker.fetch(postRequest(makeBody({ event: "prompt_submitted", event_id: "pressure-bulk" })), env, bulkCtx);
+  await Promise.all(bulkCtx.waited);
+  assert.ok(bulk.executed.some(({ sql }) => /DELETE FROM events/.test(sql)));
+  assert.equal(db.executed.filter(({ sql }) => /DELETE FROM events/.test(sql)).length, mainDeletes);
+  const repeated = makeCtx();
+  await worker.fetch(postRequest(makeBody({ event: "prompt_submitted", event_id: "pressure-bulk-2" })), env, repeated);
+  assert.equal(repeated.waited.length, 0, "bulk cooldown prevents repeated emergency pruning");
+});
+
+test("bulk SQLITE_FULL prunes only bulk even below the guardrail", async () => {
+  const db = makeDb();
+  const bulk = makeDb({ failInserts: true, failureMessage: "SQLITE_FULL: database or disk is full" });
+  const ctx = makeCtx();
+  await worker.fetch(postRequest(makeBody({ event: "prompt_submitted", event_id: "full-bulk" })),
+    { DB: db, DB_BULK: bulk, FIREHOSE: makeFirehose() }, ctx);
+  await Promise.all(ctx.waited);
+  assert.ok(bulk.executed.some(({ sql }) => /DELETE FROM events/.test(sql)));
+  assert.ok(!db.executed.some(({ sql }) => /DELETE FROM events/.test(sql)));
+});
+
+test("health distinguishes hard cap, guardrail and independent bulk pressure", async () => {
+  const response = await worker.fetch(new Request(HEALTH_URL), {
+    DB: makeDb({ sizeAfter: 7_700_000_000 }),
+    DB_BULK: makeDb({ sizeAfter: 8_100_000_000 }),
+  }, makeCtx());
+  const json = await response.json();
+  assert.equal(json.db_hard_limit_bytes, 10_000_000_000);
+  assert.equal(json.db_soft_limit_bytes, 8_000_000_000);
+  assert.equal(json.over_soft_limit, false);
+  assert.equal(json.bulk_db_size_bytes, 8_100_000_000);
+  assert.equal(json.bulk_db_hard_limit_bytes, 10_000_000_000);
+  assert.equal(json.bulk_db_soft_limit_bytes, 8_000_000_000);
+  assert.equal(json.bulk_over_soft_limit, true);
+  assert.equal(json.bulk_last_emergency_prune_at_ms, null);
+});
+
+test("hourly retention gives every event family its own bounded budget", async () => {
+  const db = makeDb({ deleteChanges: 10000 });
+  const bulk = makeDb();
+  const ctx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db, DB_BULK: bulk }, ctx);
+  await Promise.all(ctx.waited);
+  const deletes = db.executed.filter(({ sql }) => /DELETE FROM events/.test(sql));
+  const counts = new Map();
+  for (const { values } of deletes) counts.set(values[0], (counts.get(values[0]) || 0) + 1);
+  for (const family of ["turn_end", "session_start", "onboarding_step", "prompt_submitted"]) {
+    assert.equal(counts.get(family), 2, `${family} gets an independent bounded budget`);
+  }
+  assert.ok(bulk.executed.some(({ sql }) => /DELETE FROM events/.test(sql)));
+  assert.ok(!db.executed.some(({ sql }) => /oauth_accounts|usage_report_ledger|model_prices|INSERT OR IGNORE INTO daily_active_users/.test(sql)));
+});
+
+test("hourly retention escalates bulk pressure without shortening main windows", async () => {
+  const db = makeDb();
+  const bulk = makeDb({ sizeAfter: 8_100_000_000 });
+  const ctx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db, DB_BULK: bulk }, ctx);
+  await Promise.all(ctx.waited);
+  const windows = (store) => store.executed
+    .filter(({ sql, values }) => /DELETE FROM events/.test(sql) && values[0] === "turn_end")
+    .map(({ values }) => values[1]);
+  assert.deepEqual(windows(db), ["-30 days"]);
+  assert.deepEqual(windows(bulk), ["-30 days", "-15 days"]);
+});
+
+test("attribution redaction uses bounded detail-driven indexed lookups on the real schema", async () => {
+  const mock = makeDb({ updateChanges: 10000 });
+  const ctx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: mock }, ctx);
+  await Promise.all(ctx.waited);
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+    for (const table of ["web_details", "install_details"]) {
+      const updates = mock.executed.filter(({ sql }) => sql.startsWith(`UPDATE ${table} SET conversion_id`));
+      assert.equal(updates.length, 2, "redaction has a bounded per-table batch budget");
+      const { sql, values } = updates[0];
+      assert.deepEqual(values, ["-90 days", 2000]);
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values).map(({ detail }) => detail);
+      assert.ok(plan.some((detail) => detail.includes(`idx_${table}_conversion_id`)), plan.join("\n"));
+      assert.ok(plan.some((detail) => /SEARCH events(?: EXISTS)? USING INDEX idx_events_event_id/.test(detail)), plan.join("\n"));
+      assert.ok(!plan.some((detail) => /SCAN events|idx_events_created_at/.test(detail)), plan.join("\n"));
+      console.log(`${table} attribution query plan: ${plan.join(" | ")}`);
+
+      for (let index = 0; index < 4; index++) {
+        const id = `${table}-${index}`;
+        db.prepare(`INSERT INTO events (telemetry_id, event, version, os, arch, event_id, created_at)
+          VALUES ('test', 'install', 'test', 'linux', 'x86_64', ?, datetime('now', ?))`).run(id, index === 3 ? "-1 day" : "-100 days");
+        db.prepare(`INSERT INTO ${table} (event_id, conversion_id) VALUES (?, 'conversion')`).run(id);
+      }
+      const update = db.prepare(sql);
+      assert.equal(update.run("-90 days", 2).changes, 2, "one statement never exceeds its batch limit");
+      assert.equal(update.run("-90 days", 2).changes, 1);
+      assert.equal(update.run("-90 days", 2).changes, 0);
+      assert.equal(db.prepare(`SELECT conversion_id FROM ${table} WHERE event_id = ?`).get(`${table}-3`).conversion_id,
+        "conversion", "fresh attribution remains intact");
+      assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 4, "redaction does not delete details");
+    }
+    for (const { sql, values } of mock.executed.filter(({ sql, values }) => /^DELETE FROM (events|turn_details|session_details)/.test(sql)
+      && values[0] === "turn_end")) {
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values).map(({ detail }) => detail);
+      assert.ok(plan.some((detail) => /SEARCH events USING (COVERING )?INDEX idx_events_event_created_telemetry/.test(detail)), plan.join("\n"));
+      assert.ok(!plan.some((detail) => /^SCAN events/.test(detail)), plan.join("\n"));
+      console.log(`retention delete query plan: ${plan.join(" | ")}`);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("cron retention retries overload once after eleven seconds for every statement kind", async (t) => {
+  for (const prefix of ["UPDATE web_details", "UPDATE install_details", "DELETE FROM web_details",
+    "DELETE FROM install_details", "DELETE FROM desktop_update_details", "DELETE FROM todo_session_details",
+    "DELETE FROM turn_details", "DELETE FROM session_details", "DELETE FROM events"]) {
+    await t.test(prefix, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let attempts = 0;
+      let selected;
+      const db = makeDb({ beforeRun(sql, values) {
+        if (!sql.startsWith(prefix)) return;
+        const key = JSON.stringify([sql, values]);
+        selected ??= key;
+        if (key !== selected) return;
+        if (++attempts === 1) throw new Error("D1_ERROR: D1 DB is overloaded. Please try again later.");
+      } });
+      const ctx = makeCtx();
+      await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db }, ctx);
+      for (let i = 0; i < 1000 && attempts === 0; i++) await Promise.resolve();
+      assert.equal(attempts, 1);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      t.mock.timers.tick(10999);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      assert.equal(attempts, 1, "does not retry inside D1's ten-second window");
+      t.mock.timers.tick(1);
+      await Promise.all(ctx.waited);
+      assert.equal(attempts, 2, "only the failing statement is retried");
+      assert.ok(db.executed.some(({ sql, values }) => sql.startsWith("DELETE FROM events")
+        && values[0] === "desktop_update"), "later retention families still run");
+    });
+  }
+});
+
+test("retention retry is bounded and excludes non-overload failures", async (t) => {
+  for (const [error, expected] of [
+    [Object.assign(new Error("D1 error"), { code: 7429 }), 2],
+    [new Error("D1_ERROR: code 7429"), 2],
+    [new Error("D1 DB is overloaded. Please try again later."), 2],
+    [new Error("D1_ERROR", { cause: Object.assign(new Error("overload"), { code: 7429 }) }), 2],
+    [new Error("SQLITE_FULL: database or disk is full"), 1],
+    [new Error("no such table: web_details"), 1],
+    [new Error("generic transient error"), 1],
+    [new Error("unrelated service is overloaded"), 1],
+    [new Error("invalid value 74290"), 1],
+  ]) {
+    await t.test(error.message, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let attempts = 0;
+      const db = makeDb({ beforeRun(sql) {
+        if (sql.startsWith("UPDATE web_details")) { attempts++; throw error; }
+      } });
+      const ctx = makeCtx();
+      await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db }, ctx);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      t.mock.timers.tick(11000);
+      await Promise.all(ctx.waited);
+      assert.equal(attempts, expected);
+    });
+  }
+});
+
+test("split main skips bulk-only todo details but keeps parent and legacy retention", async () => {
+  const db = makeDb();
+  const bulk = makeDb();
+  const splitCtx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db, DB_BULK: bulk }, splitCtx);
+  await Promise.all(splitCtx.waited);
+  const todoDetails = (store) => store.executed.filter(({ sql }) => /DELETE FROM todo_session_details/.test(sql));
+  const todoParents = (store) => store.executed.filter(({ sql, values }) => /DELETE FROM events/.test(sql)
+    && values[0] === "todo_session");
+  assert.equal(todoDetails(db).length, 0, "split main has no optional todo detail table");
+  assert.equal(todoDetails(bulk).length, 1, "bulk still cleans detail children");
+  assert.equal(todoParents(db).length, 1, "split main still cleans raw parent rows");
+  assert.equal(todoParents(bulk).length, 1);
+
+  const legacy = makeDb();
+  const legacyCtx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: legacy }, legacyCtx);
+  await Promise.all(legacyCtx.waited);
+  assert.equal(todoDetails(legacy).length, 1, "unsplit legacy still cleans detail children");
+  assert.equal(todoParents(legacy).length, 1);
+});
+
+test("missing waitUntil does not consume the database emergency cooldown", async () => {
+  const env = { DB: makeDb({ sizeAfter: 8_100_000_000 }) };
+  await worker.fetch(postRequest(makeBody()), env);
+  const ctx = makeCtx();
+  await worker.fetch(postRequest(makeBody()), env, ctx);
+  await Promise.all(ctx.waited);
+  assert.ok(env.DB.executed.some(({ sql }) => /DELETE FROM events/.test(sql)));
+});
+
+test("backlogged main and bulk plus emergency passes stay below 1000 D1 calls", async () => {
+  const db = makeDb({ deleteChanges: 10000, sizeAfter: 8_100_000_000 });
+  const bulk = makeDb({ deleteChanges: 10000, sizeAfter: 8_200_000_000 });
+  const ctx = makeCtx();
+  await worker.scheduled({ cron: "17 0-3,5-23 * * *" }, { DB: db, DB_BULK: bulk }, ctx);
+  await Promise.all(ctx.waited);
+  const calls = db.executed.length + bulk.executed.length;
+  assert.ok(calls < 1000, `hourly maintenance used ${calls} D1 calls`);
+  for (const store of [db, bulk]) {
+    const deletes = store.executed.filter(({ sql, values }) => /DELETE FROM events/.test(sql)
+      && values[0] === "desktop_update");
+    assert.equal(deletes.length, 4, "last family receives normal and emergency budgets");
+  }
+});
+
 test("missing firehose binding degrades gracefully", async () => {
   const db = makeDb();
   const ctx = makeCtx();
@@ -653,6 +907,8 @@ test("health endpoint reports database size vs soft limit", async () => {
   assert.equal(json.db_size_bytes, 12345678);
   assert.equal(json.db_soft_limit_bytes, 8_000_000_000);
   assert.equal(json.over_soft_limit, false);
+  assert.equal(json.bulk_db_size_bytes, null);
+  assert.equal(json.bulk_over_soft_limit, null);
 });
 
 test("paid-plan database size below the budget guardrail is healthy", async () => {
@@ -1270,4 +1526,135 @@ test("missing geo binding and missing cf never break the event insert", async ()
   const json = await response.json();
   assert.equal(response.status, 200);
   assert.equal(json.durable, true);
+});
+
+// --- usage_report: per-response spend signal rolled up into daily_model_usage.
+
+function makeUsageReportBody(overrides = {}) {
+  return makeBody({
+    event: "usage_report",
+    event_id: "usage-event-1",
+    session_id: "agent-session-a",
+    source: "agent",
+    provider: "OpenAI",
+    model: "gpt-6-astra",
+    input_tokens: 1000,
+    output_tokens: 200,
+    cache_read_input_tokens: 800,
+    cache_creation_input_tokens: 0,
+    total_tokens: 2000,
+    responses: 1,
+    build_channel: "release",
+    is_ci: false,
+    ...overrides,
+  });
+}
+
+test("usage_report upserts daily_model_usage and writes no raw events row", async () => {
+  const db = makeDb();
+  const env = { DB: db, ALLOWED_ORIGIN: "*" };
+  const response = await worker.fetch(
+    new Request(EVENT_URL, { method: "POST", body: JSON.stringify(makeUsageReportBody()) }),
+    env,
+    { waitUntil() {} },
+  );
+  assert.equal(response.status, 200);
+  const rollup = db.executed.filter(({ sql }) => /INSERT INTO usage_report_ledger/.test(sql));
+  assert.equal(rollup.length, 1);
+  const [date, source, provider, model, channel, isCi, responses, input, output, cacheRead, cacheWrite, total] = rollup[0].values;
+  assert.match(date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.deepEqual(
+    [source, provider, model, channel, isCi, responses, input, output, cacheRead, cacheWrite, total],
+    ["agent", "OpenAI", "gpt-6-astra", "release", 0, 1, 1000, 200, 800, 0, 2000],
+  );
+  assert.ok(rollup[0].sql.includes("ON CONFLICT(receipt_key) DO NOTHING"));
+  assert.equal(
+    db.executed.filter(({ sql }) => /INSERT[\s\S]*INTO events\b/.test(sql)).length,
+    0,
+    "usage_report must not create raw events rows",
+  );
+});
+
+test("usage_report rejects invalid source, missing model, and bad token counts", async () => {
+  for (const [overrides, message] of [
+    [{ source: "prompt" }, "Invalid usage_report source"],
+    [{ model: "" }, "Missing usage_report model"],
+    [{ input_tokens: -5 }, "Invalid usage_report input_tokens"],
+    [{ output_tokens: 1.5 }, "Invalid usage_report output_tokens"],
+    [{ total_tokens: 60_000_000 }, "Invalid usage_report total_tokens"],
+    [{ responses: 0 }, "Invalid usage_report responses"],
+  ]) {
+    const db = makeDb();
+    const response = await worker.fetch(
+      new Request(EVENT_URL, { method: "POST", body: JSON.stringify(makeUsageReportBody(overrides)) }),
+      { DB: db, ALLOWED_ORIGIN: "*" },
+      { waitUntil() {} },
+    );
+    assert.equal(response.status, 400, JSON.stringify(overrides));
+    assert.equal((await response.json()).error, message);
+    assert.equal(db.executed.filter(({ sql }) => /daily_model_usage/.test(sql)).length, 0);
+  }
+});
+
+test("usage_report maps provider/model/source onto firehose blobs", async () => {
+  const points = [];
+  const env = {
+    DB: makeDb(),
+    ALLOWED_ORIGIN: "*",
+    FIREHOSE_USAGE: { writeDataPoint(point) { points.push(point); } },
+  };
+  const response = await worker.fetch(
+    new Request(EVENT_URL, { method: "POST", body: JSON.stringify(makeUsageReportBody({ source: "compaction" })) }),
+    env,
+    { waitUntil() {} },
+  );
+  assert.equal(response.status, 200);
+  const point = points.find((p) => p.blobs.includes("usage_report"));
+  assert.ok(point, "firehose point written");
+  assert.ok(point.blobs.includes("gpt-6-astra"));
+  assert.ok(point.blobs.includes("OpenAI"));
+  assert.ok(point.blobs.includes("compaction"));
+  assert.ok(point.doubles.includes(1000) && point.doubles.includes(2000));
+});
+
+test("desktop fleet events land in events with sanitized update fields", async () => {
+  const db = makeDb();
+  const base = { step: undefined, auth_provider: undefined, auth_method: undefined, auth_failure_reason: undefined, is_ci: true };
+  for (const body of [
+    makeBody({ ...base, event: "desktop_active", event_id: "d-active", version: "0.6.0" }),
+    makeBody({ ...base, event: "desktop_upgrade", event_id: "d-upgrade", version: "0.6.0", from_version: "0.5.0" }),
+    makeBody({
+      ...base,
+      event: "desktop_update",
+      event_id: "d-update",
+      version: "0.6.0",
+      from_version: "0.5.0",
+      install_kind: "Linux Managed",
+      update_outcome: "failure",
+      update_failure_stage: "verify: /home/u/secret " + "x".repeat(100),
+    }),
+  ]) {
+    const response = await worker.fetch(postRequest(body), { DB: db }, makeCtx());
+    assert.equal(response.status, 200, body.event);
+  }
+  const inserts = db.executed.filter(({ sql }) => /INSERT OR IGNORE INTO events /.test(sql));
+  assert.equal(inserts.length, 3);
+  const details = db.executed.filter(({ sql }) => /INSERT OR IGNORE INTO desktop_update_details/.test(sql));
+  assert.equal(details.length, 1, "only desktop_update writes details");
+  const row = (insert) => {
+    const cols = insert.sql.match(/\(([^)]*)\)/)[1].split(",").map((c) => c.trim());
+    return Object.fromEntries(cols.map((c, i) => [c, insert.values[i]]));
+  };
+  const [active, upgrade, update] = inserts.map(row);
+  const detail = row(details[0]);
+  assert.equal(detail.event_id, "d-update");
+  assert.equal(active.event, "desktop_active");
+  assert.equal(active.from_version, null);
+  assert.equal(upgrade.from_version, "0.5.0");
+  assert.equal(update.version, "0.6.0");
+  assert.equal(detail.install_kind, "linux_managed");
+  assert.equal(detail.update_outcome, "failure");
+  assert.ok(detail.update_failure_stage.startsWith("verify_home_u_secret_"));
+  assert.ok(detail.update_failure_stage.length <= 64);
+  assert.equal(update.is_ci, 1);
 });

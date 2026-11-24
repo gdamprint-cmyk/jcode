@@ -1,10 +1,14 @@
 use chrono::{DateTime, Utc};
-use jcode_message_types::{ContentBlock, Message, Role, ToolCall};
+use jcode_message_types::{ContentBlock, Message, Role, SharedContent, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 mod title;
+mod transcription;
 pub use title::prompt_title;
+pub use transcription::{
+    TRANSCRIPTION_CLOSE, TRANSCRIPTION_OPEN, strip_transcription, wrap_transcription,
+};
 
 /// Identifies a session to resume, across the agent backends jcode can import
 /// from. This is pure data (only ids/paths) with no UI dependency; it lives in
@@ -72,6 +76,9 @@ pub struct ResponseStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedMessage {
+    /// Execution duration for a completed tool row, when recorded by the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_duration_ms: Option<u64>,
     /// Present only on the final visible assistant row of a completed stored
     /// user turn. Tool-only intermediate rounds contribute to these totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,7 +271,7 @@ pub struct StoredMemoryInjection {
 pub struct StoredMessage {
     pub id: String,
     pub role: Role,
-    pub content: Vec<ContentBlock>,
+    pub content: SharedContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_role: Option<StoredDisplayRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +287,7 @@ pub struct StoredMessage {
 pub enum StoredDisplayRole {
     System,
     BackgroundTask,
+    FileActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,7 +308,8 @@ pub struct StoredTokenUsage {
 pub struct StoredCompactionState {
     pub summary_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_encrypted_content: Option<String>,
+    // Shared with manager summaries and copy-on-write session snapshots.
+    pub openai_encrypted_content: Option<std::sync::Arc<str>>,
     pub covers_up_to_turn: usize,
     pub original_turn_count: usize,
     pub compacted_count: usize,
@@ -433,12 +442,15 @@ pub fn session_search_raw_matches_query(raw: &[u8], query: &SessionSearchQueryPr
         if contains_case_insensitive_bytes(raw, query.normalized.as_bytes()) {
             return true;
         }
-        let matched_terms = query
-            .terms
-            .iter()
-            .filter(|term| contains_case_insensitive_bytes(raw, term.as_bytes()))
-            .count();
-        return matched_terms >= query.min_term_matches;
+        // Public profiles may request zero hits. Avoid underflow, and stop once
+        // enough terms match without changing duplicate or empty-term semantics.
+        return query.min_term_matches == 0
+            || query
+                .terms
+                .iter()
+                .filter(|term| contains_case_insensitive_bytes(raw, term.as_bytes()))
+                .nth(query.min_term_matches - 1)
+                .is_some();
     }
 
     let Ok(raw_text) = std::str::from_utf8(raw) else {
@@ -494,6 +506,26 @@ pub fn tokenize_session_search_query(query: &str) -> Vec<String> {
 
     terms
 }
+
+/// Tokenize text already lowercased as a whole, preserving index Unicode boundaries.
+/// Ordinary queries intentionally retain split-then-lowercase behavior.
+pub fn tokenize_prelowercased_session_search_text(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for token in text.split(|c: char| !c.is_alphanumeric()) {
+        if token.is_empty() || is_session_search_stop_word(token) {
+            continue;
+        }
+        let keep = token.chars().count() >= 2 || token.chars().all(|c| c.is_ascii_digit());
+        if keep && seen.insert(token) {
+            terms.push(token.to_owned());
+        }
+    }
+    terms
+}
+
+#[cfg(test)]
+mod prelowercased_tokenization_tests;
 
 pub fn is_session_search_stop_word(token: &str) -> bool {
     matches!(

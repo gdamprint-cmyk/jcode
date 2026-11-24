@@ -1,16 +1,26 @@
 use jcode_logging as logging;
 use jcode_storage as storage;
 mod concurrency;
+mod desktop;
+pub use desktop::{record_desktop_active, record_desktop_update};
+mod oauth_account;
+pub use oauth_account::{
+    OAUTH_ACCOUNT_NOTICE_TEXT, OAuthAccountNotice, acknowledge_oauth_account_notice_displayed,
+    enqueue_oauth_account, pending_oauth_account_notice,
+};
+mod categories;
+pub use categories::{TelemetryCategory, category_settings, set_category_settings};
 mod lifecycle;
 pub use concurrency::{ConcurrencySession, begin_concurrency_session};
 pub mod onboarding_trace;
 mod state_support;
+mod usage_outbox;
 use chrono::{DateTime, NaiveDate, Utc};
 use jcode_usage_types::{
     AuthEvent, DiscoveryEvent, ErrorCounts, FeedbackEvent, InstallEvent, OnboardingStepEvent,
     SessionLifecycleEvent, SessionStartEvent, TelemetryProjectProfile as ProjectProfile,
     TelemetryToolCategory as ToolCategory, TelemetryWorkflowCounts, TodoSessionEvent, TurnEndEvent,
-    UpgradeEvent, classify_telemetry_tool_category as classify_tool_category,
+    UpgradeEvent, UsageReportEvent, classify_telemetry_tool_category as classify_tool_category,
     looks_like_telemetry_test_run as looks_like_test_run,
     mcp_telemetry_server_name as mcp_server_name, sanitize_feedback_text, sanitize_telemetry_label,
     telemetry_workflow_flags_from_counts,
@@ -31,6 +41,17 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
+const TELEMETRY_USAGE_ENDPOINT: &str = "https://telemetry.jcode.sh/v2/usage";
+
+fn telemetry_endpoint(payload: &serde_json::Value) -> &'static str {
+    // An old worker must reject new retryable usage without mutating legacy
+    // aggregates. Never fall back to /v1/event when this endpoint is absent.
+    if payload["event"] == "usage_report" {
+        TELEMETRY_USAGE_ENDPOINT
+    } else {
+        TELEMETRY_ENDPOINT
+    }
+}
 const TRANSCRIPT_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/transcript";
 #[cfg(not(test))]
 const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -513,6 +534,10 @@ pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
         return false;
     };
     if enabled {
+        #[cfg(not(test))]
+        if path.exists() || opt_out_forced_by_env() {
+            usage_outbox::clear_pending();
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => true,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -534,6 +559,8 @@ pub fn set_usage_telemetry_enabled(enabled: bool) -> bool {
         match std::fs::write(&path, b"1") {
             Ok(()) => {
                 logging::debug("usage telemetry opted out via marker");
+                #[cfg(not(test))]
+                usage_outbox::clear_pending();
                 true
             }
             Err(err) => {
@@ -892,87 +919,9 @@ pub fn record_todo_update(update: TodoTelemetryUpdate) {
     }
 }
 
-fn update_active_days(id: &str) -> (u32, u32) {
-    let Some(path) = active_days_path(id) else {
-        return (0, 0);
-    };
-    let today = Utc::now().date_naive();
-    let mut days = std::fs::read_to_string(&path)
-        .ok()
-        .into_iter()
-        .flat_map(|text| {
-            text.lines()
-                .map(str::trim)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter_map(|line| NaiveDate::parse_from_str(&line, "%Y-%m-%d").ok())
-        .collect::<Vec<_>>();
-    days.push(today);
-    days.sort_unstable();
-    days.dedup();
-    let rendered = days
-        .iter()
-        .map(NaiveDate::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    write_private_file(&path, &rendered);
-    let days_7 = days
-        .iter()
-        .filter(|day| (today.signed_duration_since(**day).num_days()) < 7)
-        .count()
-        .min(u32::MAX as usize) as u32;
-    let days_30 = days
-        .iter()
-        .filter(|day| (today.signed_duration_since(**day).num_days()) < 30)
-        .count()
-        .min(u32::MAX as usize) as u32;
-    (days_7, days_30)
-}
-
-fn detect_project_profile() -> ProjectProfile {
-    fn keep_project_entry(entry: &walkdir::DirEntry) -> bool {
-        if !entry.file_type().is_dir() {
-            return true;
-        }
-        let name = entry.file_name().to_str().unwrap_or_default();
-        !matches!(
-            name,
-            ".git" | "target" | "node_modules" | "dist" | "build" | ".next"
-        )
-    }
-
-    let cwd = std::env::current_dir().ok();
-    let mut profile = ProjectProfile::default();
-    let Some(root) = cwd.as_deref() else {
-        return profile;
-    };
-    profile.repo_present = root.join(".git").exists() || is_jcode_repo_dir(root);
-    let mut scanned_files = 0usize;
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(3)
-        .into_iter()
-        .filter_entry(keep_project_entry)
-        .filter_map(Result::ok)
-    {
-        if scanned_files >= 400 {
-            break;
-        }
-        if entry.file_type().is_dir() {
-            continue;
-        }
-        scanned_files += 1;
-        profile.note_extension(
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default(),
-        );
-    }
-    profile
-}
-
+#[path = "lib_project_profile.rs"]
+mod project_profile;
+use project_profile::*;
 fn now_ms_since(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -1022,100 +971,8 @@ fn update_turn_activity_timestamp(turn: &mut TurnTelemetry, now: Instant) {
     }
 }
 
-fn min_optional_ms(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
-    values.into_iter().flatten().min()
-}
-
-fn time_to_first_agent_action_ms(state: &SessionTelemetry) -> Option<u64> {
-    min_optional_ms([
-        state.first_assistant_response_ms,
-        state.first_tool_call_ms,
-        state.first_tool_success_ms,
-        state.first_file_edit_ms,
-        state.first_test_pass_ms,
-    ])
-}
-
-fn time_to_first_useful_action_ms(state: &SessionTelemetry) -> Option<u64> {
-    min_optional_ms([
-        state.first_tool_success_ms,
-        state.first_file_edit_ms,
-        state.first_test_pass_ms,
-    ])
-    .or(state.first_assistant_response_ms)
-}
-
-fn infer_agent_role(state: &SessionTelemetry) -> &'static str {
-    if state.feature_swarm_used || state.tool_cat_swarm > 0 {
-        "swarm"
-    } else if state.feature_subagent_used || state.tool_cat_subagent > 0 {
-        "subagent"
-    } else if state.feature_background_used || state.background_task_count > 0 {
-        "background"
-    } else {
-        "foreground"
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn infer_session_stop_reason(
-    event_name: &'static str,
-    reason: SessionEndReason,
-    state: &SessionTelemetry,
-    errors: &ErrorCounts,
-    duration_secs: u64,
-    session_success: bool,
-    abandoned_before_response: bool,
-    workflow_coding_used: bool,
-) -> &'static str {
-    if event_name == "session_crash"
-        || matches!(reason, SessionEndReason::Panic | SessionEndReason::Signal)
-    {
-        return "crash";
-    }
-    if errors.auth_failed > 0 {
-        return "auth_blocked";
-    }
-    if errors.rate_limited > 0 {
-        return "rate_limited";
-    }
-    if errors.provider_timeout > 0 {
-        return "provider_timeout";
-    }
-    if !state.had_user_prompt {
-        return "never_prompted";
-    }
-    if abandoned_before_response {
-        return "no_first_response";
-    }
-    if state.user_cancelled_count > 0 || matches!(reason, SessionEndReason::Disconnect) {
-        return "user_interrupted";
-    }
-    if matches!(state.first_assistant_response_ms, Some(ms) if ms > 60_000)
-        && time_to_first_useful_action_ms(state).is_none_or(|ms| ms > 60_000)
-    {
-        return "too_slow";
-    }
-    if state.executed_tool_failures >= 3 && state.executed_tool_successes == 0 {
-        return "tool_error_loop";
-    }
-    if errors.tool_error > 0 && state.executed_tool_successes == 0 {
-        return "tool_failures";
-    }
-    if workflow_coding_used && state.file_write_calls == 0 {
-        return "no_file_change";
-    }
-    if state.tests_run > 0 && state.tests_passed == 0 {
-        return "test_failure_unresolved";
-    }
-    if !session_success && duration_secs >= 300 && state.agent_active_ms_total >= 300_000 {
-        return "agent_got_stuck";
-    }
-    if !session_success {
-        return "no_useful_action";
-    }
-    "completed_successfully"
-}
+mod session_outcome;
+use session_outcome::*;
 
 fn mark_command_family_usage(state: &mut SessionTelemetry, command: &str) {
     let family = command
@@ -1302,9 +1159,17 @@ pub fn record_command_family(command: &str) {
 
 #[cfg(not(test))]
 fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
-    if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
+    if payload["event"] == "usage_report" && !is_enabled() {
         return false;
     }
+    // Spend delivery must survive an unrelated activity event tripping the
+    // legacy circuit breaker. Older workers can reject newer activity schemas.
+    let breaker_exempt = payload_is_breaker_exempt(&payload);
+    if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) && !breaker_exempt {
+        return false;
+    }
+    // Newer event types can reach an older worker that rejects them as unknown.
+    // That must only drop the one payload, never disable all telemetry.
     let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .user_agent(jcode_provider_core::JCODE_USER_AGENT)
@@ -1312,15 +1177,21 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
             .expect("telemetry HTTP client should build")
     });
     match client
-        .post(TELEMETRY_ENDPOINT)
+        .post(telemetry_endpoint(&payload))
         .timeout(timeout)
         .json(&payload)
         .send()
     {
-        Ok(response) if response.status().is_success() => true,
+        Ok(response) if response.status().is_success() => {
+            if payload["event"] == "usage_report" {
+                usage_outbox::acknowledged(response, &payload)
+            } else {
+                true
+            }
+        }
         Ok(response) => {
             let status = response.status();
-            if telemetry_status_is_permanent(status.as_u16()) {
+            if telemetry_status_is_permanent(status.as_u16()) && !breaker_exempt {
                 TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
                 logging::warn(&format!(
                     "telemetry endpoint permanently rejected payload with HTTP {status}; suppressing telemetry delivery for this process"
@@ -1346,7 +1217,9 @@ fn post_payload_with_retry(payload: serde_json::Value, timeout: Duration) -> boo
         return true;
     }
     for delay in RETRY_DELAYS {
-        if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
+        if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed)
+            && !payload_is_breaker_exempt(&payload)
+        {
             return false;
         }
         std::thread::sleep(delay);
@@ -1390,6 +1263,44 @@ fn telemetry_status_is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
 
+/// Event types added after the worker's validation was frozen. A 4xx for one of
+/// these means "this worker does not know the event yet", not "stop sending".
+fn payload_is_breaker_exempt(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("event").and_then(|value| value.as_str()),
+        Some("usage_report" | "desktop_active" | "desktop_upgrade" | "desktop_update")
+    )
+}
+
+/// Background payloads queued but not yet delivered (or abandoned).
+static TELEMETRY_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Block until queued background telemetry has been delivered, or `timeout`
+/// elapses. For short-lived processes, such as `jcode-desktop --update`, that
+/// exit right after recording an event.
+pub fn flush_pending(timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    #[cfg(not(test))]
+    usage_outbox::wake();
+    while (TELEMETRY_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0
+        || durable_usage_pending())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn durable_usage_pending() -> bool {
+    #[cfg(not(test))]
+    {
+        usage_outbox::has_pending()
+    }
+    #[cfg(test)]
+    {
+        false
+    }
+}
+
 fn spawn_background_worker<F>(capacity: usize, mut deliver: F) -> std::io::Result<SyncSender<Value>>
 where
     F: FnMut(Value) + Send + 'static,
@@ -1410,6 +1321,7 @@ fn background_sender() -> &'static SyncSender<Value> {
     TELEMETRY_BACKGROUND_SENDER.get_or_init(|| {
         spawn_background_worker(BACKGROUND_QUEUE_CAPACITY, |payload| {
             let _ = post_payload_with_retry(payload, ASYNC_SEND_TIMEOUT);
+            TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
         })
         .expect("telemetry background worker should start")
     })
@@ -1460,19 +1372,30 @@ fn send_payload(mut payload: serde_json::Value, mode: DeliveryMode) -> bool {
 
 #[cfg(not(test))]
 fn send_payload(mut payload: serde_json::Value, mode: DeliveryMode) -> bool {
+    if !categories::payload_allowed(&payload) {
+        return false;
+    }
     concurrency::mark_legacy_concurrency_unavailable(&mut payload);
+    // Usage events bypass the volatile activity queue. A process exit, queue
+    // overflow, or retry exhaustion must not discard the authoritative spend.
+    if payload["event"] == "usage_report" {
+        return usage_outbox::enqueue(payload);
+    }
+    usage_outbox::wake();
     match mode {
         DeliveryMode::Background => {
             if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
                 return false;
             }
             logging::debug("queueing telemetry payload for background delivery");
+            TELEMETRY_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
             match background_sender().try_send(payload) {
                 Ok(()) => {
                     TELEMETRY_QUEUE_OVERFLOW_WARNED.store(false, Ordering::Relaxed);
                     true
                 }
                 Err(TrySendError::Full(_)) => {
+                    TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
                     if !TELEMETRY_QUEUE_OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
                         logging::warn(&format!(
                             "telemetry background queue is full (capacity={BACKGROUND_QUEUE_CAPACITY}); dropping events until delivery catches up"
@@ -1481,6 +1404,7 @@ fn send_payload(mut payload: serde_json::Value, mode: DeliveryMode) -> bool {
                     false
                 }
                 Err(TrySendError::Disconnected(_)) => {
+                    TELEMETRY_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
                     logging::warn("telemetry background worker stopped; dropping payload");
                     false
                 }
@@ -1986,6 +1910,8 @@ fn begin_session_with_mode(
     resumed_session: bool,
 ) {
     if !is_enabled() {
+        #[cfg(not(test))]
+        usage_outbox::clear_pending();
         return;
     }
     logging::info(&format!(
@@ -2308,6 +2234,206 @@ pub fn record_connection_type(connection: &str) {
         }
     }
     maybe_emit_session_start();
+}
+
+/// Where a provider call originated, for usage accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// A normal agent turn (foreground, swarm worker, background, subagent).
+    Agent,
+    /// A compaction summary request.
+    Compaction,
+    /// A memory/sidecar helper request.
+    Sidecar,
+}
+
+impl UsageSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            UsageSource::Agent => "agent",
+            UsageSource::Compaction => "compaction",
+            UsageSource::Sidecar => "sidecar",
+        }
+    }
+}
+
+/// Provider-reported token usage for one completed provider response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl ProviderUsage {
+    /// Convert provider-native counters to non-overlapping spend buckets.
+    /// OpenAI-compatible and Gemini inputs contain their cache subsets, while
+    /// Anthropic and Bedrock report uncached input separately. Key on transport,
+    /// not model name: OpenRouter can serve Anthropic with inclusive counters.
+    fn normalized(self, provider: &str) -> Self {
+        if matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "openai" | "openrouter" | "gemini" | "antigravity" | "copilot"
+        ) {
+            Self {
+                input_tokens: self
+                    .input_tokens
+                    .saturating_sub(self.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_sub(self.cache_creation_input_tokens.unwrap_or(0)),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens.unwrap_or(0) == 0
+            && self.cache_creation_input_tokens.unwrap_or(0) == 0
+    }
+}
+
+/// Emit a `usage_report` for one provider response, attributed to the calling
+/// session and supplied model label. This legacy API does not claim the label
+/// was resolved by the provider. Use the attribution API for observed IDs.
+///
+/// This is the authoritative spend signal. Unlike `session_end`, it does not
+/// depend on the session ending cleanly and does not read the process-global
+/// telemetry session, so concurrent agents in one server process (swarm
+/// workers, background tasks, desktop panels) are each attributed correctly.
+/// Delivery persists before returning and retries in the background. A server
+/// acknowledgement is required to remove the event. Token counts only, no content.
+pub fn record_provider_usage(
+    session_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    source: UsageSource,
+    usage: ProviderUsage,
+) {
+    record_provider_usage_with_model_attribution(session_id, provider, model, None, source, usage);
+}
+
+/// Record request attribution separately from the actual provider response ID.
+/// Only response-observed IDs belong in `resolved_model`. Unknown resolution
+/// leaves the requested label effective without claiming it was resolved.
+pub fn record_provider_usage_with_model_attribution(
+    session_id: Option<&str>,
+    provider: &str,
+    requested_model: &str,
+    resolved_model: Option<&str>,
+    source: UsageSource,
+    usage: ProviderUsage,
+) {
+    if !is_enabled() || usage.is_zero() {
+        return;
+    }
+    let Some(id) = get_or_create_id() else {
+        return;
+    };
+    let session_id = session_id
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            SESSION_STATE
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|state| state.session_id.clone()))
+        })
+        .unwrap_or_default();
+    let usage = usage.normalized(provider);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
+    let requested_model = sanitize_telemetry_label(requested_model);
+    let resolved_model = resolved_model
+        .map(sanitize_telemetry_label)
+        // The ingestion contract bounds metadata by UTF-8 bytes. An oversized
+        // response label is unknown, not a truncated ID and not a poison event
+        // that would permanently block this response's durable usage delivery.
+        .filter(|value| !value.is_empty() && value.len() <= 120);
+    let (schema_version, build_channel, git_checkout, ci, from_cargo) = telemetry_envelope();
+    let event = UsageReportEvent {
+        usage_contract_version: 2,
+        occurred_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        event_id: new_event_id(),
+        id,
+        session_id,
+        event: "usage_report",
+        version: version(),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        source: source.as_str(),
+        provider: sanitize_telemetry_label(provider),
+        model: resolved_model.as_ref().unwrap_or(&requested_model).clone(),
+        requested_model: (!requested_model.is_empty() && requested_model.len() <= 120)
+            .then_some(requested_model),
+        resolved_model,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        total_tokens: usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation),
+        responses: 1,
+        schema_version,
+        build_channel,
+        is_git_checkout: git_checkout,
+        is_ci: ci,
+        ran_from_cargo: from_cargo,
+    };
+    if let Ok(payload) = serde_json::to_value(&event) {
+        let _ = send_payload(payload, DeliveryMode::Background);
+    }
+}
+
+/// Convenience wrapper for side calls made through
+/// `Provider::complete_simple_with_usage`.
+pub fn record_simple_completion_usage(
+    session_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    source: UsageSource,
+    usage: jcode_provider_core::SimpleCompletionUsage,
+) {
+    if usage.is_empty() {
+        return;
+    }
+    record_provider_usage_with_model_attribution(
+        session_id,
+        provider,
+        usage.requested_model.as_deref().unwrap_or(model),
+        usage.resolved_model.as_deref(),
+        source,
+        ProviderUsage {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        },
+    );
+}
+
+/// Record only usage actually observed before a simple completion failed.
+/// Untyped failures have no authoritative usage and must not be estimated.
+pub fn record_simple_completion_failure_usage(
+    session_id: Option<&str>,
+    source: UsageSource,
+    error: &anyhow::Error,
+) {
+    if let Some(failure) = error.downcast_ref::<jcode_provider_core::SimpleCompletionError>() {
+        record_simple_completion_usage(
+            session_id,
+            &failure.provider,
+            &failure.model,
+            source,
+            failure.usage.clone(),
+        );
+    }
 }
 
 pub fn record_token_usage(

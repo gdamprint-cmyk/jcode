@@ -189,7 +189,13 @@ pub(crate) fn create_test_app() -> App {
     crate::tui::ui::clear_test_render_state_for_tests();
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Keep background-task semantics without allocating a host-sized worker
+    // pool per fixture (hosted machines can expose dozens of CPU cores).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
     let mut app = App::new_for_test_harness(provider, registry);
     app.queue_mode = false;
@@ -203,7 +209,11 @@ fn create_named_provider_test_app(name: &'static str, model: &'static str) -> Ap
     crate::tui::ui::clear_test_render_state_for_tests();
 
     let provider: Arc<dyn Provider> = Arc::new(NamedMockProvider { name, model });
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
     let mut app = App::new_for_test_harness(provider, registry);
     app.queue_mode = false;
@@ -229,7 +239,11 @@ fn create_refresh_summary_test_app(summary: crate::provider::ModelCatalogRefresh
     crate::tui::ui::clear_test_render_state_for_tests();
 
     let provider: Arc<dyn Provider> = Arc::new(RefreshSummaryProvider { summary });
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
     let mut app = App::new_for_test_harness(provider, registry);
     app.queue_mode = false;
@@ -246,7 +260,11 @@ fn create_openrouter_spec_capture_test_app() -> (App, StdArc<StdMutex<Vec<String
     let provider: Arc<dyn Provider> = Arc::new(OpenRouterSpecCaptureProvider {
         set_model_calls: set_model_calls.clone(),
     });
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
     let mut app = App::new_for_test_harness(provider, registry);
     app.queue_mode = false;
@@ -316,6 +334,27 @@ fn debug_memory_profile_includes_app_owned_summary_for_large_client_state() {
             .unwrap_or(&Vec::new())
             .is_empty()
     );
+}
+
+#[test]
+fn debug_state_exposes_pending_interrupt_lifecycle() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.current_message_id = Some(88);
+    app.pending_soft_interrupts = vec!["correction".to_string()];
+    app.pending_soft_interrupt_requests = vec![(89, "correction".to_string())];
+    app.pending_queued_dispatch = true;
+    app.remote_session_id = Some("session_test".to_string());
+
+    let state: serde_json::Value =
+        serde_json::from_str(&app.handle_debug_command("state")).unwrap();
+    assert_eq!(state["processing"], true);
+    assert_eq!(state["current_message_id"], 88);
+    assert_eq!(state["pending_soft_interrupts"], 1);
+    assert_eq!(state["pending_soft_interrupt_requests"], 1);
+    assert_eq!(state["pending_queued_dispatch"], true);
+    assert_eq!(state["remote_session_id"], "session_test");
+    assert!(state["processing_status"].is_string());
 }
 
 fn test_side_panel_snapshot(page_id: &str, title: &str) -> crate::side_panel::SidePanelSnapshot {
@@ -411,11 +450,45 @@ fn clear_persisted_test_ui_state() {
     crate::auth::AuthStatus::invalidate_cache();
 }
 
+struct EnvRestoreGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestoreGuard {
+    fn capture(keys: impl IntoIterator<Item = &'static str>) -> Self {
+        Self(
+            keys.into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        )
+    }
+
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let guard = Self::capture([key]);
+        crate::env::set_var(key, value);
+        guard
+    }
+}
+
+impl Drop for EnvRestoreGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            if let Some(value) = value {
+                crate::env::set_var(key, value);
+            } else {
+                crate::env::remove_var(key);
+            }
+        }
+    }
+}
+
 fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     let _guard = crate::storage::lock_test_env();
+    let _provider_env = ProviderEnvGuard::clear();
     let temp = tempfile::tempdir().expect("tempdir");
-    let prev_home = std::env::var_os("JCODE_HOME");
+    let _env_guard = EnvRestoreGuard::capture(["JCODE_HOME"]);
     crate::env::set_var("JCODE_HOME", temp.path());
+    // Preserve inherited telemetry opt-out env. In this crate telemetry-core is
+    // a dependency, so cfg(test) does not stub its HTTP delivery path; inherited
+    // opt-out must keep blocking delivery for tests that exercise onboarding.
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
@@ -430,11 +503,6 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
     crate::tui::app::helpers::clear_ambient_info_cache_for_tests();
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
     // Drop any config loaded from the temp home so it cannot leak into the next
     // test, which is process-global state shared across this suite.
     crate::config::invalidate_config_cache();
@@ -452,10 +520,8 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
 /// silently following a config default they do not control.
 fn with_reasoning_current_home<T>(f: impl FnOnce() -> T) -> T {
     with_temp_jcode_home(|| {
-        crate::config::Config::set_reasoning_display(
-            crate::config::ReasoningDisplayMode::Current,
-        )
-        .expect("pin reasoning display to current for the test config");
+        crate::config::Config::set_reasoning_display(crate::config::ReasoningDisplayMode::Current)
+            .expect("pin reasoning display to current for the test config");
         crate::config::invalidate_config_cache();
         f()
     })
@@ -513,6 +579,7 @@ fn test_handle_turn_error_failover_prompt_manual_mode_shows_system_notice() {
             from_label: "Anthropic".to_string(),
             to_provider: "openai".to_string(),
             to_label: "OpenAI".to_string(),
+            target_route: Some("openai-oauth@openai-fox:gpt-5.4".to_string()),
             reason: "OAuth usage exhausted".to_string(),
             estimated_input_chars: 48_000,
             estimated_input_tokens: 12_000,
@@ -522,12 +589,13 @@ fn test_handle_turn_error_failover_prompt_manual_mode_shows_system_notice() {
 
         let last = app.display_messages.last().expect("display message");
         assert_eq!(last.role, "system");
-        assert!(last.content.contains("did not resend your prompt"));
-        assert!(last.content.contains("/model"));
         assert!(
             last.content
-                .contains("cross_provider_failover = \"manual\"")
+                .contains("Anthropic unavailable: OAuth usage exhausted")
         );
+        assert!(last.content.contains("/model"));
+        assert!(!last.content.contains("cross_provider_failover"));
+        assert!(last.content.lines().count() <= 2);
         assert!(app.pending_provider_failover.is_none());
     });
 }
@@ -535,20 +603,47 @@ fn test_handle_turn_error_failover_prompt_manual_mode_shows_system_notice() {
 #[test]
 fn test_handle_turn_error_failover_prompt_countdown_can_switch_and_retry() {
     with_temp_jcode_home(|| {
-        write_test_config("[provider]\ncross_provider_failover = \"countdown\"\n");
+        write_test_config(
+            "[provider]\ncross_provider_failover = \"countdown\"\nexhausted_usage_immediate_failover = false\n",
+        );
         let (mut app, active_provider) = create_switchable_test_app("claude");
         let prompt = crate::provider::ProviderFailoverPrompt {
             from_provider: "claude".to_string(),
             from_label: "Anthropic".to_string(),
             to_provider: "openai".to_string(),
             to_label: "OpenAI".to_string(),
+            target_route: Some("openai-oauth@openai-fox:gpt-5.4".to_string()),
             reason: "OAuth usage exhausted".to_string(),
             estimated_input_chars: 32_000,
             estimated_input_tokens: 8_000,
         };
 
+        let before = app.display_messages.len();
         app.handle_turn_error(failover_error_message(&prompt));
+        let added = &app.display_messages[before..];
+        assert_eq!(added.len(), 2, "{added:?}");
+        assert_eq!(added[0].role, "error");
+        assert!(added[0].content.contains("OAuth usage exhausted"));
+        assert_eq!(added[1].role, "system");
+        assert!(added[1].content.starts_with("↪ Switching to OpenAI"));
+        assert!(!added[1].content.contains('\n'));
         assert!(app.pending_provider_failover.is_some());
+        assert_eq!(active_provider.lock().unwrap().as_str(), "claude");
+        assert!(!app.pending_turn);
+        let pending = app.pending_provider_failover.as_ref().unwrap();
+        let remaining = pending.deadline.saturating_duration_since(Instant::now());
+        assert!(remaining <= Duration::from_secs(3));
+        assert!(remaining > Duration::from_secs(2));
+        app.maybe_progress_provider_failover_countdown();
+        assert_eq!(active_provider.lock().unwrap().as_str(), "claude");
+        assert!(!app.pending_turn);
+        assert!(
+            app.display_messages
+                .last()
+                .unwrap()
+                .content
+                .contains("Esc to cancel")
+        );
 
         if let Some(pending) = app.pending_provider_failover.as_mut() {
             pending.deadline = Instant::now() - Duration::from_secs(1);
@@ -558,13 +653,72 @@ fn test_handle_turn_error_failover_prompt_countdown_can_switch_and_retry() {
         assert!(app.pending_provider_failover.is_none());
         assert!(app.pending_turn);
         assert_eq!(active_provider.lock().unwrap().as_str(), "openai");
-        assert_eq!(app.session.model.as_deref(), Some("gpt-test"));
-        let last = app.display_messages.last().expect("display message");
+        assert_eq!(app.session.model.as_deref(), Some("gpt-5.4"));
+        // Cause, switch and retry collapse into one line.
+        let added = &app.display_messages[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
         assert!(
-            last.content
-                .contains("cross_provider_failover = \"manual\"")
+            added[0]
+                .content
+                .starts_with("✓ Usage limit reached. Switched to model: gpt-5.4"),
+            "{}",
+            added[0].content
+        );
+        assert!(added[0].content.ends_with(". Retrying."));
+        assert!(!added[0].content.contains('\n'));
+        let last = app.display_messages.last().expect("display message");
+        assert!(!last.content.contains("cross_provider_failover"));
+        assert!(last.content.lines().count() <= 2);
+        assert!(
+            !app.display_messages
+                .iter()
+                .any(|message| message.content.starts_with("↪ Switching to")),
+            "countdown line should be dropped once the switch happens"
         );
     });
+}
+
+#[test]
+fn test_first_failure_immediate_switch_and_manual_safety() {
+    for (mode, enabled, reason, immediate) in [
+        ("countdown", true, "OAuth usage exhausted", true),
+        ("countdown", false, "OAuth usage exhausted", false),
+        ("manual", true, "OAuth usage exhausted", false),
+        (
+            "countdown",
+            true,
+            "429 rate_limit_error: This request would exceed your account's rate limit. Please try again later.",
+            true,
+        ),
+    ] {
+        with_temp_jcode_home(|| {
+            write_test_config(&format!(
+                "[provider]\ncross_provider_failover = \"{mode}\"\nexhausted_usage_immediate_failover = {enabled}\n"
+            ));
+            let (mut app, active) = create_switchable_test_app("claude");
+            app.handle_turn_error(failover_error_message(
+                &crate::provider::ProviderFailoverPrompt {
+                    from_provider: "claude".into(),
+                    from_label: "Anthropic".into(),
+                    to_provider: "openai".into(),
+                    to_label: "OpenAI".into(),
+                    target_route: Some("openai-oauth@openai-fox:gpt-5.4".into()),
+                    reason: reason.into(),
+                    estimated_input_chars: 400,
+                    estimated_input_tokens: 100,
+                },
+            ));
+            assert_eq!(
+                active.lock().unwrap().as_str(),
+                if immediate { "openai" } else { "claude" }
+            );
+            assert_eq!(app.pending_turn, immediate);
+            assert_eq!(
+                app.pending_provider_failover.is_some(),
+                !immediate && mode == "countdown"
+            );
+        });
+    }
 }
 
 /// A new session must start with auto-poke off when the config says so, and

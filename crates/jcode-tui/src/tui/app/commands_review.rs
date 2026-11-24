@@ -68,7 +68,8 @@ fn judge_transcript_text_message(role: Role, text: String) -> StoredMessage {
         content: vec![ContentBlock::Text {
             text,
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -322,6 +323,8 @@ pub(super) fn reset_current_session(app: &mut App) {
     app.swarm_plan_version = None;
     app.swarm_plan_swarm_id = None;
     app.queued_messages.clear();
+    app.queued_images.clear();
+    app.queued_commands.clear();
     app.pasted_contents.clear();
     app.pending_images.clear();
     app.clear_inline_image_state();
@@ -400,35 +403,48 @@ pub(super) fn handle_observe_command(app: &mut App, trimmed: &str) -> bool {
 }
 
 fn current_autoreview_model_summary(app: &App) -> String {
-    crate::config::config()
-        .autoreview
-        .model
-        .clone()
+    current_autoreview_model_override(app)
         .or_else(|| app.session.model.clone())
         .unwrap_or_else(|| app.provider.model())
 }
 
-fn current_autoreview_model_override() -> Option<String> {
-    crate::config::config().autoreview.model.clone()
+pub(super) fn current_autoreview_model_override(app: &App) -> Option<String> {
+    app.session
+        .effective_agent_model("review", crate::config::Config::load().autoreview.model)
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary, so the TUI cannot disagree with the
+        // server about which spellings mean "no explicit override".
+        .filter(|model| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model))
 }
 
 fn current_autojudge_model_summary(app: &App) -> String {
-    crate::config::config()
-        .autojudge
-        .model
-        .clone()
+    current_autojudge_model_override(app)
         .or_else(|| app.session.model.clone())
         .unwrap_or_else(|| app.provider.model())
 }
 
-fn current_autojudge_model_override() -> Option<String> {
-    crate::config::config().autojudge.model.clone()
+pub(super) fn current_autojudge_model_override(app: &App) -> Option<String> {
+    app.session
+        .effective_agent_model("judge", crate::config::Config::load().autojudge.model)
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary.
+        .filter(|model| !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model))
 }
 
 pub(super) fn autoreview_status_message(app: &App) -> String {
     let default_enabled = crate::config::config().autoreview.enabled;
     let config_model = crate::config::config().autoreview.model.as_deref();
     let model_line = match config_model {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel is NOT a model override, so
+        // the status line must say the same thing the resolver decides.
+        Some(model) if crate::config::AgentsConfig::is_swarm_inherit_sentinel(model) => format!(
+            "Reviewer model: inherit current session ({})",
+            current_autoreview_model_summary(app)
+        ),
         Some(model) => format!("Reviewer model override: {}", model),
         None => format!(
             "Reviewer model: inherit current session ({})",
@@ -455,6 +471,14 @@ pub(super) fn autojudge_status_message(app: &App) -> String {
     let default_enabled = crate::config::config().autojudge.enabled;
     let config_model = crate::config::config().autojudge.model.as_deref();
     let model_line = match config_model {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary. A sentinel is NOT a model override, so
+        // the status line must say the same thing the resolver decides.
+        Some(model) if crate::config::AgentsConfig::is_swarm_inherit_sentinel(model) => format!(
+            "Judge model: inherit current session ({})",
+            current_autojudge_model_summary(app)
+        ),
         Some(model) => format!("Judge model override: {}", model),
         None => format!(
             "Judge model: inherit current session ({})",
@@ -638,16 +662,40 @@ pub(super) fn preferred_one_shot_review_override() -> Option<(String, String)> {
     }
 }
 
-fn current_review_model_override() -> (Option<String>, Option<String>) {
+/// Any explicit choice, session or saved global, wins over the built-in
+/// preferred reviewer. The inherit sentinel is NOT an explicit choice: it
+/// means "no override", so it falls through to the preferred reviewer.
+/// Only an unconfigured role uses the preferred reviewer.
+fn feedback_model_override(
+    app: &App,
+    role: &str,
+    configured: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if let Some(choice) = app.session.effective_agent_model(role, configured) {
+        // reference: crates/jcode-config-types/src/lib.rs -
+        // AgentsConfig::is_swarm_inherit_sentinel is the single source of truth
+        // for the sentinel vocabulary: any spelling of the sentinel means
+        // "no explicit override", never a concrete reviewer model.
+        return ((
+            !crate::config::AgentsConfig::is_swarm_inherit_sentinel(&choice)
+        )
+        .then_some(choice), None);
+    }
     preferred_one_shot_review_override()
         .map(|(model, provider_key)| (Some(model), Some(provider_key)))
-        .unwrap_or_else(|| (current_autoreview_model_override(), None))
+        .unwrap_or((None, None))
 }
 
-fn current_judge_model_override() -> (Option<String>, Option<String>) {
-    preferred_one_shot_review_override()
-        .map(|(model, provider_key)| (Some(model), Some(provider_key)))
-        .unwrap_or_else(|| (current_autojudge_model_override(), None))
+pub(super) fn current_review_model_override(app: &App) -> (Option<String>, Option<String>) {
+    feedback_model_override(
+        app,
+        "review",
+        crate::config::Config::load().autoreview.model,
+    )
+}
+
+pub(super) fn current_judge_model_override(app: &App) -> (Option<String>, Option<String>) {
+    feedback_model_override(app, "judge", crate::config::Config::load().autojudge.model)
 }
 
 fn clone_session_for_review(
@@ -680,6 +728,7 @@ fn clone_session_for_prompt(app: &App) -> anyhow::Result<(String, String)> {
     child.working_dir = app.session.working_dir.clone();
     child.model = app.session.model.clone();
     child.provider_key = app.session.provider_key.clone();
+    child.route_api_method = app.session.route_api_method.clone();
     child.subagent_model = app.session.subagent_model.clone();
     child.autoreview_enabled = app.session.autoreview_enabled;
     child.autojudge_enabled = app.session.autojudge_enabled;
@@ -836,13 +885,13 @@ fn launch_autoreview_window_local(app: &mut App) -> anyhow::Result<bool> {
         "autoreview",
         "Autoreview",
         build_autoreview_startup_message(&parent_session_id),
-        current_autoreview_model_override(),
+        current_autoreview_model_override(app),
         None,
     )
 }
 
 fn launch_review_once_local(app: &mut App) -> anyhow::Result<bool> {
-    let (model_override, provider_key_override) = current_review_model_override();
+    let (model_override, provider_key_override) = current_review_model_override(app);
     let parent_session_id = current_feedback_target_session_id(app);
     launch_review_window_local(
         app,
@@ -861,13 +910,13 @@ fn launch_autojudge_window_local(app: &mut App) -> anyhow::Result<bool> {
         "autojudge",
         "Autojudge",
         build_autojudge_startup_message(&parent_session_id),
-        current_autojudge_model_override(),
+        current_autojudge_model_override(app),
         None,
     )
 }
 
 fn launch_judge_once_local(app: &mut App) -> anyhow::Result<bool> {
-    let (model_override, provider_key_override) = current_judge_model_override();
+    let (model_override, provider_key_override) = current_judge_model_override(app);
     let parent_session_id = current_feedback_target_session_id(app);
     launch_review_window_local(
         app,
@@ -911,7 +960,7 @@ pub(super) fn queue_autojudge_remote(app: &mut App) {
         "Autojudge",
         parent_session_id.clone(),
         build_autojudge_startup_message(&parent_session_id),
-        current_autojudge_model_override(),
+        current_autojudge_model_override(app),
         None,
     );
 }

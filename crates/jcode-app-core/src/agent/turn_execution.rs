@@ -1,13 +1,71 @@
 use super::*;
 use crate::{terminal_eprintln as eprintln, terminal_println as println};
 
+#[path = "session_restore.rs"]
+mod session_restore;
+
 impl Agent {
+    /// Refuse to run a model turn when this session moved to another machine
+    /// or this in-memory copy is older than the transcript on disk.
+    pub(crate) fn ensure_session_lease(&self) -> Result<()> {
+        let account_route = self
+            .session
+            .route_api_method
+            .as_deref()
+            .or(self.session.provider_key.as_deref());
+        if let Some(expected) = account_route.and_then(jcode_provider_core::oauth_account_label)
+            && self.provider.oauth_account_label().as_deref() != Some(expected)
+        {
+            anyhow::bail!(
+                "Saved account '{}' could not be restored for this session. Select an available account using /model or /login before sending a request.",
+                expected
+            );
+        }
+        match self.session.migration_lease_block() {
+            Some(block) => Err(anyhow::anyhow!("Session is not runnable here: {block}")),
+            None => Ok(()),
+        }
+    }
+
+    /// True when this copy may not run turns on this machine.
+    pub(crate) fn session_lease_blocked(&self) -> bool {
+        self.session.migration_lease_block().is_some()
+    }
+
+    /// True when a newer migrated transcript replaced this copy on disk.
+    pub(crate) fn session_copy_is_stale(&self) -> bool {
+        matches!(
+            self.session.migration_lease_block(),
+            Some(crate::storage::SessionLeaseBlock::StaleCopy { .. })
+        )
+    }
+
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
+        let _turn = self.claim_server_turn()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
+        // A real user message is a new request: the plan for it has to be
+        // declared before any work tool runs.
+        // reference: crates/jcode-app-core/src/tool/plan_declaration.rs
+        // (note_user_request - the runtime state this arms).
+        crate::tool::plan_declaration::note_user_request(&self.session.id, user_message, false);
+        // The reminder travels with the prompt, so the analysis pass is not
+        // blocked by the gate and the declaration is still asked for.
+        if crate::tool::plan_declaration::plan_declaration_state(&self.session.id)
+            == crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+        {
+            self.append_turn_system_reminder(crate::tool::plan_declaration::plan_declaration_reminder())?;
+        }
+        self.announce_late_mcp_tools().await;
+        self.announce_late_skills();
         let input_id = self.add_message(
             Role::User,
             vec![ContentBlock::Text {
-                text: user_message.to_string(),
+                text: crate::prompt::with_swarm_user_message_reminder(
+                    user_message,
+                    self.provider.reasoning_effort().as_deref(),
+                ),
                 cache_control: None,
             }],
         );
@@ -18,8 +76,15 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        let _ = self.run_turn(true).await?;
-        Ok(())
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        self.fire_turn_start_hook("run");
+        let result = self.run_turn(true).await.map(|_| ());
+        // `jcode run` uses this path, so headless turns fire the same
+        // lifecycle hooks as streaming turns (docs/HOOKS.md).
+        self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
+        result
     }
 
     pub async fn run_once_capture(&mut self, user_message: &str) -> Result<String> {
@@ -32,10 +97,18 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
+        let _turn = self.claim_server_turn()?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
+        self.announce_late_mcp_tools().await;
+        self.announce_late_skills();
         let input_id = self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
-                text: user_message.to_string(),
+                text: crate::prompt::with_swarm_user_message_reminder(
+                    user_message,
+                    self.provider.reasoning_effort().as_deref(),
+                ),
                 cache_control: None,
             }],
             display_role,
@@ -47,7 +120,21 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        // Swarm workers use this path (`server/swarm.rs` calls `run_once_capture`).
+        // Without the lifecycle hooks their turns are invisible to every
+        // external integration that observes turns - Entire.io checkpoints,
+        // status bars, turn counters - so a whole swarm produces no provenance.
+        // Mirror `run_once`, which fires the same pair.
+        self.fire_turn_start_hook("capture");
+        let result = self.run_turn(false).await;
+        let hook_result = match &result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        };
+        self.fire_turn_end_hook(&hook_result, turn_started_at, start_message_index);
+        result
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
@@ -76,35 +163,198 @@ impl Agent {
         event_tx: mpsc::UnboundedSender<ServerEvent>,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<()> {
+        let lease = self.claim_server_turn()?;
+        self.run_reserved_streaming_mpsc(
+            &lease,
+            user_message,
+            images,
+            system_reminder,
+            event_tx,
+            display_role,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_reserved_streaming_mpsc(
+        &mut self,
+        lease: &TurnLease,
+        user_message: &str,
+        images: Vec<(String, String)>,
+        system_reminder: Option<String>,
+        event_tx: mpsc::UnboundedSender<ServerEvent>,
+        display_role: Option<crate::session::StoredDisplayRole>,
+    ) -> Result<()> {
+        self.validate_server_turn(lease)?;
+        let _runtime_activity =
+            crate::runtime_activity::global().try_enter_session(&self.session.id)?;
         // Inject any pending notifications before the user message
+        let alert_start = self.session.messages.len();
         let alerts = self.take_alerts();
-        if !alerts.is_empty() {
+        for alert in alerts {
             let alert_text = format!(
-                "[NOTIFICATION]\nYou received {} notification(s) from other agents working in this codebase:\n\n{}\n\nUse the communicate tool to coordinate with other agents (prefer dm; broadcast reaches only your spawned subtree).",
-                alerts.len(),
-                alerts.join("\n\n---\n\n")
+                "[NOTIFICATION]\nYou received a notification from another agent working in this codebase:\n\n{alert}\n\nUse the communicate tool to coordinate with other agents (prefer dm; broadcast reaches only your spawned subtree)."
             );
-            self.add_message(
+            self.add_message_with_display_role(
                 Role::User,
                 vec![ContentBlock::Text {
                     text: alert_text,
                     cache_control: None,
                 }],
+                Some(crate::session::StoredDisplayRole::System),
             );
         }
+        self.emit_context_messages_since(alert_start, &event_tx);
 
-        self.current_turn_system_reminder =
-            system_reminder.filter(|value| !value.trim().is_empty());
-
-        self.append_user_context_message_with_display_role(user_message, images, display_role)?;
+        let system_reminder = system_reminder.filter(|value| !value.trim().is_empty());
+        // A reminder-only turn (e.g. reload recovery) used to persist an empty
+        // user message, so the model saw a blank prompt and asked about it.
+        // Carry the reminder as the turn's message instead.
+        let (user_message, system_reminder, display_role, continues_turn) = match system_reminder {
+            Some(reminder) if user_message.trim().is_empty() && images.is_empty() => (
+                std::borrow::Cow::Owned(format!("[auto] {}", reminder.trim())),
+                None,
+                display_role.or(Some(crate::session::StoredDisplayRole::System)),
+                true,
+            ),
+            reminder => (
+                std::borrow::Cow::Borrowed(user_message),
+                reminder,
+                display_role,
+                false,
+            ),
+        };
+        let announcement_start = self.session.messages.len();
+        self.announce_late_mcp_tools().await;
+        self.announce_late_skills();
+        self.emit_context_messages_since(announcement_start, &event_tx);
+        let input_start = self.session.messages.len();
+        self.append_user_context_message_with_display_role(
+            &user_message,
+            images,
+            display_role,
+            continues_turn,
+        )?;
+        if continues_turn || display_role.is_some() {
+            self.emit_context_messages_since(input_start, &event_tx);
+        }
+        // The per-turn reminder (swarm DM wake, mission continuation, ...) goes
+        // into the transcript after the prompt, never into the system prompt.
+        // The system prompt precedes every message, so changing it for one turn
+        // invalidated the whole cached conversation on that turn and again on
+        // the next turn when it disappeared.
+        if let Some(reminder) = system_reminder {
+            let reminder_start = self.session.messages.len();
+            self.append_turn_system_reminder(&reminder)?;
+            self.emit_context_messages_since(reminder_start, &event_tx);
+        }
+        // A real request that reached this turn armed the gate in the caller.
+        // Ask for the declaration after the analysis, not before it.
+        if crate::tool::plan_declaration::plan_declaration_state(&self.session.id)
+            == crate::tool::plan_declaration::PlanDeclarationState::AwaitingDeclaration
+        {
+            self.append_turn_system_reminder(crate::tool::plan_declaration::plan_declaration_reminder())?;
+        }
         crate::telemetry::record_turn();
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
         self.fire_turn_start_hook("chat");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
-        self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
         result
+    }
+
+    /// Re-run the model loop for the turn already in history, without
+    /// appending a new user message. Used after the server switched routes
+    /// because the previous account hit a usage limit: the failed request is
+    /// retried on the new route exactly as if it had never been sent.
+    pub(crate) async fn continue_turn_after_failover(
+        &mut self,
+        lease: &TurnLease,
+        system_reminder: Option<String>,
+        event_tx: mpsc::UnboundedSender<ServerEvent>,
+    ) -> Result<()> {
+        self.validate_server_turn(lease)?;
+        if self.is_graceful_shutdown() {
+            return Ok(());
+        }
+        // The original attempt already persisted the turn's reminder in the
+        // transcript, so the retried request carries it unchanged.
+        let _ = system_reminder;
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        self.fire_turn_start_hook("failover");
+        let result = self.run_turn_streaming_mpsc(event_tx).await;
+        self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.maybe_run_skill_review(start_message_index).await;
+        result
+    }
+
+    /// Turn preparation runs before the streaming loop installs its sender.
+    /// Publish each newly appended context message explicitly so clients see a
+    /// new transcript entry, rather than silently changing only model history.
+    fn emit_context_messages_since(
+        &self,
+        start: usize,
+        event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    ) {
+        for message in &self.session.messages[start..] {
+            let content = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if event_tx
+                .send(ServerEvent::SoftInterruptInjected {
+                    content,
+                    display_role: Some(
+                        match message.display_role {
+                            Some(crate::session::StoredDisplayRole::FileActivity) => {
+                                "file_activity"
+                            }
+                            Some(crate::session::StoredDisplayRole::BackgroundTask) => {
+                                "background_task"
+                            }
+                            _ => "system",
+                        }
+                        .to_string(),
+                    ),
+                    point: "context".to_string(),
+                    tools_skipped: None,
+                    client_ids: Vec::new(),
+                })
+                .is_err()
+            {
+                logging::debug(&format!(
+                    "Context message receiver disconnected for session {}",
+                    self.session.id
+                ));
+                break;
+            }
+        }
+    }
+
+    /// Persist a model-visible `<system-reminder>` message at the tail
+    /// of the transcript so it does not disturb the cached prompt prefix.
+    fn append_turn_system_reminder(&mut self, reminder: &str) -> Result<()> {
+        let reminder = reminder.trim();
+        if reminder.is_empty() {
+            return Ok(());
+        }
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("<system-reminder>\n{reminder}\n</system-reminder>"),
+                cache_control: None,
+            }],
+            Some(crate::session::StoredDisplayRole::System),
+        );
+        self.session.save()
     }
 
     /// Append and persist a user message without starting a model turn.
@@ -113,7 +363,7 @@ impl Agent {
         user_message: &str,
         images: Vec<(String, String)>,
     ) -> Result<()> {
-        self.append_user_context_message_with_display_role(user_message, images, None)
+        self.append_user_context_message_with_display_role(user_message, images, None, false)
     }
 
     fn append_user_context_message_with_display_role(
@@ -121,13 +371,24 @@ impl Agent {
         user_message: &str,
         images: Vec<(String, String)>,
         display_role: Option<crate::session::StoredDisplayRole>,
+        // A synthetic continuation (reload recovery) resumes the previous
+        // turn, so it must not start a new model-usage turn.
+        continues_turn: bool,
     ) -> Result<()> {
         let mut blocks: Vec<ContentBlock> = images
             .into_iter()
             .map(|(media_type, data)| ContentBlock::Image { media_type, data })
             .collect();
+        let text = if continues_turn {
+            user_message.to_string()
+        } else {
+            crate::prompt::with_swarm_user_message_reminder(
+                user_message,
+                self.provider.reasoning_effort().as_deref(),
+            )
+        };
         blocks.push(ContentBlock::Text {
-            text: user_message.to_string(),
+            text,
             cache_control: None,
         });
 
@@ -138,7 +399,7 @@ impl Agent {
             ));
         }
 
-        let starts_turn = blocks.len() > 1 || !user_message.trim().is_empty();
+        let starts_turn = !continues_turn && (blocks.len() > 1 || !user_message.trim().is_empty());
         let input_id = self.add_message_with_display_role(Role::User, blocks, display_role);
         if starts_turn {
             self.begin_model_usage_turn(&input_id);
@@ -191,112 +452,26 @@ impl Agent {
             let snippet: String = text.chars().take(LAST_TEXT_LIMIT).collect();
             event = event.field("LAST_ASSISTANT_TEXT", snippet);
         }
+        if let Some(usage) = turn_token_usage_after(&self.session.messages, start_message_index) {
+            if let Some(value) = usage.prompt_tokens {
+                event = event.field("PROMPT_TOKENS", value.to_string());
+            }
+            event = event
+                .field("INPUT_TOKENS", usage.input_tokens.to_string())
+                .field("OUTPUT_TOKENS", usage.output_tokens.to_string());
+            if let Some(value) = usage.cache_read_input_tokens {
+                event = event.field("CACHE_READ_TOKENS", value.to_string());
+            }
+            if let Some(value) = usage.cache_creation_input_tokens {
+                event = event.field("CACHE_WRITE_TOKENS", value.to_string());
+            }
+        }
         if let Err(error) = result {
             const ERROR_LIMIT: usize = 1000;
             let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
             event = event.field("ERROR", message);
         }
         crate::hooks::dispatch_observer(event);
-    }
-
-    /// Clear conversation history
-    pub fn clear(&mut self) {
-        let preserve_canary = self.session.is_canary;
-        let preserve_testing_build = self.session.testing_build.clone();
-        let preserve_debug = self.session.is_debug;
-        let preserve_working_dir = self.session.working_dir.clone();
-
-        self.session.mark_closed();
-        self.finish_concurrency_tracking();
-        self.persist_session_best_effort("pre-clear session close state");
-
-        let mut new_session = Session::create(None, None);
-        new_session.mark_active();
-        new_session.model = Some(self.provider_model());
-        new_session.provider_key = self.provider_key_for_new_session();
-        new_session.is_canary = preserve_canary;
-        new_session.testing_build = preserve_testing_build;
-        new_session.is_debug = preserve_debug;
-        new_session.working_dir = preserve_working_dir;
-        new_session.ensure_initial_session_context_message();
-
-        self.session = new_session;
-        self.begin_concurrency_tracking();
-        self._tool_policy_registration = crate::tool::register_session_tool_policy(
-            &self.session.id,
-            self.allowed_tools.clone(),
-            self.disabled_tools.clone(),
-        );
-        self.refresh_agents_md_snapshot();
-        self.reconcile_explicit_provider_pin_route();
-        self.reset_runtime_state_for_session_change();
-        self.provider_session_id = None;
-        self.seed_compaction_from_session();
-    }
-
-    /// Clear provider session so the next turn sends full context.
-    pub fn reset_provider_session(&mut self) {
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
-        self.persist_session_best_effort("provider session reset");
-    }
-
-    /// Rewind the conversation to a 1-based visible transcript message index.
-    ///
-    /// The index is interpreted against the same rendered transcript the TUI
-    /// numbers in `/rewind` (user/assistant entries only, tool cards and
-    /// system notices excluded). Mapping through raw stored messages instead
-    /// would count tool-result messages the UI never numbers, sending
-    /// `/rewind N` far earlier than the on-screen message N (issue #432).
-    ///
-    /// Provider-side resumable sessions are reset so the next request sends the
-    /// truncated context from scratch instead of continuing from a stale upstream
-    /// conversation.
-    pub fn rewind_to_message(&mut self, message_index: usize) -> Result<usize, String> {
-        let targets = self.session.rewind_target_stored_indices();
-        let message_count = targets.len();
-        if message_index == 0 || message_index > message_count {
-            return Err(format!(
-                "Invalid message number: {}. Valid range: 1-{}",
-                message_index, message_count
-            ));
-        }
-        let stored_len = targets[message_index - 1] + 1;
-
-        let removed = message_count - message_index;
-        self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
-            messages: self.session.messages.clone(),
-            provider_session_id: self.provider_session_id.clone(),
-            session_provider_session_id: self.session.provider_session_id.clone(),
-            visible_message_count: message_count,
-        });
-        self.session.truncate_messages(stored_len);
-        self.session.updated_at = chrono::Utc::now();
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
-        self.cache_tracker.reset();
-        self.locked_tools = None;
-        self.reset_tool_output_tracking();
-        self.persist_session_best_effort("conversation rewind");
-        Ok(removed)
-    }
-
-    pub fn undo_rewind(&mut self) -> Result<usize, String> {
-        let Some(snapshot) = self.rewind_undo_snapshot.take() else {
-            return Err("No rewind to undo.".to_string());
-        };
-
-        let current_count = self.session.rewind_target_count();
-        let restored = snapshot.visible_message_count.saturating_sub(current_count);
-        self.session.replace_messages(snapshot.messages);
-        self.provider_session_id = snapshot.provider_session_id;
-        self.session.provider_session_id = snapshot.session_provider_session_id;
-        self.session.updated_at = chrono::Utc::now();
-        self.cache_tracker.reset();
-        self.locked_tools = None;
-        self.reset_tool_output_tracking();
-        self.persist_session_best_effort("conversation rewind undo");
-        Ok(restored)
     }
 
     /// Unlock the tool list so the next API request picks up any new tools.
@@ -306,6 +481,7 @@ impl Agent {
             logging::info("Tool list unlocked — next request will pick up current tools");
             self.locked_tools = None;
             self.cache_tracker.reset();
+            self.kv_cache_monitor.reset();
         }
         // Allow the late-MCP-registration recheck to fire once for the next
         // snapshot (e.g. after an explicit `mcp` reload).
@@ -315,10 +491,12 @@ impl Agent {
     /// Unlock tools if a tool execution may have changed the registry
     /// (e.g., mcp connect/disconnect/reload)
     pub(super) fn unlock_tools_if_needed(&mut self, tool_name: &str) {
-        // With native deferred MCP loading the `mcp` tool only changes the
-        // deferred subset, which is refreshed every turn without touching the
-        // cached prefix. Unlocking would be a needless prompt-cache miss.
-        if tool_name == "mcp" && !self.native_deferred_mcp() {
+        // Only explicit `eager` exposes per-server definitions in the cached
+        // tool list. Every other mode keeps that list fixed (native deferred
+        // loading or the `mcp` search/call surface), so an `mcp`
+        // connect/disconnect must not unlock it: that would be a needless
+        // full prompt-cache miss.
+        if tool_name == "mcp" && self.mcp_tools_mode == crate::config::McpToolsMode::Eager {
             self.unlock_tools();
         }
     }
@@ -371,15 +549,17 @@ impl Agent {
         self.inline_output_tap = enabled;
     }
 
-    /// Whether this session streams an inline output tail to the bus.
+    /// Whether this session streams a public output tail to the bus. Owned
+    /// workers retain a tail in every spawn mode so forced stops can still
+    /// deliver recent output when transcript collection cannot finish.
     pub(crate) fn inline_output_tap(&self) -> bool {
-        self.inline_output_tap
+        self.inline_output_tap || self.session.parent_id.is_some()
     }
 
     /// Publish the current rolling activity tail to the bus for the
     /// coordinator's inline gallery. No-op unless the inline tap is enabled.
     pub(crate) fn publish_inline_tail(&self) {
-        if !self.inline_output_tap {
+        if !self.inline_output_tap() {
             return;
         }
         crate::bus::Bus::global().publish(crate::bus::BusEvent::SwarmOutputTail(
@@ -407,6 +587,7 @@ impl Agent {
     /// `tool_definitions`, this does not pin the tool snapshot or consume the
     /// one-shot late-MCP-discovery check before the first real turn.
     pub(crate) async fn prewarm_provider(&self) {
+        self.provider.set_session_id(&self.session.id);
         if self.session.is_canary {
             self.registry.register_selfdev_tools().await;
         }
@@ -421,24 +602,6 @@ impl Agent {
     pub(super) async fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
         if self.session.is_canary {
             self.registry.register_selfdev_tools().await;
-        }
-
-        // Account sign-in/out and verified entitlement changes must reach the
-        // model even when the tool list is frozen (including deferred MCP).
-        // Only update this definition when its guidance actually changes.
-        if !crate::tool::sdk::custom(&self.session.id, "compile_remote")
-            && self
-                .locked_tools
-                .as_ref()
-                .is_some_and(|tools| tools.iter().any(|tool| tool.name == "compile_remote"))
-            && let Some(fresh) = self.registry.remote_compile_definition().await
-            && let Some(locked) = self.locked_tools.as_mut()
-            && let Some(previous) = locked.iter_mut().find(|tool| tool.name == "compile_remote")
-            && (previous.description != fresh.description
-                || previous.input_schema != fresh.input_schema)
-        {
-            *previous = fresh;
-            self.cache_tracker.reset();
         }
 
         // Provider-native deferred MCP loading: MCP definitions live outside
@@ -457,6 +620,7 @@ impl Agent {
             self.locked_tools = None;
             self.mcp_late_register_resolved = false;
             self.cache_tracker.reset();
+            self.kv_cache_monitor.reset();
         }
         if native {
             return self.native_deferred_tool_definitions().await;
@@ -480,19 +644,15 @@ impl Agent {
         // prompt-cache miss (the turn MCP tools first appear). The
         // `mcp_late_register_resolved` flag makes this a one-shot check so we do
         // not rescan the registry on every subsequent turn.
-        let locked_uses_fixed_mcp_surface = self.locked_tools.as_ref().is_some_and(|locked| {
-            locked
-                .iter()
-                .any(|tool| matches!(tool.name.as_str(), "mcp_search" | "mcp_call"))
-                && !locked.iter().any(|tool| tool.name.starts_with("mcp__"))
-        });
-        if (self.mcp_tools_mode == crate::config::McpToolsMode::Deferred
-            || locked_uses_fixed_mcp_surface)
-            && let Some(locked) = self.locked_tools.clone()
-        {
+        // Every mode except explicit `eager` keeps a cache-stable MCP surface:
+        // per-server tools registering later never change the locked list.
+        let locked_uses_fixed_mcp_surface =
+            self.mcp_tools_mode != crate::config::McpToolsMode::Eager;
+        if locked_uses_fixed_mcp_surface && let Some(locked) = self.locked_tools.clone() {
             // Per-server tools may continue registering in the background, but
-            // deferred mode's fixed surface cannot change as a result. Avoid an
-            // unnecessary provider cache reset and registry scan.
+            // the fixed surface cannot change as a result. Avoid a provider
+            // cache reset and registry scan; new tools are announced in the
+            // transcript instead (see `announce_late_mcp_tools`).
             self.mcp_late_register_resolved = true;
             return locked;
         }
@@ -514,6 +674,7 @@ impl Agent {
                 self.mcp_late_register_resolved = true;
                 self.locked_tools = None;
                 self.cache_tracker.reset();
+                self.kv_cache_monitor.reset();
             } else {
                 // No MCP tools have appeared. They may still be connecting, so
                 // leave the guard unset and re-check on the next turn. Once they
@@ -532,6 +693,14 @@ impl Agent {
         ));
         self.locked_tools = Some(tools.clone());
         self.locked_tools_native_deferred = false;
+        // Per-server definitions in the snapshot itself (eager mode) are
+        // already described to the model; never announce them again.
+        self.announced_mcp_tools.extend(
+            tools
+                .iter()
+                .filter(|tool| tool.name.starts_with("mcp__"))
+                .map(|tool| tool.name.clone()),
+        );
         tools
     }
 
@@ -539,7 +708,7 @@ impl Agent {
     /// loading (see [`ToolDefinition::defer_loading`]). Eager mode keeps
     /// top-level definitions; every other mode prefers the native path when
     /// the active provider supports it, and falls back to the fixed
-    /// `mcp_search`/`mcp_call` surface otherwise.
+    /// `mcp` search/call surface otherwise.
     pub(crate) fn native_deferred_mcp(&self) -> bool {
         self.mcp_tools_mode != crate::config::McpToolsMode::Eager
             && self.provider.supports_deferred_tools()
@@ -583,6 +752,20 @@ impl Agent {
     /// Build the agent's tool definitions from the registry, applying the
     /// session's `allowed_tools`, `disabled_tools`, and self-dev filters.
     async fn build_filtered_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.build_filtered_tool_definitions_with(true).await
+    }
+
+    /// Filtered definitions before MCP exposure: includes per-server
+    /// `mcp__*` definitions (with policy filters applied) even when the
+    /// provider sees only the fixed search/call surface.
+    async fn build_filtered_tool_definitions_raw(&self) -> Vec<ToolDefinition> {
+        self.build_filtered_tool_definitions_with(false).await
+    }
+
+    async fn build_filtered_tool_definitions_with(
+        &self,
+        apply_mcp_exposure: bool,
+    ) -> Vec<ToolDefinition> {
         let sdk = crate::tool::sdk::config(&self.session.id);
         let enabled = sdk
             .as_ref()
@@ -602,12 +785,31 @@ impl Agent {
             self.session.is_canary,
             self.is_desktop_selfdev(),
         );
-        self.apply_mcp_tool_exposure(&mut tools);
+        if apply_mcp_exposure {
+            self.apply_mcp_tool_exposure(&mut tools);
+        }
         let mut tools = crate::tool::sdk::apply_definitions(&self.session.id, tools);
         if let Some(config) = sdk.as_ref() {
             let disabled = config.disabled.iter().cloned().collect();
             tools.retain(|tool| !self.registry.tool_is_disabled(&disabled, &tool.name));
         }
+        // Rarely used built-ins ride the same native deferred path as MCP
+        // tools, so the snapshot rebuild on a provider change covers them too.
+        // An SDK tool that reuses a built-in name is the caller's own and stays.
+        let loader = crate::tool::load_tools::LOAD_TOOLS_NAME;
+        let sdk_disabled: HashSet<String> = sdk
+            .iter()
+            .flat_map(|config| config.disabled.iter().cloned())
+            .collect();
+        let loader_allowed = allowed.is_none_or(|set| self.registry.tool_is_allowed(set, loader))
+            && !self.registry.tool_is_disabled(&self.disabled_tools, loader)
+            && !self.registry.tool_is_disabled(&sdk_disabled, loader);
+        crate::tool::load_tools::apply_deferral(
+            &mut tools,
+            self.native_deferred_mcp(),
+            loader_allowed,
+            |name| crate::tool::sdk::custom(&self.session.id, name),
+        );
         tools
     }
 
@@ -616,38 +818,26 @@ impl Agent {
     /// serialized, already-filtered definitions the provider would receive.
     fn apply_mcp_tool_exposure(&self, tools: &mut Vec<ToolDefinition>) {
         if self.native_deferred_mcp() {
-            // Keep `mcp_search` eager for discovery (its results load the
-            // matching definitions via tool references). Every MCP definition
-            // is deferred, and so is `mcp_call`: discovered tools are called
-            // natively, but a stable deferred entry matters for caching. Some
-            // models (observed on Opus 4.8) rebuild the prefix when the
-            // deferred set goes from empty to non-empty, while changes within
-            // a non-empty deferred set keep the cache. `mcp_call` stays in the
-            // set for the whole session, so the first server connecting later
-            // is still cache-neutral.
+            // Keep the unified MCP tool eager for discovery and management.
+            // Search results load matching server definitions via references.
             for tool in tools.iter_mut() {
-                if tool.name.starts_with("mcp__") || tool.name == "mcp_call" {
+                if tool.name.starts_with("mcp__") {
                     tool.defer_loading = true;
                 }
             }
             return;
         }
-        let mcp_definitions: Vec<ToolDefinition> = tools
-            .iter()
-            .filter(|tool| tool.name.starts_with("mcp__"))
-            .cloned()
-            .collect();
-        let estimated_tokens = ToolDefinition::aggregate_prompt_token_estimate(&mcp_definitions);
-        let deferred = match self.mcp_tools_mode {
-            crate::config::McpToolsMode::Auto => estimated_tokens > self.mcp_tools_token_threshold,
-            crate::config::McpToolsMode::Eager => false,
-            crate::config::McpToolsMode::Deferred => true,
-        };
+        // Only explicit `eager` puts per-server definitions in the cached
+        // prefix. `auto` used to switch on a token threshold, but any MCP
+        // change (late connect, `mcp connect`, crossing the threshold) then
+        // rewrote the tool list and busted the whole prompt cache. On
+        // providers without native deferred loading, `auto` therefore always
+        // uses the fixed `mcp` search/call surface; the definitions
+        // reach the model through the transcript instead.
+        let deferred = !matches!(self.mcp_tools_mode, crate::config::McpToolsMode::Eager);
 
         if deferred {
             tools.retain(|tool| !tool.name.starts_with("mcp__"));
-        } else {
-            tools.retain(|tool| !matches!(tool.name.as_str(), "mcp_search" | "mcp_call"));
         }
     }
 
@@ -689,6 +879,198 @@ impl Agent {
         }
     }
 
+    /// Announce MCP tools that became available after the tool list locked,
+    /// by appending a note to the transcript before the next user message.
+    ///
+    /// Only used on the fixed `mcp` search/call surface (providers
+    /// without native deferred loading, in any mode but `eager`). The cached
+    /// tool list must never change, so this appended note, which carries
+    /// each tool's input schema, is how the model learns about servers that
+    /// finished connecting mid-session. Each tool is announced once.
+    pub(crate) async fn announce_late_mcp_tools(&mut self) {
+        if self.mcp_tools_mode == crate::config::McpToolsMode::Eager || self.native_deferred_mcp() {
+            return;
+        }
+        self.seed_announced_mcp_tools_from_transcript();
+        let current = self.build_filtered_tool_definitions_raw().await;
+        let fresh: Vec<ToolDefinition> = current
+            .into_iter()
+            .filter(|tool| {
+                tool.name.starts_with("mcp__") && !self.announced_mcp_tools.contains(&tool.name)
+            })
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let mut text = String::from(
+            "<system-reminder>\nNew MCP tools are available. They are not in your tool list; \
+             call them with mcp action=call (server, tool, arguments matching input_schema).\n",
+        );
+        for tool in fresh.iter().take(MAX_ANNOUNCED_MCP_TOOLS) {
+            let (server, raw) = self
+                .registry
+                .mcp_identity_for_alias(&tool.name)
+                .unwrap_or_else(|| {
+                    let (server, raw) = split_mcp_dispatch_name(&tool.name);
+                    (server.to_string(), raw.to_string())
+                });
+            text.push_str(&format!(
+                "- {}: server: {server}  tool: {raw}  ({})\n  input_schema: {}\n",
+                tool.name,
+                tool.description.trim(),
+                serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".to_string()),
+            ));
+        }
+        if fresh.len() > MAX_ANNOUNCED_MCP_TOOLS {
+            text.push_str(&format!(
+                "... and {} more; use mcp action=search to find them.\n",
+                fresh.len() - MAX_ANNOUNCED_MCP_TOOLS
+            ));
+        }
+        text.push_str("</system-reminder>");
+        for tool in &fresh {
+            self.announced_mcp_tools.insert(tool.name.clone());
+        }
+        logging::info(&format!(
+            "Announcing {} late MCP tool(s) in the transcript (tool list stays cache-stable)",
+            fresh.len()
+        ));
+        // This is a server-written notice, not the user's own words. Persist it
+        // as Role::User (the model must treat it as a continuation prompt) but
+        // tag the display role so a transcript reader does not show it as the
+        // user's message. MEASURED 2026-11-12: these entries appeared as
+        // unattributed user messages in live journals.
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(crate::session::StoredDisplayRole::System),
+        );
+    }
+
+    /// Announce skills installed after the session's system prompt was built.
+    ///
+    /// The "Available Skills" section is frozen per session (see
+    /// `prompt_skills_snapshot`) because rewriting the system prompt forces a
+    /// KV cache miss on the whole conversation. New skills are instead
+    /// described once, in a note appended before the next user message.
+    pub(crate) fn announce_late_skills(&mut self) {
+        if self.session.system_prompt.is_some() {
+            return;
+        }
+        self.seed_announced_skills_from_transcript();
+        let fresh: Vec<crate::prompt::SkillInfo> = self
+            .current_prompt_skill_infos()
+            .into_iter()
+            .filter(|skill| !self.announced_skills.contains(&skill.name))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let mut text = format!("<system-reminder>\n{LATE_SKILL_ANNOUNCEMENT_MARKER} ");
+        text.push_str(
+            "They are not in the Available Skills list above but can be invoked with `/skillname` \
+             the same way:\n",
+        );
+        for skill in &fresh {
+            let description = skill
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            // A user-invoked-only skill must be marked as such here too: this
+            // announcement is how the model learns the skill exists, and
+            // without the marker it would look auto-loadable.
+            if skill.user_invoked_only {
+                text.push_str(&format!(
+                    "- `/{} ` - {} (user-invoked only; load it only when the user asks)\n",
+                    skill.name, description
+                ));
+            } else {
+                text.push_str(&format!("- `/{} ` - {}\n", skill.name, description));
+            }
+        }
+        text.push_str("</system-reminder>");
+        for skill in &fresh {
+            self.announced_skills.insert(skill.name.clone());
+        }
+        logging::info(&format!(
+            "Announcing {} late skill(s) in the transcript (system prompt stays cache-stable)",
+            fresh.len()
+        ));
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(crate::session::StoredDisplayRole::System),
+        );
+        self.announced_skills_scan_index = self.session.messages.len();
+    }
+
+    /// Mark skills named in earlier announcements as announced, so a
+    /// restored session does not describe them again.
+    fn seed_announced_skills_from_transcript(&mut self) {
+        let start = self
+            .announced_skills_scan_index
+            .min(self.session.messages.len());
+        for message in &self.session.messages[start..] {
+            for block in &message.content {
+                if let ContentBlock::Text { text, .. } = block
+                    && text.contains(LATE_SKILL_ANNOUNCEMENT_MARKER)
+                {
+                    for line in text.lines() {
+                        if let Some(name) = line
+                            .strip_prefix("- `/")
+                            .and_then(|rest| rest.split(' ').next())
+                            .filter(|name| !name.is_empty())
+                        {
+                            self.announced_skills.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        self.announced_skills_scan_index = self.session.messages.len();
+    }
+
+    /// Mark MCP tools the transcript already describes as announced: tools
+    /// loaded by a tool reference (`mcp connect` / `mcp search` results carry
+    /// their schemas) and tools named in earlier announcements (which matters
+    /// after a session restore, when the in-memory set starts empty).
+    fn seed_announced_mcp_tools_from_transcript(&mut self) {
+        let start = self
+            .announced_mcp_scan_index
+            .min(self.session.messages.len());
+        for message in &self.session.messages[start..] {
+            for block in &message.content {
+                match block {
+                    ContentBlock::ToolReference { tool_name, .. } => {
+                        self.announced_mcp_tools.insert(tool_name.clone());
+                    }
+                    ContentBlock::Text { text, .. }
+                        if text.contains(LATE_MCP_ANNOUNCEMENT_MARKER) =>
+                    {
+                        for line in text.lines() {
+                            if let Some(name) = line
+                                .strip_prefix("- ")
+                                .and_then(|rest| rest.split(':').next())
+                                .filter(|name| name.starts_with("mcp__"))
+                            {
+                                self.announced_mcp_tools.insert(name.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.announced_mcp_scan_index = self.session.messages.len();
+    }
+
     /// Returns true if the registry contains `mcp__*` tools (subject to the
     /// session's `allowed_tools` filter) that are not present in the currently
     /// locked snapshot. Used to detect the async MCP-registration race (#206).
@@ -709,6 +1091,20 @@ impl Agent {
         self.mcp_late_register_resolved = false;
         self.locked_tools = None;
         self.cache_tracker.reset();
+        self.kv_cache_monitor.reset();
+    }
+
+    pub(crate) async fn set_desktop_response_capability(&mut self, enabled: bool) {
+        let was_enabled = self
+            .registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|n| n == "user_response");
+        if was_enabled != enabled {
+            self.registry.set_desktop_ui_enabled(enabled).await;
+            self.invalidate_sdk_tools();
+        }
     }
 
     pub async fn tool_names(&self) -> Vec<String> {
@@ -717,6 +1113,51 @@ impl Agent {
             .into_iter()
             .map(|tool| tool.name)
             .collect()
+    }
+
+    /// Per-server MCP tool names the session can see, for the client header's
+    /// `mcp:` inventory.
+    ///
+    /// Equivalent to filtering [`Self::tool_names`] for `mcp__*`, but reads only
+    /// registry keys: building full definitions (every schema, sorted, SDK
+    /// overlay applied) just to count names took up to ~40ms on the bootstrap
+    /// History path that gates the client's first settled frame.
+    pub async fn visible_mcp_tool_names(&self) -> Vec<String> {
+        // Mirrors `apply_mcp_tool_exposure`: on the unified `mcp` surface
+        // per-server definitions are not exposed.
+        if !self.native_deferred_mcp()
+            && !matches!(self.mcp_tools_mode, crate::config::McpToolsMode::Eager)
+        {
+            return Vec::new();
+        }
+        let sdk = crate::tool::sdk::config(&self.session.id);
+        let enabled: Option<HashSet<String>> = sdk
+            .as_ref()
+            .and_then(|c| c.enabled.as_ref())
+            .map(|names| names.iter().cloned().collect());
+        let allowed = enabled.as_ref().or(self.allowed_tools.as_ref());
+        let sdk_disabled: HashSet<String> = sdk
+            .as_ref()
+            .map(|c| c.disabled.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut names: Vec<String> = self
+            .registry
+            .tool_names()
+            .await
+            .into_iter()
+            .filter(|name| name.starts_with("mcp__"))
+            .filter(|name| allowed.is_none_or(|set| self.registry.tool_is_allowed(set, name)))
+            .filter(|name| {
+                enabled.is_some()
+                    || self.disabled_tools.is_empty()
+                    || !self.registry.tool_is_disabled(&self.disabled_tools, name)
+            })
+            .filter(|name| {
+                sdk_disabled.is_empty() || !self.registry.tool_is_disabled(&sdk_disabled, name)
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     /// Get full tool definitions for debug introspection (bypasses lock)
@@ -859,128 +1300,6 @@ impl Agent {
         Ok(())
     }
 
-    /// Restore a session by ID (loads from disk)
-    pub fn restore_session(&mut self, session_id: &str) -> Result<SessionStatus> {
-        self.restore_session_with_working_dir(session_id, None)
-    }
-
-    pub(crate) fn restore_session_with_working_dir(
-        &mut self,
-        session_id: &str,
-        working_dir: Option<&str>,
-    ) -> Result<SessionStatus> {
-        let restore_start = Instant::now();
-        let load_start = Instant::now();
-        let mut session = Session::load(session_id)?;
-        if let Some(working_dir) = working_dir {
-            session.working_dir = Some(working_dir.to_string());
-            session.refresh_initial_session_context_message();
-        }
-        let load_ms = load_start.elapsed().as_millis();
-        logging::info(&format!(
-            "Restoring session '{}' with {} messages, provider_session_id: {:?}, status: {}",
-            session_id,
-            session.messages.len(),
-            session.provider_session_id,
-            session.status.display()
-        ));
-        let previous_status = session.status.clone();
-
-        let assign_start = Instant::now();
-        // A failed load must leave the current Agent and its concurrency lease
-        // alive. Close it only after the replacement is ready to install.
-        self.mark_closed();
-        // Restore provider_session_id for Claude CLI session resume
-        self.provider_session_id = session.provider_session_id.clone();
-        self.session = session;
-        self.refresh_agents_md_snapshot();
-        self._tool_policy_registration = crate::tool::register_session_tool_policy(
-            &self.session.id,
-            self.allowed_tools.clone(),
-            self.disabled_tools.clone(),
-        );
-        let assign_ms = assign_start.elapsed().as_millis();
-
-        let reset_start = Instant::now();
-        self.reset_runtime_state_for_session_change();
-        let restored_soft_interrupts = self.restore_persisted_soft_interrupts();
-        let reset_ms = reset_start.elapsed().as_millis();
-
-        let model_start = Instant::now();
-        if let Some(model) = self.session.model.clone() {
-            let model_request =
-                crate::provider::MultiProvider::model_switch_request_for_session_route(
-                    &model,
-                    self.session.provider_key.as_deref(),
-                    self.session.route_api_method.as_deref(),
-                );
-            if let Err(e) =
-                crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), &model_request)
-            {
-                logging::error(&format!(
-                    "Failed to restore session model '{}' via '{}': {}",
-                    model, model_request, e
-                ));
-            } else {
-                self.reconcile_explicit_provider_pin_route();
-            }
-        } else {
-            self.session.model = Some(self.provider_model());
-        }
-        self.restore_reasoning_effort_from_session();
-        let model_ms = model_start.elapsed().as_millis();
-
-        let mark_active_start = Instant::now();
-        self.session.mark_active();
-        self.begin_concurrency_tracking();
-        let mark_active_ms = mark_active_start.elapsed().as_millis();
-        self.sync_memory_dedup_state_from_session();
-
-        logging::info(&format!(
-            "restore_session: loaded session {} with {} messages, calling seed_compaction",
-            session_id,
-            self.session.messages.len()
-        ));
-        let compaction_start = Instant::now();
-        self.seed_compaction_from_session();
-        let compaction_ms = compaction_start.elapsed().as_millis();
-
-        let env_snapshot_start = Instant::now();
-        self.log_env_snapshot("resume");
-        let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
-        self.fire_session_lifecycle_hook("session_start", "resume");
-
-        let save_start = Instant::now();
-        if let Err(err) = self.session.save() {
-            logging::error(&format!(
-                "Failed to persist resumed session state for {}: {}",
-                session_id, err
-            ));
-        }
-        let save_ms = save_start.elapsed().as_millis();
-
-        logging::info(&format!(
-            "[TIMING] restore_session: session={}, messages={}, restored_soft_interrupts={}, load={}ms, assign={}ms, reset={}ms, model={}ms, mark_active={}ms, compaction={}ms, env_snapshot={}ms, save={}ms, total={}ms",
-            session_id,
-            self.session.messages.len(),
-            restored_soft_interrupts,
-            load_ms,
-            assign_ms,
-            reset_ms,
-            model_ms,
-            mark_active_ms,
-            compaction_ms,
-            env_snapshot_ms,
-            save_ms,
-            restore_start.elapsed().as_millis(),
-        ));
-        logging::info(&format!(
-            "Session restored: {} messages in session",
-            self.session.messages.len()
-        ));
-        Ok(previous_status)
-    }
-
     /// Get conversation history for sync
     pub fn get_history(&self) -> Vec<HistoryMessage> {
         crate::session::render_messages(&self.session)
@@ -997,6 +1316,12 @@ impl Agent {
                 tool_data: msg.tool_data,
             })
             .collect()
+    }
+
+    /// Borrow the in-memory session so history assembly need not re-read the
+    /// (possibly tens of MB) persisted snapshot.
+    pub(crate) fn session_for_history(&self) -> &crate::session::Session {
+        &self.session
     }
 
     pub fn get_history_and_rendered_images(
@@ -1105,6 +1430,7 @@ impl Agent {
                     println!("Activating skill: {}", skill.name);
                     println!("{}\n", skill.description);
                     self.active_skill = Some(invocation.name.to_string());
+                    self.announce_active_skill();
                     if let Some(prompt) = invocation.prompt {
                         if let Err(e) = self.run_once(prompt).await {
                             eprintln!("\nError: {}\n", e);
@@ -1135,117 +1461,48 @@ impl Agent {
         }
 
         // Extract memories from session before exiting
-        self.extract_session_memories().await;
+        //
+        // MEASURED 2026-11-11 (Jev removal, 4950764e1): local sidecar extraction
+        // is gone; retention is Hindsight's retain pipeline (the turn_end hook).
+        // Calling the old extractor here would have returned 0 on every turn, so it
+        // is not called at all rather than called and discarded.
 
         Ok(())
     }
 
-    /// Extract memories from the session transcript
-    /// Returns the number of memories extracted, or 0 if none/skipped
+    /// Extract memories from the session transcript.
+    ///
+    /// MEASURED 2026-11-11 (Jev removal, 4950764e1): retained memory is owned by
+    /// Hindsight's retain pipeline, so there is no local extraction to force. The
+    /// `trigger_extraction` debug command still exists and now reports that
+    /// retention is Hindsight-owned; the returned count is always 0.
     pub async fn extract_session_memories(&self) -> usize {
-        if !self.memory_enabled {
-            return 0;
-        }
-
-        // Need at least 4 messages for meaningful extraction
-        if self.session.messages.len() < 4 {
-            return 0;
-        }
-
-        logging::info(&format!(
-            "Extracting memories from {} messages",
-            self.session.messages.len()
-        ));
-
-        // Build transcript
-        let mut transcript = String::new();
-        for msg in &self.session.messages {
-            let role = match msg.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            transcript.push_str(&format!("**{}:**\n", role));
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text, .. } => {
-                        if text.trim_start().starts_with("<system-reminder>") {
-                            continue;
-                        }
-                        transcript.push_str(text);
-                        transcript.push('\n');
-                    }
-                    ContentBlock::ToolUse { name, .. } => {
-                        transcript.push_str(&format!("[Used tool: {}]\n", name));
-                    }
-                    ContentBlock::ToolResult { content, .. } => {
-                        let preview = if content.len() > 200 {
-                            format!("{}...", crate::util::truncate_str(content, 200))
-                        } else {
-                            content.clone()
-                        };
-                        transcript.push_str(&format!("[Result: {}]\n", preview));
-                    }
-                    ContentBlock::Reasoning { .. }
-                    | ContentBlock::ReasoningTrace { .. }
-                    | ContentBlock::AnthropicThinking { .. }
-                    | ContentBlock::OpenAIReasoning { .. }
-                    | ContentBlock::ToolReference { .. } => {}
-                    ContentBlock::Image { .. } => {
-                        transcript.push_str("[Image]\n");
-                    }
-                    ContentBlock::OpenAICompaction { .. } => {
-                        transcript.push_str("[OpenAI native compaction]\n");
-                    }
-                }
-            }
-            transcript.push('\n');
-        }
-
-        if !crate::memory::memory_llm_judge_available() {
-            logging::info("Memory extraction skipped: LLM judge unavailable");
-            return 0;
-        }
-
-        // Extract using sidecar
-        let sidecar = crate::sidecar::Sidecar::new();
-        match sidecar.extract_memories(&transcript).await {
-            Ok(extracted) if !extracted.is_empty() => {
-                let manager = self
-                    .session
-                    .working_dir
-                    .as_deref()
-                    .map(|dir| crate::memory::MemoryManager::new().with_project_dir(dir))
-                    .unwrap_or_default();
-                let mut stored_count = 0;
-
-                for memory in &extracted {
-                    let category = crate::memory::MemoryCategory::from_extracted(&memory.category);
-
-                    let trust = match memory.trust.as_str() {
-                        "high" => crate::memory::TrustLevel::High,
-                        "low" => crate::memory::TrustLevel::Low,
-                        _ => crate::memory::TrustLevel::Medium,
-                    };
-
-                    let entry = crate::memory::MemoryEntry::new(category, &memory.content)
-                        .with_source(&self.session.id)
-                        .with_trust(trust);
-
-                    if manager.remember_project(entry).is_ok() {
-                        stored_count += 1;
-                    }
-                }
-
-                if stored_count > 0 {
-                    logging::info(&format!("Extracted {} memories from session", stored_count));
-                }
-                stored_count
-            }
-            Ok(_) => 0,
-            Err(e) => {
-                logging::info(&format!("Memory extraction skipped: {}", e));
-                0
-            }
-        }
+        0
     }
 }
+
+#[path = "turn_usage.rs"]
+mod turn_usage;
+use turn_usage::turn_token_usage_after;
+/// Cap on tools listed in one late-MCP transcript announcement.
+const MAX_ANNOUNCED_MCP_TOOLS: usize = 32;
+
+/// Split a registry key `mcp__<server>__<tool>` into (server, tool).
+/// Server names cannot contain `__`, so the first separator is the split.
+fn split_mcp_dispatch_name(name: &str) -> (&str, &str) {
+    name.strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .unwrap_or(("", name))
+}
+
+/// Stable header of the late-MCP transcript announcement; used to recognize
+/// earlier announcements when a session is restored.
+const LATE_MCP_ANNOUNCEMENT_MARKER: &str = "New MCP tools are available.";
+
+/// Stable header of the late-skill transcript announcement; used to recognize
+/// earlier announcements when a session is restored.
+const LATE_SKILL_ANNOUNCEMENT_MARKER: &str = "New skills were installed.";
+
+#[cfg(test)]
+#[path = "turn_token_usage_tests.rs"]
+mod turn_token_usage_tests;

@@ -27,7 +27,8 @@ fn prewarm_user_message(text: &str) -> ChatMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }
@@ -90,6 +91,11 @@ async fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_stat
         assert_eq!(warm["instructions"], "preserve this system prompt");
         assert_eq!(warm["input"], serde_json::json!([]));
         assert_eq!(warm["generate"], false);
+        assert!(
+            warm["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| !key.is_empty())
+        );
         assert_eq!(warm["reasoning"]["effort"], "high");
         assert_eq!(warm["tools"][0]["name"], "lookup");
         socket
@@ -115,6 +121,7 @@ async fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_stat
         .expect("generated JSON");
         assert_eq!(generated["type"], "response.create");
         assert_eq!(generated["previous_response_id"], "resp_warm");
+        assert_eq!(generated["prompt_cache_key"], warm["prompt_cache_key"]);
         assert_eq!(generated["model"], "gpt-5.6-sol");
         assert_eq!(generated["instructions"], "preserve this system prompt");
         assert_eq!(generated["reasoning"]["effort"], "high");
@@ -129,12 +136,16 @@ async fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_stat
         assert!(input.iter().any(|item| item["type"] == "reasoning"
             && item["id"] == "rs_history"
             && item["encrypted_content"] == "encrypted-history"));
-        assert!(input
-            .iter()
-            .any(|item| item.to_string().contains("first user turn")));
-        assert!(input
-            .iter()
-            .any(|item| item.to_string().contains("current user turn")));
+        assert!(
+            input
+                .iter()
+                .any(|item| item.to_string().contains("first user turn"))
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item.to_string().contains("current user turn"))
+        );
 
         socket
             .send(WsMessage::Text(
@@ -183,7 +194,8 @@ async fn websocket_v2_prewarm_is_adopted_by_complete_without_losing_request_stat
                     text: "prior answer".to_string(),
                     cache_control: None,
                 },
-            ],
+            ]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },

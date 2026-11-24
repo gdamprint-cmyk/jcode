@@ -1,4 +1,6 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/recall-first-turn.md
 use super::*;
+use ranking::prefilter_for_jev;
 
 #[test]
 fn manager_without_project_dir_does_not_use_process_cwd() {
@@ -318,7 +320,8 @@ fn format_context_includes_roles_and_tools() {
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -329,7 +332,8 @@ fn format_context_includes_roles_and_tools() {
                 tool_use_id: "tool-2".to_string(),
                 content: "boom".to_string(),
                 is_error: Some(true),
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -353,7 +357,8 @@ fn extraction_context_keeps_tool_io_details() {
                 name: "memory".to_string(),
                 input: json!({"action": "list"}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -927,7 +932,7 @@ fn hybrid_excludes_superseded_memories() {
 }
 
 #[test]
-fn focus_query_text_strips_noise_and_leads_with_user_intent() {
+fn focus_query_text_strips_noise_and_keeps_only_the_user_intent() {
     let raw = "\
 <system-reminder>\n# Session Context\nDate: 2026-06-14\n</system-reminder>\n\
 User:\n\
@@ -956,13 +961,19 @@ The bug is in the mouse delta calc.";
     // Role markers are gone.
     assert!(!focused.contains("User:"));
     assert!(!focused.contains("Assistant:"));
-    // Real prose is kept.
+    // The user's own words are the query.
     assert!(focused.contains("scroll bug in navigation.rs"));
-    assert!(focused.contains("mouse delta calc"));
-    // Leads with the latest user intent.
+    assert_eq!(focused, "how do I fix the scroll bug in navigation.rs");
+    // The assistant's prose is NOT part of the query.
+    //
+    // MEASURED 2026-11-09 on bank `jcode-legacy`: appending the assistant's
+    // prose made the recall worse in all three measured queries - it lifted
+    // the agent's own implementation chatter to the top of the results and
+    // pushed the owner's statements down. The cross-encoder scores
+    // (query, candidate) PAIRS, so the transcript is not a query.
     assert!(
-        focused.starts_with("how do I fix the scroll bug in navigation.rs"),
-        "should lead with latest user message: {focused}"
+        !focused.contains("mouse delta calc"),
+        "assistant prose leaked into the query: {focused}"
     );
 }
 
@@ -981,7 +992,7 @@ fn focused_query_excludes_multiline_tool_errors_but_keeps_later_user_prose() {
                 text: "Keep the token rotation behavior unchanged.".to_string(),
                 cache_control: None,
             },
-        ],
+        ].into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1010,7 +1021,118 @@ fn focus_query_text_falls_back_when_all_stripped() {
 }
 
 #[test]
-fn jev_recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
+fn focused_query_keeps_the_question_when_a_long_reminder_block_is_truncated() {
+    // MEASURED 2026-11-05: the MCP tool catalogue arrives as ONE text block
+    // of ~48,000 chars. Truncating it to 1,200 chars used to cut off the
+    // closing `</system-reminder>`, so `focus_query_text` treated the whole
+    // rest of the transcript as reminder content and dropped the user's
+    // question. It then fell back to the raw context, where the catalogue
+    // excerpt dominated the recall query.
+    let catalogue = format!(
+        "<system-reminder>\nNew MCP tools are available.\n{}\n</system-reminder>",
+        "mcp__cgrep__cgrep_agent_expand: expand selected locate IDs with context. ".repeat(60),
+    );
+    assert!(
+        catalogue.chars().count() > 1_200,
+        "the fixture must exceed the cap"
+    );
+
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: catalogue,
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "What is the jcode memory verification nonce?".to_string(),
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let focused = format_focused_query_for_relevance(&messages);
+
+    assert!(
+        focused.contains("jcode memory verification nonce"),
+        "the user's question was dropped from the recall query: {focused}"
+    );
+    assert!(
+        focused.starts_with("What is the jcode memory verification nonce?"),
+        "the query should lead with the user's intent: {focused}"
+    );
+    assert!(
+        !focused.contains("cgrep_agent_expand"),
+        "the truncated catalogue leaked into the query: {focused}"
+    );
+}
+
+#[test]
+fn focused_query_never_sends_hindsight_a_query_without_word_characters() {
+    // MEASURED 2026-11-05: on 20 of 7301 live session files the focused
+    // recall query was "." (or ".\n."), and Hindsight answered HTTP 422
+    // "query must contain at least one word character after normalization,
+    // input: .\n." - so the recall produced nothing at all.
+    let catalogue = format!(
+        "<system-reminder>\nNew MCP tools are available.\n{}\n</system-reminder>",
+        "mcp__cgrep__cgrep_agent_expand: expand selected locate IDs with context. ".repeat(60),
+    );
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "<system-reminder>\n# Session Context\nDate: 2026-11-05\n</system-reminder>"
+                    .to_string(),
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: catalogue,
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: ".".to_string(),
+                cache_control: None,
+            }]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let focused = format_focused_query_for_relevance(&messages);
+
+    // A NON-EMPTY query must carry a word character: Hindsight rejects the
+    // rest with 422, so a punctuation-only query is a wasted recall. An
+    // empty query is fine - the callers skip the recall entirely.
+    assert!(
+        focused.trim().is_empty() || focused.chars().any(|c| c.is_alphanumeric()),
+        "a non-empty recall query must contain a word character, got {focused:?}"
+    );
+}
+
+#[test]
+fn recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
     let mut entries: Vec<MemoryEntry> = (0..2000)
         .map(|i| {
             MemoryEntry::new(
@@ -1026,12 +1148,10 @@ fn jev_recall_prefilter_bounds_candidates_and_keeps_relevant_memories() {
     let kept = prefilter_for_jev(entries, "update the fundraising CRM notes for the SAFE");
     assert!(kept.len() <= MAX_JEV_RECALL_CANDIDATES);
     assert!(kept.iter().any(|e| e.content.contains("fundraising CRM")));
-    // At most three Jev batches of 24 per recall instead of ~84 for this store.
-    assert!(kept.len().div_ceil(crate::memory_jev::MAX_BATCH_ENTRIES) <= 3);
 }
 
 #[test]
-fn jev_recall_prefilter_leaves_small_stores_untouched() {
+fn recall_prefilter_leaves_small_stores_untouched() {
     let entries: Vec<MemoryEntry> = (0..10)
         .map(|i| MemoryEntry::new(MemoryCategory::Fact, format!("note {i}")))
         .collect();

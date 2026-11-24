@@ -69,6 +69,21 @@ fn builds_both_desktop_packages_with_matching_profile() {
 }
 
 #[test]
+fn schema_advertises_only_one_desktop_rebuild_and_reload_action() {
+    let schema = DesktopSelfDevTool::new().parameters_schema();
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("reload")));
+    assert!(!actions.contains(&json!("build-reload")));
+    assert!(
+        schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("reload rebuilds/reloads Desktop")
+    );
+    assert_eq!(input("build-reload").action, "build-reload");
+}
+
+#[test]
 fn reload_actions_never_route_to_cli_or_subprocess() {
     for action in ["reload", "build-reload"] {
         assert!(command_spec(Path::new("/desktop"), &input(action), "debug", None).is_err());
@@ -127,13 +142,30 @@ fn screenshot_rejects_symlink_destination() {
 
 #[test]
 fn ambiguous_instances_and_foreign_executables_are_rejected() {
-    assert!(choose_instance(vec!["main.sock".into(), "other.sock".into()]).is_err());
+    let error = choose_instance(vec![
+        ("main", "main.sock".into()),
+        ("single-panel", "single.sock".into()),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("main, single-panel"), "{error}");
     assert_eq!(choose_instance(vec![]).unwrap(), None);
     assert_eq!(
-        choose_instance(vec!["main.sock".into()]).unwrap(),
+        choose_instance(vec![("main", "main.sock".into())]).unwrap(),
         Some("main.sock".into())
     );
     assert!(select_instance(Some("../../arbitrary")).is_err());
+    assert!(select_instance(Some("single-panel-123")).is_err());
+    // The shared single-panel host is reachable by its fixed socket name.
+    assert_eq!(
+        instance_socket_name("single-panel"),
+        "jcode-desktop-single-panel.sock"
+    );
+    assert_eq!(instance_socket_name("main"), "jcode-desktop.sock");
+    assert_eq!(
+        instance_socket_name("no-sidebar"),
+        "jcode-desktop-no-sidebar.sock"
+    );
     let root = Path::new("/desktop");
     assert_eq!(
         host_profile(root, Path::new("/desktop/target/release/jcode-desktop")).unwrap(),

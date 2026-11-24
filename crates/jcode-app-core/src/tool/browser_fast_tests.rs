@@ -1,3 +1,4 @@
+use super::browser_fast_actions::risky;
 use super::*;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -9,6 +10,7 @@ struct MockBrowser {
     fail_action: bool,
     action_error: Option<String>,
     action_result: Option<Value>,
+    expected_browser: Option<&'static str>,
 }
 impl MockBrowser {
     fn new(observations: Vec<Value>) -> Self {
@@ -19,6 +21,7 @@ impl MockBrowser {
             fail_action: false,
             action_error: None,
             action_result: None,
+            expected_browser: None,
         }
     }
 }
@@ -31,8 +34,20 @@ impl BrowserProvider for MockBrowser {
         &["auto"]
     }
     async fn status(&self, _: &ToolContext) -> Result<ToolOutput> {
+        assert!(
+            self.expected_browser.is_none(),
+            "readiness lost browser scope"
+        );
         self.calls.lock().unwrap().push("status".into());
         Ok(ToolOutput::new("").with_metadata(json!({"ready":self.ready})))
+    }
+    async fn status_for(&self, browser: Option<&str>, ctx: &ToolContext) -> Result<ToolOutput> {
+        if let Some(expected) = self.expected_browser {
+            assert_eq!(browser, Some(expected), "readiness changed browser");
+            self.calls.lock().unwrap().push("status".into());
+            return Ok(ToolOutput::new("").with_metadata(json!({"ready":self.ready})));
+        }
+        self.status(ctx).await
     }
     async fn setup(&self) -> Result<ToolOutput> {
         panic!("must not setup")
@@ -49,14 +64,31 @@ impl BrowserProvider for MockBrowser {
         assert_eq!(input.tab_id, Some(7));
         assert_eq!(input.frame_id, Some(0));
         assert_eq!(input.all_frames, Some(false));
+        if let Some(expected) = self.expected_browser {
+            assert_eq!(
+                input.browser.as_deref(),
+                Some(expected),
+                "{action} changed browser"
+            );
+        }
         self.calls.lock().unwrap().push(action.into());
+        if action == "list_tabs" && self.expected_browser.is_some() {
+            return Ok(ToolOutput::new("").with_metadata(json!({
+                "windows": [{"windowId":9,"tabs":[{"tabId":7}]}]
+            })));
+        }
         if action == "eval" && input.script.as_deref() == Some(OBSERVE_SCRIPT) {
-            let mut values = self.observations.lock().unwrap();
-            let value = if values.len() > 1 {
-                values.pop_front().unwrap()
-            } else {
-                values.front().unwrap().clone()
+            let value = {
+                let mut values = self.observations.lock().unwrap();
+                if values.len() > 1 {
+                    values.pop_front().unwrap()
+                } else {
+                    values.front().unwrap().clone()
+                }
             };
+            if value["bridge_pending"] == true {
+                return std::future::pending().await;
+            }
             if let Some(error) = value["bridge_error"].as_str() {
                 anyhow::bail!("{error}");
             }
@@ -218,8 +250,11 @@ async fn sensitive_pages_never_reach_transport() {
         result["reason"]
             .as_str()
             .unwrap()
-            .contains("Never reset passwords")
+            .contains("complete a CAPTCHA")
     );
+    // The main agent must know to ask the user to complete the challenge and resume.
+    assert_eq!(result["requested_help"], "user_login");
+    assert!(result["reason"].as_str().unwrap().contains("same tab_id"));
     assert!(transport.observed.lock().unwrap().is_empty());
 }
 #[tokio::test]
@@ -243,6 +278,130 @@ async fn validates_inputs_before_browser_calls() {
         assert!(browser.calls.lock().unwrap().is_empty());
     }
 }
+struct FailingDecisionTransport {
+    first: Option<MockTransport>,
+    error: &'static str,
+}
+#[async_trait]
+impl DecisionTransport for FailingDecisionTransport {
+    fn model(&self) -> &str {
+        "typesafe/jev-1.13"
+    }
+    async fn decide(&self, request: &DecisionRequest) -> Result<Decision> {
+        if let Some(first) = &self.first
+            && !first.decisions.lock().unwrap().is_empty()
+        {
+            return first.decide(request).await;
+        }
+        anyhow::bail!(self.error)
+    }
+}
+
+#[tokio::test]
+async fn decision_provider_failure_requests_direct_actions_and_preserves_tab() {
+    for error in [
+        "Jev returned HTTP 502: selected provider is unavailable or rejected the request",
+        "Jev decision request failed or timed out; check the selected provider",
+        "Jev returned HTTP 403: selected provider denied access or the account is not entitled",
+    ] {
+        let browser = MockBrowser::new(vec![page("before")]);
+        let transport = FailingDecisionTransport { first: None, error };
+        let value = run(&browser, &transport, &input(), &ctx()).await.unwrap();
+        let result = value.metadata.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&value.output).unwrap(),
+            result
+        );
+        assert_eq!(result["status"], "hand_back");
+        assert_eq!(result["requested_help"], "direct_actions");
+        assert_eq!(result["tab_id"], 7);
+        assert_eq!(result["frame_id"], 0);
+        assert_eq!(result["final_observation"]["text"], "before");
+        assert!(result["action_trace"].as_array().unwrap().is_empty());
+        let reason = result["reason"].as_str().unwrap();
+        assert!(reason.contains(error));
+        assert!(reason.contains("same tab_id and frame_id"));
+        assert!(reason.contains("do not replay completed actions"));
+        assert!(reason.contains("Do not ask the user to sign in or switch paid providers"));
+        assert!(
+            browser
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call == "status" || call == "eval")
+        );
+    }
+}
+
+#[tokio::test]
+async fn decision_provider_failure_preserves_completed_action_progress() {
+    let browser = MockBrowser::new(vec![page("before"), page("before"), page("after")]);
+    let transport = FailingDecisionTransport {
+        first: Some(MockTransport::new(&[("a0", 0.99)])),
+        error: "Jev returned HTTP 502",
+    };
+    let value = run(&browser, &transport, &input(), &ctx())
+        .await
+        .unwrap()
+        .metadata
+        .unwrap();
+    assert_eq!(value["requested_help"], "direct_actions");
+    assert_eq!(value["tab_id"], 7);
+    assert_eq!(value["final_observation"]["text"], "after");
+    assert_eq!(value["action_trace"].as_array().unwrap().len(), 1);
+    assert_ne!(value["action_trace"][0]["status"], "started");
+}
+
+struct PendingDecisionTransport(Option<crate::agent::InterruptSignal>);
+#[async_trait]
+impl DecisionTransport for PendingDecisionTransport {
+    fn model(&self) -> &str {
+        "mock/jev"
+    }
+    async fn decide(&self, _: &DecisionRequest) -> Result<Decision> {
+        if let Some(signal) = &self.0 {
+            signal.fire();
+        }
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn decision_timeout_recovers_but_shutdown_does_not_request_more_actions() {
+    for cancelled in [false, true] {
+        let browser = MockBrowser::new(vec![page("before")]);
+        let mut context = ctx();
+        let signal = crate::agent::InterruptSignal::new();
+        if cancelled {
+            context.graceful_shutdown_signal = Some(signal.clone());
+        }
+        let transport = PendingDecisionTransport(cancelled.then_some(signal));
+        let mut args = input();
+        args.timeout_ms = Some(10);
+        let value = run(&browser, &transport, &args, &context)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(value["status"], "hand_back");
+        assert_eq!(value["tab_id"], 7);
+        assert_eq!(
+            value["requested_help"],
+            if cancelled {
+                "uncertain"
+            } else {
+                "direct_actions"
+            }
+        );
+        assert!(value["reason"].as_str().unwrap().contains(if cancelled {
+            "cancelled"
+        } else {
+            "timed out"
+        }));
+    }
+}
+
 #[tokio::test]
 async fn browser_errors_and_not_ready_hand_back() {
     let mut browser = MockBrowser::new(vec![page("before")]);
@@ -250,9 +409,11 @@ async fn browser_errors_and_not_ready_hand_back() {
     let value = result(&browser, &MockTransport::new(&[("a0", 0.99)]), &input()).await;
     assert_eq!(value["status"], "hand_back");
     assert!(value["reason"].as_str().unwrap().contains("mock failure"));
+    assert_eq!(value["requested_help"], "uncertain");
     browser.ready = false;
     let value = result(&browser, &MockTransport::new(&[]), &input()).await;
     assert!(value["reason"].as_str().unwrap().contains("not ready"));
+    assert_eq!(value["requested_help"], "uncertain");
 }
 #[test]
 fn rejects_scope_escapes_and_recursive_actions() {
@@ -322,14 +483,40 @@ fn auto_candidates_filter_risky_controls_and_use_only_supplied_text() {
     assert!(
         !options
             .iter()
-            .any(|c| matches!(c.input.selector.as_deref(), Some("#bad" | "#send" | "#pw")))
+            .any(|c| matches!(c.input.selector.as_deref(), Some("#bad" | "#send")))
     );
-    let typing = options.iter().find(|c| c.input.action == "type").unwrap();
+    let typing = options
+        .iter()
+        .find(|c| c.input.action == "type" && c.input.selector.as_deref() == Some("#q"))
+        .unwrap();
+    let password = options
+        .iter()
+        .find(|c| c.input.action == "type" && c.input.selector.as_deref() == Some("#pw"))
+        .unwrap();
+    assert_eq!(password.input.text.as_deref(), Some("trusted query"));
+    assert_eq!(password.input.submit, Some(false));
     assert_eq!(typing.input.text.as_deref(), Some("trusted query"));
     assert_eq!(typing.input.submit, Some(false));
     let select = options.iter().find(|c| c.input.action == "select").unwrap();
     assert_eq!(select.input.text.as_deref(), Some("en"));
 }
+#[test]
+fn password_workflows_are_not_blanket_blocked() {
+    for label in [
+        "Reset password",
+        "Password",
+        "OTP",
+        "Verification code",
+        "Security code",
+    ] {
+        assert!(!risky(label), "{label}");
+    }
+    assert!(risky("CAPTCHA"));
+    assert!(risky("Pay now"));
+    assert!(!OBSERVE_SCRIPT.contains("type==='password'"));
+    assert!(OBSERVE_SCRIPT.contains("if(/captcha/i.test(body))sensitive=true;"));
+}
+
 #[test]
 fn candidates_are_capped_below_model_limit() {
     let mut input = input();
@@ -451,6 +638,70 @@ fn whole_tab_actions_cannot_escape_explicit_subframe() {
     }
 }
 
+#[test]
+fn scoped_inputs_inherit_requested_browser() {
+    let mut parent = input();
+    parent.browser = Some("edge".into());
+    let observe = scoped(
+        BrowserInput {
+            action: "eval".into(),
+            script: Some(OBSERVE_SCRIPT.into()),
+            ..Default::default()
+        },
+        &parent,
+    )
+    .unwrap();
+    assert_eq!(observe.browser.as_deref(), Some("edge"));
+    let click = scoped(
+        serde_json::from_value(json!({"action":"click","selector":"#go"})).unwrap(),
+        &parent,
+    )
+    .unwrap();
+    assert_eq!(click.browser.as_deref(), Some("edge"));
+    assert!(
+        scoped(
+            serde_json::from_value(json!({"action":"click","selector":"#go","browser":"firefox"}))
+                .unwrap(),
+            &parent,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn requested_browser_is_preserved_through_entire_handoff() {
+    let mut browser = MockBrowser::new(vec![page("before"), page("before"), page("after")]);
+    browser.expected_browser = Some("edge");
+    let mut input = input();
+    input.browser = Some("edge".into());
+    input.window_id = Some(9);
+    input.candidates.push(ExactCandidate {
+        label: "Click next".into(),
+        input: json!({"action":"click","selector":"#next"}),
+    });
+    let value = result(
+        &browser,
+        &MockTransport::new(&[("a0", 0.99), ("done", 0.99)]),
+        &input,
+    )
+    .await;
+    assert_eq!(value["status"], "done", "{value}");
+    assert_eq!(value["action_trace"][0]["action"], "click");
+    assert_eq!(
+        *browser.calls.lock().unwrap(),
+        vec![
+            "status",
+            "list_tabs",
+            "eval",
+            "eval",
+            "click",
+            "eval",
+            "eval",
+            "eval"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn mismatched_window_is_rejected_before_observing_page() {
     let browser = MockBrowser::new(vec![]);
@@ -497,6 +748,7 @@ async fn credentials_in_page_never_reach_transport_or_parent() {
         assert_eq!(value["status"], "hand_back");
         assert!(!value.to_string().contains(secret));
         assert!(value["final_observation"]["sensitive"] == true);
+        assert_eq!(value["requested_help"], "direct_actions");
         assert!(transport.observed.lock().unwrap().is_empty());
     }
 }
@@ -626,6 +878,7 @@ async fn decision_timeout_is_structured_handback() {
     let value = output.metadata.unwrap();
     assert_eq!(value["status"], "hand_back");
     assert!(value["reason"].as_str().unwrap().contains("timed out"));
+    assert!(!value["reason"].as_str().unwrap().contains("in-flight"));
     assert_eq!(*browser.calls.lock().unwrap(), vec!["status", "eval"]);
 }
 
@@ -1026,31 +1279,8 @@ async fn distinct_successful_actions_on_unchanged_page_do_not_stall() {
     assert_eq!(value["action_trace"].as_array().unwrap().len(), 4);
 }
 
-#[tokio::test]
-async fn initial_and_predecision_observation_disconnects_are_retried_read_only() {
-    let error = json!({"bridge_error":"Receiving end does not exist"});
-    let browser = MockBrowser::new(vec![
-        error.clone(),
-        page("complete"),
-        error,
-        page("complete"),
-    ]);
-    let value = result(&browser, &MockTransport::new(&[("done", 0.99)]), &input()).await;
-    assert_eq!(value["status"], "done", "{value}");
-    assert!(value["action_trace"].as_array().unwrap().is_empty());
-}
+#[path = "browser_fast_tests/reconnect_timeout.rs"]
+mod reconnect_timeout;
 
-#[tokio::test]
-async fn identical_url_and_target_on_new_document_requires_replan() {
-    let mut before = page("same");
-    before["document_id"] = json!("old-document");
-    before["elements"] = json!([{"identity":1,"tag":"a","text":"Docs","selector":"#docs","href":"https://example.test/docs"}]);
-    let mut after = before.clone();
-    after["document_id"] = json!("new-document");
-    let browser = MockBrowser::new(vec![before, after]);
-    let transport = MockTransport::new(&[("a0", 0.99), ("done", 0.99)]);
-    let value = result(&browser, &transport, &input()).await;
-    assert_eq!(value["status"], "done", "{value}");
-    assert!(value["action_trace"].as_array().unwrap().is_empty());
-    assert_eq!(transport.observed.lock().unwrap().len(), 2);
-}
+#[path = "browser_fast_observation_tests.rs"]
+mod observation_reconnect;

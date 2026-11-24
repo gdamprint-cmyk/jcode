@@ -736,10 +736,77 @@ fn parse_judge_response(resp: &str, n: usize) -> Vec<usize> {
 
 // ---- Listwise LLM reranker (recall-5, Mode-2) ----------------------------
 //
-// The prompt/parse/rerank logic lives in the shared `jcode::memory_rerank`
-// module so the benchmark and the live memory agent use ONE implementation
-// (bench == prod). This file only orchestrates running it over the gold set.
-use jcode::memory_rerank::{LLM_RERANK_SYSTEM, build_rerank_prompt, parse_rerank_response};
+// MEASURED 2026-11-11 (Jev removal, 4950764e1): the shared `jcode::memory_rerank`
+// module was deleted with the Jev backend, so this benchmark no longer shares a
+// reranker with the live agent (the live agent no longer reranks at all; recall is
+// Hindsight-owned). The prompt/parse helpers are reproduced here verbatim from the
+// deleted module so the LLM configs keep compiling and stay comparable to the
+// recorded baseline numbers.
+// reference: git show 4950764e1~1:crates/jcode-base/src/memory_rerank.rs
+//   (LLM_RERANK_SYSTEM :27, build_rerank_prompt :109, extract_ranking :131,
+//    parse_rerank_response :156, MAX_QUERY_CHARS :87, MAX_CANDIDATE_CHARS :90)
+
+const MAX_QUERY_CHARS: usize = 4000;
+const MAX_CANDIDATE_CHARS: usize = 600;
+
+const LLM_RERANK_SYSTEM: &str = "You re-rank stored MEMORIES by how useful each would be to surface to an AI coding agent for the CURRENT request. \
+Order them best-first: a memory ranks high if a competent engineer would say knowing it specifically helps respond here (a relevant fact, preference, correction, or procedure). \
+Off-topic, generic, or keyword-only matches rank low. \
+Reply with ONLY a JSON array of candidate numbers, best first, e.g. [3,1,7]. Include only clearly useful candidates; omit ones that are not relevant. No prose.";
+
+fn truncate_tail(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    s.chars().skip(count - max).collect()
+}
+
+fn truncate_head(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
+}
+
+fn build_rerank_prompt(focused_query: &str, candidates: &[(String, String)]) -> String {
+    let q = truncate_tail(focused_query, MAX_QUERY_CHARS);
+    let mut p = String::with_capacity(256 + candidates.len() * 64);
+    p.push_str("CURRENT REQUEST:\n");
+    p.push_str(&q);
+    p.push_str("\n\nCANDIDATE MEMORIES:\n");
+    for (i, (_id, content)) in candidates.iter().enumerate() {
+        let one_line = truncate_head(content, MAX_CANDIDATE_CHARS).replace('\n', " ");
+        p.push_str(&format!("{}. {}\n", i + 1, one_line));
+    }
+    p.push_str("\nReturn candidate numbers ranked best-first as a JSON array.");
+    p
+}
+
+fn parse_rerank_response(resp: &str, n: usize) -> Vec<usize> {
+    extract_ranking(resp, n).unwrap_or_default()
+}
+
+fn extract_ranking(resp: &str, n: usize) -> Option<Vec<usize>> {
+    let (s, e) = (resp.find('[')?, resp.rfind(']')?);
+    if e < s {
+        return None;
+    }
+    let nums: Vec<i64> = serde_json::from_str(&resp[s..=e]).ok()?;
+    let mut seen = HashSet::new();
+    Some(
+        nums.into_iter()
+            .filter_map(|x| {
+                let idx = usize::try_from(x).ok()?;
+                if idx >= 1 && idx <= n && seen.insert(idx) {
+                    Some(idx - 1)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
 
 /// STRICT precision variant of the listwise rerank system prompt. Pushes the
 /// model to keep ONLY memories it is near-certain are useful for THIS request,

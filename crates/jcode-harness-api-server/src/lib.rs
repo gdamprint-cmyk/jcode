@@ -18,8 +18,11 @@
 
 pub mod allocator;
 pub mod background_progress;
+pub mod timing;
 pub mod translate;
 
+#[cfg(all(test, unix))]
+mod session_presence_tests;
 #[cfg(all(test, unix))]
 mod stdio_tests;
 
@@ -50,10 +53,13 @@ fn release_large_frame(buffer: &mut Vec<u8>) {
     }
 }
 
+/// Capabilities the native daemon advertises in its ping reply. `None` means
+/// the probe failed, not that the daemon advertised no capabilities.
+///
 /// Probe only an old, universally supported control request on a disposable
 /// connection. Older daemons close that connection after ping, and may close
 /// connections receiving unknown requests. Never probe on the session stream.
-async fn daemon_supports_session_tools(socket: &std::path::Path) -> bool {
+async fn daemon_capabilities(socket: &std::path::Path) -> Option<Vec<String>> {
     let probe = async {
         let mut stream = Stream::connect(socket).await.ok()?;
         write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0}))
@@ -63,19 +69,60 @@ async fn daemon_supports_session_tools(socket: &std::path::Path) -> bool {
         let mut line = String::new();
         read_frame(&mut reader, &mut line).await.ok()?;
         let reply: Value = serde_json::from_str(&line).ok()?;
+        if reply["type"] != "pong" || reply["id"] != 0 {
+            return None;
+        }
         Some(
-            reply["type"] == "pong"
-                && reply["id"] == 0
-                && reply["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|cap| cap == "session_tools")),
+            reply["capabilities"]
+                .as_array()
+                .map(|caps| {
+                    caps.iter()
+                        .filter_map(|cap| cap.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         )
     };
     tokio::time::timeout(std::time::Duration::from_millis(500), probe)
         .await
         .ok()
         .flatten()
-        .unwrap_or(false)
+}
+
+/// Fresh source-daemon connections. A disposable Ping never subscribes,
+/// resumes, or creates a session. Failed snapshots clear connection presence.
+async fn daemon_user_connections(socket: &std::path::Path) -> std::collections::HashSet<String> {
+    let probe = async {
+        let mut stream = Stream::connect(socket)
+            .await
+            .context("connect presence probe")?;
+        write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0})).await?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        read_frame(&mut reader, &mut line).await?;
+        let reply: Value = serde_json::from_str(&line).context("parse presence pong")?;
+        if reply["type"] != "pong" || reply["id"] != 0 {
+            anyhow::bail!("presence probe received an uncorrelated reply");
+        }
+        // Older daemons do not advertise connection presence.
+        if reply["user_connected_session_ids"].is_null() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<String> = serde_json::from_value(reply["user_connected_session_ids"].clone())
+            .context("parse connected session IDs")?;
+        Ok::<_, anyhow::Error>(ids.into_iter().filter(|id| !id.is_empty()).collect())
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(500), probe).await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(error)) => {
+            eprintln!("Harness presence snapshot unavailable: {error:#}");
+            std::collections::HashSet::new()
+        }
+        Err(_) => {
+            eprintln!("Harness presence probe timed out, clearing connection presence");
+            std::collections::HashSet::new()
+        }
+    }
 }
 
 /// Largest single request frame accepted from an API client, in bytes.
@@ -277,6 +324,7 @@ where
 {
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
+    let mut pending = timing::Pending::default();
 
     // 1. Handshake: first frame must be hello with a compatible version.
     read_frame(&mut reader, &mut line).await?;
@@ -314,11 +362,25 @@ where
         write_json_line(&mut write_half, &frame).await?;
         return Ok(());
     }
+    let hello_at = std::time::Instant::now();
     // Do not claim a usable connection before the native daemon is reachable.
     let legacy = Stream::connect(&legacy_socket)
         .await
         .with_context(|| format!("connect legacy socket {}", legacy_socket.display()))?;
-    let session_tools_supported = daemon_supports_session_tools(&legacy_socket).await;
+    let daemon_connected = hello_at.elapsed();
+    let daemon_caps = daemon_capabilities(&legacy_socket)
+        .await
+        .unwrap_or_default();
+    timing::log(&format!(
+        "hello client={client_name} first_frame={:.1}ms daemon_connect={:.1}ms daemon_caps={:.1}ms",
+        timing::ms(pending.connection_age() - hello_at.elapsed()),
+        timing::ms(daemon_connected),
+        timing::ms(hello_at.elapsed() - daemon_connected),
+    ));
+    let user_connections_supported = daemon_caps.iter().any(|cap| cap == "session_connections");
+    let runtime_commands_supported = daemon_caps.iter().any(|cap| cap == "runtime_commands");
+    let session_tools_supported = daemon_caps.iter().any(|cap| cap == "session_tools");
+    let soft_interrupt_ids_supported = daemon_caps.iter().any(|cap| cap == "soft_interrupt_ids");
     let hello_ok = ServerFrame::reply(
         reply_to,
         ApiEvent::HelloOk {
@@ -339,10 +401,19 @@ where
                 "session_retention",
                 "session_files",
                 "session_fork",
+                "todo_state",
             ]
             .into_iter()
             .map(str::to_string)
+            .chain(user_connections_supported.then(|| "session_connections".to_string()))
+            .chain(runtime_commands_supported.then(|| "runtime_commands".to_string()))
             .chain(session_tools_supported.then(|| "session_tools".to_string()))
+            .chain(
+                ["soft_interrupt_ids", "background_tool_result"]
+                    .into_iter()
+                    .filter(|_| soft_interrupt_ids_supported)
+                    .map(str::to_string),
+            )
             .collect(),
         },
     );
@@ -355,6 +426,10 @@ where
     let mut state =
         translate::BridgeState::with_crash_on_disconnect(client_name.starts_with("jcode-desktop-"));
     state.session_tools_supported = session_tools_supported;
+    state.supports_user_response = hello["supports_user_response"].as_bool().unwrap_or(false);
+    state.client_name = Some(client_name.to_string()).filter(|n| !n.is_empty());
+    state.runtime_commands_supported = runtime_commands_supported;
+    state.soft_interrupt_ids_supported = soft_interrupt_ids_supported;
 
     // 3. Pump both directions in one select loop so translation state stays
     //    single-threaded.
@@ -388,6 +463,7 @@ where
                 let parsed = serde_json::from_slice(&api_frame);
                 api_frame.clear();
                 release_large_frame(&mut api_frame);
+                let received = std::time::Instant::now();
                 let request: Value = match parsed {
                     Ok(value) => value,
                     Err(error) => {
@@ -401,12 +477,48 @@ where
                         continue;
                     }
                 };
+                // The initial bounded probe may have timed out while the daemon
+                // was busy. A missing advertised capability is only a snapshot,
+                // not a permanent rejection. Recheck on a disposable connection
+                // before dispatch, without reattaching or replaying anything on
+                // the live session stream.
+                if request["req"] == "runtime_command" && !state.runtime_commands_supported {
+                    match daemon_capabilities(&legacy_socket).await {
+                        Some(capabilities) => {
+                            state.runtime_commands_supported = capabilities.iter().any(|cap| cap == "runtime_commands");
+                        }
+                        None => {
+                            write_json_line(&mut write_half, &ServerFrame::reply(
+                                request["id"].as_u64().unwrap_or(0),
+                                ApiEvent::Error {
+                                    code: ErrorCode::Internal,
+                                    message: "Could not verify runtime command support because the daemon capability probe failed. Retry the command once the runtime is responsive. The command was not executed.".into(),
+                                },
+                            )).await?;
+                            continue;
+                        }
+                    }
+                }
+                if request["req"] == "list_sessions" {
+                    state.user_connected_sessions = if user_connections_supported {
+                        daemon_user_connections(&legacy_socket).await
+                    } else { Default::default() };
+                }
                 // Translation may inspect persisted session/archive files. Tell
                 // Tokio before entering that synchronous region so it can keep
                 // the accept loop and fresh-client handshakes scheduled.
+                let translate_started = std::time::Instant::now();
                 let outbound = tokio::task::block_in_place(|| {
                     state.api_request_to_legacy(&request)
                 });
+                if let Some(id) = request["id"].as_u64() {
+                    pending.begin(
+                        id,
+                        request["req"].as_str().unwrap_or("?"),
+                        received,
+                        translate_started.elapsed(),
+                    );
+                }
                 let heavy = allocator::request_is_heavy(&request);
                 drop(request);
                 for out in outbound {
@@ -415,7 +527,7 @@ where
                             write_json_line(&mut legacy_write, &value).await?;
                         }
                         translate::Outbound::Reply(frame) => {
-                            write_json_line(&mut write_half, &frame).await?;
+                            write_frame_timed(&mut write_half, &frame, &mut pending, "bridge").await?;
                         }
                     }
                 }
@@ -451,14 +563,23 @@ where
                 // block_in_place handed the worker core to a fresh blocking
                 // thread per event: a busy session grew the bridge to 69 idle
                 // threads, each pinning its own allocator arena.
+                let translate_started = std::time::Instant::now();
                 let frames = if translate::legacy_event_may_block(&event) {
                     tokio::task::block_in_place(|| state.legacy_event_to_api(&event))
                 } else {
                     state.legacy_event_to_api(&event)
                 };
+                let translated = translate_started.elapsed();
+                if translated > timing::SLOW_TRANSLATE {
+                    timing::log(&format!(
+                        "slow_event {} translate={:.1}ms",
+                        event["type"].as_str().unwrap_or("?"),
+                        timing::ms(translated),
+                    ));
+                }
                 drop(event);
                 for frame in frames {
-                    write_json_line(&mut write_half, &frame).await?;
+                    write_frame_timed(&mut write_half, &frame, &mut pending, "daemon").await?;
                 }
                 if large {
                     release_large_frame(&mut legacy_frame);
@@ -466,6 +587,32 @@ where
             }
         }
     }
+}
+
+/// Write a frame and, if it answers a timed request, log that request.
+async fn write_frame_timed<W>(
+    writer: &mut W,
+    frame: &ServerFrame,
+    pending: &mut timing::Pending,
+    source: &str,
+) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut line = serde_json::to_string(frame)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await?;
+    if let Some(reply_to) = frame.reply_to {
+        // Avoid a second serialization of large replies just for the name.
+        // Missing event names remain empty timing labels, not request failures.
+        let event = line
+            .split_once("\"ev\":\"")
+            .and_then(|(_, rest)| rest.split('"').next())
+            .unwrap_or("");
+        pending.finish(reply_to, event, line.len(), source);
+    }
+    Ok(())
 }
 
 async fn write_json_line<W, T>(writer: &mut W, value: &T) -> Result<()>
@@ -479,6 +626,9 @@ where
     writer.flush().await?;
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod runtime_command_compat_tests;
 
 #[cfg(all(test, unix))]
 mod public_acceptance_tests {

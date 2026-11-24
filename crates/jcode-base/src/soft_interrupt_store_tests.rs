@@ -15,6 +15,7 @@ fn append_take_and_clear_round_trip() {
             images: Vec::new(),
             urgent: true,
             source: SoftInterruptSource::System,
+            client_id: None,
         },
     )
     .expect("append first interrupt");
@@ -24,7 +25,8 @@ fn append_take_and_clear_round_trip() {
             content: "world".to_string(),
             images: Vec::new(),
             urgent: false,
-            source: SoftInterruptSource::BackgroundTask,
+            source: SoftInterruptSource::FileActivity,
+            client_id: None,
         },
     )
     .expect("append second interrupt");
@@ -34,6 +36,7 @@ fn append_take_and_clear_round_trip() {
     assert_eq!(loaded[0].content, "hello");
     assert!(loaded[0].urgent);
     assert_eq!(loaded[1].content, "world");
+    assert_eq!(loaded[1].source, SoftInterruptSource::FileActivity);
 
     let taken = take(session_id).expect("take interrupts");
     assert_eq!(taken.len(), 2);
@@ -46,11 +49,34 @@ fn append_take_and_clear_round_trip() {
             images: Vec::new(),
             urgent: false,
             source: SoftInterruptSource::User,
+            client_id: None,
         },
     )
     .expect("append later interrupt");
     clear(session_id).expect("clear interrupts");
     assert!(load(session_id).expect("load after clear").is_empty());
+
+    for (content, client_id) in [("x", Some("f1")), ("y", None), ("z", Some("f2"))] {
+        append(
+            session_id,
+            SoftInterruptMessage {
+                content: content.to_string(),
+                images: Vec::new(),
+                urgent: false,
+                source: SoftInterruptSource::User,
+                client_id: client_id.map(str::to_string),
+            },
+        )
+        .expect("append id-bearing interrupt");
+    }
+    let removed = remove_by_client_ids(session_id, &["f2".to_string(), "nope".to_string()])
+        .expect("remove by id");
+    assert_eq!(removed, vec!["f2".to_string()]);
+    let left = load(session_id).expect("load after remove");
+    assert_eq!(left.len(), 2);
+    assert_eq!(left[0].client_id.as_deref(), Some("f1"));
+    assert_eq!(left[1].client_id, None);
+    clear(session_id).expect("clear interrupts");
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);

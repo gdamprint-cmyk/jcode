@@ -69,6 +69,7 @@ pub fn anthropic_api_pricing_with_tier(
 
     match base {
         "claude-opus-5-5" => exact(4.0, 20.0, 0.20, "Anthropic API pricing"),
+        "claude-fable-5-2" => exact(8.0, 40.0, 0.20, "Anthropic API pricing"),
         "claude-fable-5-1" => exact(10.0, 50.0, 0.25, "Anthropic API pricing"),
         "claude-fable-5" => exact(10.0, 50.0, 1.0, "Anthropic API pricing"),
         "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
@@ -79,6 +80,8 @@ pub fn anthropic_api_pricing_with_tier(
         "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4-20250514" => {
             exact(3.0, 15.0, 0.3, "Anthropic API pricing")
         }
+        "claude-sonnet-5-5" => exact(2.0, 10.0, 0.1, "Anthropic API pricing"),
+        "claude-haiku-5-5" => exact(0.1, 0.5, 0.01, "Anthropic API pricing"),
         "claude-haiku-4-5" => exact(1.0, 5.0, 0.1, "Anthropic API pricing"),
         _ => None,
     }
@@ -151,9 +154,10 @@ pub fn openai_api_pricing(model: &str) -> Option<RouteCheapnessEstimate> {
 
 /// OpenAI API pricing honoring the active service tier.
 ///
-/// `priority` (fast mode) and `flex` bill different per-token rates on the
-/// models that support them; other tier values and unsupported models fall
-/// back to standard rates.
+/// `priority` (fast mode), `ultrafast`, and `flex` bill different per-token
+/// rates on supported models. These are short-context reference rates,
+/// excluding cache writes and regional uplifts. Other tier values and
+/// unsupported models fall back to standard rates.
 pub fn openai_api_pricing_with_tier(
     model: &str,
     service_tier: Option<&str>,
@@ -176,6 +180,7 @@ pub fn openai_api_pricing_with_tier(
         .as_deref()
     {
         Some("priority") => match base {
+            "gpt-6.1-sol" => return exact(4.0, 20.0, Some(0.20), "OpenAI API fast pricing"),
             "gpt-6-astra" => return exact(20.0, 100.0, Some(2.0), "OpenAI API fast pricing"),
             "gpt-5.5" => return exact(12.5, 75.0, Some(1.25), "OpenAI API priority pricing"),
             "gpt-5.4" => return exact(5.0, 30.0, Some(0.5), "OpenAI API priority pricing"),
@@ -183,7 +188,17 @@ pub fn openai_api_pricing_with_tier(
             "gpt-5.3-codex" => return exact(3.5, 28.0, Some(0.35), "OpenAI API priority pricing"),
             _ => {}
         },
+        Some("ultrafast") => {
+            // Verified 2026-10-16: https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast
+            if base == "gpt-6.1-sol" {
+                return exact(12.0, 60.0, Some(0.60), "OpenAI API ultrafast pricing");
+            }
+            if base == "gpt-6-astra" {
+                return exact(60.0, 300.0, Some(6.0), "OpenAI API ultrafast pricing");
+            }
+        }
         Some("flex") => match base {
+            "gpt-6.1-sol" => return exact(1.0, 5.0, Some(0.05), "OpenAI API flex pricing"),
             "gpt-6-astra" => return exact(5.0, 25.0, Some(0.5), "OpenAI API flex pricing"),
             "gpt-5.5" => return exact(2.5, 15.0, Some(0.25), "OpenAI API flex pricing"),
             "gpt-5.5-pro" => return exact(15.0, 90.0, None, "OpenAI API flex pricing"),
@@ -197,6 +212,8 @@ pub fn openai_api_pricing_with_tier(
     }
 
     match base {
+        // Verified 2026-10-16: https://developers.openai.com/api/docs/pricing
+        "gpt-6.1-sol" => exact(2.0, 10.0, Some(0.10), "OpenAI API pricing"),
         // Verified 2026-09-07: https://developers.openai.com/api/docs/models/gpt-6-astra
         // The caller applies the >272K-input surcharge using actual request usage.
         "gpt-6-astra" => exact(10.0, 50.0, Some(1.0), "OpenAI API pricing"),
@@ -342,6 +359,11 @@ mod tests {
         assert_eq!(fable_51.output_price_per_mtok_micros, Some(50_000_000));
         assert_eq!(fable_51.cache_read_price_per_mtok_micros, Some(250_000));
 
+        let fable_52 = anthropic_api_pricing("claude-fable-5-2").expect("priced model");
+        assert_eq!(fable_52.input_price_per_mtok_micros, Some(8_000_000));
+        assert_eq!(fable_52.output_price_per_mtok_micros, Some(40_000_000));
+        assert_eq!(fable_52.cache_read_price_per_mtok_micros, Some(200_000));
+
         let sonnet = anthropic_api_pricing("claude-sonnet-4-6").expect("priced model");
         assert_eq!(sonnet.input_price_per_mtok_micros, Some(3_000_000));
         assert_eq!(sonnet.output_price_per_mtok_micros, Some(15_000_000));
@@ -426,11 +448,29 @@ mod tests {
             (None, 10_000_000, 50_000_000, 1_000_000),
             (Some("flex"), 5_000_000, 25_000_000, 500_000),
             (Some("priority"), 20_000_000, 100_000_000, 2_000_000),
+            (Some("ultrafast"), 60_000_000, 300_000_000, 6_000_000),
         ] {
             let price = openai_api_pricing_with_tier("gpt-6-astra", tier).unwrap();
             assert_eq!(price.input_price_per_mtok_micros, Some(input));
             assert_eq!(price.output_price_per_mtok_micros, Some(output));
             assert_eq!(price.cache_read_price_per_mtok_micros, Some(cached));
+        }
+    }
+
+    #[test]
+    fn sol_public_api_rates_cover_all_speed_tiers() {
+        for model in ["gpt-6.1-sol", "gpt-6.1-sol[1m]"] {
+            for (tier, input, output, cached) in [
+                (None, 2_000_000, 10_000_000, 100_000),
+                (Some("flex"), 1_000_000, 5_000_000, 50_000),
+                (Some("priority"), 4_000_000, 20_000_000, 200_000),
+                (Some("ultrafast"), 12_000_000, 60_000_000, 600_000),
+            ] {
+                let price = openai_api_pricing_with_tier(model, tier).unwrap();
+                assert_eq!(price.input_price_per_mtok_micros, Some(input));
+                assert_eq!(price.output_price_per_mtok_micros, Some(output));
+                assert_eq!(price.cache_read_price_per_mtok_micros, Some(cached));
+            }
         }
     }
 

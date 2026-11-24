@@ -1,7 +1,9 @@
 //! Live OpenAI-compatible provider probes shared by the auth lifecycle driver
 //! and the provider doctor. These are pure HTTP/JSON checks with no test-only
 //! dependencies, so they compile into the shipping binary.
-//!
+//
+// reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-provider-openrouter-runtime/src/request_headers.rs (the streaming path's `x-opencode-session` helper, issue #1167; the probe path now shares it)
+//
 //! The OpenAI-compatible probes hit `/v1/chat/completions` directly. The native
 //! Claude probes ([`run_live_claude_native_*`]) instead drive the production
 //! [`AnthropicProvider`] runtime end-to-end (auth, OAuth preflight, request
@@ -51,6 +53,96 @@ fn apply_provider_auth(
         &resolved.api_base,
         api_key,
     )
+}
+
+/// Apply the auth headers AND the per-host headers an OpenAI-compatible
+/// endpoint may require.
+///
+/// OpenCode Go/Zen reject any inference request without a stable
+/// `x-opencode-session` header (HTTP 400 `MissingSessionID`). The streaming
+/// runtime has always sent it; these probes are the NON-STREAMING path, so
+/// without this they reported the route as broken while real agent sessions
+/// on the same route worked.
+fn apply_probe_headers(
+    request: reqwest::RequestBuilder,
+    resolved: &ResolvedOpenAiCompatibleProfile,
+    api_key: &str,
+    conversation_id: &str,
+) -> reqwest::RequestBuilder {
+    let request = apply_provider_auth(request, resolved, api_key);
+    jcode_base::provider_catalog::apply_opencode_session_header(
+        request,
+        &resolved.api_base,
+        conversation_id,
+    )
+}
+
+/// Format an error together with its whole source chain.
+///
+/// `reqwest::Error::to_string()` returns only the TOP-level message
+/// ("error sending request for url (...)"). The detail that identifies a
+/// transient fault - "client error (SendRequest)", "connection closed before
+/// message completed", "peer closed connection without sending TLS
+/// close_notify" - lives in the `source()` chain, so classifying on
+/// `to_string()` alone silently classifies every transport fault as
+/// permanent, and the retry never fires.
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut current = error.source();
+    while let Some(source) = current {
+        text.push_str(": ");
+        text.push_str(&source.to_string());
+        current = source.source();
+    }
+    text
+}
+
+/// Send a probe request, retrying a TRANSIENT transport fault on a fresh
+/// connection.
+///
+/// The provider-doctor probes used to send once, so a transient transport
+/// fault (a rustls "peer closed connection without sending TLS close_notify",
+/// a reset connection, a DNS hiccup) failed the whole diagnostic run even
+/// though the provider was healthy. The streaming runtime has always retried
+/// these, because `jcode_provider_core::transport::is_transient_transport_error`
+/// classifies them as transient - the doctor path simply never used it.
+///
+/// reference: https://github.com/1jehuang/jcode/blob/main/crates/jcode-provider-core/src/transport.rs (the shared transient-transport classifier and its existing tests)
+///
+/// A non-transient error is returned immediately: retrying a 401 or a 400
+/// would only spend the user's balance on a request that cannot succeed.
+async fn send_probe_request(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    timeout: std::time::Duration,
+    attempts: usize,
+) -> anyhow::Result<reqwest::Response> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts.max(1) {
+        match tokio::time::timeout(timeout, build().send()).await {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) => {
+                let message = format_error_chain(&error);
+                if !jcode_provider_core::is_transient_transport_error(&message) {
+                    return Err(anyhow::Error::from(error));
+                }
+                eprintln!(
+                    "provider-doctor: transient transport fault on attempt {attempt}/{attempts}, retrying: {message}"
+                );
+                last_error = Some(anyhow::Error::from(error));
+            }
+            Err(_) => {
+                let message = format!("probe timed out after {timeout:?}");
+                eprintln!(
+                    "provider-doctor: transient transport fault on attempt {attempt}/{attempts}, retrying: {message}"
+                );
+                last_error = Some(anyhow::anyhow!("{message}"));
+            }
+        }
+        if attempt < attempts.max(1) {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("probe request failed")))
 }
 
 /// Set an output-token cap on a chat-completions body using the parameter name
@@ -174,14 +266,23 @@ pub async fn run_live_openai_compatible_smoke(
         ],
         "stream": false
     });
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
-    let response = tokio::time::timeout(smoke_timeout(30), request.send())
-        .await
-        .context("timed out running live smoke completion")?
-        .with_context(|| format!("run live {} smoke completion", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(30),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} smoke completion", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
@@ -222,158 +323,11 @@ pub async fn run_live_openai_compatible_smoke(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use jcode_base::provider_catalog::resolve_openai_compatible_profile;
-    use jcode_provider_metadata::{
-        GEMINI_OPENAI_COMPAT_PROFILE, OPENAI_NATIVE_OPENAI_COMPAT_PROFILE,
-    };
+mod tests;
 
-    #[test]
-    fn gemini_openai_compat_strips_models_prefix_from_catalog_ids() {
-        let resolved = resolve_openai_compatible_profile(GEMINI_OPENAI_COMPAT_PROFILE);
-        assert_eq!(
-            normalize_openai_compatible_model_id(&resolved, "models/gemini-2.5-flash"),
-            "gemini-2.5-flash"
-        );
-        // Already-bare ids pass through unchanged.
-        assert_eq!(
-            normalize_openai_compatible_model_id(&resolved, "gemini-2.5-pro"),
-            "gemini-2.5-pro"
-        );
-    }
-
-    #[test]
-    fn non_gemini_openai_compat_leaves_model_ids_untouched() {
-        let resolved = resolve_openai_compatible_profile(OPENAI_NATIVE_OPENAI_COMPAT_PROFILE);
-        // A leading `models/` segment on a non-Gemini host is not stripped.
-        assert_eq!(
-            normalize_openai_compatible_model_id(&resolved, "models/gpt-5.1"),
-            "models/gpt-5.1"
-        );
-        assert_eq!(
-            normalize_openai_compatible_model_id(&resolved, "gpt-5.1"),
-            "gpt-5.1"
-        );
-    }
-
-    fn tool_call_with_signature(signature: Option<&str>) -> NativeClaudeToolCall {
-        NativeClaudeToolCall {
-            id: "call_1".to_string(),
-            name: "read".to_string(),
-            input_json: "{}".to_string(),
-            thought_signature: signature.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn reasoning_capability_classifies_streamed_when_reasoning_text_present() {
-        let outcome = NativeClaudeStreamOutcome {
-            reasoning_text_len: 42,
-            saw_message_end: true,
-            ..Default::default()
-        };
-        assert_eq!(outcome.reasoning_capability(), "streamed");
-    }
-
-    #[test]
-    fn reasoning_capability_classifies_opaque_from_thinking_signature() {
-        // No reasoning text, but a ThinkingSignatureDelta-style signal: opaque.
-        let outcome = NativeClaudeStreamOutcome {
-            saw_reasoning_signal: true,
-            saw_message_end: true,
-            ..Default::default()
-        };
-        assert_eq!(outcome.reasoning_capability(), "opaque");
-    }
-
-    #[test]
-    fn reasoning_capability_classifies_opaque_from_tool_thought_signature() {
-        // A Gemini-3 tool call carrying a thought_signature is an opaque signal
-        // even when no reasoning text streamed.
-        let outcome = NativeClaudeStreamOutcome {
-            tool_calls: vec![tool_call_with_signature(Some("SIG_ABC"))],
-            saw_message_end: true,
-            ..Default::default()
-        };
-        assert_eq!(outcome.reasoning_capability(), "opaque");
-    }
-
-    #[test]
-    fn reasoning_capability_classifies_none_without_any_signal() {
-        // A tool call with no signature is not a reasoning signal.
-        let outcome = NativeClaudeStreamOutcome {
-            tool_calls: vec![tool_call_with_signature(None)],
-            saw_message_end: true,
-            ..Default::default()
-        };
-        assert_eq!(outcome.reasoning_capability(), "none");
-    }
-
-    #[test]
-    fn reasoning_capability_prefers_streamed_over_opaque() {
-        // Streamed reasoning text wins even when an opaque signal is also present.
-        let outcome = NativeClaudeStreamOutcome {
-            reasoning_text_len: 10,
-            saw_reasoning_signal: true,
-            tool_calls: vec![tool_call_with_signature(Some("SIG"))],
-            saw_message_end: true,
-            ..Default::default()
-        };
-        assert_eq!(outcome.reasoning_capability(), "streamed");
-    }
-
-    #[test]
-    fn parallel_tool_use_replays_every_signature_in_one_assistant_message() {
-        let calls = vec![
-            NativeClaudeToolCall {
-                id: "a".to_string(),
-                name: "read".to_string(),
-                input_json: "{\"file_path\":\"/tmp/a\"}".to_string(),
-                thought_signature: Some("SIG_A".to_string()),
-            },
-            NativeClaudeToolCall {
-                id: "b".to_string(),
-                name: "read".to_string(),
-                input_json: "{\"file_path\":\"/tmp/b\"}".to_string(),
-                thought_signature: Some("SIG_B".to_string()),
-            },
-        ];
-        let assistant = assistant_parallel_tool_uses(&calls);
-        assert!(matches!(assistant.role, Role::Assistant));
-        // One assistant message must carry BOTH tool_use blocks, each with its
-        // own signature preserved.
-        assert_eq!(assistant.content.len(), 2);
-        let sigs: Vec<Option<String>> = assistant
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::ToolUse {
-                    thought_signature, ..
-                } => thought_signature.clone(),
-                other => panic!("expected ToolUse, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            sigs,
-            vec![Some("SIG_A".to_string()), Some("SIG_B".to_string())]
-        );
-
-        // The results message must answer every call with a matching id.
-        let results = parallel_tool_results(&calls);
-        assert!(matches!(results.role, Role::User));
-        assert_eq!(results.content.len(), 2);
-        let ids: Vec<String> = results
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.clone(),
-                other => panic!("expected ToolResult, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
-    }
-}
+#[cfg(test)]
+#[path = "live_provider_probes/opencode_session_header_wire_tests.rs"]
+mod opencode_session_header_wire_tests;
 
 pub async fn run_live_openai_compatible_stream_smoke(
     profile: OpenAiCompatibleProfile,
@@ -394,14 +348,23 @@ pub async fn run_live_openai_compatible_stream_smoke(
         "stream": true,
         "stream_options": {"include_usage": true}
     });
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
-    let response = tokio::time::timeout(smoke_timeout(45), request.send())
-        .await
-        .context("timed out running live stream smoke completion")?
-        .with_context(|| format!("run live {} stream smoke completion", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(45),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} stream smoke completion", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
@@ -509,14 +472,23 @@ pub async fn run_live_openai_compatible_tool_smoke(
     if !resolved.api_base.contains("fptcloud.com") {
         body["tool_choice"] = serde_json::json!("auto");
     }
-    let request = jcode_base::provider::shared_http_client()
-        .post(&url)
-        .json(&body);
-    let request = apply_provider_auth(request, &resolved, api_key);
-    let response = tokio::time::timeout(smoke_timeout(45), request.send())
-        .await
-        .context("timed out running live tool-call smoke completion")?
-        .with_context(|| format!("run live {} tool-call smoke", resolved.display_name))?;
+    let response = send_probe_request(
+        || {
+            let request = jcode_base::provider::shared_http_client()
+                .post(&url)
+                .json(&body);
+            apply_probe_headers(
+                request,
+                &resolved,
+                api_key,
+                &jcode_base::provider_catalog::new_opencode_conversation_id(),
+            )
+        },
+        smoke_timeout(45),
+        3,
+    )
+    .await
+    .with_context(|| format!("run live {} tool-call smoke", resolved.display_name))?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     ensure!(
@@ -669,6 +641,27 @@ struct NativeClaudeStreamOutcome {
     cache_creation: u64,
 }
 
+#[cfg(test)]
+#[test]
+fn borrowed_stop_reason_evidence_matches_legacy_and_retains_source() {
+    for stop_reason in [None, Some(String::new()), Some("end_turn 🦀".to_string())] {
+        let mut outcome = NativeClaudeStreamOutcome {
+            stop_reason,
+            ..Default::default()
+        };
+        let legacy = serde_json::json!(outcome.stop_reason.clone());
+        let evidence = serde_json::json!(outcome.stop_reason);
+        assert_eq!(evidence, legacy);
+        assert_eq!(
+            serde_json::to_vec(&evidence).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        assert_eq!(outcome.stop_reason.as_deref(), legacy.as_str());
+        outcome.stop_reason = Some("changed after serialization".to_string());
+        assert_eq!(evidence, legacy);
+    }
+}
+
 #[derive(Clone)]
 struct NativeClaudeToolCall {
     id: String,
@@ -775,6 +768,13 @@ async fn consume_native_stream(
                     outcome.chunk_count += 1;
                     outcome.text.push_str(&text);
                 }
+                StreamEvent::TextSuffixReplace { old_text, new_text } => {
+                    jcode_base::message::replace_text_suffix(
+                        &mut outcome.text,
+                        &old_text,
+                        &new_text,
+                    );
+                }
                 StreamEvent::ThinkingDelta(text) => {
                     outcome.thinking_chunk_count += 1;
                     outcome.reasoning_text_len += text.len();
@@ -834,6 +834,34 @@ async fn consume_native_stream(
                         tool.thought_signature = Some(signature);
                     }
                 }
+                // Native providers such as Cursor emit a complete tool call in
+                // one event and keep their bidirectional stream open until the
+                // caller sends a result. The production agent loop does that in
+                // app-core; the doctor must do the same at this public boundary
+                // or its live probe will deadlock waiting for MessageEnd.
+                StreamEvent::NativeToolCall {
+                    request_id,
+                    tool_name,
+                    input,
+                } => {
+                    outcome.tool_calls.push(NativeClaudeToolCall {
+                        id: request_id.clone(),
+                        name: tool_name,
+                        input_json: input.to_string(),
+                        thought_signature: None,
+                    });
+                    let sender = provider
+                        .native_result_sender()
+                        .context("native provider emitted a tool call without a result bridge")?;
+                    sender
+                        .send(jcode_base::provider::NativeToolResult::success(
+                            request_id,
+                            "TOOL_RESULT_TOKEN=42. Report this token back to confirm you read it."
+                                .to_string(),
+                        ))
+                        .await
+                        .context("send native provider tool result")?;
+                }
                 StreamEvent::TokenUsage {
                     input_tokens,
                     output_tokens,
@@ -887,7 +915,8 @@ pub async fn run_live_claude_native_smoke(
         content: vec![ContentBlock::Text {
             text: "Reply with exactly AUTH_TEST_OK and nothing else.".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -919,10 +948,7 @@ pub async fn run_live_claude_native_smoke(
     .with_duration_ms(started.elapsed().as_millis() as u64)
     .with_evidence("model", serde_json::json!(model))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -947,7 +973,8 @@ pub async fn run_live_claude_native_stream_smoke(
                    only and do not call any tool."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1017,10 +1044,7 @@ pub async fn run_live_claude_native_stream_smoke(
     )
     .with_evidence("total_events", serde_json::json!(outcome.total_events))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1070,7 +1094,8 @@ pub async fn run_live_claude_native_tool_smoke(
                    Call the tool now; do not answer in text."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1120,7 +1145,8 @@ pub async fn run_live_claude_native_tool_smoke(
             name: tool_call.name.clone(),
             input: parsed_arguments.clone(),
             thought_signature: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     });
@@ -1131,7 +1157,8 @@ pub async fn run_live_claude_native_tool_smoke(
             content: "TOOL_RESULT_TOKEN=42. Report this token back to confirm you read it."
                 .to_string(),
             is_error: Some(false),
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     });
@@ -1215,7 +1242,8 @@ pub async fn run_live_antigravity_native_smoke(
         content: vec![ContentBlock::Text {
             text: "Reply with exactly AUTH_TEST_OK and nothing else.".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1247,10 +1275,7 @@ pub async fn run_live_antigravity_native_smoke(
     .with_duration_ms(started.elapsed().as_millis() as u64)
     .with_evidence("model", serde_json::json!(model))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1275,7 +1300,8 @@ pub async fn run_live_antigravity_native_stream_smoke(
                    only and do not call any tool."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1337,10 +1363,7 @@ pub async fn run_live_antigravity_native_stream_smoke(
     .with_evidence("attempts", serde_json::json!(attempts))
     .with_evidence("total_events", serde_json::json!(outcome.total_events))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1406,7 +1429,8 @@ pub async fn run_live_native_provider_smoke(
         content: vec![ContentBlock::Text {
             text: "Reply with exactly AUTH_TEST_OK and nothing else.".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1438,10 +1462,7 @@ pub async fn run_live_native_provider_smoke(
     .with_duration_ms(started.elapsed().as_millis() as u64)
     .with_evidence("model", serde_json::json!(model))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1467,7 +1488,8 @@ pub async fn run_live_native_provider_stream_smoke(
                    only and do not call any tool."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1529,10 +1551,7 @@ pub async fn run_live_native_provider_stream_smoke(
     .with_evidence("attempts", serde_json::json!(attempts))
     .with_evidence("total_events", serde_json::json!(outcome.total_events))
     .with_evidence("matched_expected_content", serde_json::json!(true))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1576,7 +1595,8 @@ pub async fn run_live_native_provider_reasoning_smoke(
                    its own final line."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1633,10 +1653,7 @@ pub async fn run_live_native_provider_reasoning_smoke(
         serde_json::json!(outcome.saw_reasoning_signal),
     )
     .with_evidence("total_events", serde_json::json!(outcome.total_events))
-    .with_evidence(
-        "stop_reason",
-        serde_json::json!(outcome.stop_reason.clone()),
-    );
+    .with_evidence("stop_reason", serde_json::json!(outcome.stop_reason));
     if let Some(usage) = outcome.usage_evidence() {
         stage = stage.with_evidence("usage", usage);
     }
@@ -1701,7 +1718,8 @@ pub async fn run_live_native_provider_tool_smoke(
                    Call the tool now; do not answer in text."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1788,7 +1806,8 @@ pub async fn run_live_native_provider_tool_smoke(
                    in text first."
                 .to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -1877,7 +1896,8 @@ pub async fn run_live_native_provider_tool_smoke(
                        text and do not wait for the first result before making the second call."
                     .to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         }],
@@ -1904,7 +1924,8 @@ pub async fn run_live_native_provider_tool_smoke(
                            /tmp/auth_tool_probe_2.txt."
                         .to_string(),
                     cache_control: None,
-                }],
+                }]
+                .into(),
                 timestamp: None,
                 tool_duration_ms: None,
             },
@@ -1968,88 +1989,6 @@ pub async fn run_live_native_provider_tool_smoke(
     Ok(stage)
 }
 
-/// Parse a streamed tool-call argument blob into a JSON object (empty object for
-/// a blank payload), shared by the native tool smoke probes.
-fn parse_tool_arguments(input_json: &str) -> serde_json::Value {
-    jcode_base::message::ToolCall::parse_streamed_input_to_object(if input_json.trim().is_empty() {
-        "{}"
-    } else {
-        input_json.trim()
-    })
-}
-
-/// Build the assistant `tool_use` replay block for a captured native tool call,
-/// preserving any provider-emitted `thought_signature` so backends that require
-/// it (Gemini-3 via the Cloud Code/Antigravity runtime) accept the follow-up.
-fn assistant_tool_use(call: &NativeClaudeToolCall, arguments: &serde_json::Value) -> Message {
-    Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            input: arguments.clone(),
-            thought_signature: call.thought_signature.clone(),
-        }],
-        timestamp: None,
-        tool_duration_ms: None,
-    }
-}
-
-/// Build a user turn carrying a synthetic `tool_result` for a captured native
-/// tool call, used to answer each step of the multi-call replay loop.
-fn tool_result_then_text(tool_use_id: &str, result: &str) -> Message {
-    Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.to_string(),
-            content: result.to_string(),
-            is_error: Some(false),
-        }],
-        timestamp: None,
-        tool_duration_ms: None,
-    }
-}
-
-/// Build a single assistant message that replays *every* captured tool call as a
-/// parallel batch (multiple `ToolUse` blocks in one message), each preserving
-/// its own `thought_signature`. This is the shape the parallel-tool-call phase
-/// asserts the backend accepts as one assistant turn carrying N `functionCall`
-/// parts.
-fn assistant_parallel_tool_uses(calls: &[NativeClaudeToolCall]) -> Message {
-    let content = calls
-        .iter()
-        .map(|call| ContentBlock::ToolUse {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            input: parse_tool_arguments(&call.input_json),
-            thought_signature: call.thought_signature.clone(),
-        })
-        .collect();
-    Message {
-        role: Role::Assistant,
-        content,
-        timestamp: None,
-        tool_duration_ms: None,
-    }
-}
-
-/// Build a single user message answering *every* parallel tool call with a
-/// synthetic `tool_result`, so a parallel assistant turn is fully resolved in
-/// one follow-up message.
-fn parallel_tool_results(calls: &[NativeClaudeToolCall]) -> Message {
-    let content = calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| ContentBlock::ToolResult {
-            tool_use_id: call.id.clone(),
-            content: format!("Contents of file {}: token_{index}.", index + 1),
-            is_error: Some(false),
-        })
-        .collect();
-    Message {
-        role: Role::User,
-        content,
-        timestamp: None,
-        tool_duration_ms: None,
-    }
-}
+#[path = "live_provider_probes_tool_replay.rs"]
+mod tool_replay;
+use tool_replay::*;

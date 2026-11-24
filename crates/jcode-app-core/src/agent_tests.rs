@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[path = "agent_tests/cache_session_affinity.rs"]
+mod cache_session_affinity;
+
 #[path = "agent_tests/tool_streaming.rs"]
 mod tool_streaming;
 
@@ -23,12 +26,80 @@ mod desktop_selfdev;
 #[path = "agent_tests/compile_remote.rs"]
 mod compile_remote;
 
+#[path = "agent_tests/mcp_remote_cache.rs"]
+mod mcp_remote_cache;
+
+#[path = "agent_tests/swarm_lifecycle_hooks.rs"]
+mod swarm_lifecycle_hooks;
+
 struct DelayedProvider {
     open_delay: Duration,
     first_event_delay: Duration,
 }
 
 struct NativeAutoCompactionProvider;
+
+struct BoundSavedAccountProvider;
+
+#[async_trait]
+impl Provider for BoundSavedAccountProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        panic!("metadata test must not send a request")
+    }
+    fn name(&self) -> &str {
+        "OpenAI"
+    }
+    fn oauth_account_label(&self) -> Option<String> {
+        Some("work".to_string())
+    }
+    fn active_resolved_credential(&self) -> Option<jcode_provider_core::ResolvedCredential> {
+        Some(jcode_provider_core::ResolvedCredential::Oauth)
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self)
+    }
+}
+
+#[tokio::test]
+async fn saved_account_restore_mismatch_blocks_model_turn() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(home) => crate::env::set_var("JCODE_HOME", home),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut agent = Agent::new(provider, Registry::empty());
+    agent.session.route_api_method = Some("openai-oauth@work".into());
+    let error = agent.ensure_session_lease().unwrap_err().to_string();
+    assert!(error.contains("Saved account 'work' could not be restored"));
+    agent.session.route_api_method = None;
+    agent.session.provider_key = Some("openai-oauth@personal".into());
+    assert!(
+        agent
+            .ensure_session_lease()
+            .unwrap_err()
+            .to_string()
+            .contains("personal")
+    );
+    agent.session.provider_key = Some("openai-oauth".into());
+    assert!(agent.ensure_session_lease().is_ok());
+}
 
 struct NativeCompactionStreamProvider;
 
@@ -218,6 +289,24 @@ fn message_text(message: &Message) -> &str {
     content_text(&message.content)
 }
 
+/// Strip the harness timestamp prefix ("[2026-11-10T10:11:22.472Z] ") that
+/// `features.message_timestamps` puts in front of every message, so a message
+/// can be compared to an expected body exactly.
+///
+/// reference: no prior art, searched the jcode repo for an existing
+/// timestamp-prefix stripper; the prefix is produced by
+/// `Message::with_timestamps` in crates/jcode-message-types, used by the
+/// request assembly in
+/// crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs.
+fn strip_message_timestamp(message: &str) -> &str {
+    if let Some(rest) = message.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[end + 1..].trim_start();
+    }
+    message
+}
+
 #[test]
 fn agent_drop_removes_its_configured_session_tool_policy() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
@@ -390,6 +479,17 @@ impl Provider for NativeAutoCompactionProvider {
     async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
         Ok("manual summary from native-auto provider".to_string())
     }
+
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        system: &str,
+    ) -> Result<(String, jcode_provider_core::SimpleCompletionUsage)> {
+        Ok((
+            self.complete_simple(prompt, system).await?,
+            jcode_provider_core::SimpleCompletionUsage::default(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -444,6 +544,50 @@ impl Provider for NativeCompactionStreamProvider {
 
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(Self)
+    }
+}
+
+#[tokio::test]
+async fn context_limit_recovery_announces_measured_token_counts() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeCompactionStreamProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    for idx in 0..40 {
+        agent.add_message(
+            if idx % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            },
+            vec![ContentBlock::Text {
+                text: format!("message {idx} {}", "x".repeat(4_000)),
+                cache_control: None,
+            }],
+        );
+    }
+
+    assert!(agent.try_auto_compact_after_context_limit("maximum context length exceeded"));
+    match agent.take_recovery_compaction_event() {
+        ServerEvent::Compaction {
+            trigger,
+            pre_tokens,
+            post_tokens,
+            tokens_saved,
+            messages_dropped,
+            ..
+        } => {
+            assert_eq!(trigger, "auto_recovery");
+            let pre = pre_tokens.expect("recovery must report a pre-compaction count");
+            let post = post_tokens.expect("recovery must report a post-compaction count");
+            assert!(
+                post < pre,
+                "recovery should shrink the context ({pre} -> {post})"
+            );
+            assert_eq!(tokens_saved, Some(pre - post));
+            assert!(messages_dropped.is_some_and(|count| count > 0));
+        }
+        other => panic!("expected compaction event, got {other:?}"),
     }
 }
 
@@ -518,6 +662,107 @@ async fn queued_soft_interrupt_images_are_injected_as_image_blocks() {
         &message.content[1],
         ContentBlock::Text { text, .. } if text == "look at this"
     ));
+}
+
+#[tokio::test]
+async fn injected_soft_interrupts_report_client_ids_per_group_in_queue_order() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+
+    let user = SoftInterruptSource::User;
+    agent.queue_soft_interrupt_with_id("one".into(), vec![], false, user, Some("f1".into()));
+    agent.queue_soft_interrupt_with_id("anon".into(), vec![], false, user, None);
+    agent.queue_soft_interrupt_with_id("two".into(), vec![], false, user, Some("f2".into()));
+    agent.queue_soft_interrupt(
+        "[Background Task Completed]".into(),
+        vec![],
+        false,
+        SoftInterruptSource::BackgroundTask,
+    );
+    agent.queue_soft_interrupt_with_id("three".into(), vec![], false, user, Some("f3".into()));
+
+    let injected = agent.inject_soft_interrupts();
+    let events = Agent::build_soft_interrupt_events(injected, "D", None);
+    let summary: Vec<(String, Vec<String>)> = events
+        .into_iter()
+        .map(|event| match event {
+            ServerEvent::SoftInterruptInjected {
+                content,
+                client_ids,
+                ..
+            } => (content, client_ids),
+            other => panic!("unexpected event {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (
+                "one\n\nanon\n\ntwo".to_string(),
+                vec!["f1".into(), "f2".into()]
+            ),
+            ("[Background Task Completed]".to_string(), vec![]),
+            ("three".to_string(), vec!["f3".into()]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn file_activity_interrupt_keeps_typed_identity_without_model_prefix() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+    let content = "moss edited src/parser.rs +3-1: fix parser";
+    agent.queue_soft_interrupt(
+        content.into(),
+        vec![],
+        false,
+        SoftInterruptSource::FileActivity,
+    );
+    let injected = agent.inject_soft_interrupts();
+    let stored = agent.session.messages.last().unwrap();
+    assert_eq!(
+        stored.display_role,
+        Some(crate::session::StoredDisplayRole::FileActivity)
+    );
+    assert!(matches!(&stored.content[0], ContentBlock::Text { text, .. } if text == content));
+    let events = Agent::build_soft_interrupt_events(injected, "D", None);
+    assert!(
+        matches!(&events[0], ServerEvent::SoftInterruptInjected { content: text, display_role: Some(role), .. }
+        if text == content && role == "file_activity")
+    );
+}
+
+#[tokio::test]
+async fn adjacent_notifications_each_emit_a_delivery_event() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = Agent::new(provider, registry);
+    for source in [
+        SoftInterruptSource::System,
+        SoftInterruptSource::BackgroundTask,
+    ] {
+        for content in ["first notice", "second notice"] {
+            agent.queue_soft_interrupt(content.into(), vec![], false, source);
+        }
+    }
+    let injected = agent.inject_soft_interrupts();
+    let events = Agent::build_soft_interrupt_events(injected, "D", None);
+    assert_eq!(events.len(), 4);
+    for (event, expected) in events.iter().zip([
+        "first notice",
+        "second notice",
+        "first notice",
+        "second notice",
+    ]) {
+        assert!(
+            matches!(event, ServerEvent::SoftInterruptInjected { content, .. } if content == expected)
+        );
+    }
 }
 
 #[tokio::test]
@@ -613,6 +858,8 @@ async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset(
         if let ServerEvent::Compaction {
             trigger,
             pre_tokens,
+            post_tokens,
+            tokens_saved,
             messages_compacted,
             ..
         } = event
@@ -623,6 +870,12 @@ async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset(
                 Some(80_000),
                 "remote compaction must forward the provider's pre-compaction count"
             );
+            let post = post_tokens.expect("native compaction must report an estimated post count");
+            assert!(
+                post < 80_000,
+                "post count should reflect the compacted context"
+            );
+            assert_eq!(tokens_saved, Some(80_000 - post));
             assert!(
                 messages_compacted.is_some_and(|count| count > 0),
                 "native compaction should report a non-empty compacted prefix"
@@ -729,6 +982,93 @@ async fn run_turn_streaming_mpsc_emits_model_changed_on_midstream_switch() {
         Some("claude-opus-4-8"),
         "expected a ModelChanged event resyncing to the served model"
     );
+}
+
+struct MidStreamAccountSwitchProvider {
+    switched: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Provider for MidStreamAccountSwitchProvider {
+    async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+        resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        self.switched
+            .store(true, std::sync::atomic::Ordering::Release);
+        MidStreamModelSwitchProvider {
+            model: std::sync::Mutex::new(self.model()),
+            switch_to: self.model(),
+        }
+        .complete(messages, tools, system, resume_session_id)
+        .await
+    }
+
+    fn name(&self) -> &str {
+        "claude"
+    }
+
+    fn model(&self) -> String {
+        "same-model".to_string()
+    }
+
+    fn oauth_account_label(&self) -> Option<String> {
+        Some(
+            if self.switched.load(std::sync::atomic::Ordering::Acquire) {
+                "personal"
+            } else {
+                "work"
+            }
+            .to_string(),
+        )
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            switched: std::sync::atomic::AtomicBool::new(
+                self.switched.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        })
+    }
+}
+
+#[tokio::test]
+async fn run_turn_streaming_mpsc_emits_account_only_change_without_email() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(MidStreamAccountSwitchProvider {
+        switched: std::sync::atomic::AtomicBool::new(false),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "test".to_string(),
+            cache_control: None,
+        }],
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn_streaming_mpsc(tx).await.unwrap();
+    let mut labels = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::ModelChanged {
+            model,
+            provider_oauth_account_label,
+            provider_oauth_email,
+            error,
+            ..
+        } = event
+        {
+            assert_eq!(model, "same-model");
+            assert!(provider_oauth_email.is_none());
+            assert!(error.is_none());
+            labels.push(provider_oauth_account_label);
+        }
+    }
+    assert_eq!(labels, vec![Some("personal".to_string())]);
 }
 
 #[tokio::test]
@@ -1156,7 +1496,6 @@ fn seed_transient_session_state(agent: &mut Agent) {
     agent.tool_output_scan_index = 7;
     agent.last_upstream_provider = Some("upstream_old".to_string());
     agent.last_connection_type = Some("websocket".to_string());
-    agent.current_turn_system_reminder = Some("reminder".to_string());
     agent.last_usage = TokenUsage {
         input_tokens: 11,
         output_tokens: 17,
@@ -1194,7 +1533,6 @@ async fn clear_resets_runtime_interrupt_and_queue_state() {
     assert_eq!(agent.tool_output_scan_index, 0);
     assert!(agent.last_upstream_provider.is_none());
     assert!(agent.last_connection_type.is_none());
-    assert!(agent.current_turn_system_reminder.is_none());
     assert_eq!(agent.last_usage.input_tokens, 0);
     assert_eq!(agent.last_usage.output_tokens, 0);
     assert!(agent.locked_tools.is_none());
@@ -1236,7 +1574,6 @@ async fn restore_session_resets_runtime_interrupt_and_queue_state() {
     assert_eq!(agent.tool_output_scan_index, 0);
     assert!(agent.last_upstream_provider.is_none());
     assert!(agent.last_connection_type.is_none());
-    assert!(agent.current_turn_system_reminder.is_none());
     assert_eq!(agent.last_usage.input_tokens, 0);
     assert_eq!(agent.last_usage.output_tokens, 0);
     assert!(agent.locked_tools.is_none());
@@ -1278,6 +1615,121 @@ async fn explicit_provider_pin_is_persisted_and_reapplied_on_restore() {
         ["openrouter:z-ai/glm-5.2@Novita"]
     );
     assert_eq!(restored_agent.provider_model(), "z-ai/glm-5.2@Novita");
+}
+
+// reference: no prior art for this regression test, searched this repo for an
+// existing instance-scoped provider-identity test (crates/jcode-base/src/
+// session_tests/provider_identity_tests.rs covers the env-derived key only) and
+// the Rust trait-object dispatch guidance at
+// https://siddharthqs.com/design-patterns-in-rust (dynamic dispatch through a
+// trait object; avoid global mutable state).
+#[derive(Clone)]
+struct InstanceProfileProvider {
+    model: String,
+    profile_id: Option<String>,
+}
+
+impl InstanceProfileProvider {
+    fn new(model: &str, profile_id: Option<&str>) -> Self {
+        Self {
+            model: model.to_string(),
+            profile_id: profile_id.map(str::to_string),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for InstanceProfileProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unreachable!("InstanceProfileProvider does not complete requests")
+    }
+
+    fn name(&self) -> &str {
+        "openrouter"
+    }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        self.profile_id.clone()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Regression: a session's persisted `provider_key` must come from the runtime
+/// INSTANCE, not from process-global env state.
+///
+/// A named provider profile's constructor sets `JCODE_OPENROUTER_CACHE_NAMESPACE`
+/// process-wide. When a swarm worker ran on the `nous-free` profile, an ambient
+/// cycle created right after it inherited that namespace and persisted
+/// `provider_key=nous-free` while its model was `MiniMax-M3.1-Flash` (the
+/// minimax profile's model). The two were never cross-checked, so the persisted
+/// pair named two different providers.
+///
+/// Before the fix this session would persist `provider_key=nous-free`.
+#[tokio::test]
+async fn new_session_provider_key_uses_instance_profile_not_process_env_namespace() {
+    let _guard = crate::storage::lock_test_env();
+
+    // Simulate the pollution left behind by another session's model switch to
+    // the `nous-free` named profile.
+    let previous_namespace = std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE").ok();
+    let previous_runtime = std::env::var("JCODE_RUNTIME_PROVIDER").ok();
+    crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "nous-free");
+    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-compatible");
+
+    // The runtime instance actually serves the minimax profile.
+    let provider: Arc<dyn Provider> =
+        Arc::new(InstanceProfileProvider::new("MiniMax-M3.1-Flash", Some("minimax")));
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Agent::new(provider, registry);
+
+    assert_eq!(
+        agent.session_provider_key().as_deref(),
+        Some("minimax"),
+        "the session must persist the profile its own runtime serves, not the \
+         process-global namespace another session left behind"
+    );
+    assert_eq!(agent.session.model.as_deref(), Some("MiniMax-M3.1-Flash"));
+
+    // Negative control: a runtime that serves NO direct OpenAI-compatible
+    // profile must not invent one, and must keep the previous fallback.
+    //
+    // The pollution is cleared FIRST, so the control measures the fallback
+    // path in isolation instead of re-observing the same dirty namespace.
+    crate::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
+    let plain: Arc<dyn Provider> =
+        Arc::new(InstanceProfileProvider::new("anthropic/claude-sonnet-4", None));
+    let plain_registry = Registry::new(plain.clone()).await;
+    let plain_agent = Agent::new(plain, plain_registry);
+    assert_eq!(
+        plain_agent.session_provider_key().as_deref(),
+        Some("openrouter"),
+        "a runtime without a direct profile must keep the previous fallback"
+    );
+
+    if let Some(value) = previous_namespace {
+        crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", value);
+    } else {
+        crate::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    }
+    if let Some(value) = previous_runtime {
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", value);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
+    }
 }
 
 #[tokio::test]
@@ -1324,7 +1776,7 @@ async fn restore_session_rehydrates_injected_memory_ids() {
 }
 
 #[tokio::test]
-async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop() {
+async fn build_memory_prompt_nonblocking_delivers_pending_memory_without_waiting_for_a_user_turn() {
     let _guard = crate::storage::lock_test_env();
     struct RestoreMemoryHome(Option<std::ffi::OsString>);
     impl Drop for RestoreMemoryHome {
@@ -1379,29 +1831,40 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
                 thought_signature: None,
-            }],
+            }]
+            .into(),
             timestamp: Some(chrono::Utc::now()),
             tool_duration_ms: None,
         },
         Message::tool_result("call_1", "ok", false),
     ];
 
+    // A tool loop is NOT a fresh user turn, but the payload must still be
+    // delivered on the next provider iteration. MEASURED 2026-11-04: the
+    // recall is prepared in the background, so a payload raised during
+    // autonomous tool work used to sit in the queue until the user spoke
+    // again - the agent worked for hours without the memory it had already
+    // fetched. Commit db2d92148 changed the contract from "only at a fresh
+    // user turn" to "on every provider iteration"; this test pins the CURRENT
+    // contract, not the superseded one.
     let pending = agent.build_memory_prompt_nonblocking(&tool_loop_messages, None);
-    assert!(pending.is_none(), "memory should not inject mid tool loop");
-    assert!(crate::memory::has_pending_memory(&session_id));
-    assert!(!crate::memory::is_memory_injected(&session_id, &entry.id));
-
-    let next_turn_messages = vec![Message::user("follow up")];
-    let pending = agent.build_memory_prompt_nonblocking(&next_turn_messages, None);
     assert!(
         pending.is_some(),
-        "memory should inject on the next real user turn"
+        "pending memory must be delivered mid tool loop, not deferred to the next user turn"
     );
     let pending = pending.unwrap();
     assert_eq!(pending.prompt, prompt);
     assert_eq!(pending.memory_ids, vec![entry.id.clone()]);
-    assert!(crate::memory::is_memory_injected(&session_id, &entry.id));
+    // Consumed exactly once: the payload is out of the queue and the
+    // memories are recorded as injected.
     assert!(!crate::memory::has_pending_memory(&session_id));
+    assert!(crate::memory::is_memory_injected(&session_id, &entry.id));
+    // A second iteration must not deliver it again.
+    assert!(
+        agent.build_memory_prompt_nonblocking(&tool_loop_messages, None)
+            .is_none(),
+        "a consumed payload must not be delivered twice"
+    );
 
     crate::memory::clear_all_pending_memory();
 }
@@ -1539,7 +2002,8 @@ async fn env_snapshot_detail_is_minimal_for_empty_sessions_and_full_after_histor
             content: vec![ContentBlock::Text {
                 text: "hello".to_string(),
                 cache_control: None,
-            }],
+            }]
+            .into(),
             display_role: None,
             timestamp: None,
             tool_duration_ms: None,
@@ -1604,19 +2068,39 @@ impl crate::tool::Tool for VerboseFakeMcpTool {
 }
 
 async fn register_fake_deferred_mcp_surface(registry: &Registry) {
-    for name in ["mcp_search", "mcp_call"] {
-        registry
-            .register(
-                name.to_string(),
-                Arc::new(FakeMcpTool {
-                    name: name.to_string(),
-                }) as Arc<dyn crate::tool::Tool>,
-            )
-            .await;
-    }
+    let manager = Arc::new(tokio::sync::RwLock::new(
+        crate::mcp::McpManager::with_config(Default::default()),
+    ));
+    registry
+        .register(
+            "mcp".into(),
+            Arc::new(
+                crate::tool::mcp::McpManagementTool::new(manager.clone())
+                    .with_registry(registry.clone()),
+            ),
+        )
+        .await;
+    registry
+        .register(
+            "mcp_search".into(),
+            Arc::new(
+                crate::tool::mcp::McpSearchTool::new(manager.clone())
+                    .with_registry(registry.clone()),
+            ),
+        )
+        .await;
+    registry
+        .register(
+            "mcp_call".into(),
+            Arc::new(crate::tool::mcp::McpCallTool::new(manager).with_registry(registry.clone())),
+        )
+        .await;
 }
 
-async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, threshold: usize) -> Agent {
+async fn agent_with_fake_mcp_surface(
+    mode: crate::config::McpToolsMode,
+    _threshold: usize,
+) -> Agent {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
@@ -1631,7 +2115,6 @@ async fn agent_with_fake_mcp_surface(mode: crate::config::McpToolsMode, threshol
         .await;
     let mut agent = Agent::new(provider, registry);
     agent.mcp_tools_mode = mode;
-    agent.mcp_tools_token_threshold = threshold;
     agent
 }
 
@@ -1659,22 +2142,30 @@ async fn mcp_exposure_modes_select_eager_or_fixed_definitions() {
         .map(|tool| tool.name)
         .collect();
     assert!(!deferred_names.iter().any(|name| name.starts_with("mcp__")));
-    assert!(deferred_names.iter().any(|name| name == "mcp_search"));
-    assert!(deferred_names.iter().any(|name| name == "mcp_call"));
+    assert!(deferred_names.iter().any(|name| name == "mcp"));
+    assert!(
+        !deferred_names
+            .iter()
+            .any(|name| name == "mcp_search" || name == "mcp_call")
+    );
 
-    let mut auto_eager =
+    // `auto` never exposes per-server definitions on providers without
+    // native deferred loading, even for a tiny catalog: any later change to
+    // that list would bust the whole prompt cache.
+    let mut auto_small =
         agent_with_fake_mcp_surface(crate::config::McpToolsMode::Auto, usize::MAX).await;
-    let auto_eager_names: Vec<String> = auto_eager
+    let auto_small_names: Vec<String> = auto_small
         .tool_definitions()
         .await
         .into_iter()
         .map(|tool| tool.name)
         .collect();
     assert!(
-        auto_eager_names
+        !auto_small_names
             .iter()
-            .any(|name| name == "mcp__test__verbose")
+            .any(|name| name.starts_with("mcp__"))
     );
+    assert!(auto_small_names.iter().any(|name| name == "mcp"));
 
     let mut auto_deferred = agent_with_fake_mcp_surface(crate::config::McpToolsMode::Auto, 1).await;
     let auto_deferred_names: Vec<String> = auto_deferred
@@ -1688,8 +2179,7 @@ async fn mcp_exposure_modes_select_eager_or_fixed_definitions() {
             .iter()
             .any(|name| name.starts_with("mcp__"))
     );
-    assert!(auto_deferred_names.iter().any(|name| name == "mcp_search"));
-    assert!(auto_deferred_names.iter().any(|name| name == "mcp_call"));
+    assert!(auto_deferred_names.iter().any(|name| name == "mcp"));
     let stable_auto_names: Vec<String> = auto_deferred
         .tool_definitions()
         .await
@@ -1740,17 +2230,16 @@ async fn deferred_mcp_surface_ignores_late_per_tool_registration() {
 }
 
 #[tokio::test]
-async fn auto_mode_rechecks_late_mcp_definitions_before_deferring() {
+async fn auto_mode_never_changes_the_tool_list_for_late_mcp_tools() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     register_fake_deferred_mcp_surface(&registry).await;
     let mut agent = Agent::new(provider, registry);
     agent.mcp_tools_mode = crate::config::McpToolsMode::Auto;
-    agent.mcp_tools_token_threshold = 1;
 
     let before = agent.tool_definitions().await;
-    assert!(!before.iter().any(|tool| tool.name == "mcp_search"));
+    assert!(before.iter().any(|tool| tool.name == "mcp"));
     agent
         .registry
         .register(
@@ -1761,11 +2250,14 @@ async fn auto_mode_rechecks_late_mcp_definitions_before_deferring() {
             }) as Arc<dyn crate::tool::Tool>,
         )
         .await;
+    agent.unlock_tools_if_needed("mcp");
 
     let after = agent.tool_definitions().await;
-    assert!(after.iter().any(|tool| tool.name == "mcp_search"));
-    assert!(after.iter().any(|tool| tool.name == "mcp_call"));
-    assert!(!after.iter().any(|tool| tool.name.starts_with("mcp__")));
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&after).unwrap(),
+        "late MCP registration and the mcp tool must not change the cached tool list"
+    );
     assert!(agent.mcp_late_register_resolved);
 }
 
@@ -1781,6 +2273,9 @@ async fn mcp_tools_registered_after_lock_are_visible_to_agent() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     // First turn locks the snapshot (this is what happens before the async MCP
     // registration spawn completes).
@@ -1843,6 +2338,9 @@ async fn mcp_late_registration_rebuild_happens_at_most_once() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     // First turn locks the snapshot with no MCP tools yet.
     let _ = agent.tool_definitions().await;
@@ -1915,6 +2413,9 @@ async fn tool_snapshot_is_stable_without_new_mcp_tools() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // The late-registration rebuild (#206) only exists in explicit eager
+    // mode; every other mode keeps the tool list fixed for cache stability.
+    agent.mcp_tools_mode = crate::config::McpToolsMode::Eager;
 
     let first = agent.tool_definitions().await;
     // Register a NON-mcp tool after locking — this should NOT trigger a rebuild,
@@ -1981,6 +2482,15 @@ fn output_budget_truncation_requests_a_continuation() {
     // An absent reason is the pre-fix wire behaviour: it cannot be recovered
     // from, which is precisely why MessageEnd must forward the real reason.
     assert!(!Agent::should_continue_after_stop_reason(""));
+}
+
+#[test]
+fn anthropic_pause_turn_is_resumed() {
+    // Long server-tool (web search) turns stop with `pause_turn`; the turn
+    // must be resent to continue rather than treated as finished.
+    assert!(Agent::should_continue_after_stop_reason("pause_turn"));
+    assert!(Agent::is_pause_turn_stop_reason(" PAUSE_TURN "));
+    assert!(!Agent::is_pause_turn_stop_reason("max_tokens"));
 }
 
 #[test]
@@ -2298,10 +2808,13 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
     );
 }
 
+#[path = "agent_tests/system_prompt_reminder.rs"]
+mod system_prompt_reminder;
+
 #[derive(Clone, Default)]
 struct FableGuardrailProvider {
     calls: Arc<std::sync::Mutex<usize>>,
-    prompts_seen: Arc<std::sync::Mutex<Vec<String>>>,
+    prompts_seen: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
 }
 
 #[async_trait]
@@ -2319,12 +2832,43 @@ impl Provider for FableGuardrailProvider {
             *calls
         };
         if call > 1 {
-            let prompt = messages
-                .last()
-                .map(message_text)
-                .unwrap_or_default()
-                .to_string();
-            self.prompts_seen.lock().unwrap().push(prompt);
+            // Capture each user-role message SEPARATELY. MEASURED 2026-11-10:
+            // the harness can append an ephemeral message AFTER the
+            // reconsideration prompt (a memory injection, a plan-limit notice),
+            // so the reconsideration prompt is not necessarily the last message
+            // of the request. Asserting on `messages.last()` made this test
+            // depend on the user's `features.memory` setting.
+            //
+            // The messages are kept SEPARATE rather than joined, so the
+            // assertions below can require an EXACT match against the staged
+            // prompt. A joined blob would let a recalled memory that merely
+            // paraphrases the prompt satisfy a `contains` check, and the test
+            // would pass without the guardrail ever receiving the prompt.
+            //
+            // reference: no prior art, searched the jcode repo for an existing
+            // multi-message capture helper; the request assembly that makes
+            // this necessary is the `messages_with_memory` / `stamped` /
+            // `send_messages` chain in
+            // crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs.
+            let mut user_texts = Vec::new();
+            for message in messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+            {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    user_texts.push(text);
+                }
+            }
+            self.prompts_seen.lock().unwrap().push(user_texts);
         }
 
         let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(4);
@@ -2373,6 +2917,10 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
     let provider: Arc<dyn Provider> = Arc::new(fable);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider, registry);
+    // This test exercises the guardrail recovery path, not memory. Leaving
+    // memory on makes the result depend on the user's `features.memory`
+    // setting and on whatever the background recall happens to have queued.
+    agent.memory_enabled = false;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent
@@ -2390,9 +2938,28 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
     assert_eq!(*calls.lock().unwrap(), 4);
     let prompts = prompts_seen.lock().unwrap();
     assert_eq!(prompts.len(), 3);
-    assert!(prompts[0].contains("concrete harmful action"));
-    assert!(prompts[1].contains("safe portions"));
-    assert!(prompts[2].contains("final, independent policy check"));
+    // Each reconsideration request carried the matching staged prompt as its
+    // OWN user message. The match is EXACT, not a substring search: a recalled
+    // memory that paraphrases the prompt must not be able to satisfy it.
+    //
+    // The harness may prefix every message with a timestamp
+    // ("[2026-11-10T10:11:22.472Z] <text>") when `features.message_timestamps`
+    // is on, so the prefix is stripped before the exact comparison.
+    let suite = Agent::FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS;
+    for (index, expected) in suite.iter().enumerate() {
+        assert!(
+            prompts[index]
+                .iter()
+                .any(|message| strip_message_timestamp(message) == *expected),
+            "request {} must carry the staged reconsideration prompt verbatim, got: {:?}",
+            index + 2,
+            prompts[index]
+        );
+    }
+    // And the staged prompts are distinct, so a wrong prompt cannot satisfy
+    // the wrong slot.
+    assert_ne!(suite[0], suite[1]);
+    assert_ne!(suite[1], suite[2]);
     assert!(
         text.contains("Reconsidered and completed safely"),
         "{text:?}"
@@ -2412,6 +2979,7 @@ async fn sdk_custom_compile_remote_schema_survives_locked_refresh() {
         crate::protocol::SessionToolConfig {
             enabled: Some(vec![]),
             disabled: vec![],
+            system_prompt_append: None,
             custom: vec![crate::protocol::SessionToolDefinition {
                 name: "compile_remote".into(),
                 description: "SDK override".into(),
@@ -2477,145 +3045,151 @@ fn system_prompt_override_restores_and_does_not_leak_across_sessions() {
     }
 }
 
-/// Test provider advertising provider-native deferred tool loading.
-struct NativeDeferredToolsProvider;
-
-#[async_trait]
-impl Provider for NativeDeferredToolsProvider {
-    async fn complete(
-        &self,
-        _messages: &[Message],
-        _tools: &[ToolDefinition],
-        _system: &str,
-        _resume_session_id: Option<&str>,
-    ) -> Result<EventStream> {
-        let (_tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(1);
-        Ok(Box::pin(ReceiverStream::new(rx)))
-    }
-
-    fn name(&self) -> &str {
-        "claude"
-    }
-
-    fn supports_deferred_tools(&self) -> bool {
-        true
-    }
-
-    fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(Self)
-    }
-}
-
-async fn native_deferred_agent(mode: crate::config::McpToolsMode) -> Agent {
-    let provider: Arc<dyn Provider> = Arc::new(NativeDeferredToolsProvider);
-    let registry = Registry::new(provider.clone()).await;
-    register_fake_deferred_mcp_surface(&registry).await;
-    let mut agent = Agent::new(provider, registry);
-    agent.mcp_tools_mode = mode;
-    agent.mcp_tools_token_threshold = 1;
-    agent
-}
-
-fn eager_names(tools: &[ToolDefinition]) -> Vec<String> {
-    tools
-        .iter()
-        .filter(|t| !t.defer_loading)
-        .map(|t| t.name.clone())
-        .collect()
-}
-
-/// With provider-native deferred loading, MCP tools registering after the
-/// first turn (async connect, `mcp connect`, reconnect) only extend the
-/// deferred set. The eager, cached prefix must be byte-identical and the
-/// cache tracker must not be reset.
-#[tokio::test]
-async fn native_deferred_mcp_late_registration_keeps_eager_prefix() {
-    let _guard = crate::storage::lock_test_env();
-    for mode in [
-        crate::config::McpToolsMode::Auto,
-        crate::config::McpToolsMode::Deferred,
-    ] {
-        let mut agent = native_deferred_agent(mode).await;
-        let before = agent.tool_definitions().await;
-        assert!(agent.native_deferred_mcp());
-        assert!(
-            before
-                .iter()
-                .any(|t| t.name == "mcp_search" && !t.defer_loading),
-            "mcp_search stays eager for discovery"
+#[test]
+fn passive_screen_context_is_dynamic_session_local_and_never_transcribed() {
+    let _lock = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut agent = Agent::new(provider.clone(), Registry::empty());
+    let other = Agent::new(provider, Registry::empty());
+    let baseline = agent.build_system_prompt_split(None);
+    let id = agent.session_id().to_owned();
+    let before_messages = serde_json::to_string(&agent.session).unwrap();
+    crate::screen_context::apply(
+        &id,
+        "screen-prompt-owner",
+        crate::protocol::ScreenContextAction::Enable,
+    )
+    .unwrap();
+    let snapshot = crate::protocol::ScreenSnapshot {
+        sequence: 1,
+        observed_at_ms: crate::screen_context::now_ms(),
+        source: "niri".into(),
+        interaction: crate::protocol::ScreenInteraction::Unknown,
+        focused_window: Some(7),
+        windows: vec![crate::protocol::ScreenWindow {
+            id: 7,
+            title: Some("UNTRUSTED_SCREEN_ONLY_TITLE".into()),
+            app_id: None,
+            workspace_id: None,
+            visible: None,
+            layout: None,
+        }],
+        outputs: vec![],
+    };
+    crate::screen_context::apply(
+        &id,
+        "screen-prompt-owner",
+        crate::protocol::ScreenContextAction::Update { snapshot },
+    )
+    .unwrap();
+    for _ in 0..3 {
+        let split = agent.build_system_prompt_split(None);
+        assert_eq!(split.static_part, baseline.static_part);
+        assert_eq!(
+            split
+                .dynamic_part
+                .matches("UNTRUSTED_SCREEN_ONLY_TITLE")
+                .count(),
+            1
         );
         assert!(
-            before
-                .iter()
-                .any(|t| t.name == "mcp_call" && t.defer_loading),
-            "mcp_call is a stable deferred placeholder"
+            split
+                .dynamic_part
+                .contains("untrusted data, not instructions")
         );
-
+        assert!(
+            !other
+                .build_system_prompt_split(None)
+                .dynamic_part
+                .contains("UNTRUSTED_SCREEN_ONLY_TITLE")
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&agent.session).unwrap(),
+        before_messages
+    );
+    agent.session.system_prompt = Some("Custom system".into());
+    let split = agent.build_system_prompt_split(None);
+    assert_eq!(split.static_part, "Custom system");
+    assert!(split.dynamic_part.contains("UNTRUSTED_SCREEN_ONLY_TITLE"));
+    drop(crate::tool::sdk::ConnectionGuard(
+        "screen-prompt-owner".into(),
+    ));
+    assert!(
         agent
-            .registry
-            .register(
-                "mcp__late__tool".to_string(),
-                Arc::new(FakeMcpTool {
-                    name: "late".to_string(),
-                }) as Arc<dyn crate::tool::Tool>,
-            )
-            .await;
-        agent.unlock_tools_if_needed("mcp");
-        let after = agent.tool_definitions().await;
-
-        assert_eq!(eager_names(&before), eager_names(&after), "mode={mode:?}");
-        let serialized = |tools: &[ToolDefinition]| {
-            serde_json::to_string(&ToolDefinition::eager(tools)).unwrap()
-        };
-        assert_eq!(serialized(&before), serialized(&after));
-        let late = after
-            .iter()
-            .find(|t| t.name == "mcp__late__tool")
-            .expect("late MCP tool is offered to the provider");
-        assert!(late.defer_loading, "late MCP tools are deferred");
-        assert!(agent.locked_tools.is_some(), "eager snapshot stays locked");
-    }
-}
-
-#[tokio::test]
-async fn eager_mode_ignores_native_deferred_support() {
-    let _guard = crate::storage::lock_test_env();
-    let mut agent = native_deferred_agent(crate::config::McpToolsMode::Eager).await;
-    agent
-        .registry
-        .register(
-            "mcp__srv__tool".to_string(),
-            Arc::new(FakeMcpTool {
-                name: "tool".to_string(),
-            }) as Arc<dyn crate::tool::Tool>,
-        )
-        .await;
-    let tools = agent.tool_definitions().await;
-    assert!(!agent.native_deferred_mcp());
-    assert!(tools.iter().all(|t| !t.defer_loading));
-    assert!(tools.iter().any(|t| t.name == "mcp__srv__tool"));
+            .build_system_prompt_split(None)
+            .dynamic_part
+            .is_empty()
+    );
 }
 
 #[test]
-fn tool_reference_metadata_becomes_reference_blocks() {
-    let output = ToolOutput::new("found").with_metadata(serde_json::json!({
-        "tool_references": ["mcp__a__x", "mcp__b__y"],
-    }));
-    let blocks = tool_output_to_content_blocks("call_9".to_string(), output);
-    assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
-    let refs: Vec<(&str, &str)> = blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::ToolReference {
-                tool_use_id,
-                tool_name,
-            } => Some((tool_use_id.as_str(), tool_name.as_str())),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(refs, vec![("call_9", "mcp__a__x"), ("call_9", "mcp__b__y")]);
+fn sdk_system_prompt_append_is_session_local_static_and_cleared() {
+    let _lock = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut agent = Agent::new(provider.clone(), Registry::empty());
+    let other = Agent::new(provider, Registry::empty());
+    let baseline = agent.build_system_prompt_split(None);
+    let other_baseline = other.build_system_prompt_split(None).static_part;
+    let id = agent.session_id().to_owned();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let suffix = "Unique SDK session instructions";
+    let configure = || {
+        crate::tool::sdk::configure(
+            &id,
+            "prompt-agent-owner",
+            crate::protocol::SessionToolConfig {
+                system_prompt_append: Some(suffix.into()),
+                ..Default::default()
+            },
+            tx.clone(),
+        )
+        .unwrap();
+    };
+    configure();
+    for _ in 0..3 {
+        let split = agent.build_system_prompt_split(None);
+        assert_eq!(
+            split.static_part,
+            format!("{}\n\n{suffix}", baseline.static_part)
+        );
+        assert_eq!(split.static_part.matches(suffix).count(), 1);
+        assert_eq!(split.dynamic_part, baseline.dynamic_part);
+    }
+    assert_eq!(
+        other.build_system_prompt_split(None).static_part,
+        other_baseline
+    );
+    assert!(agent.session.system_prompt.is_none());
+    assert!(
+        !serde_json::to_string(&agent.session)
+            .unwrap()
+            .contains(suffix)
+    );
+    agent.session.system_prompt = Some("Explicit override".into());
+    let split = agent.build_system_prompt_split(Some("do not add memory to override"));
+    assert_eq!(split.static_part, format!("Explicit override\n\n{suffix}"));
+    assert!(split.dynamic_part.is_empty());
+    agent.session.system_prompt = Some(String::new());
+    assert_eq!(agent.build_system_prompt_split(None).static_part, suffix);
+    agent.session.system_prompt = None;
+    crate::tool::sdk::configure(&id, "prompt-agent-owner", Default::default(), tx.clone()).unwrap();
+    assert_eq!(
+        agent.build_system_prompt_split(None).static_part,
+        baseline.static_part
+    );
+    configure();
+    drop(crate::tool::sdk::ConnectionGuard(
+        "prompt-agent-owner".into(),
+    ));
+    assert!(crate::tool::sdk::config(&id).is_none());
+    assert_eq!(
+        agent.build_system_prompt_split(None).static_part,
+        baseline.static_part
+    );
 }
 
+/// Test provider advertising provider-native deferred tool loading.
 /// Provider whose deferred-loading capability can flip, like a mid-session
 /// switch between Claude and a non-native route.
 struct SwitchableDeferredProvider(Arc<std::sync::atomic::AtomicBool>);
@@ -2646,34 +3220,251 @@ impl Provider for SwitchableDeferredProvider {
     }
 }
 
-#[tokio::test]
-async fn switching_away_from_native_deferred_restores_mcp_fallback_surface() {
-    let _guard = crate::storage::lock_test_env();
-    let native = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let provider: Arc<dyn Provider> = Arc::new(SwitchableDeferredProvider(Arc::clone(&native)));
-    let registry = Registry::new(provider.clone()).await;
-    register_fake_deferred_mcp_surface(&registry).await;
-    let mut agent = Agent::new(provider, registry);
-    agent.mcp_tools_mode = crate::config::McpToolsMode::Deferred;
-
-    let on_native = agent.tool_definitions().await;
-    assert!(
-        on_native
-            .iter()
-            .any(|t| t.name == "mcp_call" && t.defer_loading)
-    );
-
-    native.store(false, std::sync::atomic::Ordering::SeqCst);
-    let fallback = agent.tool_definitions().await;
-    assert!(
-        fallback
-            .iter()
-            .any(|t| t.name == "mcp_call" && !t.defer_loading),
-        "non-native provider must get an eager mcp_call"
-    );
-    assert!(fallback.iter().all(|t| !t.defer_loading));
-
-    native.store(true, std::sync::atomic::Ordering::SeqCst);
-    let back = agent.tool_definitions().await;
-    assert!(back.iter().any(|t| t.name == "mcp_call" && t.defer_loading));
+fn transcript_texts(agent: &Agent) -> Vec<String> {
+    agent
+        .session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
+
+#[path = "agent_tests/deferred_tools.rs"]
+mod deferred_tools;
+
+#[test]
+fn skill_installed_mid_session_keeps_system_prompt_stable_and_is_announced_once() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => crate::env::set_var("JCODE_HOME", home),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let project = tempfile::tempdir().unwrap();
+    let write_skill = |name: &str, description: &str| {
+        let dir = project.path().join(".jcode/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\nBody of {name}.\n"),
+        )
+        .unwrap();
+    };
+    write_skill("early-skill", "Present when the session starts");
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let mut agent = Agent::new_with_initial_working_dir(
+        provider,
+        Registry::empty(),
+        Some(project.path().to_str().unwrap()),
+    );
+    let before = agent.build_system_prompt_split(None).static_part;
+    assert!(before.contains("/early-skill "), "{before}");
+
+    write_skill("late-skill", "Installed after the prompt was cached");
+
+    // The cached system prefix must not change when a skill is installed.
+    let after = agent.build_system_prompt_split(None).static_part;
+    assert_eq!(before, after);
+    assert!(!after.contains("late-skill"));
+
+    agent.announce_late_skills();
+    let announcements: Vec<String> = transcript_texts(&agent)
+        .into_iter()
+        .filter(|text| text.contains("New skills were installed."))
+        .collect();
+    assert_eq!(announcements.len(), 1);
+    assert!(announcements[0].contains("- `/late-skill ` - Installed after the prompt was cached"));
+    assert!(!announcements[0].contains("early-skill"));
+
+    // Nothing new: no second announcement, prompt still stable.
+    agent.announce_late_skills();
+    let count = transcript_texts(&agent)
+        .into_iter()
+        .filter(|text| text.contains("New skills were installed."))
+        .count();
+    assert_eq!(count, 1);
+    assert_eq!(agent.build_system_prompt_split(None).static_part, before);
+
+    // A restored agent (fresh in-memory state) must not re-announce.
+    agent.announced_skills.clear();
+    agent.announced_skills.insert("early-skill".to_string());
+    agent.announced_skills_scan_index = 0;
+    agent.announce_late_skills();
+    let count = transcript_texts(&agent)
+        .into_iter()
+        .filter(|text| text.contains("New skills were installed."))
+        .count();
+    assert_eq!(count, 1);
+}
+
+/// Esc after a queued follow-up: a cancelled turn must not swallow the
+/// follow-up into history. It stays queued so the next turn can send it.
+#[tokio::test]
+async fn cancelled_turn_leaves_soft_interrupt_queued() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.queue_soft_interrupt(
+        "do this instead".to_string(),
+        Vec::new(),
+        false,
+        SoftInterruptSource::User,
+    );
+
+    agent.request_graceful_shutdown();
+    assert!(agent.inject_soft_interrupts().is_empty());
+    assert_eq!(agent.soft_interrupt_count(), 1, "still queued after cancel");
+
+    agent.graceful_shutdown_signal().reset();
+    assert_eq!(agent.inject_soft_interrupts().len(), 1);
+    assert_eq!(agent.soft_interrupt_count(), 0);
+}
+
+/// Provider that only has the Claude OAuth credential: any request pinned to
+/// the API-key route fails exactly like the real runtime does.
+#[derive(Clone, Default)]
+struct OAuthOnlyClaudeProvider {
+    model: Arc<std::sync::Mutex<String>>,
+    set_model_requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for OAuthOnlyClaudeProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unreachable!("OAuthOnlyClaudeProvider does not complete requests")
+    }
+
+    fn name(&self) -> &str {
+        "Claude"
+    }
+
+    fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+
+    fn set_model(&self, request: &str) -> Result<()> {
+        self.set_model_requests
+            .lock()
+            .unwrap()
+            .push(request.to_string());
+        if request.starts_with("claude-api:") {
+            anyhow::bail!("No Anthropic API key found");
+        }
+        let model = request
+            .split_once(':')
+            .map(|(_, model)| model)
+            .unwrap_or(request);
+        *self.model.lock().unwrap() = model.to_string();
+        Ok(())
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// A session created while the deployment used an Anthropic API key, resumed
+/// after it moved to Claude OAuth, must come back on OAuth and persist that
+/// route. Before the fix the restore failed, the stale `provider_key` stayed
+/// on disk, and every swarm worker inheriting it died with
+/// "No Anthropic API key found".
+#[tokio::test]
+async fn resume_heals_stale_credential_route_after_credential_type_change() {
+    let _guard = crate::storage::lock_test_env();
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => crate::env::set_var(key, value),
+                    None => crate::env::remove_var(key),
+                }
+            }
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = RestoreEnv(
+        ["JCODE_HOME", "JCODE_RUNTIME_PROVIDER"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+    );
+    let home = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "claude");
+    crate::config::Config::invalidate_cache();
+
+    let mut stale = crate::session::Session::create_with_id(
+        "session_stale_api_key_route".to_string(),
+        None,
+        None,
+    );
+    stale.model = Some("claude-sonnet-5".to_string());
+    stale.provider_key = Some("anthropic-api".to_string());
+    stale.route_api_method = None;
+    stale.save_prepared().expect("persist stale session");
+
+    let provider = Arc::new(OAuthOnlyClaudeProvider::default());
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let registry = Registry::new(provider_dyn.clone()).await;
+    let mut agent = Agent::new(provider_dyn, registry);
+    agent
+        .restore_session("session_stale_api_key_route")
+        .expect("restore stale session");
+
+    assert_eq!(
+        provider.set_model_requests.lock().unwrap().as_slice(),
+        [
+            "claude-api:claude-sonnet-5",
+            "claude-api:claude-sonnet-5",
+            "claude-oauth:claude-sonnet-5"
+        ],
+        "restore tries the persisted route (plus the auth-refresh retry), then the runtime's"
+    );
+    assert_eq!(agent.provider_model(), "claude-sonnet-5");
+    assert_eq!(
+        agent.session_provider_key().as_deref(),
+        Some("claude-oauth")
+    );
+    assert_eq!(
+        agent.session_route_api_method().as_deref(),
+        Some("claude-oauth")
+    );
+
+    // What a swarm spawn reads when the coordinator is mid-turn.
+    let persisted = crate::session::Session::load("session_stale_api_key_route").unwrap();
+    assert_eq!(persisted.provider_key.as_deref(), Some("claude-oauth"));
+    assert_eq!(persisted.route_api_method.as_deref(), Some("claude-oauth"));
+    assert_eq!(
+        crate::provider::MultiProvider::model_switch_request_for_session_route(
+            "claude-sonnet-5",
+            persisted.provider_key.as_deref(),
+            persisted.route_api_method.as_deref(),
+        ),
+        "claude-oauth:claude-sonnet-5",
+        "workers inheriting the healed session must target the live credential"
+    );
+}
+
+#[path = "agent_tests_additional_tests.rs"]
+mod additional_working_directory_moves_preserve_first_active_session_origin;

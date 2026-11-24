@@ -32,6 +32,9 @@ impl OpenAIUsageData {
     pub fn display_snapshot(&self) -> Self {
         let mut snapshot = self.clone();
         let mut cleared_any_window = false;
+        snapshot
+            .additional_windows
+            .retain(|window| !reset_timestamp_passed(window.resets_at.as_deref()));
 
         if let Some(window) = snapshot.five_hour.as_mut()
             && reset_timestamp_passed(window.resets_at.as_deref())
@@ -175,5 +178,7 @@ pub fn format_usage_bar(percent: f32, width: usize) -> String {
     let filled = filled.min(width);
     let empty = width.saturating_sub(filled);
     let bar: String = "█".repeat(filled) + &"░".repeat(empty);
-    format!("{} {:.0}%", bar, percent)
+    // Right-align the number so the `%` (and any "· resets" suffix) lines up
+    // across rows with different percentages.
+    format!("{} {:>3.0}%", bar, percent)
 }

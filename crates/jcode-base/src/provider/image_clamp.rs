@@ -1,3 +1,10 @@
+// reference: request-body byte ceilings are provider policy, not a library API.
+//   Anthropic Messages API: 128 MB max request size, 413 request_too_large
+//   (https://docs.claude.com/en/api/errors, "Request size limits").
+//   Nous Research inference-api.nousresearch.com: measured 413
+//   "Request in excess of 10MB. That's too big." on 2026-11-23; no public
+//   page states the limit, the value comes from the observed gateway response
+//   and the request-body character counts in the session log.
 //! Clamp outbound image dimensions before sending a request to a provider.
 //!
 //! Anthropic's Messages API enforces a per-image pixel cap that depends on how
@@ -33,9 +40,64 @@
 //! cap (e.g. a large, high-detail PNG). When that happens we re-encode the
 //! image as JPEG and progressively downscale it until its base64 payload fits
 //! within budget.
+//!
+//! Per-image limits are not the whole story. The provider weighs the **entire**
+//! request body, and aggregators reject it far below Anthropic's own ceiling:
+//! Nous Research's `inference-api.nousresearch.com` answers
+//! `413 Request in excess of 10MB` for a body whose images were each well under
+//! every per-image cap. [`clamp_outbound_request_body`] therefore drops the
+//! oldest inline images until the whole estimated body fits the budget in
+//! `jcode-compaction-core`.
 
 use base64::Engine as _;
+use jcode_compaction_core::REQUEST_BODY_CHAR_BUDGET;
 use jcode_message_types::{ContentBlock, Message};
+
+use crate::image_normalize::{normalize_image_bytes, sniff_provider_media_type};
+
+/// Prefix of the label the agent emits after an image attached to a tool
+/// result (see `agent::tools`). Folded together with an omitted image.
+const TOOL_IMAGE_LABEL_PREFIX: &str = "[Attached image associated with the preceding tool result: ";
+
+/// Replace the image at `index` with a textual `marker`.
+///
+/// When the image belongs to a tool result (the block before it is a
+/// `ToolResult`), the marker and any trailing image label are folded into that
+/// result's text instead of becoming sibling text blocks. Anthropic requires
+/// the results of a parallel tool-call turn to be contiguous, so a stray text
+/// block between them would itself break the request.
+///
+/// Returns the index of the next block to examine.
+fn omit_image_block(content: &mut Vec<ContentBlock>, index: usize, marker: String) -> usize {
+    let folds_into_tool_result =
+        index > 0 && matches!(content[index - 1], ContentBlock::ToolResult { .. });
+    if !folds_into_tool_result {
+        content[index] = ContentBlock::Text {
+            text: marker,
+            cache_control: None,
+        };
+        return index + 1;
+    }
+    content.remove(index);
+    let mut note = marker;
+    if let Some(ContentBlock::Text { text, .. }) = content.get(index)
+        && text.starts_with(TOOL_IMAGE_LABEL_PREFIX)
+    {
+        note.push('\n');
+        note.push_str(text);
+        content.remove(index);
+    }
+    if let ContentBlock::ToolResult {
+        content: result, ..
+    } = &mut content[index - 1]
+    {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&note);
+    }
+    index
+}
 
 /// Build a request-safe copy of `messages` when the selected provider/model
 /// cannot accept image input. Replacing each image with a small textual marker
@@ -57,15 +119,16 @@ pub(crate) fn filter_unsupported_outbound_images(
 
     let mut filtered = messages.to_vec();
     for message in &mut filtered {
-        for block in &mut message.content {
-            if let ContentBlock::Image { media_type, .. } = block {
-                *block = ContentBlock::Text {
-                    text: format!(
-                        "[Image omitted: this provider/model does not support image input; media_type={media_type}]"
-                    ),
-                    cache_control: None,
-                };
+        let mut index = 0;
+        while index < message.content.len() {
+            if let ContentBlock::Image { media_type, .. } = &message.content[index] {
+                let marker = format!(
+                    "[Image omitted: this provider/model does not support image input; media_type={media_type}]"
+                );
+                index = omit_image_block(&mut message.content, index, marker);
+                continue;
             }
+            index += 1;
         }
     }
     Some(filtered)
@@ -83,6 +146,118 @@ const IMAGE_BASE64_BYTE_LIMIT: usize = 10 * 1024 * 1024;
 /// Target base64 size we re-encode oversized images down to. Kept a little
 /// under the hard limit so we always land safely inside the cap.
 const IMAGE_BASE64_BYTE_TARGET: usize = 9 * 1024 * 1024;
+
+/// Serialized size of a single content block, matching how the request body is
+/// measured. Used to price an image against the text marker replacing it.
+fn message_block_chars(block: &ContentBlock) -> usize {
+    serde_json::to_vec(block).map(|bytes| bytes.len()).unwrap_or(0)
+}
+
+/// Text marker left where an inline image was dropped.
+fn image_omission_marker(media_type: &str, original_len: usize) -> String {
+    format!(
+        "[Older image omitted to keep the request body under the provider size limit: media_type={media_type}, original_base64_chars={original_len}. Rely on adjacent tool text, screenshots saved to disk, or take a new screenshot if visual details are needed.]"
+    )
+}
+
+/// Estimated serialized size of the whole request body: messages plus system
+/// prompt plus tool catalog.
+///
+/// Message sizes come from `Message::serialized_json_bytes`, which counts the
+/// exact JSON without re-serializing shared payloads; the small constant covers
+/// the per-message envelope keys and the request's own top-level fields.
+fn estimate_request_body_chars(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> usize {
+    messages
+        .iter()
+        .map(|message| message.serialized_json_bytes() + 64)
+        .sum::<usize>()
+        + system_chars
+        + tools_chars
+}
+
+/// Return true when the request body is likely over the provider's byte
+/// ceiling, so the caller should drop images before sending.
+pub(crate) fn request_body_exceeds_budget(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> bool {
+    estimate_request_body_chars(messages, system_chars, tools_chars) > REQUEST_BODY_CHAR_BUDGET
+}
+
+/// Build a request-safe copy of `messages` whose estimated body fits the
+/// provider byte budget, replacing the oldest inline images with short text
+/// markers until it does.
+///
+/// The provider weighs the whole body (system prompt + tool catalog + messages),
+/// not individual images. A transcript of 24 screenshots can therefore be
+/// rejected with `413 Request in excess of 10MB` even though every image passes
+/// the per-image caps in [`clamp_outbound_images`] (#1713).
+///
+/// Returns `None` when the request already fits, so the common path never
+/// clones history. The newest images survive: they are the ones the model just
+/// asked for.
+pub(crate) fn clamp_outbound_request_body(
+    messages: &[Message],
+    system_chars: usize,
+    tools_chars: usize,
+) -> Option<Vec<Message>> {
+    if !request_body_exceeds_budget(messages, system_chars, tools_chars) {
+        return None;
+    }
+    if !messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+    {
+        return None;
+    }
+
+    let mut clamped = messages.to_vec();
+    // The marker that replaces an image is itself a few hundred bytes, so the
+    // loop cannot simply re-check the whole body after each swap: the marker weight
+    // would count against the budget it is trying to satisfy. Track the body size
+    // incrementally, charging each replaced image only its marker's weight.
+    let mut body_chars = estimate_request_body_chars(messages, system_chars, tools_chars);
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    for (mi, message) in clamped.iter().enumerate() {
+        for (bi, block) in message.content.iter().enumerate() {
+            if matches!(block, ContentBlock::Image { .. }) {
+                order.push((mi, bi));
+            }
+        }
+    }
+
+    for (mi, bi) in order {
+        if body_chars <= REQUEST_BODY_CHAR_BUDGET {
+            break;
+        }
+        let block = &mut clamped[mi].content[bi];
+        if let ContentBlock::Image { media_type, data } = block {
+            let media_type = media_type.clone();
+            let original_len = data.len();
+            let marker = image_omission_marker(&media_type, original_len);
+            let image_chars = message_block_chars(block);
+            let marker_chars = message_block_chars(&ContentBlock::Text {
+                text: marker.clone(),
+                cache_control: None,
+            });
+            body_chars = body_chars
+                .saturating_sub(image_chars)
+                .saturating_add(marker_chars);
+            *block = ContentBlock::Text {
+                text: marker,
+                cache_control: None,
+            };
+        }
+    }
+
+    Some(clamped)
+}
 
 /// Inspect `messages` and, if any `ContentBlock::Image` exceeds the per-image
 /// edge limit implied by the total image count, or the per-image base64 byte
@@ -118,8 +293,7 @@ pub(crate) fn clamp_outbound_images(messages: &[Message]) -> Option<Vec<Message>
         })
         .any(|(media_type, data)| {
             data.len() > IMAGE_BASE64_BYTE_LIMIT
-                || image_exceeds_edge(data, max_edge)
-                || media_type_mismatch(media_type, data)
+                || decoded_image_needs_change(media_type, data, max_edge)
         });
     if !needs_change {
         return None;
@@ -128,8 +302,23 @@ pub(crate) fn clamp_outbound_images(messages: &[Message]) -> Option<Vec<Message>
     let mut clamped = messages.to_vec();
     let mut changed = false;
     for message in &mut clamped {
-        for block in &mut message.content {
-            if let ContentBlock::Image { media_type, data } = block {
+        let mut index = 0;
+        while index < message.content.len() {
+            if let ContentBlock::Image { media_type, data } = &mut message.content[index] {
+                // Formats no provider accepts (BMP, ICO, TIFF, HEIC, ...) are
+                // converted to PNG when possible and otherwise replaced by a
+                // text marker. This only rewrites the request copy, so it also
+                // un-sticks sessions whose history already holds such an image
+                // (#1712).
+                match ensure_provider_format(media_type, data) {
+                    Ok(converted) => changed |= converted,
+                    Err(reason) => {
+                        let marker = format!("[Image omitted: {media_type} {reason}]");
+                        index = omit_image_block(&mut message.content, index, marker);
+                        changed = true;
+                        continue;
+                    }
+                }
                 // Correct a mismatched label first (e.g. JPEG bytes tagged as
                 // `image/png`) so downstream re-encoding decisions and the wire
                 // payload agree. Providers reject a request outright when the
@@ -141,42 +330,67 @@ pub(crate) fn clamp_outbound_images(messages: &[Message]) -> Option<Vec<Message>
                     changed = true;
                 }
             }
+            index += 1;
         }
     }
 
     changed.then_some(clamped)
 }
 
-/// Detect an image's true media type from its leading magic bytes. Returns
-/// `None` for formats we do not attempt to correct (the block is then left as
-/// declared).
-fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && bytes[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
-        return Some("image/png");
+/// True when the block cannot go on the wire as-is: the payload is not valid
+/// base64, its bytes are not a provider-accepted format, or the declared
+/// `media_type` disagrees with the magic bytes.
+/// Decode once for both header checks. In-limit images previously allocated and
+/// decoded their entire base64 payload twice even though only headers are read.
+fn decoded_image_needs_change(media_type: &str, data_b64: &str, max_edge: u32) -> bool {
+    let Some(bytes) = decode_b64(data_b64) else {
+        return true;
+    };
+    if probe_dimensions(&bytes).is_none_or(|(w, h)| w > max_edge || h > max_edge) {
+        return true;
     }
-    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
-        return Some("image/jpeg");
+    match sniff_provider_media_type(&bytes) {
+        Some(actual) => !media_type.eq_ignore_ascii_case(actual),
+        None => true,
     }
-    if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
-        return Some("image/gif");
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-    None
 }
 
-/// True when `media_type` disagrees with what the base64 payload's magic bytes
-/// say the image actually is. Unknown formats and undecodable payloads are
-/// treated as "no mismatch" so we never touch data we cannot reason about.
-fn media_type_mismatch(media_type: &str, data_b64: &str) -> bool {
+#[cfg(test)]
+pub(super) fn preflight_probe(media: &str, data: Option<&str>, baseline: bool) -> bool {
+    let Some(data) = data else { return false };
+    data.len() > IMAGE_BASE64_BYTE_LIMIT
+        || if baseline {
+            image_exceeds_edge(data, 8000) || format_needs_fix(media, data)
+        } else {
+            decoded_image_needs_change(media, data, 8000)
+        }
+}
+
+#[cfg(test)]
+fn format_needs_fix(media_type: &str, data_b64: &str) -> bool {
     let Some(bytes) = decode_b64(data_b64) else {
-        return false;
+        return true;
     };
-    match sniff_media_type(&bytes) {
+    match sniff_provider_media_type(&bytes) {
         Some(actual) => !media_type.eq_ignore_ascii_case(actual),
-        None => false,
+        None => true,
     }
+}
+
+/// Make sure the payload is a provider-accepted format. Returns `Ok(true)` when
+/// it was converted (to PNG), `Ok(false)` when it already was, and `Err` with a
+/// reason when it cannot be sent at all.
+fn ensure_provider_format(media_type: &mut String, data: &mut String) -> Result<bool, String> {
+    let Some(bytes) = decode_b64(data) else {
+        return Err("data is not valid base64, so it cannot be sent to the model".into());
+    };
+    if sniff_provider_media_type(&bytes).is_some() {
+        return Ok(false);
+    }
+    let image = normalize_image_bytes(bytes)?;
+    *media_type = image.media_type.to_string();
+    *data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+    Ok(true)
 }
 
 /// Rewrite `media_type` to match the payload's magic bytes when they disagree.
@@ -185,7 +399,7 @@ fn reconcile_media_type(media_type: &mut String, data_b64: &str) -> bool {
     let Some(bytes) = decode_b64(data_b64) else {
         return false;
     };
-    match sniff_media_type(&bytes) {
+    match sniff_provider_media_type(&bytes) {
         Some(actual) if !media_type.eq_ignore_ascii_case(actual) => {
             *media_type = actual.to_string();
             true
@@ -424,7 +638,8 @@ mod tests {
             content: vec![ContentBlock::Image {
                 media_type: "image/png".to_string(),
                 data,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         }
@@ -436,7 +651,8 @@ mod tests {
             content: vec![ContentBlock::Image {
                 media_type: media_type.to_string(),
                 data,
-            }],
+            }]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         }
@@ -455,6 +671,84 @@ mod tests {
         let bytes = decode_b64(data_b64).unwrap();
         let img = image::load_from_memory(&bytes).unwrap();
         (img.width(), img.height())
+    }
+
+    // Frozen preflight expression from d103e8a62, before decode sharing.
+    fn baseline_needs_change(media_type: &str, data: &str, max_edge: u32) -> bool {
+        data.len() > IMAGE_BASE64_BYTE_LIMIT
+            || image_exceeds_edge(data, max_edge)
+            || format_needs_fix(media_type, data)
+    }
+
+    #[test]
+    fn shared_decode_matches_frozen_preflight() {
+        let fixtures = [
+            encode_png(100, 100),
+            encode_jpeg_b64(64, 64),
+            bmp_b64(),
+            "@@not base64@@".into(),
+            "".into(),
+            base64::engine::general_purpose::STANDARD.encode(b"unknown bytes"),
+            format!(" \n{}\t", encode_png(32, 32)),
+            "A".repeat(IMAGE_BASE64_BYTE_LIMIT + 1),
+        ];
+        for data in fixtures {
+            for media in ["image/png", "IMAGE/PNG", "image/jpeg", "image/bmp"] {
+                for edge in [1, 32, 2000, 8000] {
+                    assert_eq!(
+                        baseline_needs_change(media, &data, edge),
+                        data.len() > IMAGE_BASE64_BYTE_LIMIT
+                            || decoded_image_needs_change(media, &data, edge),
+                        "media={media}, edge={edge}, length={}",
+                        data.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run explicitly with --ignored --nocapture. Linux schedstat reports actual
+    /// CPU nanoseconds consumed by this test thread, excluding time descheduled.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn image_preflight_cpu_probe() {
+        fn cpu_ns() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/schedstat")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let large = encode_noise_png(1400, 1400);
+        let ordinary = encode_png(100, 100);
+        for (name, data, iterations) in [
+            ("large-in-limit", large.as_str(), 40),
+            ("ordinary", ordinary.as_str(), 100_000),
+            ("invalid", "@@not base64@@", 100_000),
+        ] {
+            for (label, check) in [
+                (
+                    "baseline",
+                    baseline_needs_change as fn(&str, &str, u32) -> bool,
+                ),
+                ("shared", |media: &str, data: &str, edge| {
+                    data.len() > IMAGE_BASE64_BYTE_LIMIT
+                        || decoded_image_needs_change(media, data, edge)
+                }),
+            ] {
+                let start = cpu_ns();
+                for _ in 0..iterations {
+                    std::hint::black_box(check("image/png", std::hint::black_box(data), 8000));
+                }
+                eprintln!(
+                    "image-preflight {name} {label}: iterations={iterations} cpu_ns={}",
+                    cpu_ns() - start
+                );
+            }
+        }
     }
 
     #[test]
@@ -650,18 +944,168 @@ mod tests {
     #[test]
     fn sniff_detects_common_formats() {
         assert_eq!(
-            sniff_media_type(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
+            sniff_provider_media_type(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
             Some("image/png")
         );
         assert_eq!(
-            sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            sniff_provider_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
             Some("image/jpeg")
         );
-        assert_eq!(sniff_media_type(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(sniff_provider_media_type(b"GIF89a....."), Some("image/gif"));
         assert_eq!(
-            sniff_media_type(b"RIFF\0\0\0\0WEBP...."),
+            sniff_provider_media_type(b"RIFF\0\0\0\0WEBP...."),
             Some("image/webp")
         );
-        assert_eq!(sniff_media_type(b"not an image"), None);
+        assert_eq!(sniff_provider_media_type(b"not an image"), None);
+    }
+
+    fn bmp_b64() -> String {
+        let img = RgbImage::from_pixel(4, 4, image::Rgb([200, 10, 10]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, ImageFormat::Bmp)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    }
+
+    fn tool_result_block(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: None,
+        }
+    }
+
+    /// #1712: a persisted `image/bmp` block must be converted before it reaches
+    /// the wire, which also recovers sessions already holding one.
+    #[test]
+    fn bmp_block_is_converted_to_png() {
+        let messages = vec![image_message_with("image/bmp", bmp_b64())];
+        let out = clamp_outbound_images(&messages).expect("bmp must be rewritten");
+        let ContentBlock::Image { media_type, data } = &out[0].content[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(media_type, "image/png");
+        let bytes = decode_b64(data).unwrap();
+        assert_eq!(sniff_provider_media_type(&bytes), Some("image/png"));
+        assert_eq!(dims(data), (4, 4));
+    }
+
+    /// TIFF bytes behind a `.png` label must not go out as `image/png`.
+    #[test]
+    fn tiff_bytes_labelled_png_are_converted() {
+        let img = RgbImage::from_pixel(3, 3, image::Rgb([1, 2, 3]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, ImageFormat::Tiff)
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(out.into_inner());
+        let messages = vec![image_message_with("image/png", data)];
+        let out = clamp_outbound_images(&messages).expect("tiff must be rewritten");
+        let ContentBlock::Image { media_type, data } = &out[0].content[0] else {
+            panic!("expected image block");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            sniff_provider_media_type(&decode_b64(data).unwrap()),
+            Some("image/png")
+        );
+    }
+
+    /// An undecodable image inside a tool result becomes a note folded into
+    /// that result, keeping parallel tool results contiguous.
+    #[test]
+    fn undecodable_tool_image_folds_marker_into_tool_result() {
+        let mut heic = vec![0, 0, 0, 24];
+        heic.extend_from_slice(b"ftypheic");
+        heic.extend_from_slice(&[0; 16]);
+        let heic = base64::engine::general_purpose::STANDARD.encode(heic);
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                tool_result_block("toolu_1", "Image: x.heic"),
+                ContentBlock::Image {
+                    media_type: "image/heic".into(),
+                    data: heic,
+                },
+                ContentBlock::Text {
+                    text: format!("{TOOL_IMAGE_LABEL_PREFIX}x.heic]"),
+                    cache_control: None,
+                },
+                tool_result_block("toolu_2", "second"),
+            ]
+            .into(),
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        let out = clamp_outbound_images(&messages).expect("heic must be rewritten");
+        let content = &out[0].content;
+        assert_eq!(content.len(), 2, "tool results must stay contiguous");
+        let ContentBlock::ToolResult { content: first, .. } = &content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(first.starts_with("Image: x.heic\n[Image omitted: image/heic HEIC"));
+        assert!(first.contains(TOOL_IMAGE_LABEL_PREFIX));
+        assert!(matches!(
+            &content[1],
+            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_2"
+        ));
+    }
+
+    #[test]
+    fn invalid_base64_image_is_omitted() {
+        let messages = vec![image_message_with("image/png", "@@not base64@@".into())];
+        let out = clamp_outbound_images(&messages).expect("must be rewritten");
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text, .. } if text.starts_with("[Image omitted: image/png")
+        ));
+    }
+
+    /// The regression that caused the 413: a transcript whose images are each
+    /// well under the per-image caps still overflows the whole body. The clamp
+    /// must drop the oldest images until the estimated body fits.
+    #[test]
+    fn request_body_clamp_drops_oldest_images_when_body_overflows() {
+        // 24 screenshots of 300 KiB each: each is far below the per-image cap,
+        // and their ~7 MiB total still fits the body budget on its own. The
+        // system prompt and tool catalog push the whole body past the ceiling,
+        // which is exactly the shape that produced the 413 (#1713).
+        let screenshot = "A".repeat(300 * 1024);
+        let messages: Vec<Message> = (0..24).map(|_| image_message(screenshot.clone())).collect();
+        let system = "s".repeat(71 * 1024);
+        let tools = 2 * 1024 * 1024;
+
+        // Images alone still fit; the body is what overflows.
+        assert!(!request_body_exceeds_budget(&messages, 0, 0));
+        assert!(request_body_exceeds_budget(&messages, system.len(), tools));
+
+        let clamped = clamp_outbound_request_body(&messages, system.len(), tools)
+            .expect("an over-budget body must be clamped");
+        assert!(!request_body_exceeds_budget(&clamped, system.len(), tools));
+        assert!(clamped.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        }));
+        assert!(matches!(clamped[0].content[0], ContentBlock::Text { .. }));
+        if let ContentBlock::Text { text, .. } = &clamped[0].content[0] {
+            assert!(text.contains("under the provider size limit"));
+        }
+        // The persisted history is untouched: this is a request snapshot.
+        assert!(matches!(messages[0].content[0], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn request_body_clamp_noop_when_body_fits() {
+        let messages = vec![image_message("A".repeat(4096))];
+        assert!(clamp_outbound_request_body(&messages, 16, 16).is_none());
+    }
+
+    #[test]
+    fn request_body_clamp_noop_without_images() {
+        let messages = vec![Message::user("a long prompt".repeat(4096).as_str())];
+        assert!(clamp_outbound_request_body(&messages, 1 << 20, 1 << 20).is_none());
     }
 }

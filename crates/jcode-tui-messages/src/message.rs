@@ -221,11 +221,18 @@ impl DisplayMessage {
 
     /// Convert the shared session renderer output into the TUI transcript model.
     pub fn from_rendered_message(item: RenderedMessage) -> Self {
+        let duration_secs = (item.role == "tool")
+            .then(|| {
+                item.tool_duration_ms
+                    .map(|ms| ms as f32 / 1000.0)
+                    .or_else(|| Self::tool_duration_from_output(&item.content))
+            })
+            .flatten();
         Self {
             role: item.role,
             content: item.content,
             tool_calls: item.tool_calls,
-            duration_secs: None,
+            duration_secs,
             title: None,
             tool_data: item.tool_data,
         }
@@ -259,10 +266,57 @@ impl DisplayMessage {
         self
     }
 
+    /// Read only the runner's leading timing header, not timing text in tool output.
+    /// Some display paths prefix the header with `[tool_name]`.
+    pub fn tool_timing_header_from_output(output: &str) -> Option<&str> {
+        let mut prefix = output.trim_start();
+        if !prefix.starts_with("[tool timing:") {
+            let (label, rest) = prefix.strip_prefix('[')?.split_once(']')?;
+            if label.is_empty() || label.chars().any(char::is_whitespace) {
+                return None;
+            }
+            prefix = rest.trim_start();
+        }
+        let header = prefix.strip_prefix("[tool timing:")?.split_once(']')?.0;
+        Some(header)
+    }
+
+    /// Local wall-clock time at which the tool run started, from the runner's
+    /// `[tool timing: start=...]` header. Falls back to "now" when the header
+    /// is absent (older transcripts, or a row built without runner timing).
+    pub fn tool_start_local_label(output: &str, now: chrono::DateTime<chrono::Local>) -> String {
+        let start = Self::tool_timing_header_from_output(output)
+            .and_then(|header| header.split_once("start=")?.1.split(' ').next())
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|utc| utc.with_timezone(&now.timezone()))
+            .unwrap_or(now);
+        start.format("%H:%M").to_string()
+    }
+
+    pub fn tool_duration_from_output(output: &str) -> Option<f32> {
+        let header = Self::tool_timing_header_from_output(output)?;
+        let value = header.split_once("duration=")?.1.trim();
+        let seconds = if let Some(ms) = value.strip_suffix("ms") {
+            parse_timing_number::<u64>(ms)? as f64 / 1000.0
+        } else if let Some((minutes, seconds)) = value.split_once("m ") {
+            parse_timing_number::<u64>(minutes)? as f64 * 60.0
+                + parse_timing_number::<u64>(seconds.strip_suffix('s')?)? as f64
+        } else if let Some(minutes) = value.strip_suffix('m') {
+            parse_timing_number::<u64>(minutes)? as f64 * 60.0
+        } else {
+            parse_timing_number::<f64>(value.strip_suffix('s')?)?
+        };
+        (seconds.is_finite() && seconds >= 0.0 && seconds <= f32::MAX as f64)
+            .then_some(seconds as f32)
+    }
+
     pub fn stable_cache_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.role.hash(&mut hasher);
         self.content.hash(&mut hasher);
+        if self.role == "tool" {
+            self.duration_secs.map(f32::to_bits).hash(&mut hasher);
+        }
         self.tool_calls.hash(&mut hasher);
         self.title.hash(&mut hasher);
         if let Some(tool) = &self.tool_data {
@@ -438,18 +492,100 @@ mod tests {
     }
 
     #[test]
-    fn stable_cache_hash_ignores_duration() {
+    fn stable_cache_hash_tracks_tool_duration_but_ignores_assistant_duration() {
         let mut first = message_with_input(json!({ "file_path": "a.rs" }));
         let mut second = first.clone();
         first.duration_secs = Some(1.0);
         second.duration_secs = Some(9.0);
+        assert_ne!(first.stable_cache_hash(), second.stable_cache_hash());
+        first.role = "assistant".into();
+        second.role = "assistant".into();
         assert_eq!(first.stable_cache_hash(), second.stable_cache_hash());
+    }
+
+    #[test]
+    fn tool_duration_headers_accept_runner_formats_only() {
+        for (value, expected) in [
+            ("0ms", 0.0),
+            ("73ms", 0.073),
+            ("2.4s", 2.4),
+            ("1m", 60.0),
+            ("1m 4s", 64.0),
+        ] {
+            let output = format!("[read] [tool timing: start=x finish=y duration={value}] body");
+            assert_eq!(
+                DisplayMessage::tool_duration_from_output(&output),
+                Some(expected)
+            );
+        }
+        for output in [
+            "plain output",
+            "body [tool timing: duration=2s]",
+            "[tool timing: duration=NaNs]",
+            "[tool timing: duration=-1s]",
+            "[tool timing: duration=infs]",
+            "[tool timing: duration=oops]",
+        ] {
+            assert_eq!(DisplayMessage::tool_duration_from_output(output), None);
+        }
+    }
+
+    #[test]
+    fn tool_start_local_label_reads_the_runner_header_in_local_time() {
+        let now = chrono::Local::now();
+        let label = DisplayMessage::tool_start_local_label(
+            "[tool timing: start=2026-05-14T14:10:08.525Z finish=2026-05-14T14:10:08.598Z duration=73ms] ok",
+            now,
+        );
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-05-14T14:10:08.525Z")
+            .unwrap()
+            .with_timezone(&now.timezone())
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(label, expected);
+
+        let fallback = DisplayMessage::tool_start_local_label("plain output", now);
+        assert_eq!(fallback, now.format("%H:%M").to_string());
+    }
+
+    #[test]
+    fn tool_duration_restored_metadata_wins_and_missing_stays_unknown() {
+        let mut row = RenderedMessage {
+            response_stats: None,
+            tool_duration_ms: Some(1234),
+            role: "tool".into(),
+            content: "[tool timing: duration=2s] body".into(),
+            tool_calls: vec![],
+            tool_data: None,
+            stored_index: None,
+        };
+        assert_eq!(
+            DisplayMessage::from_rendered_message(row.clone()).duration_secs,
+            Some(1.234)
+        );
+        row.tool_duration_ms = None;
+        assert_eq!(
+            DisplayMessage::from_rendered_message(row.clone()).duration_secs,
+            Some(2.0)
+        );
+        row.content = "old result".into();
+        assert_eq!(
+            DisplayMessage::from_rendered_message(row.clone()).duration_secs,
+            None
+        );
+        row.role = "assistant".into();
+        row.tool_duration_ms = Some(1234);
+        assert_eq!(
+            DisplayMessage::from_rendered_message(row).duration_secs,
+            None
+        );
     }
 
     #[test]
     fn rendered_messages_convert_to_display_messages() {
         let rendered = RenderedMessage {
             response_stats: None,
+            tool_duration_ms: None,
             role: "assistant".to_string(),
             content: "done".to_string(),
             tool_calls: vec!["read".to_string()],
@@ -488,5 +624,19 @@ mod tests {
             latest_user_transcript_preview(messages.iter().copied(), 20),
             Some("hello world".to_string())
         );
+    }
+}
+
+/// Reject malformed or partial timing fields without dropping their diagnostics.
+fn parse_timing_number<T: std::str::FromStr>(value: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match value.parse() {
+        Ok(number) => Some(number),
+        Err(error) => {
+            jcode_logging::debug(&format!("Ignoring malformed tool timing number: {error}"));
+            None
+        }
     }
 }

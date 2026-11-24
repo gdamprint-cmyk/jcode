@@ -2,26 +2,30 @@
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
 
 /// Quality-first default for OpenAI-capable routes.
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6-astra";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6.1-sol";
 
 /// Available Claude models used by model lists and provider routing.
 ///
 /// NOTE: The Mythos preview family was retired by Anthropic and 404s, so it is
 /// intentionally NOT listed here. `claude-fable-5` was briefly retired but is
-/// live again. Opus 5.5 launched 2026-09-22. The list is curated best-first;
+/// live again. Opus 5.5 launched 2026-09-22 and `claude-fable-5-2` on
+/// 2026-11-09. The list is curated best-first;
 /// position 0 is the flagship used for post-login default selection.
 pub const ALL_CLAUDE_MODELS: &[&str] = &[
     "claude-opus-5-5",
     DEFAULT_CLAUDE_MODEL,
     "claude-opus-5",
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-6[1m]",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
     "claude-opus-4-5",
     "claude-sonnet-4-5",
@@ -63,7 +67,9 @@ pub const ALL_OPENAI_MODELS: &[&str] = &[
     // GPT-6 Astra: newest OpenAI flagship (live on api.openai.com and
     // OpenRouter as of 2026-09). Listed explicitly because the frontier
     // auto-promoter only accepts bare numeric ids and would skip the suffix.
+    // GPT-6.1 Sol (2026-10-16): latest generation and the default.
     DEFAULT_OPENAI_MODEL,
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-pro",
     // ChatGPT web-only route. The `[web]` suffix is intentionally part of the
@@ -116,8 +122,8 @@ mod gpt_5_6_catalog_tests {
         }
         assert!(is_openai_api_only_pro_model("gpt-5.6-pro"));
         assert!(!is_openai_api_only_pro_model("gpt-5.6-sol"));
-        assert_eq!(DEFAULT_OPENAI_MODEL, "gpt-6-astra");
-        assert_eq!(ALL_OPENAI_MODELS[0], "gpt-6-astra");
+        assert_eq!(DEFAULT_OPENAI_MODEL, "gpt-6.1-sol");
+        assert_eq!(ALL_OPENAI_MODELS[0], "gpt-6.1-sol");
     }
 }
 
@@ -241,6 +247,32 @@ pub fn context_limit_for_model_with_provider_and_cache(
     provider_hint: Option<&str>,
     cached_context_limit: impl Fn(&str) -> Option<usize>,
 ) -> Option<usize> {
+    let raw_model_had_vendor_prefix = model.contains('/');
+    // A custom OpenAI-compatible endpoint can serve ids that carry another
+    // vendor's name: `anthropic/claude-sonnet-4` behind an endpoint configured
+    // as `deepseek` is still a Claude-named id, but the window that matters is
+    // the endpoint's. The static Claude table is only authoritative when the
+    // endpoint is Anthropic itself or a routing gateway that labels its ids
+    // `vendor/model`. Anywhere else the configured or catalogued value must be
+    // honoured, which the comment on `cached_context_limit` already promises.
+    let endpoint_is_anthropic_or_gateway = match provider_hint {
+        Some(hint) => matches!(
+            normalize_provider_id(hint).as_str(),
+            "anthropic"
+                | "claude"
+                | "openai"
+                | "openrouter"
+                | "copilot"
+                | "github copilot"
+                | "antigravity"
+                | "gemini"
+                | "google gemini"
+                | "cursor"
+        ),
+        None => true,
+    };
+    let foreign_ids_on_custom_endpoint =
+        raw_model_had_vendor_prefix && !endpoint_is_anthropic_or_gateway;
     let provider = provider_key_from_hint(provider_hint).or_else(|| provider_for_model(model));
     let (model, is_1m) = model_id_for_capability_lookup(model, provider);
     let model = model.as_str();
@@ -263,7 +295,9 @@ pub fn context_limit_for_model_with_provider_and_cache(
             mode.default_context_window()
         }
     });
-    if claude_static_limit.is_some() && crate::anthropic::anthropic_context_mode_is_verified(model)
+    if !foreign_ids_on_custom_endpoint
+        && claude_static_limit.is_some()
+        && crate::anthropic::anthropic_context_mode_is_verified(model)
     {
         return claude_static_limit;
     }
@@ -333,8 +367,14 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
 
     // --- Z.AI GLM family ---
     if m.contains("glm") {
-        // GLM-5.2: first GLM with a truly usable 1M-token context window.
-        if m.contains("glm-5.2") || m.contains("glm-52") || m.contains("glm-5p2") {
+        // GLM-5.2 and GLM-5.3 support a 1M-token context window.
+        if m.contains("glm-5.2")
+            || m.contains("glm-5.3")
+            || m.contains("glm-52")
+            || m.contains("glm-53")
+            || m.contains("glm-5p2")
+            || m.contains("glm-5p3")
+        {
             return Some(1_000_000);
         }
         // GLM-5 / GLM-5.1 and GLM-4.6 / GLM-4.7: 200K context.
@@ -386,7 +426,11 @@ pub fn open_weight_family_context_limit(model: &str) -> Option<usize> {
     }
 
     // --- MiniMax M2 family: 204,800 context ---
+    // --- MiniMax M3 family: 1,000,000 context ---
     if m.contains("minimax") {
+        if m.contains("m3") {
+            return Some(1_000_000);
+        }
         return Some(204_800);
     }
 
@@ -544,10 +588,54 @@ mod tests {
         );
     }
 
+    /// Regression: a live Claude model missing from the bundled list has no
+    /// Claude OAuth/API route until the account catalog has been fetched, so
+    /// the picker could only offer it through some other provider that lists
+    /// the same id (a user picking Fable 5.2 landed on an OpenAI-compatible
+    /// endpoint instead of their Claude subscription).
+    #[test]
+    fn bundled_claude_list_covers_live_generations() {
+        for model in ["claude-fable-5-2", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+            assert!(ALL_CLAUDE_MODELS.contains(&model), "{model} missing");
+            assert_eq!(provider_for_model(model), Some("claude"), "{model}");
+            assert_eq!(
+                context_limit_for_model_with_provider(model, Some("claude")),
+                Some(1_000_000),
+                "{model}"
+            );
+            assert_eq!(
+                crate::anthropic::anthropic_max_output_tokens(model),
+                128_000,
+                "{model}"
+            );
+        }
+        let position = |model: &str| ALL_CLAUDE_MODELS.iter().position(|m| *m == model);
+        assert!(position("claude-fable-5-2") < position("claude-fable-5-1"));
+    }
+
     #[test]
     fn bare_k3_resolves_globally_to_one_million_context() {
         // Global resolution path used by the TUI meter and compaction budget (#577).
         assert_eq!(context_limit_for_model("k3"), Some(1_048_576));
+    }
+
+    #[test]
+    fn glm_53_family_resolves_to_one_million_context() {
+        for model in [
+            "glm-5.3",
+            "glm-5.3-flash",
+            "glm-5.3-flashx",
+            "zai-org/glm-5.3",
+            "glm-53",
+            "glm-5p3-flash",
+        ] {
+            assert_eq!(
+                open_weight_family_context_limit(model),
+                Some(1_000_000),
+                "unexpected context limit for {model}"
+            );
+        }
+        assert_eq!(open_weight_family_context_limit("glm-5.1"), Some(200_000));
     }
 
     #[test]
@@ -579,6 +667,61 @@ mod tests {
         );
         assert_eq!(
             context_limit_for_model_with_provider("claude-sonnet-4.6", Some("claude")),
+            Some(200_000)
+        );
+    }
+
+    /// Regression for upstream #1625: a custom OpenAI-compatible endpoint can
+    /// serve ids that carry another vendor's name, and the static Claude table was
+    /// returning before the configured limit was ever read. `anthropic/claude-sonnet-4`
+    /// behind an endpoint configured as `deepseek` resolved to 200K even with an
+    /// explicit 1M configured, contradicting the comment on `cached_context_limit`
+    /// and the README's `context_window` escape hatch.
+    #[test]
+    fn custom_endpoint_claude_named_id_honours_configured_window() {
+        let one_m = Some(1_000_000);
+        assert_eq!(
+            context_limit_for_model_with_provider_and_cache(
+                "anthropic/claude-sonnet-4",
+                Some("deepseek"),
+                |_| one_m,
+            ),
+            one_m,
+            "a custom endpoint's own window must win over the static Claude table"
+        );
+
+        // A routing gateway still labels ids `vendor/model` and the static table
+        // stays authoritative there, so this behaviour is deliberately unchanged.
+        assert_eq!(
+            context_limit_for_model_with_provider_and_cache(
+                "anthropic/claude-sonnet-4",
+                Some("openrouter"),
+                |_| one_m,
+            ),
+            Some(200_000)
+        );
+
+        // A plain unqualified Claude id on Anthropic keeps the static answer too.
+        assert_eq!(
+            context_limit_for_model_with_provider_and_cache(
+                "claude-sonnet-4",
+                Some("claude"),
+                |_| one_m
+            ),
+            Some(200_000)
+        );
+    }
+
+    /// With nothing configured the custom endpoint still falls back to the static
+    /// Claude value as a last resort, rather than reporting no limit at all.
+    #[test]
+    fn custom_endpoint_claude_named_id_still_falls_back_without_config() {
+        assert_eq!(
+            context_limit_for_model_with_provider_and_cache(
+                "anthropic/claude-sonnet-4",
+                Some("deepseek"),
+                |_| None,
+            ),
             Some(200_000)
         );
     }

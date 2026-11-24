@@ -1,3 +1,7 @@
+// reference: https://hindsight.vectorize.io/0.10/developer/api/recall
+//   (upstream contract for the recall block this module publishes; the
+//   mental-models half of it is documented at
+//   https://hindsight.vectorize.io/developer/mental-models)
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -21,6 +25,13 @@ struct QueuedPendingMemory {
 struct PendingBinding {
     project_dir: Option<String>,
     snapshots: HashMap<String, MemorySnapshot>,
+    /// True when the memories come from an EXTERNAL backend (Hindsight) and
+    /// therefore do not exist in the local memory graph. Such a payload is
+    /// still bound to the project (so a session that changes directory does
+    /// not pick it up), but it is NOT re-validated against the local graph:
+    /// the local graph cannot know about a foreign document, and pretending
+    /// otherwise would discard every externally recalled memory.
+    external: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -34,8 +45,6 @@ struct MemorySnapshot {
 static LAST_INJECTED_PROMPT_SIGNATURE: Mutex<Option<HashMap<String, (String, Instant)>>> =
     Mutex::new(None);
 
-/// Recently injected memory ID sets per session.
-/// Used to suppress near-duplicate re-injection even when formatting differs.
 static LAST_INJECTED_MEMORY_SET: Mutex<Option<LastInjectedMemorySetBySession>> = Mutex::new(None);
 
 /// Memory IDs that have already been injected into the conversation, with the
@@ -43,6 +52,51 @@ static LAST_INJECTED_MEMORY_SET: Mutex<Option<LastInjectedMemorySetBySession>> =
 /// re-injected on subsequent turns while it is still fresh in the transcript.
 /// Keyed by session ID.
 static INJECTED_MEMORY_IDS: Mutex<Option<InjectedMemoryIdsBySession>> = Mutex::new(None);
+
+/// Tool calls observed since the last memory refresh, per session.
+///
+/// The agent can work for a long time without a user message, and a recall
+/// that only fires on a user turn therefore never arrives during that work.
+/// This counter lets the caller ask for a refresh after N tool calls.
+static TOOL_CALLS_SINCE_REFRESH: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// Record that `count` tool calls completed for this session.
+pub fn note_tool_calls(session_id: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        let entry = map.entry(session_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(count);
+    }
+}
+
+/// Tool calls observed since the last refresh, without resetting.
+///
+/// Separate from the reset because the refresh decision is evaluated on
+/// EVERY provider iteration. A combined take-and-reset would clear the
+/// counter each iteration, so the threshold could only ever be reached by a
+/// single iteration making N tool calls at once, and the cadence would
+/// never fire in a normal agent loop.
+pub fn tool_calls_since_refresh(session_id: &str) -> usize {
+    let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() else {
+        return 0;
+    };
+    guard
+        .as_mut()
+        .and_then(|map| map.get(session_id).copied())
+        .unwrap_or(0)
+}
+
+/// Reset the refresh counter for this session.
+pub fn reset_tool_calls_since_refresh(session_id: &str) {
+    if let Ok(mut guard) = TOOL_CALLS_SINCE_REFRESH.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.remove(session_id);
+        }
+    }
+}
 
 /// Guard to ensure only one memory check runs at a time, per session.
 /// Keyed by session ID.
@@ -243,7 +297,9 @@ fn take_pending_memory_inner(
         crate::memory_log::log_pending_discarded(session_id, "stale (>120s)");
         return None;
     }
-    if let Some(binding) = &queued.binding {
+    if let Some(binding) = &queued.binding
+        && !binding.external
+    {
         let valid =
             snapshot_selected_memories(binding.project_dir.as_deref(), &queued.pending.memory_ids)
                 .is_ok_and(|(current, _)| current == binding.snapshots);
@@ -368,6 +424,200 @@ pub fn set_pending_memory_for_project(
     );
 }
 
+/// Publish a memory payload that came from an EXTERNAL backend (Hindsight).
+///
+/// The payload is bound to the project so a session that changes directory
+/// does not pick it up, but it is not validated against the local memory
+/// graph: the documents live in the Hindsight bank, so the local graph
+/// cannot confirm or deny them. The document ids still drive the existing
+/// dedup/TTL bookkeeping, so the same fact is not injected twice.
+pub fn set_pending_memory_external(
+    session_id: &str,
+    prompt: String,
+    count: usize,
+    memory_ids: Vec<String>,
+    display_prompt: Option<String>,
+    project_dir: Option<&str>,
+) {
+    store_pending_memory(
+        session_id,
+        prompt,
+        count,
+        memory_ids,
+        display_prompt,
+        Some(PendingBinding {
+            project_dir: project_dir.map(str::to_owned),
+            snapshots: HashMap::new(),
+            external: true,
+        }),
+    );
+}
+
+/// Merge a payload into the one already queued for this session, instead of
+/// replacing it.
+///
+/// The reopen trigger publishes its notice on its OWN payload, because the
+/// notice is external content and must not be blended into the recall facts.
+/// But a session's pending slot holds ONE payload: a plain `insert` made the
+/// reopen notice DISPLACE the recall facts that were published moments
+/// earlier in the same turn, so the agent received the notice INSTEAD of the
+/// recalled context.
+///
+/// MEASURED 2026-11-11 on the source: `store_pending_memory` ended in
+/// `map.insert(session_id, ...)`, while `publish_reopen_notice` ran after
+/// `set_pending_memory_external` inside the same `process_context` call. The
+/// comment in `memory_agent.rs` claimed the notice "cannot displace the
+/// recall facts"; the code did the opposite.
+///
+/// The merge is section-wise, not a blind concatenation: the recall block and
+/// the reopen notice are separate `## ` sections, so a payload that is
+/// already queued with a DIFFERENT top-level section is appended under its
+/// own heading. When both payloads carry the same section, the newer one
+/// replaces that section's text, so a stale notice cannot survive a refresh.
+fn merge_pending_payload(existing: &PendingMemory, added: PendingMemory) -> PendingMemory {
+    /// Split a payload into its top-level `## ` sections, keeping the heading
+    /// with its body.
+    fn sections(prompt: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut current: Option<(String, String)> = None;
+        for line in prompt.lines() {
+            if line.starts_with("## ") {
+                if let Some(section) = current.take() {
+                    out.push(section);
+                }
+                current = Some((line.to_string(), String::new()));
+            } else if let Some((_, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            } else if !line.trim().is_empty() {
+                // Content before any `## ` heading (the "# Memory" title and
+                // a possible preamble) is kept as its own leading section.
+                match out.first_mut() {
+                    Some((_, body)) => {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                    None => out.push((String::new(), format!("{line}\n"))),
+                }
+            }
+        }
+        if let Some(section) = current.take() {
+            out.push(section);
+        }
+        out
+    }
+
+    let mut merged = existing.clone();
+    let mut prompt = String::new();
+    let mut display = String::new();
+
+    for (heading, body) in sections(&existing.prompt) {
+        prompt.push_str(&heading);
+        prompt.push('\n');
+        prompt.push_str(&body);
+    }
+    for (heading, body) in sections(&added.prompt) {
+        // Same section: the newer payload replaces that section's text, so a
+        // stale notice cannot survive a refresh.
+        let replaced = !heading.is_empty() && existing.prompt.contains(&heading);
+        if replaced {
+            let mut rebuilt = String::new();
+            for (h, b) in sections(&existing.prompt) {
+                if h == heading {
+                    continue;
+                }
+                rebuilt.push_str(&h);
+                rebuilt.push('\n');
+                rebuilt.push_str(&b);
+            }
+            prompt = rebuilt;
+        }
+        prompt.push_str(&heading);
+        prompt.push('\n');
+        prompt.push_str(&body);
+    }
+
+    if let Some(existing_display) = existing.display_prompt.as_ref() {
+        display.push_str(existing_display);
+        display.push_str("\n\n");
+    }
+    if let Some(added_display) = added.display_prompt.as_ref() {
+        display.push_str(added_display);
+    }
+
+    merged.prompt = prompt;
+    merged.display_prompt = if display.trim().is_empty() {
+        None
+    } else {
+        Some(display)
+    };
+    merged.computed_at = added.computed_at;
+    merged.count = existing.count + added.count;
+    let mut ids = existing.memory_ids.clone();
+    for id in added.memory_ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    merged.memory_ids = ids;
+    merged
+}
+
+/// Publish a payload that is ADDITIONAL to whatever is already queued for
+/// this session, rather than replacing it.
+///
+/// Used by publishers that must not displace an existing payload: the reopen
+/// notice is one. When the slot is empty this behaves exactly like
+/// `set_pending_memory_external`.
+pub fn append_pending_memory_external(
+    session_id: &str,
+    prompt: String,
+    count: usize,
+    memory_ids: Vec<String>,
+    display_prompt: Option<String>,
+    project_dir: Option<&str>,
+) {
+    let binding = Some(PendingBinding {
+        project_dir: project_dir.map(str::to_owned),
+        snapshots: HashMap::new(),
+        external: true,
+    });
+    crate::memory_log::log_pending_prepared(session_id, &prompt, count, &memory_ids);
+
+    if let Ok(mut guard) = PENDING_MEMORY.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        match map.get_mut(session_id) {
+            Some(existing) if existing.pending.is_fresh() => {
+                existing.pending = merge_pending_payload(
+                    &existing.pending,
+                    PendingMemory {
+                        prompt,
+                        display_prompt,
+                        computed_at: Instant::now(),
+                        count,
+                        memory_ids,
+                    },
+                );
+            }
+            _ => {
+                map.insert(
+                    session_id.to_string(),
+                    QueuedPendingMemory {
+                        pending: PendingMemory {
+                            prompt,
+                            display_prompt,
+                            computed_at: Instant::now(),
+                            count,
+                            memory_ids,
+                        },
+                        binding,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Automatic publishers must retain the entries actually judged by Jev. A
 /// canonical prompt alone cannot detect tags-only edits while inference was in
 /// flight, because tags are model input but not part of the rendered prompt.
@@ -450,6 +700,7 @@ fn publish_scoped_memory(
         Some(PendingBinding {
             project_dir: project_dir.map(str::to_owned),
             snapshots,
+            external: false,
         }),
     );
 }
@@ -637,22 +888,30 @@ pub fn clear_all_injected_memories() {
 
 /// Clear any pending memory result for a session.
 pub fn clear_pending_memory(session_id: &str) {
+    clear_pending_payload(session_id);
+    clear_injected_memories(session_id);
+}
+
+/// Clear only the QUEUED payload for a session, keeping the bookkeeping of
+/// what was already delivered.
+///
+/// reference: no prior art, searched the Hindsight docs (mental-models,
+/// recall, mcp-server) - upstream has no notion of "what this client already
+/// put in the conversation". That state is the client's own.
+///
+/// MEASURED 2026-11-10 on the live daemon: `clear_pending_memory` used to be
+/// called before EVERY recall, and it also cleared the injected-id set and
+/// the last-injected-set map. Both dedup lines were therefore dead: the same
+/// payload (6 facts + 2 models, identical ids) was delivered twice into one
+/// session 26 seconds apart. The pending payload and the delivered-set
+/// bookkeeping are two different things - a stale QUEUE entry must be
+/// dropped, but a fact the model already saw must stay remembered.
+pub fn clear_pending_payload(session_id: &str) {
     if let Ok(mut guard) = PENDING_MEMORY.lock()
         && let Some(map) = guard.as_mut()
     {
         map.remove(session_id);
     }
-    if let Ok(mut guard) = LAST_INJECTED_PROMPT_SIGNATURE.lock()
-        && let Some(map) = guard.as_mut()
-    {
-        map.remove(session_id);
-    }
-    if let Ok(mut guard) = LAST_INJECTED_MEMORY_SET.lock()
-        && let Some(map) = guard.as_mut()
-    {
-        map.remove(session_id);
-    }
-    clear_injected_memories(session_id);
 }
 
 /// Clear all pending memory state across all sessions.
@@ -966,6 +1225,232 @@ mod scoped_tests {
                 take_pending_memory_for_project("global-switched", Some("/project/a")).is_none()
             );
             assert!(!is_memory_injected("global-switched", &global.id));
+        });
+    }
+
+    /// The reopen notice must not displace the recall facts published in the
+    /// same turn.
+    ///
+    /// MEASURED 2026-11-11 on the source: the pending slot holds ONE payload
+    /// and `store_pending_memory` ended in `map.insert`, so a notice
+    /// published after the recall REPLACED the recall facts. The agent then
+    /// received the notice instead of the recalled context.
+    ///
+    /// reference: crates/jcode-base/src/memory_agent.rs
+    ///   (`publish_reopen_notice` - the publisher that must not displace).
+    #[test]
+    fn an_appended_notice_does_not_displace_the_recall_facts() {
+        fixture(|| {
+            set_pending_memory_external(
+                "merge",
+                "# Memory\n\n## Relevant facts\n\n- fact one\n- fact two".to_string(),
+                2,
+                vec!["fact-1".to_string(), "fact-2".to_string()],
+                None,
+                None,
+            );
+            append_pending_memory_external(
+                "merge",
+                "## Goals worth reopening\n\n- **Ship the thing** -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("merge", None)
+                .expect("the merged payload must still be delivered");
+            assert!(
+                pending.prompt.contains("- fact one"),
+                "the recall facts must survive the notice: {}",
+                pending.prompt
+            );
+            assert!(
+                pending.prompt.contains("Goals worth reopening"),
+                "the notice must survive the merge: {}",
+                pending.prompt
+            );
+            assert_eq!(pending.count, 3, "the counts add up");
+            assert!(
+                pending.memory_ids.contains(&"fact-1".to_string())
+                    && pending.memory_ids.contains(&"reopen:Goals worth reopening".to_string()),
+                "both id sets are tracked: {:?}",
+                pending.memory_ids
+            );
+        });
+    }
+
+    /// A notice that carries the SAME section as the queued payload replaces
+    /// that section, so a stale notice cannot survive a refresh.
+    #[test]
+    fn an_appended_notice_replaces_the_same_section() {
+        fixture(|| {
+            set_pending_memory_external(
+                "same-section",
+                "# Memory\n\n## Goals worth reopening\n\n- old goal -> wait".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            append_pending_memory_external(
+                "same-section",
+                "## Goals worth reopening\n\n- new goal -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("same-section", None)
+                .expect("the payload must be delivered");
+            assert!(
+                !pending.prompt.contains("- old goal"),
+                "the stale section must be replaced: {}",
+                pending.prompt
+            );
+            assert!(
+                pending.prompt.contains("- new goal"),
+                "the fresh section must be present: {}",
+                pending.prompt
+            );
+        });
+    }
+
+    /// Appending to an EMPTY slot behaves exactly like the plain setter: the
+    /// payload is delivered on its own.
+    #[test]
+    fn an_appended_notice_into_an_empty_slot_is_delivered_alone() {
+        fixture(|| {
+            append_pending_memory_external(
+                "empty",
+                "## Goals worth reopening\n\n- goal -> reopen".to_string(),
+                1,
+                vec!["reopen:Goals worth reopening".to_string()],
+                None,
+                None,
+            );
+            let pending = take_pending_memory_for_project("empty", None)
+                .expect("the payload must be delivered");
+            assert!(pending.prompt.contains("- goal -> reopen"));
+            assert_eq!(pending.count, 1);
+        });
+    }
+
+    /// The mental-model ids must take part in the injected-set bookkeeping.
+    ///
+    /// MEASURED 2026-11-10: only the FACT ids were tracked, so a model
+    /// whose text was already in the transcript could be delivered again on
+    /// the next turn - the "the same thing every time" complaint had a
+    /// second cause. The model ids are tracked with a `model:` prefix so
+    /// they cannot collide with Hindsight fact ids.
+    ///
+    /// reference: https://hindsight.vectorize.io/0.10/developer/api/mental-models
+    ///   (`id` is the "Unique mental model ID"; it is stable across
+    ///   refreshes, so it is a valid dedup key for an already delivered
+    ///   model).
+    #[test]
+    fn an_already_delivered_model_is_not_delivered_again() {
+        fixture(|| {
+            let ids = vec!["fact-1".to_string(), "model:active-work".to_string()];
+            set_pending_memory_external(
+                "models",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids.clone(),
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("models", None).is_some());
+            assert!(is_memory_injected("models", "model:active-work"));
+
+            // The SAME payload on the next turn must not reach the model
+            // again: every element of it is already known.
+            set_pending_memory_external(
+                "models",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids,
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("models", None).is_none(),
+                "an already delivered model set must not be delivered again"
+            );
+        });
+    }
+
+    /// A payload with a NEW fact alongside an already delivered model is
+    /// still delivered: the suppression is per-element, not per-payload.
+    #[test]
+    fn a_new_fact_alongside_a_known_model_is_delivered() {
+        fixture(|| {
+            set_pending_memory_external(
+                "mixed",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                1,
+                vec!["model:active-work".to_string()],
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("mixed", None).is_some());
+
+            set_pending_memory_external(
+                "mixed",
+                "# Memory\n\n## Relevant facts\n\n- fact one\n- fact two".to_string(),
+                2,
+                vec!["model:active-work".to_string(), "fact-two".to_string()],
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("mixed", None).is_some(),
+                "a payload with a new fact must still be delivered"
+            );
+        });
+    }
+
+    /// Clearing the QUEUED payload must not forget what was already
+    /// delivered.
+    ///
+    /// MEASURED 2026-11-10 on the live daemon: the recall path cleared the
+    /// pending queue AND the injected-id set before every recall, so both
+    /// dedup lines were dead and one session received the identical payload
+    /// (6 facts + 2 models, same ids) twice within 26 seconds.
+    #[test]
+    fn clearing_the_queued_payload_keeps_the_delivered_set() {
+        fixture(|| {
+            let ids = vec!["fact-1".to_string(), "model:active-work".to_string()];
+            set_pending_memory_external(
+                "queue",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids.clone(),
+                None,
+                None,
+            );
+            assert!(take_pending_memory_for_project("queue", None).is_some());
+
+            // The recall path drops the stale queue entry before fetching.
+            clear_pending_payload("queue");
+            assert!(!has_pending_memory("queue"));
+            assert!(
+                is_memory_injected("queue", "model:active-work"),
+                "the delivered set must survive a queue clear"
+            );
+
+            // And the same payload is therefore not delivered again.
+            set_pending_memory_external(
+                "queue",
+                "# Memory\n\n## Relevant facts\n\n- fact one".to_string(),
+                2,
+                ids,
+                None,
+                None,
+            );
+            assert!(
+                take_pending_memory_for_project("queue", None).is_none(),
+                "an already delivered payload must not reach the model again"
+            );
         });
     }
 

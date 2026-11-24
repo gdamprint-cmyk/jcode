@@ -1,0 +1,20 @@
+{
+  "installed": true,
+  "local_dev": false,
+  "force": false,
+  "agent": "jcode",
+  "hook_names": [
+    "session-start",
+    "turn-start",
+    "turn-end",
+    "session-end"
+  ],
+  "commands": {
+    "session-start": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' session-start",
+    "turn-start": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' turn-start",
+    "turn-end": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' turn-end",
+    "session-end": "python 'C:\\Users\\WorkShop1\\proj\\entire-agent-jcode\\entire-agent-jcode-hook.py' session-end"
+  },
+  "jcode_config": "C:\\Users\\WorkShop1\\.jcode\\config.toml",
+  "global_scope": false
+}

@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
+// reference: https://github.com/NousResearch/hermes-agent/blob/main/tools/memory_tool.py
 //! Memory tool for storing and recalling information across sessions
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -147,6 +148,36 @@ impl Tool for MemoryTool {
                     .parse()
                     .map_err(|err| anyhow::anyhow!("invalid memory category: {}", err))?;
                 let scope = input.scope.as_deref().unwrap_or("project");
+
+                // Memory write gate (opt-in, default off). When enabled, the
+                // write is NOT applied until the user approves it through the
+                // existing permission surface (`jcode permissions`, the
+                // Telegram/email reply paths). The request id is deterministic,
+                // so repeating the same write after an approval goes through.
+                match crate::tool::memory_write_gate::evaluate_memory_write(
+                    &ctx.session_id,
+                    scope,
+                    &category.to_string(),
+                    &content,
+                ) {
+                    crate::tool::memory_write_gate::GateOutcome::Allowed => {}
+                    crate::tool::memory_write_gate::GateOutcome::Pending {
+                        request_id,
+                        reason,
+                    } => {
+                        memory::set_state(MemoryState::Idle);
+                        return Ok(ToolOutput::new(format!(
+                            "Memory write pending approval (request id {request_id}): {reason}"
+                        )));
+                    }
+                    crate::tool::memory_write_gate::GateOutcome::Rejected { reason } => {
+                        memory::set_state(MemoryState::Idle);
+                        return Err(anyhow::anyhow!(
+                            "Memory write rejected by the user: {reason}"
+                        ));
+                    }
+                }
+
                 memory::set_state(MemoryState::ToolAction {
                     action: "remember".into(),
                     detail: truncate_for_widget(&content, 40),
@@ -219,11 +250,14 @@ impl Tool for MemoryTool {
                         result
                     }
                     "jev" | "semantic" | "cascade" => {
+                        // reference: https://hindsight.vectorize.io/developer/api/retain
+                        // (retention is Hindsight-owned; this branch is now the local
+                        // graph's own semantic scan, not a remote Jev decision)
                         let query = match &input.query {
                             Some(q) => q.clone(),
                             None => {
                                 return Err(anyhow::anyhow!(
-                                    "query required for Jev recall (including semantic/cascade aliases)"
+                                    "query required for recall (semantic/cascade are aliases)"
                                 ));
                             }
                         };
@@ -235,10 +269,8 @@ impl Tool for MemoryTool {
                         let results = if limit == 0 {
                             Ok(Vec::new())
                         } else {
-                            crate::memory_jev::recall(&manager, &query, limit, scope).await
+                            manager.search_scoped(&query, scope)
                         };
-                        // A missing Jev credential or failed request must not leave
-                        // the widget busy or silently fall back to unjudged recall.
                         memory::set_state(MemoryState::Idle);
                         let results = results?;
 
@@ -259,26 +291,22 @@ impl Tool for MemoryTool {
                                 results.len(),
                                 query
                             );
-                            for (entry, score) in results {
+                            for entry in results {
                                 let tags_str = if entry.tags.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [{}]", entry.tags.join(", "))
                                 };
                                 out.push_str(&format!(
-                                    "- [{}] {}{}\n  id: {} (relevance: {:.0}%)\n\n",
-                                    entry.category,
-                                    entry.content,
-                                    tags_str,
-                                    entry.id,
-                                    score * 100.0
+                                    "- [{}] {}{}\n  id: {}\n\n",
+                                    entry.category, entry.content, tags_str, entry.id
                                 ));
                             }
                             Ok(ToolOutput::new(out))
                         }
                     }
                     other => Err(anyhow::anyhow!(
-                        "Unknown mode: {}. Use recent or jev (semantic/cascade are Jev aliases)",
+                        "Unknown mode: {}. Use recent or semantic (cascade is an alias)",
                         other
                     )),
                 }
@@ -470,6 +498,24 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The opt-in memory write gate: off by default, and the write is held
+    /// for approval when it is on.
+    ///
+    /// The unit tests live in `memory_write_gate_tests.rs`, NEXT TO this file
+    /// in `tool/`. A `#[path]` on a module declared inside an INLINE module
+    /// block is resolved against the directory of that inline module, which
+    /// here is `tool/memory/tests/`. MEASURED 2026-11-17: the bare name
+    /// resolved to `tool/memory/tests/memory_write_gate_tests.rs` and
+    /// `"../..."` to `tool/memory/memory_write_gate_tests.rs` - neither
+    /// exists. The path must climb TWO levels to reach `tool/`.
+    ///
+    /// They are wired HERE, inside `mod tests`, because they use `super::*`
+    /// for `MemoryTool` and `test_ctx`, which live in this module.
+    /// reference: crates/jcode-app-core/src/tool/research_gate.rs - the sibling
+    /// gate, wired from `tool/mod.rs` because its tests need `crate::tool`.
+    #[path = "../../memory_write_gate_tests.rs"]
+    mod memory_write_gate_tests;
+
     #[test]
     fn schema_only_advertises_core_memory_fields() {
         let schema = MemoryTool::new().parameters_schema();
@@ -516,7 +562,6 @@ mod tests {
                 "JCODE_API_KEY",
                 "TYPESAFE_API_KEY",
                 "AIMLAPI_API_KEY",
-                "JCODE_MEMORY_JEV_PROVIDER",
             ];
             let previous = keys
                 .into_iter()
@@ -542,8 +587,21 @@ mod tests {
         }
     }
 
+    /// MEASURED 2026-11-17: the Jev backend was removed by the local commit
+    /// 4950764e1 ("remove the Jev backend, leave Hindsight as the only memory
+    /// writer"), which replaced the remote `crate::memory_jev::recall` call
+    /// with the LOCAL graph's own semantic scan. The test that still expected
+    /// a Jev credential error therefore failed on every branch carrying that
+    /// commit. The contract is now the opposite: a queried recall needs NO
+    /// credentials at all, because it is a local scan.
+    /// reference: crates/jcode-base/src/memory.rs:915 - `search_scoped`, the
+    /// local scan the "jev"/"semantic"/"cascade" branch now runs.
+    /// reference: https://doc.rust-lang.org/reference/items/modules.html - the
+    /// `#[path]` rule that made this module's path `../../` rather than a bare
+    /// name (a path inside an inline module block is relative to the directory
+    /// named after the non-mod-rs module plus the inline module components).
     #[tokio::test]
-    async fn queried_recall_uses_jev_for_default_and_legacy_aliases() {
+    async fn queried_recall_uses_the_local_scan_for_default_and_legacy_aliases() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::tempdir().unwrap();
         let _env = OfflineEnv::new(home.path());
@@ -563,12 +621,17 @@ mod tests {
             if let Some(mode) = mode {
                 input["mode"] = json!(mode);
             }
-            let error = tool
+            // The local scan needs no credentials, so the recall succeeds with
+            // the credential environment stripped.
+            let output = tool
                 .execute(input.clone(), ctx())
                 .await
-                .expect_err("populated query recall without credentials must fail closed");
-            assert!(error.to_string().contains("Jev"), "{mode:?}: {error}");
-            assert!(!error.to_string().contains("jev-only-recall-probe"));
+                .expect("a queried recall runs a local scan and needs no credentials");
+            assert!(
+                output.output.contains("jev-only-recall-probe"),
+                "{mode:?}: the remembered fact must be recalled: {}",
+                output.output
+            );
 
             input["limit"] = json!(0);
             let output = tool
@@ -579,7 +642,8 @@ mod tests {
         }
 
         // An empty selected scope is not allowed to borrow candidates from
-        // another scope (which would also require unavailable Jev credentials).
+        // another scope (a memory is never searched outside the scope it was
+        // written to).
         let empty = tool
             .execute(
                 json!({"action":"recall", "query":"probe", "scope":"global"}),

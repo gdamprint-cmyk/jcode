@@ -143,9 +143,11 @@ mod tests {
             rate_limit_backoff(429, None, Some(90), Some(9_999), now).unwrap(),
             Duration::from_secs(90)
         );
-        // A bogus far-future reset must not disable checks forever.
+        // A bogus far-future reset must not disable checks forever. Keep the
+        // epoch representable: u64::MAX/2 overflows SystemTime::checked_add on
+        // Windows, which falls back to the default before the clamp is reached.
         assert_eq!(
-            rate_limit_backoff(429, Some(0), None, Some(u64::MAX / 2), now).unwrap(),
+            rate_limit_backoff(429, Some(0), None, Some(1_000 + 10 * 60 * 60), now).unwrap(),
             RATE_LIMIT_BACKOFF_MAX
         );
         // Past/zero hints fall back to the default window.

@@ -38,6 +38,9 @@ pub struct SubscriptionUsage {
 pub struct SubscriptionCapabilities {
     #[serde(default)]
     pub voice_transcription: bool,
+    /// Server-verified entitlement for mobile transcript sync.
+    #[serde(default)]
+    pub mobile_sync: bool,
     /// Server-verified entitlement and configured isolated build service.
     #[serde(default)]
     pub remote_compile: bool,
@@ -271,19 +274,31 @@ fn error_code(body: &str) -> Option<String> {
         .map(|code| code.chars().take(80).collect())
 }
 
+#[derive(Serialize)]
+struct DeviceAuthorizationRequest {
+    client_name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_tier: Option<&'static str>,
+}
+
+impl DeviceAuthorizationRequest {
+    fn new(requested_tier: Option<JcodeTier>) -> Self {
+        Self {
+            client_name: "jcode-cli",
+            requested_tier: requested_tier.map(JcodeTier::as_str),
+        }
+    }
+}
+
 pub async fn request_device_authorization(
     client: &reqwest::Client,
     api_base: &str,
     requested_tier: Option<JcodeTier>,
 ) -> std::result::Result<DeviceAuthorization, AccountApiError> {
     let url = endpoint_url(api_base, "auth/device");
-    let mut payload = serde_json::json!({ "client_name": "jcode-cli" });
-    if let Some(tier) = requested_tier {
-        payload["requested_tier"] = serde_json::Value::String(tier.as_str().to_string());
-    }
     let response = client
         .post(url)
-        .json(&payload)
+        .json(&DeviceAuthorizationRequest::new(requested_tier))
         .timeout(DEVICE_REQUEST_TIMEOUT)
         .send()
         .await
@@ -325,6 +340,42 @@ pub async fn request_device_authorization(
     })
 }
 
+#[derive(Serialize)]
+struct DeviceTokenRequest<'a> {
+    device_code: &'a str,
+}
+
+#[derive(Serialize)]
+struct EmailCodeStartRequest<'a> {
+    client_name: &'static str,
+    email: &'a str,
+}
+
+impl<'a> EmailCodeStartRequest<'a> {
+    fn new(email: &'a str) -> Self {
+        Self {
+            client_name: "jcode-cli",
+            email: email.trim(),
+        }
+    }
+}
+
+// Keep fields in the sorted order emitted by the legacy JSON maps.
+#[derive(Serialize)]
+struct EmailCodeVerifyRequest<'a> {
+    code: &'a str,
+    login_token: &'a str,
+}
+
+impl<'a> EmailCodeVerifyRequest<'a> {
+    fn new(login_token: &'a str, code: &'a str) -> Self {
+        Self {
+            code: code.trim(),
+            login_token,
+        }
+    }
+}
+
 pub async fn poll_device_token_once(
     client: &reqwest::Client,
     api_base: &str,
@@ -333,7 +384,7 @@ pub async fn poll_device_token_once(
     let url = endpoint_url(api_base, "auth/token");
     let response = client
         .post(url)
-        .json(&serde_json::json!({ "device_code": device_code }))
+        .json(&DeviceTokenRequest { device_code })
         .timeout(DEVICE_REQUEST_TIMEOUT)
         .send()
         .await
@@ -425,7 +476,7 @@ pub async fn request_email_code(
 ) -> std::result::Result<EmailCodeStart, AccountApiError> {
     let response = client
         .post(endpoint_url(api_base, "auth/email/start"))
-        .json(&serde_json::json!({ "client_name": "jcode-cli", "email": email.trim() }))
+        .json(&EmailCodeStartRequest::new(email))
         .timeout(DEVICE_REQUEST_TIMEOUT)
         .send()
         .await
@@ -462,7 +513,7 @@ pub async fn verify_email_code(
 ) -> std::result::Result<EmailCodeVerifyOutcome, AccountApiError> {
     let response = client
         .post(endpoint_url(api_base, "auth/email/verify"))
-        .json(&serde_json::json!({ "login_token": login_token, "code": code.trim() }))
+        .json(&EmailCodeVerifyRequest::new(login_token, code))
         .timeout(DEVICE_REQUEST_TIMEOUT)
         .send()
         .await
@@ -573,6 +624,255 @@ pub async fn revoke_current_key(
     })
 }
 
+/// Usage-billing state for the current period, from `GET /v1/billing`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BillingStatus {
+    #[serde(default)]
+    pub monthly_hard_cap_cents: u64,
+    /// Monthly plan in dollars, present only for active subscribers.
+    #[serde(default)]
+    pub plan_usd: Option<u64>,
+    #[serde(default)]
+    pub activation: BillingActivation,
+    #[serde(default)]
+    pub promotional_credit: BillingCredit,
+    #[serde(default)]
+    pub period: BillingPeriod,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BillingActivation {
+    #[serde(default)]
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BillingCredit {
+    #[serde(default)]
+    pub original_microusd: u64,
+    #[serde(default)]
+    pub remaining_microusd: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BillingPeriod {
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    #[serde(default)]
+    pub billable_microusd: u64,
+    #[serde(default)]
+    pub remaining_cap_microusd: u64,
+}
+
+impl BillingStatus {
+    pub fn monthly_hard_cap_usd(&self) -> f64 {
+        self.monthly_hard_cap_cents as f64 / 100.0
+    }
+
+    pub fn billable_usd(&self) -> f64 {
+        self.period.billable_microusd as f64 / 1_000_000.0
+    }
+
+    pub fn promotional_credit_usd(&self) -> f64 {
+        self.promotional_credit.remaining_microusd as f64 / 1_000_000.0
+    }
+}
+
+#[derive(Deserialize)]
+struct BillingEnvelope {
+    billing: BillingStatus,
+}
+
+#[derive(Deserialize)]
+struct PortalWire {
+    url: String,
+}
+
+async fn account_response_body(
+    response: reqwest::Response,
+) -> std::result::Result<String, AccountApiError> {
+    let status = response.status();
+    let body = response.text().await.map_err(offline)?;
+    if status.is_success() {
+        return Ok(body);
+    }
+    Err(match status {
+        StatusCode::UNAUTHORIZED => AccountApiError::Unauthorized,
+        StatusCode::FORBIDDEN => AccountApiError::Forbidden,
+        _ => AccountApiError::Http {
+            status: status.as_u16(),
+            code: error_code(&body),
+        },
+    })
+}
+
+/// Fetch usage billing (monthly hard cap, period spend, credit).
+pub async fn fetch_billing_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+) -> std::result::Result<BillingStatus, AccountApiError> {
+    let response = client
+        .get(endpoint_url(api_base, "billing"))
+        .bearer_auth(api_key)
+        .timeout(ME_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(offline)?;
+    let body = account_response_body(response).await?;
+    serde_json::from_str::<BillingEnvelope>(&body)
+        .map(|envelope| envelope.billing)
+        .map_err(|_| AccountApiError::InvalidResponse("malformed /v1/billing JSON"))
+}
+
+#[derive(Serialize)]
+struct MonthlyHardCapRequest {
+    monthly_hard_cap_cents: u64,
+}
+
+#[derive(Serialize)]
+struct PlanRequest {
+    plan_usd: u64,
+}
+
+/// Set the monthly spending hard cap, in whole cents. Returns the new state.
+pub async fn set_monthly_hard_cap_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    cents: u64,
+) -> std::result::Result<BillingStatus, AccountApiError> {
+    let response = client
+        .put(endpoint_url(api_base, "billing/hard-cap"))
+        .bearer_auth(api_key)
+        .json(&MonthlyHardCapRequest {
+            monthly_hard_cap_cents: cents,
+        })
+        .timeout(ME_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(offline)?;
+    let body = account_response_body(response).await?;
+    serde_json::from_str::<BillingEnvelope>(&body)
+        .map(|envelope| envelope.billing)
+        .map_err(|_| AccountApiError::InvalidResponse("malformed /v1/billing/hard-cap JSON"))
+}
+
+/// Create a short-lived Stripe billing portal session (payment method,
+/// invoices, cancellation). Only `https://` URLs are returned.
+pub async fn billing_portal_url_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+) -> std::result::Result<String, AccountApiError> {
+    let response = client
+        .post(endpoint_url(api_base, "billing/portal"))
+        .bearer_auth(api_key)
+        .timeout(DEVICE_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(offline)?;
+    let body = account_response_body(response).await?;
+    let url = serde_json::from_str::<PortalWire>(&body)
+        .map_err(|_| AccountApiError::InvalidResponse("malformed billing portal JSON"))?
+        .url;
+    if !url.starts_with("https://") {
+        return Err(AccountApiError::InvalidResponse(
+            "billing portal URL was not https",
+        ));
+    }
+    Ok(url)
+}
+
+/// Open Stripe Checkout for a new subscription at `plan_usd` dollars a month
+/// (a multiple of $10). Stripe Checkout offers Link and saved cards, so most
+/// people never retype card details. Only `checkout.stripe.com` URLs are
+/// returned.
+pub async fn start_subscription_checkout_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    plan_usd: u64,
+) -> std::result::Result<String, AccountApiError> {
+    let response = client
+        .post(endpoint_url(api_base, "billing/subscribe"))
+        .bearer_auth(api_key)
+        .json(&PlanRequest { plan_usd })
+        .timeout(DEVICE_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(offline)?;
+    let body = account_response_body(response).await?;
+    let url = serde_json::from_str::<PortalWire>(&body)
+        .map_err(|_| AccountApiError::InvalidResponse("malformed checkout JSON"))?
+        .url;
+    if !url.starts_with("https://checkout.stripe.com/") {
+        return Err(AccountApiError::InvalidResponse(
+            "checkout URL was not Stripe Checkout",
+        ));
+    }
+    Ok(url)
+}
+
+/// Result of an in-place plan switch.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PlanChange {
+    pub plan_usd: u64,
+    pub monthly_limit_usd: f64,
+    /// When the new price applies, e.g. "next_invoice".
+    #[serde(default)]
+    pub effective: String,
+}
+
+/// Switch an active subscription to `plan_usd` dollars a month. Uses the
+/// payment method already on the subscription, so nothing is entered.
+pub async fn change_plan_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    plan_usd: u64,
+) -> std::result::Result<PlanChange, AccountApiError> {
+    let response = client
+        .post(endpoint_url(api_base, "billing/plan"))
+        .bearer_auth(api_key)
+        .json(&PlanRequest { plan_usd })
+        .timeout(DEVICE_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(offline)?;
+    let body = account_response_body(response).await?;
+    serde_json::from_str(&body)
+        .map_err(|_| AccountApiError::InvalidResponse("malformed plan change JSON"))
+}
+
+/// How a sign-out finished. Local credentials are always cleared first-class;
+/// remote revocation is best effort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignOutOutcome {
+    Revoked,
+    AlreadyRevoked,
+    NoCredential,
+    /// Local credentials were cleared but the key could not be revoked.
+    LocalOnly(String),
+}
+
+/// Revoke the current key (best effort) and clear local credentials.
+pub async fn sign_out_current_account(client: &reqwest::Client) -> Result<SignOutOutcome> {
+    let api_key = subscription_catalog::configured_api_key();
+    let remote = match api_key.as_deref() {
+        Some(key) => Some(revoke_current_key(client, &configured_api_base(), key).await),
+        None => None,
+    };
+    subscription_catalog::clear_account_credentials()?;
+    let _ = subscription_catalog::store_cached_tier(None);
+    Ok(match remote {
+        None => SignOutOutcome::NoCredential,
+        Some(Ok(())) => SignOutOutcome::Revoked,
+        Some(Err(AccountApiError::Unauthorized)) => SignOutOutcome::AlreadyRevoked,
+        Some(Err(error)) => SignOutOutcome::LocalOnly(error.to_string()),
+    })
+}
+
 /// Poll `/v1/me` after a successful token exchange until a paid plan becomes
 /// active or a clear terminal/recovery state is reached.
 pub async fn poll_for_paid_activation(
@@ -658,214 +958,186 @@ impl PollingBackoff {
 }
 
 #[cfg(test)]
-mod tests {
+mod scalar_payload_tests {
     use super::*;
-    use std::io::{Read, Write};
 
-    /// (status, extra headers, body) for one canned HTTP response.
-    type CannedResponse = (u16, Vec<(&'static str, &'static str)>, String);
+    #[test]
+    fn account_scalar_payloads_match_exact_legacy_wire() {
+        let client = reqwest::Client::new();
+        for value in [0, 1, u64::MAX] {
+            let cap = MonthlyHardCapRequest {
+                monthly_hard_cap_cents: value,
+            };
+            let plan = PlanRequest { plan_usd: value };
+            let cap_bytes = serde_json::to_vec(&serde_json::json!({
+                "monthly_hard_cap_cents": value
+            }))
+            .unwrap();
+            let plan_bytes = serde_json::to_vec(&serde_json::json!({ "plan_usd": value })).unwrap();
+            assert_eq!(serde_json::to_vec(&cap).unwrap(), cap_bytes);
+            assert_eq!(serde_json::to_vec(&plan).unwrap(), plan_bytes);
 
-    fn spawn_server(responses: Vec<CannedResponse>) -> String {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        std::thread::spawn(move || {
-            for (status, headers, body) in responses {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let mut request = [0u8; 8192];
-                let _ = stream.read(&mut request);
-                let extra = headers
-                    .into_iter()
-                    .map(|(name, value)| format!("{name}: {value}\r\n"))
-                    .collect::<String>();
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+            // Build only, never send: verify reqwest retains the exact wire body.
+            for (path, body, expected) in [
+                (
+                    "billing/hard-cap",
+                    client.put("https://example.invalid").json(&cap),
+                    &cap_bytes,
+                ),
+                (
+                    "billing/subscribe",
+                    client.post("https://example.invalid").json(&plan),
+                    &plan_bytes,
+                ),
+                (
+                    "billing/plan",
+                    client.post("https://example.invalid").json(&plan),
+                    &plan_bytes,
+                ),
+            ] {
+                let request = body.build().unwrap();
+                assert_eq!(
+                    request.body().unwrap().as_bytes().unwrap(),
+                    expected,
+                    "{path}"
                 );
-                stream.write_all(response.as_bytes()).expect("write");
             }
-        });
-        format!("http://{addr}/v1")
+        }
     }
+}
 
-    fn client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client")
-    }
+#[cfg(test)]
+#[path = "subscription_api_tests.rs"]
+mod tests;
 
-    #[test]
-    fn subscription_me_parses_expected_shape() {
-        let json = r#"{
-            "account_id": "acct_123", "email": "dev@example.com",
-            "tier": "flagship", "status": "active",
-            "usage": {"used_usd": 12.5, "budget_usd": 3000.0},
-            "manage_url": "https://jcode.sh/account"
-        }"#;
-        let me: SubscriptionMe = serde_json::from_str(json).expect("parse");
-        assert_eq!(me.parsed_tier(), Some(JcodeTier::Flagship));
-        assert!(!me.capabilities.voice_transcription);
-        assert!(!me.capabilities.remote_compile);
-        assert!(me.has_active_paid_plan());
-        assert_eq!(me.manage_url.as_deref(), Some("https://jcode.sh/account"));
-    }
+#[cfg(test)]
+mod login_request_tests {
+    use super::*;
 
     #[test]
-    fn metered_account_parses_spending_limit_and_tranche_state_without_a_tier() {
-        let json = r#"{
-            "account_id": "acct_metered", "email": "dev@example.com",
-            "tier": "none", "status": "active",
-            "usage": {
-                "used_usd": 34.5,
-                "spend_limit_usd": 100.0,
-                "billed_usd": 20.0,
-                "next_charge_at_usd": 60.0
+    fn login_payloads_match_exact_legacy_wire() {
+        for value in [
+            "",
+            " \t\r\n",
+            "example",
+            "  雪😀\"\\\n\t\u{0000}  ",
+            "\u{2003}雪\u{2003}",
+        ] {
+            let cases = [
+                (
+                    serde_json::to_vec(&DeviceTokenRequest { device_code: value }).unwrap(),
+                    serde_json::json!({ "device_code": value }),
+                ),
+                (
+                    serde_json::to_vec(&EmailCodeStartRequest::new(value)).unwrap(),
+                    serde_json::json!({ "client_name": "jcode-cli", "email": value.trim() }),
+                ),
+                (
+                    serde_json::to_vec(&EmailCodeVerifyRequest::new(value, value)).unwrap(),
+                    serde_json::json!({ "login_token": value, "code": value.trim() }),
+                ),
+            ];
+            for (actual, legacy) in cases {
+                assert_eq!(actual, serde_json::to_vec(&legacy).unwrap());
             }
-        }"#;
-        let me: SubscriptionMe = serde_json::from_str(json).expect("parse metered account");
-        assert_eq!(me.parsed_tier(), None);
-        assert!(me.has_active_paid_plan());
-        assert_eq!(me.usage.budget_usd, 100.0);
-        assert_eq!(me.usage.billed_usd, 20.0);
-        assert_eq!(me.usage.next_charge_at_usd, Some(60.0));
+        }
+        assert_eq!(
+            serde_json::to_string(&EmailCodeVerifyRequest::new(" token ", " 123456 ")).unwrap(),
+            r#"{"code":"123456","login_token":" token "}"#,
+        );
     }
 
     #[test]
-    fn polling_backoff_is_deterministic_and_bounded() {
-        let mut state = PollingBackoff::new(Duration::from_secs(3));
-        assert_eq!(state.delay(), Duration::from_secs(3));
-        state.on_slow_down(None);
-        assert_eq!(state.delay(), Duration::from_secs(8));
-        state.on_slow_down(Some(Duration::from_secs(12)));
-        assert_eq!(state.delay(), Duration::from_secs(12));
-        state.on_offline_error();
-        assert_eq!(state.delay(), Duration::from_secs(24));
-        state.on_offline_error();
-        assert_eq!(state.delay(), Duration::from_secs(30));
-        state.on_pending();
-        assert_eq!(state.delay(), Duration::from_secs(3));
+    fn builders_own_login_bodies_after_borrowed_sources_end() {
+        let client = reqwest::Client::new();
+        for value in ["", " \t\r\n", "  雪😀\"\\\n\t\u{0000}  "] {
+            let cases = {
+                let source = value.to_owned();
+                let device = DeviceTokenRequest {
+                    device_code: &source,
+                };
+                let start = EmailCodeStartRequest::new(&source);
+                let verify = EmailCodeVerifyRequest::new(&source, &source);
+                [
+                    ("auth/token", client.post("http://localhost.invalid/v1/auth/token").json(&device), serde_json::to_vec(&serde_json::json!({ "device_code": source })).unwrap()),
+                    ("auth/email/start", client.post("http://localhost.invalid/v1/auth/email/start").json(&start), serde_json::to_vec(&serde_json::json!({ "client_name": "jcode-cli", "email": source.trim() })).unwrap()),
+                    ("auth/email/verify", client.post("http://localhost.invalid/v1/auth/email/verify").json(&verify), serde_json::to_vec(&serde_json::json!({ "login_token": source, "code": source.trim() })).unwrap()),
+                ]
+            };
+            for (path, builder, expected) in cases {
+                let request = builder.timeout(DEVICE_REQUEST_TIMEOUT).build().unwrap();
+                assert_eq!(request.method(), reqwest::Method::POST);
+                assert_eq!(
+                    request.url().as_str(),
+                    format!("http://localhost.invalid/v1/{path}")
+                );
+                assert_eq!(
+                    request.headers()[reqwest::header::CONTENT_TYPE],
+                    "application/json"
+                );
+                assert!(
+                    !request
+                        .headers()
+                        .contains_key(reqwest::header::AUTHORIZATION)
+                );
+                assert_eq!(request.timeout(), Some(&DEVICE_REQUEST_TIMEOUT));
+                assert_eq!(request.body().unwrap().as_bytes().unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_authorization_request_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_matches_exact_legacy_wire_for_every_tier() {
+        for tier in std::iter::once(None).chain(JcodeTier::ALL.iter().copied().map(Some)) {
+            let mut legacy = serde_json::json!({ "client_name": "jcode-cli" });
+            if let Some(tier) = tier {
+                legacy["requested_tier"] = serde_json::Value::String(tier.as_str().to_string());
+            }
+            let bytes = serde_json::to_vec(&DeviceAuthorizationRequest::new(tier)).unwrap();
+            assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+            let expected = match tier {
+                Some(tier) => format!(
+                    r#"{{"client_name":"jcode-cli","requested_tier":"{}"}}"#,
+                    tier.as_str()
+                ),
+                None => r#"{"client_name":"jcode-cli"}"#.to_string(),
+            };
+            assert_eq!(bytes, expected.as_bytes());
+        }
     }
 
-    #[tokio::test]
-    async fn device_request_uses_new_contract_and_parses_public_urls() {
-        let base = spawn_server(vec![(
-            200,
-            vec![],
-            r#"{"device_code":"secret","flow_id":"public-flow","verification_uri":"https://jcode.sh/account","verification_uri_complete":"https://jcode.sh/account?flow=public-flow","verify_url":"https://jcode.sh/account?flow=public-flow","expires_in":600,"interval":3}"#.to_string(),
-        )]);
-        let result = request_device_authorization(&client(), &base, Some(JcodeTier::Pro))
-            .await
-            .expect("device auth");
-        assert_eq!(result.device_code, "secret");
-        assert_eq!(result.flow_id, "public-flow");
-        assert!(!result.verification_uri_complete.contains("secret"));
-    }
-
-    #[tokio::test]
-    async fn metered_device_request_does_not_select_a_subscription_tier() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (request_tx, request_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = [0u8; 8192];
-            let count = stream.read(&mut request).expect("read request");
-            request_tx
-                .send(String::from_utf8_lossy(&request[..count]).into_owned())
-                .expect("capture request");
-            let body = r#"{"device_code":"secret","flow_id":"public-flow","verification_uri":"https://jcode.sh/account","verification_uri_complete":"https://jcode.sh/account?flow=public-flow","expires_in":600,"interval":3}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+    #[test]
+    fn builder_owns_serialized_metadata_after_source_scope_ends() {
+        let client = reqwest::Client::new();
+        for tier in std::iter::once(None).chain(JcodeTier::ALL.iter().copied().map(Some)) {
+            let (builder, expected) = {
+                let metadata = DeviceAuthorizationRequest::new(tier);
+                let expected = serde_json::to_vec(&metadata).unwrap();
+                let builder = client
+                    .post("http://localhost.invalid/v1/auth/device")
+                    .json(&metadata)
+                    .timeout(DEVICE_REQUEST_TIMEOUT);
+                (builder, expected)
+            };
+            let request = builder.build().unwrap();
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.url().path(), "/v1/auth/device");
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                "application/json"
             );
-            stream.write_all(response.as_bytes()).expect("write");
-        });
-
-        request_device_authorization(&client(), &format!("http://{addr}/v1"), None)
-            .await
-            .expect("device auth");
-        let request = request_rx.recv().expect("captured request");
-        assert!(request.contains(r#"{"client_name":"jcode-cli"}"#));
-        assert!(!request.contains("requested_tier"), "{request}");
-    }
-
-    #[tokio::test]
-    async fn legacy_device_response_is_explained_without_echoing_body() {
-        let base = spawn_server(vec![(
-            200,
-            vec![],
-            r#"{"device_code":"do-not-echo","verify_url":"https://old.example/login"}"#.to_string(),
-        )]);
-        let error = request_device_authorization(&client(), &base, Some(JcodeTier::Pro))
-            .await
-            .expect_err("legacy response rejected");
-        assert_eq!(error, AccountApiError::LegacyBackend);
-        assert!(!error.to_string().contains("do-not-echo"));
-    }
-
-    #[tokio::test]
-    async fn token_poll_handles_pending_slow_down_success_denied_and_replay() {
-        let base = spawn_server(vec![
-            (428, vec![], r#"{"error":"authorization_pending"}"#.to_string()),
-            (429, vec![("Retry-After", "9")], r#"{"error":"slow_down"}"#.to_string()),
-            (200, vec![], r#"{"api_key":"jck_live_test","account_id":"acct","email":"user@example.com","tier":"none","status":"active"}"#.to_string()),
-            (400, vec![], r#"{"error":"access_denied"}"#.to_string()),
-            (400, vec![], r#"{"error":"expired_token"}"#.to_string()),
-        ]);
-        let client = client();
-        assert_eq!(
-            poll_device_token_once(&client, &base, "secret")
-                .await
-                .unwrap(),
-            TokenPollOutcome::Pending
-        );
-        assert_eq!(
-            poll_device_token_once(&client, &base, "secret")
-                .await
-                .unwrap(),
-            TokenPollOutcome::SlowDown {
-                retry_after: Some(Duration::from_secs(9))
-            }
-        );
-        assert!(matches!(
-            poll_device_token_once(&client, &base, "secret")
-                .await
-                .unwrap(),
-            TokenPollOutcome::Approved(_)
-        ));
-        assert_eq!(
-            poll_device_token_once(&client, &base, "secret")
-                .await
-                .unwrap(),
-            TokenPollOutcome::Denied
-        );
-        assert_eq!(
-            poll_device_token_once(&client, &base, "secret")
-                .await
-                .unwrap(),
-            TokenPollOutcome::Expired
-        );
-    }
-
-    #[tokio::test]
-    async fn me_and_revoke_classify_revoked_keys_without_leaking_them() {
-        let base = spawn_server(vec![
-            (
-                401,
-                vec![],
-                r#"{"error":"invalid_key","message":"jck_live_do-not-log"}"#.to_string(),
-            ),
-            (401, vec![], r#"{"error":"invalid_key"}"#.to_string()),
-        ]);
-        let client = client();
-        let me_error = fetch_subscription_me_with(&client, &base, "jck_live_secret")
-            .await
-            .expect_err("revoked");
-        assert_eq!(me_error, AccountApiError::Unauthorized);
-        assert!(!me_error.to_string().contains("jck_live"));
-        let revoke_error = revoke_current_key(&client, &base, "jck_live_secret")
-            .await
-            .expect_err("already revoked");
-        assert_eq!(revoke_error, AccountApiError::Unauthorized);
+            assert!(
+                !request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION)
+            );
+            assert_eq!(request.timeout(), Some(&DEVICE_REQUEST_TIMEOUT));
+            assert_eq!(request.body().unwrap().as_bytes().unwrap(), expected);
+        }
     }
 }

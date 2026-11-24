@@ -1,72 +1,4 @@
 #[test]
-fn test_scroll_ctrl_k_j_offset() {
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
-
-    assert_eq!(app.scroll_offset, 0);
-    assert!(!app.auto_scroll_paused);
-
-    let (up_code, up_mods) = scroll_up_key(&app);
-    let (down_code, down_mods) = scroll_down_key(&app);
-
-    // Render first so LAST_MAX_SCROLL is populated
-    render_and_snap(&app, &mut terminal);
-
-    // Scroll up (switches to absolute-from-top mode)
-    app.handle_key(up_code.clone(), up_mods).unwrap();
-    assert!(app.auto_scroll_paused);
-    let first_offset = app.scroll_offset;
-
-    app.handle_key(up_code.clone(), up_mods).unwrap();
-    let second_offset = app.scroll_offset;
-    assert!(
-        second_offset < first_offset,
-        "scrolling up should decrease absolute offset (move toward top)"
-    );
-
-    // Scroll down (increases absolute position = moves toward bottom)
-    app.handle_key(down_code.clone(), down_mods).unwrap();
-    assert_eq!(
-        app.scroll_offset, first_offset,
-        "one scroll down should undo one scroll up"
-    );
-
-    // Keep scrolling down until back at bottom
-    for _ in 0..10 {
-        app.handle_key(down_code.clone(), down_mods).unwrap();
-        if !app.auto_scroll_paused {
-            break;
-        }
-    }
-    assert_eq!(app.scroll_offset, 0);
-    assert!(!app.auto_scroll_paused);
-
-    // Stays at 0 when already at bottom
-    app.handle_key(down_code.clone(), down_mods).unwrap();
-    assert_eq!(app.scroll_offset, 0);
-}
-
-#[test]
-fn test_scroll_offset_capped() {
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 4);
-
-    let (up_code, up_mods) = scroll_up_key(&app);
-
-    // Render first so LAST_MAX_SCROLL is populated
-    render_and_snap(&app, &mut terminal);
-
-    // Spam scroll-up many times
-    for _ in 0..500 {
-        app.handle_key(up_code.clone(), up_mods).unwrap();
-    }
-
-    // Should be at 0 (absolute top) after scrolling up enough
-    assert_eq!(app.scroll_offset, 0);
-    assert!(app.auto_scroll_paused);
-}
-
-#[test]
 fn test_scroll_render_bottom() {
     let _render_lock = scroll_render_test_lock();
     let (app, mut terminal) = create_scroll_test_app(80, 15, 1, 20);
@@ -156,7 +88,10 @@ fn test_prompt_preview_reserves_rows_without_overwriting_visible_history() {
         text
     );
     let visible_history = text.lines().skip(2).collect::<Vec<_>>().join(" ");
-    let normalized_history = visible_history.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized_history = visible_history
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         normalized_history.contains("Intro line 20 - quick brown fox jumps over the lazy dog."),
         "latest visible content should remain visible below preview, got:\n{}",
@@ -581,56 +516,26 @@ fn test_scroll_down_past_bottom_does_not_accumulate_phantom_offset() {
 }
 
 #[test]
-fn test_overscroll_requires_gesture_starting_at_bottom() {
-    // Overscroll must only reveal when the downward gesture *began* while the
-    // view was already pinned to the bottom. A gesture that starts mid-
-    // transcript and carries the view into the bottom (with leftover momentum
-    // continuing past it) must not pop the elastic line.
-    let _render_lock = scroll_render_test_lock();
-    let (mut app, mut terminal) = create_scroll_test_app(80, 25, 1, 12);
-    // Exercise the elastic reveal explicitly (the default pins the line on).
-    app.overscroll_status_mode = crate::config::OverscrollStatusMode::Overscroll;
-    render_and_snap(&app, &mut terminal);
-    let rendered_max = crate::tui::ui::last_max_scroll();
-    assert!(rendered_max > 2, "expected scrollable chat content");
-
-    // Start a gesture partway up the transcript.
-    app.scroll_offset = 2;
-    app.auto_scroll_paused = true;
-
-    // One continuous gesture (no pause between ticks): rides into the bottom
-    // and keeps going. Momentum past the bottom must be swallowed silently.
-    // The tick budget scales with the rendered height: process-global render
-    // state (mermaid, perf tier) can legitimately change the transcript
-    // extent between isolated and full-suite runs.
-    for _ in 0..rendered_max + 10 {
-        app.scroll_down(1);
-    }
-    assert!(!app.auto_scroll_paused, "gesture should reach the bottom");
-    assert!(
-        !app.chat_overscroll_active(),
-        "momentum carrying into the bottom must not reveal the overscroll line"
-    );
-
-    // A fresh gesture that starts at the bottom (after a pause) does reveal it.
-    app.chat_scroll_down_last =
-        Some(Instant::now() - App::OVERSCROLL_GESTURE_GAP - std::time::Duration::from_millis(50));
-    app.scroll_down(1);
-    assert!(
-        app.chat_overscroll_active(),
-        "a new gesture starting at the bottom should reveal the overscroll line"
-    );
-}
-
-#[test]
 fn test_scroll_acceleration_multiplier_scales_with_flick_speed() {
     use std::time::Duration;
     // A fast flick (short gap between wheel events) gets a subtle 2x boost; a
     // slow, deliberate notch stays at 1x for precise positioning.
-    assert_eq!(App::scroll_acceleration_multiplier(Duration::from_millis(10)), 2);
-    assert_eq!(App::scroll_acceleration_multiplier(Duration::from_millis(100)), 1);
-    assert_eq!(App::scroll_acceleration_multiplier(Duration::from_millis(200)), 1);
-    assert_eq!(App::scroll_acceleration_multiplier(Duration::from_secs(5)), 1);
+    assert_eq!(
+        App::scroll_acceleration_multiplier(Duration::from_millis(10)),
+        2
+    );
+    assert_eq!(
+        App::scroll_acceleration_multiplier(Duration::from_millis(100)),
+        1
+    );
+    assert_eq!(
+        App::scroll_acceleration_multiplier(Duration::from_millis(200)),
+        1
+    );
+    assert_eq!(
+        App::scroll_acceleration_multiplier(Duration::from_secs(5)),
+        1
+    );
 }
 
 #[test]
@@ -639,10 +544,16 @@ fn test_fast_flick_enqueues_more_lines_than_a_slow_notch() {
     // "Scroll power": the lines committed per wheel notch scale with flick speed
     // (shorter inter-event gap => bigger multiplier => more lines), capped so the
     // hardest flick stays controllable. Shared by the chat and /resume preview.
-    let fast = App::scroll_intent_lines(App::scroll_acceleration_multiplier(Duration::from_millis(10)));
-    let slow =
-        App::scroll_intent_lines(App::scroll_acceleration_multiplier(Duration::from_millis(400)));
-    assert!(fast > slow, "a fast flick commits more lines than a slow notch ({fast} > {slow})");
+    let fast = App::scroll_intent_lines(App::scroll_acceleration_multiplier(
+        Duration::from_millis(10),
+    ));
+    let slow = App::scroll_intent_lines(App::scroll_acceleration_multiplier(
+        Duration::from_millis(400),
+    ));
+    assert!(
+        fast > slow,
+        "a fast flick commits more lines than a slow notch ({fast} > {slow})"
+    );
     assert_eq!(slow, 3, "a deliberate notch uses the base intent");
     // Even a maximum-velocity multiplier stays within the controllable cap.
     assert!(App::scroll_intent_lines(8) <= 5, "intent is capped");
@@ -662,7 +573,10 @@ fn test_momentum_drain_decelerates_to_one_line() {
     app.mouse_scroll_queue = 0;
     let empty = app.mouse_scroll_drain_amount();
 
-    assert!(big > small, "large momentum should drain faster ({big} > {small})");
+    assert!(
+        big > small,
+        "large momentum should drain faster ({big} > {small})"
+    );
     assert_eq!(tail, 1, "the last line should drain one at a time");
     let _ = empty;
 }
@@ -759,8 +673,11 @@ fn repro_ctrl_shift_jk_scroll_with_text_in_input() {
     app.input = "some draft text".to_string();
 
     // Ctrl+Shift+K with text present.
-    app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-        .unwrap();
+    app.handle_key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )
+    .unwrap();
     assert!(
         app.auto_scroll_paused,
         "Ctrl+Shift+K should scroll up even with text in input (offset moved like plain: {plain_offset})"
@@ -772,8 +689,11 @@ fn repro_ctrl_shift_jk_scroll_with_text_in_input() {
     let shift_up_offset = app.scroll_offset;
 
     // Ctrl+Shift+J should scroll back down.
-    app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-        .unwrap();
+    app.handle_key(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )
+    .unwrap();
     assert!(
         app.scroll_offset > shift_up_offset || !app.auto_scroll_paused,
         "Ctrl+Shift+J should scroll down toward the bottom"
@@ -899,7 +819,10 @@ fn test_history_anchor_reconciles_into_scroll_offset_after_render() {
     render_and_snap(&app, &mut terminal);
     let resolved = crate::tui::ui::last_resolved_chat_scroll();
 
-    assert!(app.reconcile_history_anchor(), "reconcile should apply once");
+    assert!(
+        app.reconcile_history_anchor(),
+        "reconcile should apply once"
+    );
     assert!(
         app.pending_history_anchor.is_none(),
         "anchor should be consumed after reconcile"
@@ -940,13 +863,16 @@ fn compacted_history_app_with_remaining(turns: usize) -> App {
         }],
     );
     let compacted_count = turns * 2;
-    app.session.compaction = Some(crate::session::StoredCompactionState {
-        summary_text: "older turns".to_string(),
-        openai_encrypted_content: None,
-        covers_up_to_turn: turns,
-        original_turn_count: turns,
-        compacted_count,
-    });
+    app.session.compaction = Some(
+        crate::session::StoredCompactionState {
+            summary_text: "older turns".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: turns,
+            original_turn_count: turns,
+            compacted_count,
+        }
+        .into(),
+    );
 
     let (rendered_messages, _images, _info) =
         crate::session::render_messages_and_images_with_compacted_history(&app.session, 0);
@@ -1249,7 +1175,8 @@ fn repro_scroll_up_holds_while_reasoning_streams() {
             }
 
             // User scrolls up while reasoning is still streaming.
-            app.handle_key(KeyCode::PageUp, KeyModifiers::empty()).unwrap();
+            app.handle_key(KeyCode::PageUp, KeyModifiers::empty())
+                .unwrap();
             let scrolled = render_and_snap(&app, &mut terminal);
 
             let moved = scrolled != bottom;
@@ -1328,8 +1255,22 @@ fn repro_mouse_wheel_during_token_by_token_reasoning() {
 
         // Token-by-token reasoning trickles in with paced reveal between tokens.
         let tokens = [
-            "Let ", "me ", "think ", "about ", "the ", "problem ", "step ", "by ", "step.\n",
-            "First ", "I ", "consider ", "the ", "inputs ", "and ", "constraints.\n",
+            "Let ",
+            "me ",
+            "think ",
+            "about ",
+            "the ",
+            "problem ",
+            "step ",
+            "by ",
+            "step.\n",
+            "First ",
+            "I ",
+            "consider ",
+            "the ",
+            "inputs ",
+            "and ",
+            "constraints.\n",
         ];
         for tok in tokens {
             app.handle_server_event(
@@ -1454,7 +1395,9 @@ fn repro_scroll_held_across_reasoning_close_and_answer() {
 
             // Reasoning closes (anchors) and the answer begins -- the big reflow.
             app.handle_server_event(
-                crate::protocol::ServerEvent::ReasoningDone { duration_secs: None },
+                crate::protocol::ServerEvent::ReasoningDone {
+                    duration_secs: None,
+                },
                 &mut remote,
             );
             app.handle_server_event(
@@ -1512,140 +1455,9 @@ fn repro_scroll_held_across_reasoning_close_and_answer() {
     );
 }
 
-
-/// Regression for the overscroll flicker (revealing the elastic status line
-/// must not re-layout the transcript).
-///
-/// When the transcript height sat exactly at the fits/overflows boundary, the
-/// one-row overscroll reveal flipped the `overflows` decision: the native
-/// scrollbar appeared, the whole transcript re-wrapped one column narrower,
-/// and every visible line shifted. On rebound it flipped back (or worse,
-/// stayed latched because the narrower wrap produced more lines). On screen
-/// this read as a full-screen flicker whenever overscroll was activated.
-///
-/// The scrollbar/overflow decision must therefore ignore the transient
-/// overscroll row: for every content height around the boundary, the
-/// transcript region rendered during the dwell must be identical to the frame
-/// before the reveal, and the frame after the rebound must equal the frame
-/// before the reveal exactly.
-#[test]
-fn overscroll_reveal_does_not_relayout_transcript() {
-    let _lock = scroll_render_test_lock();
-
-    for pad in 4..30usize {
-        let (mut app, mut terminal) = create_scroll_test_app(100, 24, 0, pad);
-        app.chat_native_scrollbar = true;
-        app.context_info = crate::prompt::ContextInfo {
-            total_chars: 40_000,
-            ..Default::default()
-        };
-        app.context_limit = 200_000;
-
-        let before = render_and_snap(&app, &mut terminal);
-        let max_before = crate::tui::ui::last_max_scroll();
-
-        // Wheel-down while pinned at the bottom: registers an overscroll tick
-        // and reveals the status line for the dwell window.
-        app.handle_mouse_event(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 10,
-            row: 5,
-            modifiers: KeyModifiers::empty(),
-        });
-        assert!(
-            app.chat_overscroll_active(),
-            "pad={pad}: wheel-down at the bottom should register an overscroll"
-        );
-        let during = render_and_snap(&app, &mut terminal);
-        let max_during = crate::tui::ui::last_max_scroll();
-
-        // The reveal may slide the transcript up by at most the one row the
-        // elastic line claims (the intended pull-to-reveal). It must not jump
-        // further, and it must never re-wrap: every transcript row shown
-        // during the dwell must be a row that already existed before the
-        // reveal (a re-wrap breaks lines at a different column, producing
-        // brand-new row strings, which is the full-screen flicker).
-        assert!(
-            max_during <= max_before + 1,
-            "pad={pad}: reveal moved the viewport by more than the elastic \
-             row (max {max_before} -> {max_during})"
-        );
-        let before_rows: Vec<&str> = before.lines().collect();
-        let during_rows: Vec<&str> = during.lines().collect();
-        // A re-wrap breaks lines at a different column, producing brand-new
-        // row strings. Compare the transcript body rows (the "Intro line"
-        // filler) as an ordered sequence: they may slide up by the one
-        // elastic row, but their content must be byte-identical. Header rows
-        // composite with the fixed-position context widget overlay and the
-        // bottom rows (idle hint, input, elastic line) legitimately change,
-        // so only body rows are compared.
-        let body = |rows: &[&str]| -> Vec<String> {
-            rows.iter()
-                .filter(|row| row.contains("quick brown fox"))
-                .map(|row| {
-                    // Drop the native scrollbar column: its thumb glyph
-                    // legitimately moves with the one-row elastic slide.
-                    let mut normalized = row
-                        .trim_end()
-                        .trim_end_matches(['│', '╷', '╵', '•'])
-                        .trim_end()
-                        .to_string();
-                    // These fixture rows have a known logical end. Keep every
-                    // transcript byte through it, then discard only the blank
-                    // suffix where the compact session-fact stack may render.
-                    // Unlike splitting on arbitrary double spaces, this cannot
-                    // hide indentation or spacing changes in transcript text.
-                    if let Some(end) = normalized.find("dog.") {
-                        normalized.truncate(end + "dog.".len());
-                    }
-                    normalized
-                })
-                .collect()
-        };
-        let body_before = body(&before_rows);
-        let body_during = body(&during_rows);
-        assert!(
-            !body_before.is_empty(),
-            "pad={pad}: expected filler body rows in the pre-reveal frame"
-        );
-        // The intended elastic behavior when the transcript already overflows
-        // is a one-row slide: the top body row scrolls out and every other row
-        // keeps its exact content. A re-wrap instead rewrites every row. So
-        // the dwell body must be a suffix of the pre-reveal body missing at
-        // most one leading row.
-        let dropped = body_before.len().saturating_sub(body_during.len());
-        assert!(
-            dropped <= 1 && body_before[dropped..] == body_during[..],
-            "pad={pad}: transcript body rows re-wrapped while the overscroll \
-             line was revealed (scrollbar/wrap flip):\nbefore:\n{before}\nduring:\n{during}"
-        );
-
-        // After the dwell expires the transcript must return to the exact
-        // pre-overscroll layout: no latched scrollbar, no residual re-wrap.
-        // (The idle status line rotates its own hint content over time, so
-        // only the transcript region is compared, plus the scroll extent.)
-        app.chat_overscroll_last = None;
-        let after = render_and_snap(&app, &mut terminal);
-        let max_after = crate::tui::ui::last_max_scroll();
-        assert_eq!(
-            max_before, max_after,
-            "pad={pad}: the rebound must restore the pre-overscroll scroll \
-             extent (scrollbar/wrap stayed latched)"
-        );
-        let after_rows: Vec<&str> = after.lines().collect();
-        let body_after = body(&after_rows);
-        assert_eq!(
-            body_before, body_after,
-            "pad={pad}: transcript body rows did not return to their \
-             pre-overscroll content after the rebound:\nbefore:\n{before}\nafter:\n{after}"
-        );
-    }
-}
-
-
 /// End-to-end: a swarm notification carrying a sender-provided tldr renders
-/// collapsed (tldr + `▸ expand` badge, body hidden) through a REAL draw, and a
-/// left click on the badge expands it in place (body visible, `▾ collapse`
+/// collapsed (shared token row + `⊞` badge, body hidden) through a REAL draw,
+/// and a left click on the badge expands it in place (body visible, `⊟`
 /// badge). Exercises the full path: collapsible encoding -> body render ->
 /// live copy-viewport snapshot -> `swarm_expand_target_from_screen` ->
 /// `toggle_swarm_message_expand`.
@@ -1656,7 +1468,8 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
 
     let body = "The flaky test was caused by a race in the setup helper. \
                 I rewrote it to use a barrier and verified 200 consecutive runs pass.";
-    let content = jcode_tui_messages::encode_collapsible_swarm_content("fixed the flaky test", body);
+    let content =
+        jcode_tui_messages::encode_collapsible_swarm_content("fixed the flaky test", body);
     app.display_messages = vec![
         DisplayMessage::user("hi"),
         DisplayMessage::swarm("DM from sheep", content),
@@ -1673,11 +1486,11 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
 
     let collapsed = render_and_snap(&app, &mut terminal);
     assert!(
-        collapsed.contains("fixed the flaky test"),
-        "collapsed card must show the tldr:\n{collapsed}"
+        collapsed.contains("tok") && !collapsed.contains("fixed the flaky test"),
+        "collapsed DM must show only token usage:\n{collapsed}"
     );
     assert!(
-        collapsed.contains("▸ expand"),
+        collapsed.contains("⊞"),
         "collapsed card must show the expand badge:\n{collapsed}"
     );
     assert!(
@@ -1694,7 +1507,7 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
         for col in 0..area.width {
             line.push_str(buf[(col, row)].symbol());
         }
-        if let Some(byte) = line.find("▸ expand") {
+        if let Some(byte) = line.find("⊞") {
             let col = line[..byte].chars().count() as u16;
             badge = Some((col, row));
             break 'rows;
@@ -1717,7 +1530,7 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
         });
     };
 
-    // A click on the tldr text (left of the badge) must NOT toggle.
+    // A click on the token text (left of the badge) must NOT toggle.
     click(&mut app, badge_col.saturating_sub(6), badge_row);
     assert!(
         jcode_tui_messages::parse_collapsible_swarm_content(&app.display_messages[1].content)
@@ -1725,12 +1538,15 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
         "click left of the badge must not expand the card"
     );
 
-    click(&mut app, badge_col + 2, badge_row);
+    click(&mut app, badge_col, badge_row);
     let parsed =
         jcode_tui_messages::parse_collapsible_swarm_content(&app.display_messages[1].content)
             .expect("content stays collapsible after toggle");
     assert!(parsed.expanded, "badge click must expand the card");
-    assert_eq!(app.status_notice(), Some("Swarm message expanded".to_string()));
+    assert_eq!(
+        app.status_notice(),
+        Some("Swarm message expanded".to_string())
+    );
 
     let expanded = render_and_snap(&app, &mut terminal);
     assert!(
@@ -1738,7 +1554,7 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
         "expanded card must show the body:\n{expanded}"
     );
     assert!(
-        expanded.contains("▾ collapse"),
+        expanded.contains("⊟"),
         "expanded card must show the collapse badge:\n{expanded}"
     );
 
@@ -1751,7 +1567,7 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
         for col in 0..area.width {
             line.push_str(buf[(col, row)].symbol());
         }
-        if let Some(byte) = line.find("▾ collapse") {
+        if let Some(byte) = line.find("⊟") {
             let col = line[..byte].chars().count() as u16;
             collapse_badge = Some((col, row));
             break 'rows2;
@@ -1759,13 +1575,16 @@ fn test_click_on_swarm_expand_badge_toggles_tldr_collapse() {
     }
     let (collapse_col, collapse_row) =
         collapse_badge.expect("collapse badge must be visible in the frame");
-    click(&mut app, collapse_col + 2, collapse_row);
+    click(&mut app, collapse_col, collapse_row);
     assert!(
         jcode_tui_messages::parse_collapsible_swarm_content(&app.display_messages[1].content)
             .is_some_and(|parsed| !parsed.expanded),
         "collapse badge click must fold the card back down"
     );
 }
+
+#[path = "scroll_copy_03/grouped_dm_badge.rs"]
+mod grouped_dm_badge;
 
 #[cfg(test)]
 #[path = "../tests_input_scroll.rs"]
@@ -1840,5 +1659,57 @@ fn command_palette_open_does_not_move_existing_rows() {
         );
         checked += 1;
     }
-    assert!(checked >= 3, "expected transcript rows to sample:\n{before}");
+    assert!(
+        checked >= 3,
+        "expected transcript rows to sample:\n{before}"
+    );
 }
+
+#[test]
+fn test_alt_e_expands_prompt_preview_to_multiple_prompts() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let _render_lock = scroll_render_test_lock();
+    let mut app = create_test_app();
+    let mut msgs = Vec::new();
+    for i in 1..=4 {
+        msgs.push(DisplayMessage {
+            role: "user".to_string(),
+            content: format!("question number {i}"),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        });
+        msgs.push(DisplayMessage {
+            role: "assistant".to_string(),
+            content: App::build_scroll_test_content(0, 12, None),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        });
+    }
+    app.display_messages = msgs;
+    app.bump_display_messages_version();
+    app.scroll_offset = 0;
+    app.auto_scroll_paused = false;
+    app.is_processing = false;
+    app.status = ProcessingStatus::Idle;
+    app.session.short_name = Some("test".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    let before = render_and_snap(&app, &mut terminal);
+    assert!(!before.contains("question number 2"), "{before}");
+
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::ALT)
+        .unwrap();
+    let after = render_and_snap(&app, &mut terminal);
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::ALT)
+        .unwrap();
+    assert!(after.contains("question number 2"), "{after}");
+    assert!(after.contains("question number 3"), "{after}");
+}
+
+#[path = "scroll_copy_03_additional_tests.rs"]
+mod additional_test_scroll_ctrl_k_j_offset;

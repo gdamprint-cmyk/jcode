@@ -1,16 +1,21 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+// reference: in-repo prior art - `run_server_promote_command` and
+// `run_server_reload_command` in this same file (the two half-steps of the
+// landing transaction), plus `crates/jcode-build-support/src/landing.rs`
+// (the transaction itself, with its own provenance declared there). The
+// landing command composes those two existing half-steps into the single
+// crash-safe boundary they were missing.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::{browser, gateway, memory, session, storage, tui};
+use crate::{browser, gateway, memory, session, storage};
 
-use super::{output::terminal_title, terminal::init_tui_runtime};
+mod ambient;
 
 mod menubar;
 mod provider_setup;
@@ -33,13 +38,7 @@ pub use restart::{
     run_restart_restore_command, run_restart_save_command, run_restart_status_command,
 };
 
-pub enum AmbientSubcommand {
-    Status,
-    Log,
-    Trigger,
-    Stop,
-    RunVisible,
-}
+pub use ambient::{AmbientSubcommand, run_ambient_command};
 
 pub enum CloudSubcommand {
     Sessions(CloudSessionsSubcommand),
@@ -1083,8 +1082,10 @@ fn run_cloud_sessions_dashboard(request: CloudSessionsDashboardRequest) -> Resul
         items.len(),
         output_path.display()
     );
-    if request.open {
-        let _ = open::that(&output_path);
+    if request.open
+        && let Err(error) = open::that(&output_path)
+    {
+        eprintln!("Dashboard saved, but could not open it: {error}");
     }
     Ok(())
 }
@@ -1398,22 +1399,6 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-pub async fn run_ambient_command(cmd: AmbientSubcommand) -> Result<()> {
-    if let AmbientSubcommand::RunVisible = cmd {
-        return run_ambient_visible().await;
-    }
-
-    let debug_cmd = match cmd {
-        AmbientSubcommand::Status => "ambient:status",
-        AmbientSubcommand::Log => "ambient:log",
-        AmbientSubcommand::Trigger => "ambient:trigger",
-        AmbientSubcommand::Stop => "ambient:stop",
-        AmbientSubcommand::RunVisible => unreachable!(),
-    };
-
-    super::debug::run_debug_command(debug_cmd, "", None, None, false).await
-}
-
 pub async fn run_transcript_command(
     text: Option<String>,
     mode: crate::protocol::TranscriptMode,
@@ -1431,11 +1416,18 @@ pub async fn run_transcript_command(
         trimmed.to_string()
     };
 
+    // Focused-window lookup needs the user's compositor, so it happens here in
+    // the client rather than in the (possibly remote) server.
+    let session = session.or_else(|| {
+        jcode_voice::dictation::focused_jcode_session()
+            .ok()
+            .flatten()
+    });
     let mut client = crate::server::Client::connect_debug().await?;
     let request_id = client.send_transcript(&text, mode, session).await?;
 
     loop {
-        match client.read_event().await? {
+        match unwrap_turn_event(client.read_event().await?) {
             crate::protocol::ServerEvent::Ack { id } if id == request_id => {}
             crate::protocol::ServerEvent::Done { id } if id == request_id => return Ok(()),
             crate::protocol::ServerEvent::Error { id, message, .. } if id == request_id => {
@@ -1446,11 +1438,61 @@ pub async fn run_transcript_command(
     }
 }
 
+/// `jcode companion --no-*` flags. Each turns a feature off on top of the
+/// `[companion]` config. A flag can never turn on something config disables.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompanionFlags {
+    pub no_voice: bool,
+    pub no_voice_waveform: bool,
+    pub no_voice_notifications: bool,
+    pub no_jarvis_fn_key: bool,
+    pub no_jarvis_fn_launch: bool,
+    pub no_open: bool,
+    pub no_spawn_terminal: bool,
+    pub no_lid: bool,
+    pub no_browser_updates: bool,
+}
+
+impl CompanionFlags {
+    pub fn apply(self, options: &mut jcode_companion::CompanionOptions) {
+        options.voice &= !self.no_voice;
+        options.voice_waveform &= !self.no_voice_waveform;
+        options.voice_notifications &= !self.no_voice_notifications;
+        options.jarvis_fn_key &= !self.no_jarvis_fn_key;
+        options.jarvis_fn_launch &= !self.no_jarvis_fn_launch;
+        options.open &= !self.no_open;
+        options.spawn_terminal &= !self.no_spawn_terminal;
+        options.lid &= !self.no_lid;
+        options.browser_updates &= !self.no_browser_updates;
+    }
+}
+
+pub async fn run_companion_command(status: bool, flags: CompanionFlags) -> Result<()> {
+    use crate::companion_client::{CompanionRequest, request_async};
+    if status {
+        match request_async(CompanionRequest::Status, std::time::Duration::from_secs(2)).await {
+            Ok(response) => {
+                println!(
+                    "{} at {} (capabilities: {})",
+                    response.message,
+                    crate::companion_client::socket_path().display(),
+                    response.capabilities.join(", ")
+                );
+                return Ok(());
+            }
+            Err(error) => anyhow::bail!("{error}"),
+        }
+    }
+    let mut options = jcode_companion::CompanionOptions::from_config();
+    flags.apply(&mut options);
+    jcode_companion::run(options).await
+}
+
 pub async fn run_dictate_command(type_output: bool) -> Result<()> {
-    let run = crate::dictation::run_configured().await?;
+    let run = jcode_voice::dictation::run_configured().await?;
 
     if type_output {
-        crate::dictation::type_text(&run.text)
+        jcode_voice::dictation::type_text(&run.text)
     } else {
         run_transcript_command(Some(run.text), run.mode, None).await
     }
@@ -1506,51 +1548,6 @@ pub fn run_session_rename_command(
         );
     }
 
-    Ok(())
-}
-
-async fn run_ambient_visible() -> Result<()> {
-    use crate::ambient::VisibleCycleContext;
-
-    let context = VisibleCycleContext::load().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load visible cycle context: {}\nIs the ambient runner running?",
-            e
-        )
-    })?;
-
-    let (provider, registry) = super::provider_init::init_provider_and_registry(
-        &super::provider_init::ProviderChoice::Auto,
-        None,
-    )
-    .await?;
-
-    registry.register_ambient_tools().await;
-
-    let safety = std::sync::Arc::new(crate::safety::SafetySystem::new());
-    crate::tool::ambient::init_safety_system(safety);
-
-    let (terminal, tui_runtime) = init_tui_runtime()?;
-
-    let mut app = tui::App::new(provider, registry);
-    app.set_ambient_mode(context.system_prompt, context.initial_message);
-
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::SetTitle(terminal_title("🤖 jcode ambient cycle"))
-    );
-
-    let result = app.run(terminal).await;
-
-    tui_runtime.finish(true);
-
-    if let Some(cycle_result) = crate::tool::ambient::take_cycle_result() {
-        let result_path = VisibleCycleContext::result_path()?;
-        crate::storage::write_json(&result_path, &cycle_result)?;
-        eprintln!("Ambient cycle result saved.");
-    }
-
-    result?;
     Ok(())
 }
 
@@ -1642,40 +1639,43 @@ async fn run_memory_command_for_dir(
 
         MemorySubcommand::Search { query, semantic } => {
             if semantic {
-                match crate::memory_jev::recall(&manager, &query, 20, memory::MemoryScope::All)
-                    .await
-                {
+                // MEASURED 2026-11-12: the Jev semantic selector was removed with
+                // the Jev backend (4950764e1). The local graph's semantic scan is
+                // now the only relevance path, so `--semantic` runs it directly
+                // instead of a remote decision that no longer exists.
+                match manager.search_scoped(&query, memory::MemoryScope::All) {
                     Ok(results) => {
                         if results.is_empty() {
                             println!("No memories found matching '{}'", query);
                         } else {
                             println!(
-                                "Found {} memories matching '{}' (Jev relevance):\n",
+                                "Found {} memories matching '{}' (local graph relevance):\n",
                                 results.len(),
                                 query
                             );
-                            for (entry, score) in results {
+                            for entry in results {
                                 let tags_str = if entry.tags.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [{}]", entry.tags.join(", "))
                                 };
+                                let conf = entry.effective_confidence();
                                 println!(
-                                    "- [{}] {}{}\n  id: {} (relevance: {:.0}%)",
+                                    "- [{}] {}{}\n  id: {} (conf: {:.0}%)",
                                     entry.category,
                                     entry.content,
                                     tags_str,
                                     entry.id,
-                                    score * 100.0
+                                    conf * 100.0
                                 );
                                 println!();
                             }
                         }
                     }
                     Err(e) => {
-                        // A credential or transport failure is not an empty
-                        // result and must give scripts a nonzero exit status.
-                        return Err(e.context("Jev memory search failed"));
+                        // A store or transport failure is not an empty result and
+                        // must give scripts a nonzero exit status.
+                        return Err(e.context("local memory search failed"));
                     }
                 }
             } else {
@@ -1739,6 +1739,39 @@ async fn run_memory_command_for_dir(
             }
             let content = std::fs::read_to_string(&input)?;
             let memories: Vec<memory::MemoryEntry> = serde_json::from_str(&content)?;
+
+            // Memory write gate (opt-in, default off). `import` writes many
+            // entries in one command, so it is gated as a BATCH: one permission
+            // request for the whole import, and nothing is written until the
+            // user approves it. The request id is deterministic, so repeating
+            // the identical import after the approval goes through.
+            //
+            // reference: crates/jcode-app-core/src/tool/memory_write_gate.rs
+            //   (evaluate_memory_write_batch, the batch entry point of the same
+            //   gate that covers the agent's `remember` tool call)
+            // The gate keys the batch by its CONTENT, not by a session: an import
+            // runs in its own process and the approval comes from ANOTHER process,
+            // so a per-process key could never be matched.
+            match crate::tool::memory_write_gate::evaluate_memory_write_batch(
+                scope.as_str(),
+                &memories,
+            ) {
+                crate::tool::memory_write_gate::GateOutcome::Allowed => {}
+                crate::tool::memory_write_gate::GateOutcome::Pending {
+                    request_id,
+                    reason,
+                } => {
+                    println!("{reason}");
+                    println!(
+                        "Nothing was imported. Re-run the same command after approving \
+                         request {request_id}."
+                    );
+                    return Ok(());
+                }
+                crate::tool::memory_write_gate::GateOutcome::Rejected { reason } => {
+                    anyhow::bail!("memory import rejected by the user: {reason}");
+                }
+            }
 
             let mut imported = 0;
             let mut skipped = 0;
@@ -1883,7 +1916,7 @@ pub fn run_pair_command(list: bool, revoke: Option<String>) -> Result<()> {
 
     eprintln!();
     eprintln!("  \x1b[1mScan with the jcode iOS app:\x1b[0m\n");
-    match crate::login_qr::render_unicode_qr(&pair_uri) {
+    match jcode_terminal_prompt::qr::render_unicode_qr(&pair_uri) {
         Ok(qr) => {
             for line in qr.lines() {
                 eprintln!("  {line}");
@@ -1999,6 +2032,9 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                 "  compatibility: {}",
                 if status.compatible {
                     "ok"
+                } else if !status.responding {
+                    // Nothing answered, so there is no extension to compare.
+                    "unknown (bridge not responding)"
                 } else {
                     "extension/bridge mismatch"
                 }
@@ -2007,7 +2043,22 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                 println!("  missing actions: {}", status.missing_actions.join(", "));
             }
 
-            if status.ready {
+            if status.ready && !browser::status_answered_by(&status, target.kind) {
+                let answering = status
+                    .connected_browser
+                    .as_deref()
+                    .unwrap_or("another browser");
+                println!(
+                    "\n{name} is not connected: the bridge that answered belongs to {answering}. Browser actions with browser={} will fail until {name} runs the Browser Agent Bridge extension. Run `jcode browser setup {}` to set it up.",
+                    target.kind.id(),
+                    target.kind.id()
+                );
+                if browser::is_browser_running(target.kind)
+                    && let Some(diagnosis) = browser::diagnose_silent_chromium_bridge(target.kind)
+                {
+                    println!("{diagnosis}");
+                }
+            } else if status.ready {
                 println!("\nBuilt-in browser tool is ready.");
             } else if status.responding && !status.compatible {
                 println!(
@@ -2024,6 +2075,9 @@ pub async fn run_browser(action: &str, requested: Option<&str>) -> Result<()> {
                     name,
                     target.kind.extensions_page()
                 );
+                if let Some(diagnosis) = browser::diagnose_silent_chromium_bridge(target.kind) {
+                    println!("{diagnosis}");
+                }
             } else {
                 println!("\nRun `jcode browser setup` to install or repair it.");
             }
@@ -2070,7 +2124,36 @@ struct NdjsonRunState {
     connection_type: Option<String>,
     connection_phase: Option<String>,
     status_detail: Option<String>,
+    requested_service_tier: Option<String>,
+    served_service_tier: Option<String>,
     usage: crate::agent::TokenUsage,
+}
+
+impl NdjsonRunState {
+    /// Compare wire metadata only. A match is not independent confirmation of
+    /// backend routing or billing, especially on subscription-backed endpoints.
+    fn service_tier_report_status(&self) -> &'static str {
+        let Some(reported) = self.served_service_tier.as_deref() else {
+            return "not_reported";
+        };
+        if reported == "auto" {
+            return "unresolved";
+        }
+        fn canonical(tier: &str) -> &str {
+            match tier {
+                "off" | "standard" | "default" | "auto" => "default",
+                "fast" | "priority" => "priority",
+                _ => tier,
+            }
+        }
+        if canonical(self.requested_service_tier.as_deref().unwrap_or("default"))
+            == canonical(reported)
+        {
+            "reported_match"
+        } else {
+            "reported_mismatch"
+        }
+    }
 }
 
 pub fn run_auth_status_command(emit_json: bool) -> Result<()> {
@@ -2156,6 +2239,312 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
     Ok(())
 }
 
+/// Compile the current source state and STAGE it for landing.
+///
+/// This is the deterministic BUILD half of the build/landing split: it
+/// compiles the tree, installs the immutable versioned binary and records it
+/// in `staged-version`. It moves NO channel - the landing owns that - so a
+/// scheduled carrier can run it without touching the live ecosystem.
+///
+/// The exit code is the executor's contract:
+/// 0 = staged (or already up to date), 75 (EX_TEMPFAIL) = the tree moved
+/// during the compile, so the caller re-runs it against the CURRENT source
+/// state, 1 = the build genuinely failed.
+///
+/// A superseded build is NOT a broken build, so it must never look like one.
+pub fn run_server_build_command(emit_json: bool) -> Result<()> {
+    let repo_dir = crate::build::get_repo_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No jcode checkout found; set JCODE_REPO_DIR or run from the repository"
+        )
+    })?;
+
+    let outcome = crate::build::run_deterministic_build(&repo_dir)?;
+
+    #[derive(Serialize)]
+    struct ServerBuildReport {
+        status: &'static str,
+        version: Option<String>,
+        fingerprint: Option<String>,
+        current_fingerprint: Option<String>,
+        /// The failure reason, for the callers that read `error`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        detail: String,
+    }
+
+    let report = match &outcome {
+        crate::build::DeterministicBuildOutcome::Staged {
+            version,
+            fingerprint,
+            versioned_path,
+        } => ServerBuildReport {
+            status: "staged",
+            version: Some(version.clone()),
+            fingerprint: Some(fingerprint.clone()),
+            current_fingerprint: Some(fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "Build staged as {version} at {}; the landing owns the channels and has not been applied yet.",
+                versioned_path.display()
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::UpToDate {
+            version,
+            fingerprint,
+        } => ServerBuildReport {
+            status: "up_to_date",
+            version: Some(version.clone()),
+            fingerprint: Some(fingerprint.clone()),
+            current_fingerprint: Some(fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "The current source state is already staged as {version}; nothing to build."
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Superseded {
+            expected_fingerprint,
+            current_fingerprint,
+            reason,
+        } => ServerBuildReport {
+            status: "superseded",
+            version: None,
+            fingerprint: Some(expected_fingerprint.clone()),
+            current_fingerprint: Some(current_fingerprint.clone()),
+            error: None,
+            detail: format!(
+                "Build superseded: the source tree moved during the compile (expected {expected_fingerprint}, now {current_fingerprint}) and nothing was published. Re-run it against the current tree. {reason}"
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Failed { reason } => ServerBuildReport {
+            status: "failed",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!("Build failed: {reason}"),
+        },
+        crate::build::DeterministicBuildOutcome::Locked { reason } => ServerBuildReport {
+            status: "locked",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!(
+                "Build could not replace the target binary: it is held open by a running session. The holder was NOT killed. {reason}"
+            ),
+        },
+        crate::build::DeterministicBuildOutcome::Busy { reason } => ServerBuildReport {
+            status: "busy",
+            version: None,
+            fingerprint: None,
+            current_fingerprint: None,
+            error: Some(reason.clone()),
+            detail: format!("Build skipped: {reason}"),
+        },
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.detail);
+    }
+
+    match report.status {
+        "staged" | "up_to_date" => Ok(()),
+        // Exit 75 (EX_TEMPFAIL) is the executor's contract for "run me
+        // again": the caller re-runs the build against the current tree. It is
+        // NOT a failure, so it must not look like one.
+        //
+        // `busy` shares it, because a busy build ALSO did not produce a
+        // staged binary: another build holds this worktree's lock, and the
+        // carrier has to try again once that build finishes. Exiting 0 there
+        // would tell the carrier "success" for a build that never happened.
+        "superseded" | "busy" => std::process::exit(75),
+        // Exit 69 (EX_UNAVAILABLE) is the contract for a locked target binary:
+        // the code may compile, but the compiler could not replace the running
+        // image. It is not a drift (75) and not a broken build (1).
+        "locked" => std::process::exit(69),
+        _ => anyhow::bail!("{}", report.detail),
+    }
+}
+
+/// Land an installed build onto the WHOLE ecosystem as one crash-safe
+/// transaction.
+///
+/// The transaction (implemented in `jcode_build_support::landing`) is:
+///
+/// 1. journal the transaction,
+/// 2. point the DAEMON channel at the target,
+/// 3. hand the running daemon off to the target,
+/// 4. PROVE the daemon runs the target (its published identity),
+/// 5. move the CLIENT channels (`current` + launcher) onto the target,
+/// 6. commit.
+///
+/// The client channels move LAST and only after the daemon has been proven
+/// to run the target. A failed handoff therefore leaves clients on the old
+/// build, and the daemon channel is restored. This is what makes "the client
+/// channel and the daemon can never disagree" true rather than aspirational.
+pub async fn run_server_land_command(version: Option<&str>, emit_json: bool) -> Result<()> {
+    // An EXPLICIT version is a deliberate rollback and is never guarded: a
+    // human who names a version wants that exact build even when it is older.
+    //
+    // The AUTOMATIC target (the staged build) IS guarded, because
+    // `staged-version` is written by every build, is never cleared, and is
+    // protected from being garbage-collected. A stale staged label would
+    // therefore move the whole ecosystem BACKWARD, silently.
+    let version = match version {
+        Some(version) => version.to_string(),
+        None => {
+            let target = crate::build::read_staged_version()?
+                .or(crate::build::read_current_version()?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No staged build is available; run a build first, or pass an installed VERSION explicitly"
+                    )
+                })?;
+            crate::build::guard_landing_target_is_not_a_downgrade(&target)?;
+            target
+        }
+    };
+
+    // The session owns the single-writer lock and the journal for the whole
+    // transaction. The handoff is the ONE async step: it asks the running
+    // daemon to exec into the target that `prepare` just pointed the daemon
+    // channel at.
+    //
+    // reference: https://doc.rust-lang.org/std/future/trait.Future.html (read
+    // 2026-11-15) - "A future represents an asynchronous computation,
+    // commonly obtained by use of `async`"; an `async` block is a future that
+    // is polled to completion, so the block below is what carries the
+    // `.await` over the daemon handoff.
+    let mut session = crate::build::LandingSession::begin(&version, None)?;
+
+    let outcome = async {
+        session.prepare()?;
+
+        // With no daemon running there is nothing to hand off and nothing to
+        // prove: the next daemon starts from the `shared-server` channel that
+        // `prepare` just pointed at the target, so the client channels may
+        // follow it directly. Waiting for a daemon identity here would burn
+        // the whole timeout and then roll back a transaction that had nothing
+        // to prove.
+        if !crate::server::has_live_listener(&crate::server::socket_path()).await {
+            crate::build::log_landing_step(
+                "no daemon is running; activating the client channels directly",
+            );
+            return Ok(session.activate_clients_without_daemon()?);
+        }
+
+        session.record_handoff()?;
+
+        // `--force` is deliberate: the daemon's own "am I already the newest?"
+        // probe compares the candidate's mtime against a snapshot PINNED at
+        // server start, so it can answer "no update" while the channel names
+        // a different build. The daemon's own guard still refuses to exec into
+        // itself or into an older binary, so forcing cannot downgrade it.
+        run_server_reload_command_to(true, false, &mut std::io::sink()).await?;
+
+        session.verify_and_activate(std::time::Duration::from_secs(120))
+    }
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A failed landing rolls back what it moved and leaves the client
+            // channels on the old version.
+            let reason = format!("{error:#}");
+            let _ = session.rollback();
+            crate::build::LandingOutcome::RolledBack {
+                target_version: version.clone(),
+                reason,
+            }
+        }
+    };
+
+    #[derive(Serialize)]
+    struct ServerLandReport {
+        version: String,
+        landed: bool,
+        previous_current_version: Option<String>,
+        previous_shared_server_version: Option<String>,
+        detail: String,
+    }
+
+    let report = match &outcome {
+        crate::build::LandingOutcome::Landed {
+            target_version,
+            previous_current_version,
+            previous_shared_server_version,
+        } => ServerLandReport {
+            version: target_version.clone(),
+            landed: true,
+            previous_current_version: previous_current_version.clone(),
+            previous_shared_server_version: previous_shared_server_version.clone(),
+            detail: format!("Landed {target_version}: the daemon and every client now run it."),
+        },
+        crate::build::LandingOutcome::RolledBack {
+            target_version,
+            reason,
+        } => ServerLandReport {
+            version: target_version.clone(),
+            landed: false,
+            previous_current_version: None,
+            previous_shared_server_version: None,
+            detail: format!(
+                "Landing {target_version} FAILED and was rolled back; the client channels stay on the previous version. Reason: {reason}"
+            ),
+        },
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.detail);
+    }
+
+    // A rolled-back landing is a FAILURE, and the exit code must say so: a
+    // caller that only checks the exit status must not mistake a failed
+    // landing for a successful one.
+    if !report.landed {
+        anyhow::bail!("{}", report.detail);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ServerReloadReport {
+    socket: String,
+    had_listener: bool,
+    forced: bool,
+    reloaded: bool,
+    already_current: bool,
+    handoff_ready: bool,
+    detail: String,
+}
+
+fn validate_server_reload_report(report: &ServerReloadReport) -> Result<()> {
+    // A reload that asked the old server to hand over, and then never saw the
+    // new one take the socket, did not succeed. It is the one outcome a caller
+    // cannot infer from the exit status alone: until now every path here
+    // returned Ok(()), and the distinction lived only inside the JSON body.
+    //
+    // Scope is deliberately narrow, because the comment below documents that
+    // an installer may call `jcode server reload` unconditionally. The two
+    // states that are arguably a success keep exit 0: there was nothing
+    // running (`had_listener == false`), or the binary was already current
+    // (`already_current`). Only the not-ready handoff, where the daemon is
+    // genuinely not serving yet, reports failure.
+    if report.had_listener && !report.already_current && !report.handoff_ready {
+        anyhow::bail!(
+            "jcode server reload was requested but the new server never became ready: {}",
+            report.detail
+        );
+    }
+    Ok(())
+}
+
 /// Gracefully reload the running background server onto the newest binary.
 ///
 /// This is the preferred upgrade path (issue #291): instead of killing the
@@ -2172,29 +2561,31 @@ pub fn run_server_promote_command(version: Option<&str>, emit_json: bool) -> Res
 /// - If no server is running, this is a successful no-op so installers can call
 ///   it unconditionally.
 pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    run_server_reload_command_to(force, emit_json, &mut stdout).await
+}
+
+async fn run_server_reload_command_to(
+    force: bool,
+    emit_json: bool,
+    stdout: &mut impl Write,
+) -> Result<()> {
     use crate::protocol::ServerEvent;
     use std::time::Duration;
 
     let socket = crate::server::socket_path();
 
-    #[derive(Serialize)]
-    struct ServerReloadReport {
-        socket: String,
-        had_listener: bool,
-        forced: bool,
-        reloaded: bool,
-        already_current: bool,
-        handoff_ready: bool,
-        detail: String,
-    }
-
-    let emit = |report: ServerReloadReport| -> Result<()> {
+    let mut emit = |report: ServerReloadReport| -> Result<()> {
+        let outcome = validate_server_reload_report(&report);
         if emit_json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            serde_json::to_writer_pretty(&mut *stdout, &report)?;
+            stdout.write_all(b"\n")?;
         } else if !report.detail.is_empty() {
-            println!("{}", report.detail);
+            writeln!(stdout, "{}", report.detail)?;
         }
-        Ok(())
+        // Keep printing the report above the status check so --json output is
+        // byte-identical for callers that parse it.
+        outcome
     };
 
     // No server? Nothing to reload. This is a success so an installer can call
@@ -2263,7 +2654,7 @@ pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<(
     // exec's a new process, which drops this connection after it sends Done;
     // we treat a disconnect after observing Reloading as the expected handoff.
     loop {
-        match client.read_event().await {
+        match client.read_event().await.map(unwrap_turn_event) {
             Ok(ServerEvent::Ack { id }) if id == request_id => {}
             Ok(ServerEvent::Reloading { .. }) => {
                 reloading = true;
@@ -2486,6 +2877,11 @@ Re-run with `--force` if you really want to stop the server.";
     Ok(())
 }
 
+/// Run a standalone, in-process agent, including its local continuation loop.
+///
+/// Even when a daemon is available (or started on demand for swarm tools), it
+/// does not own this agent or receive its turns. Daemon-owned auto-poke applies
+/// only to daemon sessions, so these local loops must remain enabled here.
 pub async fn run_single_message_command(
     choice: &super::provider_init::ProviderChoice,
     model: Option<&str>,
@@ -2494,11 +2890,19 @@ pub async fn run_single_message_command(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
-    let provider = if emit_json || emit_ndjson {
-        super::provider_init::init_provider_quiet(choice, model).await?
-    } else {
-        super::provider_init::init_provider_for_validation(choice, model).await?
-    };
+    let provider =
+        super::provider_init::init_provider_for_run(choice, model, emit_json || emit_ndjson)
+            .await?;
+    // Older model caches contain names but no account-scoped speed capabilities.
+    // Hydrate those before the first headless request so an unsupported saved
+    // tier cannot slip through the backward-compatible unknown-catalog path.
+    if provider.model_capabilities_need_refresh()
+        && let Err(error) = provider.prefetch_models().await
+    {
+        crate::logging::warn(&format!(
+            "Could not refresh model capabilities before headless run: {error}"
+        ));
+    }
     let registry = crate::tool::Registry::new(provider.clone()).await;
     // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
     // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
@@ -2528,6 +2932,29 @@ pub async fn run_single_message_command(
     run_single_message_with_agent(&mut agent, provider, message, emit_json, emit_ndjson).await
 }
 
+/// Provider id for `jcode run --json`/`--ndjson` output.
+///
+/// Every direct OpenAI-compatible profile (Ollama, LM Studio, DeepSeek, custom
+/// endpoints, ...) runs on the OpenRouter transport, whose `name()` is the
+/// fixed slot id `openrouter`. Reporting that attributed purely local runs to
+/// a paid third-party aggregator (#804). The session already records the
+/// resolved route identity, so prefer it for that slot and leave every other
+/// provider's established value unchanged.
+fn run_report_provider_name(
+    provider: &dyn crate::provider::Provider,
+    session_provider_key: Option<&str>,
+) -> String {
+    let name = provider.name();
+    if name.eq_ignore_ascii_case("openrouter")
+        && let Some(key) = session_provider_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    {
+        return key.to_string();
+    }
+    name.to_string()
+}
+
 async fn run_single_message_with_agent(
     agent: &mut crate::agent::Agent,
     provider: std::sync::Arc<dyn crate::provider::Provider>,
@@ -2535,12 +2962,20 @@ async fn run_single_message_with_agent(
     emit_json: bool,
     emit_ndjson: bool,
 ) -> Result<()> {
+    // A detached dependency can outlive a model turn without holding an
+    // in-process activity guard. Keep this CLI continuation alive across the
+    // wait too, rather than letting an idle-only runtime replacement lose it.
+    // run_once's nested read reservations are deliberately safe.
     let result: Result<()> = async {
+        let _runtime_activity = crate::runtime_activity::global().try_enter()?;
         if emit_json {
             let text = run_single_message_command_capture_with_auto_poke(agent, message).await?;
             let report = RunCommandReport {
                 session_id: agent.session_id().to_string(),
-                provider: provider.name().to_string(),
+                provider: run_report_provider_name(
+                    provider.as_ref(),
+                    agent.session_provider_key().as_deref(),
+                ),
                 model: provider.model(),
                 text,
                 usage: agent.last_usage().clone(),
@@ -2562,6 +2997,11 @@ async fn run_single_message_with_agent(
     // one-shot exit from looking like a stale-PID crash on the next startup
     // (issue #988).
     agent.mark_closed();
+    // The skill review runs detached so it does not hold the answer hostage.
+    // But this process is about to exit, and a detached task dies with the
+    // runtime. Wait for it here, AFTER the answer was printed, so the review
+    // is not silently dropped in the one-shot mode.
+    agent.wait_for_skill_review().await;
     result
 }
 
@@ -2605,17 +3045,25 @@ fn run_command_mcp_cold_wait() -> std::time::Duration {
 /// would otherwise miss the single-turn snapshot.
 fn cold_cache_mcp_servers() -> Vec<String> {
     let config = crate::mcp::McpConfig::load();
-    if config.servers.is_empty() {
-        return Vec::new();
-    }
     let cache = crate::mcp::McpSchemaCache::load();
+    uncached_enabled_mcp_servers(&config, &cache)
+}
+
+fn uncached_enabled_mcp_servers(
+    config: &crate::mcp::McpConfig,
+    cache: &crate::mcp::McpSchemaCache,
+) -> Vec<String> {
     config
         .servers
         .iter()
-        .filter(|(name, cfg)| cache.tools_for(name, cfg).is_none())
+        .filter(|(name, cfg)| cfg.is_enabled() && cache.tools_for(name, cfg).is_none())
         .map(|(name, _)| name.clone())
         .collect()
 }
+
+#[cfg(test)]
+#[path = "mcp_startup_tests.rs"]
+mod mcp_startup_tests;
 
 /// Bridge the cold-cache gap for `jcode run`: if any configured MCP server has
 /// no cached schema, briefly poll the registry until its `mcp__*` tools appear
@@ -2638,11 +3086,9 @@ async fn wait_for_cold_cache_mcp_tools(registry: &crate::tool::Registry) {
     ));
     let deadline = std::time::Instant::now() + budget;
     loop {
-        let names = registry.tool_names().await;
-        let covered = cold_servers.iter().all(|server| {
-            let prefix = format!("mcp__{}__", server);
-            names.iter().any(|name| name.starts_with(&prefix))
-        });
+        let covered = cold_servers
+            .iter()
+            .all(|server| registry.has_mcp_tools_for_server(server));
         if covered {
             crate::logging::info(
                 "jcode run: cold-cache MCP server(s) registered tools; proceeding",
@@ -2673,149 +3119,14 @@ fn run_command_auto_poke_limit_reached(turns_completed: usize, max_turns: Option
         .unwrap_or(false)
 }
 
-#[derive(Debug)]
-enum RunAutoPokeFollowUp {
-    Incomplete {
-        count: usize,
-        message: String,
-    },
-    ConfidenceSummary {
-        total_todos: usize,
-        message: String,
-        confidence_spike_challenge: bool,
-    },
-    /// Deferred quality-check reminder for the points this turn flagged and
-    /// never resolved. Delivered once, ahead of the confidence summary.
-    GateDigest {
-        message: String,
-    },
-}
-
-fn run_todos(session_id: &str) -> Vec<crate::todo::TodoItem> {
-    crate::todo::load_todos(session_id).unwrap_or_default()
-}
-
-/// Build the deferred quality-check reminder for a headless run, consuming the
-/// turn's observation log.
-///
-/// The log is cleared whether or not a reminder results, so one turn's points
-/// cannot be raised again against the next turn's work. Returns `None` only when
-/// the turn recorded nothing.
-fn take_run_gate_digest(session_id: &str, already_delivered: bool) -> Option<String> {
-    if already_delivered {
-        return None;
-    }
-    let observations = crate::todo::load_gate_observations(session_id).unwrap_or_default();
-    if observations.is_empty() {
-        return None;
-    }
-    let plan = crate::todo::load_plan(session_id).unwrap_or_default();
-    let goals = crate::todo::load_goals(session_id).unwrap_or_default();
-    let digest = crate::todo::build_gate_digest(&observations, &plan, &goals);
-    let _ = crate::todo::clear_gate_observations(session_id);
-    digest
-}
-
-/// Consume the observation log only once the turn has actually ended.
-///
-/// `take_run_gate_digest` clears the log, so calling it while todos are still
-/// open would destroy the reminder: auto-poke iterates many times with open work
-/// on a long run, and the incomplete-todo follow-up takes precedence, so the
-/// digest string would be dropped on the floor with the log already emptied.
-fn take_run_gate_digest_if_turn_ended(
-    session_id: &str,
-    already_delivered: bool,
-    todos: &[crate::todo::TodoItem],
-) -> Option<String> {
-    let work_remains = todos.iter().any(|todo| {
-        !crate::todo::todo_status_is_completed(&todo.status)
-            && !crate::todo::todo_status_is_cancelled(&todo.status)
-    });
-    if work_remains {
-        return None;
-    }
-    take_run_gate_digest(session_id, already_delivered)
-}
-
-fn build_run_auto_poke_follow_up_from_todos(
-    todos: &[crate::todo::TodoItem],
-    confidence_spike_challenged: bool,
-    gate_digest: Option<String>,
-) -> Option<RunAutoPokeFollowUp> {
-    let incomplete: Vec<_> = todos
-        .iter()
-        .filter(|todo| {
-            !crate::todo::todo_status_is_completed(&todo.status)
-                && !crate::todo::todo_status_is_cancelled(&todo.status)
-        })
-        .cloned()
-        .collect();
-    if !incomplete.is_empty() {
-        return Some(RunAutoPokeFollowUp::Incomplete {
-            count: incomplete.len(),
-            message: build_run_poke_message(&incomplete),
-        });
-    }
-    // Verify the weak points before judging completion confidence: the digest
-    // may prompt work that changes those very assessments.
-    if let Some(message) = gate_digest {
-        return Some(RunAutoPokeFollowUp::GateDigest { message });
-    }
-    if !todos.is_empty()
-        && let Some((message, confidence_spike_challenge)) =
-            build_run_todo_validation_message(todos, !confidence_spike_challenged)
-    {
-        return Some(RunAutoPokeFollowUp::ConfidenceSummary {
-            total_todos: todos.len(),
-            message,
-            confidence_spike_challenge,
-        });
-    }
-    None
-}
-
-fn build_run_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    crate::todo::build_auto_poke_message(incomplete.len())
-}
-
-fn build_run_todo_validation_message(
-    todos: &[crate::todo::TodoItem],
-    allow_confidence_spike_challenge: bool,
-) -> Option<(String, bool)> {
-    let completed: Vec<&crate::todo::TodoItem> = todos
-        .iter()
-        .filter(|todo| crate::todo::todo_status_is_completed(&todo.status))
-        .collect();
-    if completed.is_empty() {
-        return None;
-    }
-
-    let completion_confidence_needs_validation = completed
-        .iter()
-        .any(|todo| !crate::todo::completion_confidence_passes(todo.completion_confidence));
-    let confidence_spike_detected =
-        allow_confidence_spike_challenge && !crate::todo::spike_completed_todos(todos).is_empty();
-
-    if !completion_confidence_needs_validation && !confidence_spike_detected {
-        // Nothing actionable: completing the loop with a generic summary just
-        // spends tokens on "all good" theater, so send nothing and end the run.
-        return None;
-    }
-
-    if completion_confidence_needs_validation {
-        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
-        Some((
-            crate::todo::build_todo_completion_continuation_message(todos),
-            false,
-        ))
-    } else {
-        crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::ConfidenceSpike);
-        Some((
-            crate::todo::build_todo_confidence_spike_continuation_message(todos),
-            true,
-        ))
-    }
-}
+mod todo_followup;
+use todo_followup::{
+    RunAutoPokeFollowUp, build_run_auto_poke_follow_up_from_todos, prepare_run_todo_follow_up,
+    run_actionable_poke_message, run_blocked_notice, run_cannot_complete_notice, run_goals,
+    run_todos, run_user_auth_notice, take_run_gate_digest_if_turn_ended,
+};
+#[cfg(test)]
+use todo_followup::{run_actionable_todos, take_run_gate_digest};
 
 async fn run_single_message_command_plain_with_auto_poke(
     agent: &mut crate::agent::Agent,
@@ -2826,6 +3137,7 @@ async fn run_single_message_command_plain_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         agent.run_once(&next_message).await?;
         turns_completed += 1;
@@ -2833,10 +3145,43 @@ async fn run_single_message_command_plain_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            agent.session_id(),
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            eprintln!("{}", run_blocked_notice(&todos, &run_goals(agent.session_id())).unwrap_or_else(||
+                "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
+            ));
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            eprintln!(
+                "We stopped poking after {} attempts without todo progress; unfinished todos remain.",
+                crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS
+            );
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -2877,6 +3222,8 @@ async fn run_single_message_command_plain_with_auto_poke(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         eprintln!(
@@ -2908,6 +3255,7 @@ async fn run_single_message_command_capture_with_auto_poke(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         outputs.push(agent.run_once_capture(&next_message).await?);
         turns_completed += 1;
@@ -2915,10 +3263,43 @@ async fn run_single_message_command_capture_with_auto_poke(
             break;
         }
         let todos = run_todos(agent.session_id());
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            agent.session_id(),
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            eprintln!("{}", run_blocked_notice(&todos, &run_goals(agent.session_id())).unwrap_or_else(||
+                "Stopped at the turn limit with unfinished todos waiting on background dependencies.".into()
+            ));
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            eprintln!(
+                "We stopped poking after {} attempts without todo progress; unfinished todos remain.",
+                crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS
+            );
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -2956,6 +3337,8 @@ async fn run_single_message_command_capture_with_auto_poke(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         outputs.push(format!(
@@ -2990,6 +3373,8 @@ async fn run_single_message_command_ndjson(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let session_id = agent.session_id().to_string();
+    let provider_name =
+        run_report_provider_name(provider.as_ref(), agent.session_provider_key().as_deref());
     let mut stdout = std::io::stdout().lock();
     let mut state = NdjsonRunState {
         session_id: Some(session_id.clone()),
@@ -3000,7 +3385,7 @@ async fn run_single_message_command_ndjson(
         &serde_json::json!({
             "type": "start",
             "session_id": session_id,
-            "provider": provider.name(),
+            "provider": provider_name,
             "model": provider.model(),
         }),
     )?;
@@ -3011,6 +3396,7 @@ async fn run_single_message_command_ndjson(
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
     let mut gate_digest_delivered = false;
+    let mut incomplete_budget = crate::todo::IncompleteTodoBudget::default();
     loop {
         let turn_result = {
             let mut run_future = std::pin::pin!(agent.run_once_streaming_mpsc(
@@ -3051,10 +3437,66 @@ async fn run_single_message_command_ndjson(
             break;
         }
         let todos = run_todos(&session_id);
-        let gate_digest =
-            take_run_gate_digest_if_turn_ended(agent.session_id(), gate_digest_delivered, &todos);
-        match build_run_auto_poke_follow_up_from_todos(
+        let (actionable_todos, dependency_resume) = prepare_run_todo_follow_up(
+            crate::background::global(),
+            &session_id,
             &todos,
+            !run_command_auto_poke_limit_reached(turns_completed, max_turns),
+        )
+        .await;
+        if let Some(message) = dependency_resume {
+            incomplete_budget = crate::todo::IncompleteTodoBudget::default();
+            gate_digest_delivered = false;
+            next_message = message;
+            write_json_line(
+                &mut stdout,
+                &serde_json::json!({
+                    "type": "auto_poke_dependency_resolved",
+                    "session_id": session_id,
+                    "message": next_message,
+                }),
+            )?;
+            continue;
+        }
+        if todos.iter().any(crate::todo::is_incomplete_todo)
+            && !actionable_todos.iter().any(crate::todo::is_incomplete_todo)
+        {
+            write_json_line(
+                &mut stdout,
+                &serde_json::json!({
+                    "type": "auto_poke_stopped",
+                    "session_id": session_id,
+                    "reason": if run_user_auth_notice(&todos).is_some() { "requires_user_auth" } else if run_cannot_complete_notice(&todos, &run_goals(&session_id)).is_some() { "cannot_complete" } else { "turn_limit" },
+                    "message": run_blocked_notice(&todos, &run_goals(&session_id)),
+                    "requires_user_auth": todos.iter().any(crate::todo::todo_requires_user_auth),
+                    "waiting_on_background": todos.iter().any(|todo| !todo.waiting_on.is_empty()),
+                    "max_turns": max_turns,
+                }),
+            )?;
+            break;
+        }
+        if !incomplete_budget.allow_follow_up(&actionable_todos) {
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({
+                    "type": "auto_poke_stopped",
+                    "reason": "unchanged_todos",
+                    "max_attempts": crate::todo::INCOMPLETE_TODO_MAX_ATTEMPTS,
+                    "incomplete_todos": todos.iter().filter(|todo| crate::todo::is_incomplete_todo(todo)).count(),
+                })
+            )?;
+            break;
+        }
+        let gate_digest = take_run_gate_digest_if_turn_ended(
+            agent.session_id(),
+            gate_digest_delivered,
+            &todos,
+            crate::config::config().features.todo_gate_digest,
+        );
+        match build_run_auto_poke_follow_up_from_todos(
+            crate::config::config().features.todo_gate_digest,
+            &actionable_todos,
             confidence_spike_challenged,
             gate_digest,
         ) {
@@ -3108,6 +3550,8 @@ async fn run_single_message_command_ndjson(
                 continue;
             }
             Some(RunAutoPokeFollowUp::Incomplete { count, message }) => {
+                let message = run_actionable_poke_message(message, &todos, &actionable_todos);
+                gate_digest_delivered = false;
                 if run_command_auto_poke_limit_reached(turns_completed, max_turns) {
                     if let Some(max_turns) = max_turns {
                         write_json_line(
@@ -3144,7 +3588,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "done",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "text": state.text,
                     "usage": state.usage,
@@ -3152,6 +3596,12 @@ async fn run_single_message_command_ndjson(
                     "connection_type": state.connection_type,
                     "connection_phase": state.connection_phase,
                     "status_detail": state.status_detail,
+                    "requested_service_tier": state.requested_service_tier,
+                    "reported_service_tier": state.served_service_tier,
+                    "service_tier_report_status": state.service_tier_report_status(),
+                    // Retained for compatibility; this is provider-reported
+                    // metadata, not independently verified serving evidence.
+                    "served_service_tier": state.served_service_tier,
                 }),
             )?;
             Ok(())
@@ -3162,7 +3612,7 @@ async fn run_single_message_command_ndjson(
                 &serde_json::json!({
                     "type": "error",
                     "session_id": session_id,
-                    "provider": provider.name(),
+                    "provider": provider_name,
                     "model": provider.model(),
                     "message": format!("{err:#}"),
                 }),
@@ -3172,351 +3622,30 @@ async fn run_single_message_command_ndjson(
     }
 }
 
-fn emit_ndjson_event(
-    stdout: &mut impl Write,
-    state: &mut NdjsonRunState,
-    event: crate::protocol::ServerEvent,
-) -> Result<()> {
-    use crate::protocol::ServerEvent;
-
-    match event {
-        ServerEvent::TextDelta { text } => {
-            state.text.push_str(&text);
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "text_delta", "text": text }),
-            )
-        }
-        ServerEvent::TextReplace { text } => {
-            state.text = text.clone();
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "text_replace", "text": text }),
-            )
-        }
-        ServerEvent::ToolStart { id, name } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_start", "id": id, "name": name }),
-        ),
-        ServerEvent::ToolInput { delta, .. } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_input", "delta": delta }),
-        ),
-        ServerEvent::ToolExec { id, name } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "tool_exec", "id": id, "name": name }),
-        ),
-        ServerEvent::ToolDone {
-            id,
-            name,
-            output,
-            error,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "tool_done",
-                "id": id,
-                "name": name,
-                "output": output,
-                "error": error,
-            }),
-        ),
-        ServerEvent::TokenUsage {
-            input,
-            output,
-            cache_read_input,
-            cache_creation_input,
-        } => {
-            state.usage = crate::agent::TokenUsage {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_input_tokens: cache_read_input,
-                cache_creation_input_tokens: cache_creation_input,
-            };
-            write_json_line(
-                stdout,
-                &serde_json::json!({
-                    "type": "tokens",
-                    "input": input,
-                    "output": output,
-                    "cache_read_input": cache_read_input,
-                    "cache_creation_input": cache_creation_input,
-                }),
-            )
-        }
-        ServerEvent::ConnectionType { connection } => {
-            state.connection_type = Some(connection.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "connection_type", "connection": connection }),
-            )
-        }
-        ServerEvent::ConnectionPhase { phase } => {
-            state.connection_phase = Some(phase.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "connection_phase", "phase": phase }),
-            )
-        }
-        ServerEvent::StatusDetail { detail } => {
-            state.status_detail = Some(detail.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "status_detail", "detail": detail }),
-            )
-        }
-        ServerEvent::MessageEnd { stop_reason } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "message_end", "stop_reason": stop_reason }),
-        ),
-        ServerEvent::UpstreamProvider { provider } => {
-            state.upstream_provider = Some(provider.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "upstream_provider", "provider": provider }),
-            )
-        }
-        ServerEvent::SessionId { session_id } => {
-            state.session_id = Some(session_id.clone());
-            write_json_line(
-                stdout,
-                &serde_json::json!({ "type": "session", "session_id": session_id }),
-            )
-        }
-        ServerEvent::Compaction {
-            trigger,
-            pre_tokens,
-            messages_dropped,
-            post_tokens,
-            tokens_saved,
-            duration_ms,
-            messages_compacted,
-            summary_chars,
-            active_messages,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "compaction",
-                "trigger": trigger,
-                "pre_tokens": pre_tokens,
-                "messages_dropped": messages_dropped,
-                "post_tokens": post_tokens,
-                "tokens_saved": tokens_saved,
-                "duration_ms": duration_ms,
-                "messages_compacted": messages_compacted,
-                "summary_chars": summary_chars,
-                "active_messages": active_messages,
-            }),
-        ),
-        ServerEvent::MemoryInjected {
-            count,
-            prompt_chars,
-            computed_age_ms,
-            ..
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "memory_injected",
-                "count": count,
-                "prompt_chars": prompt_chars,
-                "computed_age_ms": computed_age_ms,
-            }),
-        ),
-        ServerEvent::Interrupted => {
-            write_json_line(stdout, &serde_json::json!({ "type": "interrupted" }))
-        }
-        ServerEvent::SoftInterruptInjected {
-            content,
-            display_role,
-            point,
-            tools_skipped,
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "soft_interrupt_injected",
-                "content": content,
-                "display_role": display_role,
-                "point": point,
-                "tools_skipped": tools_skipped,
-            }),
-        ),
-        ServerEvent::BatchProgress { progress } => write_json_line(
-            stdout,
-            &serde_json::json!({ "type": "batch_progress", "progress": progress }),
-        ),
-        ServerEvent::Error {
-            message,
-            retry_after_secs,
-            ..
-        } => write_json_line(
-            stdout,
-            &serde_json::json!({
-                "type": "error",
-                "message": message,
-                "retry_after_secs": retry_after_secs,
-            }),
-        ),
-        ServerEvent::Ack { .. } | ServerEvent::Done { .. } | ServerEvent::Pong { .. } => Ok(()),
-        _ => Ok(()),
+/// Legacy CLI adapters consume the payload even when an identity-aware peer
+/// sends an explicit envelope. Unwrap iteratively to tolerate nested envelopes.
+pub(super) fn unwrap_turn_event(
+    mut event: crate::protocol::ServerEvent,
+) -> crate::protocol::ServerEvent {
+    while let crate::protocol::ServerEvent::TurnEvent { event: inner, .. } = event {
+        event = *inner;
     }
+    event
 }
 
-fn write_json_line(stdout: &mut impl Write, value: &impl Serialize) -> Result<()> {
-    serde_json::to_writer(&mut *stdout, value)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
-}
+#[path = "commands_json_output.rs"]
+mod json_output;
+use json_output::*;
+#[path = "commands/model_listing.rs"]
+mod model_listing;
 
-pub async fn run_model_command(
-    choice: &super::provider_init::ProviderChoice,
-    model: Option<&str>,
-    emit_json: bool,
-    verbose: bool,
-) -> Result<()> {
-    let provider = super::provider_init::init_provider_quiet(choice, model).await?;
+#[cfg(test)]
+mod turn_envelope_tests;
+pub use model_listing::run_model_command;
 
-    if let Err(err) = provider.prefetch_models().await
-        && !super::output::quiet_enabled()
-    {
-        eprintln!("Warning: failed to refresh dynamic model list: {}", err);
-    }
+mod model_routes;
+use model_routes::*;
 
-    let routes = provider.model_routes();
-    let filtered_routes = filter_cli_model_routes_for_choice(choice, &routes);
-    let models = if filtered_routes.len() == routes.len() {
-        collect_cli_model_names(&routes, provider.available_models_display())
-    } else {
-        collect_cli_model_names(&filtered_routes, Vec::new())
-    };
-
-    if models.is_empty() {
-        anyhow::bail!(
-            "No models found for provider '{}'. Check credentials or try a different --provider.",
-            provider.name()
-        );
-    }
-
-    if emit_json {
-        let provider_label = super::provider_init::login_provider_for_choice(choice)
-            .map(|provider| provider.display_name.to_string())
-            .unwrap_or_else(|| {
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            });
-        let report = ModelListReport {
-            provider: provider_label,
-            selected_model: provider.model(),
-            models,
-            routes: filtered_routes
-                .iter()
-                .map(|route| ModelListRouteReport {
-                    provider: cli_route_provider_display(&route.provider, &route.api_method),
-                    model: route.model.clone(),
-                    method: cli_api_method_display(&route.api_method),
-                    available: route.available,
-                })
-                .collect(),
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        if verbose {
-            println!(
-                "Provider: {}",
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            );
-            println!("Selected model: {}", provider.model());
-            println!("Available models: {}", models.len());
-            println!();
-        }
-        for model in models {
-            println!("{}", model);
-        }
-    }
-
-    Ok(())
-}
-
-fn cli_api_method_display(raw: &str) -> String {
-    crate::provider::ModelRouteApiMethod::parse(raw).display_label()
-}
-
-fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
-    if crate::provider::ModelRouteApiMethod::parse(api_method).is_openrouter()
-        && provider != "auto"
-        && !provider.contains("OpenRouter")
-    {
-        format!("OpenRouter/{}", provider)
-    } else {
-        provider.to_string()
-    }
-}
-
-fn collect_cli_model_names(
-    routes: &[crate::provider::ModelRoute],
-    display_models: Vec<String>,
-) -> Vec<String> {
-    let mut deduped = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    fn push_model(deduped: &mut Vec<String>, seen: &mut BTreeSet<String>, model: &str) {
-        let trimmed = model.trim();
-        if !crate::provider::is_listable_model_name(trimmed) {
-            return;
-        }
-        if seen.insert(trimmed.to_string()) {
-            deduped.push(trimmed.to_string());
-        }
-    }
-
-    for route in routes.iter().filter(|route| route.available) {
-        push_model(&mut deduped, &mut seen, &route.model);
-    }
-
-    if deduped.is_empty() {
-        for route in routes {
-            push_model(&mut deduped, &mut seen, &route.model);
-        }
-    }
-
-    for model in display_models {
-        push_model(&mut deduped, &mut seen, &model);
-    }
-
-    deduped
-}
-
-#[allow(deprecated)]
-fn filter_cli_model_routes_for_choice(
-    choice: &super::provider_init::ProviderChoice,
-    routes: &[crate::provider::ModelRoute],
-) -> Vec<crate::provider::ModelRoute> {
-    use super::provider_init::ProviderChoice;
-
-    let keep = |route: &&crate::provider::ModelRoute| match choice {
-        ProviderChoice::Claude => route.api_method_kind().is_anthropic_credential_route(),
-        ProviderChoice::Openai => {
-            let method = route.api_method_kind();
-            matches!(method, crate::provider::ModelRouteApiMethod::OpenAIOAuth)
-                || matches!(method, crate::provider::ModelRouteApiMethod::Other(ref value) if value == "chatgpt-web")
-        }
-        ProviderChoice::OpenaiApi => matches!(
-            route.api_method_kind(),
-            crate::provider::ModelRouteApiMethod::OpenAIApiKey
-        ),
-        ProviderChoice::Openrouter | ProviderChoice::Azure => {
-            route.api_method_kind().is_openrouter()
-        }
-        ProviderChoice::Copilot => route.api_method_kind().is_copilot(),
-        _ => true,
-    };
-
-    let filtered: Vec<_> = routes.iter().filter(keep).cloned().collect();
-    if filtered.is_empty() {
-        routes.to_vec()
-    } else {
-        filtered
-    }
-}
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod tests;

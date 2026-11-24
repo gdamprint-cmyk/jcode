@@ -4,8 +4,22 @@
 
 - Jcode Desktop is in a separate repository.
 
+## TUI style
+
+- UI chrome must not wrap: startup headers, account rows, status labels, and
+  other compact UI rows should fit their available terminal-cell width or
+  truncate with an ellipsis. Count Unicode display cells, not characters.
+  Preserve one logical row per visual row, including at narrow widths.
+  Chat prose and other intentionally multiline content may wrap normally.
+- Reuse the info widget's limit-bar renderer for usage indicators instead of
+  introducing a different bar glyph, color, or used/remaining convention.
+
 ## Development Workflow
 
+- **Commit and push as you go** - Make small, scoped commits and push them to
+  the current branch's remote as meaningful work is completed, rather than
+  waiting until the end of the task. Preserve unrelated changes and never
+  force-push unless the user explicitly authorizes it.
 - **Use the user's Git identity** - Create commits with the configured
   `user.name` and `user.email`. Do not override them with `Jcode`, `Jcode agent`,
   or a fabricated agent email. Preserve existing contributor attribution when
@@ -15,10 +29,31 @@
   first-time contributor, or an agent. Good PRs can be merged directly after review
   and validation. Do not require a maintainer-authored rewrite merely because of
   who submitted the change. See `CONTRIBUTING.md` for the contribution policy.
-- **Keep work scoped** - Work on your own branch and preserve unrelated work. When
-  the user asks you to review or integrate a PR or branch, you may inspect, test,
-  and integrate that contribution regardless of author status. Do not pull in
-  unrelated branches or merge a PR without user authorization.
+- **Prefer master/main** - Work directly on the repository's primary branch
+  (`master` or `main`) by default. Do not create a branch or worktree merely to
+  start a task. Only do so when the user explicitly requests it or isolation is
+  genuinely necessary, and explain the concrete reason first.
+- **Keep work scoped** - Preserve unrelated work. If already on a branch with
+  ongoing changes, finish and integrate safely rather than switching blindly.
+  When the user asks you to review or integrate a PR or branch, you may inspect,
+  test, and integrate that contribution regardless of author status. Do not pull
+  in unrelated branches or merge a PR without user authorization.
+
+## Provider model discovery
+
+- Model arrays are offline fallbacks, not release allowlists. Providers with a
+  catalog must discover new model IDs without a Jcode release and expose them
+  through switching lists and structured model routes.
+- Implement both cached prefetch and explicit refresh. Explicit refresh must
+  bypass fresh caches. Preserve the last good catalog on network, authentication,
+  or malformed-response failures, and scope persistent caches to their endpoint.
+- Wire new providers into the shared refresh fanout and model-update publication,
+  including long-lived sessions, not only startup or login.
+- Regression tests must discover an arbitrary future model absent from all
+  fallback arrays, using the provider's actual response schema. Check picker
+  routes, forced refresh with a fresh cache, and last-good behavior on failure.
+- If a backend has no discovery API, document that limitation instead of
+  presenting a hardcoded list or a no-op refresh as live discovery.
 
 ## Install Notes
 - `~/.local/bin/jcode` is the launcher symlink used from `PATH`.
@@ -30,6 +65,14 @@
 - Ensure `~/.local/bin` is **before** `~/.cargo/bin` in `PATH`.
 
 ## Verifying a change at runtime
+
+### Keep benchmark sessions out of user history
+
+For synthetic prompts and streaming/CPU/power benchmarks, set a dedicated
+`JCODE_HOME` and `JCODE_TEST_SESSION=1` for both the server and its clients,
+in addition to using a unique `--socket`. A private socket alone isolates the
+daemon, not persisted sessions. Never run synthetic benchmark prompts against
+the user's normal session storage.
 
 `cargo build` alone proves nothing about behavior. `jcode run` and interactive
 sessions are served by the long-lived daemon at
@@ -54,3 +97,8 @@ Two things that waste time otherwise:
 - Confirm which binary you are actually inspecting. `strings` on
   `builds/shared-server/jcode` reads a 70-byte symlink, not a program; resolve it
   with `readlink -f` first.
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->

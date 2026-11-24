@@ -705,6 +705,49 @@ pub struct ErrorCounts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageReportEvent {
+    /// Version 2 uses uncached input, disjoint cache buckets and stable event IDs.
+    #[serde(default)]
+    pub usage_contract_version: u32,
+    /// UTC provider usage observation time, preserved across durable retries.
+    #[serde(default)]
+    pub occurred_at: String,
+    pub event_id: String,
+    pub id: String,
+    /// Logical session that made the call (the agent's own session id when
+    /// known). Not the process-global telemetry session, so concurrent agents
+    /// in one server process are attributed separately.
+    pub session_id: String,
+    pub event: &'static str,
+    pub version: String,
+    pub os: &'static str,
+    pub arch: &'static str,
+    /// What made the call: `agent`, `compaction`, `sidecar`.
+    pub source: &'static str,
+    pub provider: String,
+    /// Effective provider-resolved ID, or the requested label when unknown.
+    pub model: String,
+    /// Original request alias. Absent on older clients and historical reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// ID observed in the provider response, never inferred from an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub total_tokens: u64,
+    /// Number of provider responses folded into this report.
+    pub responses: u32,
+    pub schema_version: u32,
+    pub build_channel: String,
+    pub is_git_checkout: bool,
+    pub is_ci: bool,
+    pub ran_from_cargo: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEndEvent {
     pub event_id: String,
     pub id: String,

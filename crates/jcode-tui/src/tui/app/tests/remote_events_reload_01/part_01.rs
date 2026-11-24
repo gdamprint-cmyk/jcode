@@ -1,55 +1,4 @@
 #[test]
-fn test_local_bus_dictation_completion_ignores_other_session() {
-    let mut app = create_test_app();
-    let session_id = app.session.id.clone();
-    app.input = "draft".to_string();
-    app.cursor_pos = app.input.len();
-    app.dictation_in_flight = true;
-    app.dictation_request_id = Some("dictation_123".to_string());
-    app.dictation_target_session_id = Some(session_id);
-
-    let handled = crate::tui::app::local::handle_bus_event(
-        &mut app,
-        Ok(crate::bus::BusEvent::DictationCompleted {
-            dictation_id: "dictation_other".to_string(),
-            session_id: Some("session_other".to_string()),
-            text: " dictated text".to_string(),
-            mode: crate::protocol::TranscriptMode::Append,
-        }),
-    );
-
-    assert!(!handled);
-    assert_eq!(app.input, "draft");
-    assert!(app.dictation_in_flight);
-}
-
-#[test]
-fn test_remote_bus_dictation_completion_ignores_other_session() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut remote = rt.block_on(async { crate::tui::backend::RemoteConnection::dummy() });
-    app.is_remote = true;
-    app.remote_session_id = Some("session_remote".to_string());
-    app.dictation_in_flight = true;
-    app.dictation_request_id = Some("dictation_123".to_string());
-    app.dictation_target_session_id = Some("session_remote".to_string());
-
-    rt.block_on(crate::tui::app::remote::handle_bus_event(
-        &mut app,
-        &mut remote,
-        Ok(crate::bus::BusEvent::DictationCompleted {
-            dictation_id: "dictation_other".to_string(),
-            session_id: Some("session_other".to_string()),
-            text: " dictated text".to_string(),
-            mode: crate::protocol::TranscriptMode::Append,
-        }),
-    ));
-
-    assert!(app.dictation_in_flight);
-    assert_eq!(app.dictation_request_id.as_deref(), Some("dictation_123"));
-}
-
-#[test]
 fn test_remote_bus_productivity_failure_clears_refresh_state() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -71,7 +20,9 @@ fn test_remote_bus_productivity_failure_clears_refresh_state() {
     assert!(handled);
     assert!(!app.productivity_refreshing);
     assert_eq!(
-        app.status_notice.as_ref().map(|(notice, _)| notice.as_str()),
+        app.status_notice
+            .as_ref()
+            .map(|(notice, _)| notice.as_str()),
         Some("Productivity report failed")
     );
     assert!(
@@ -183,14 +134,16 @@ fn test_handle_server_event_history_clears_connection_type_on_session_change_whe
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_new".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -211,12 +164,17 @@ fn test_handle_server_event_history_clears_connection_type_on_session_change_whe
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -237,14 +195,16 @@ fn test_handle_server_event_history_preserves_connection_type_for_same_session_w
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_same".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -265,12 +225,17 @@ fn test_handle_server_event_history_preserves_connection_type_for_same_session_w
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -291,14 +256,16 @@ fn test_handle_server_event_history_preserves_reasoning_effort_for_same_session_
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_same".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("anthropic".to_string()),
             provider_model: Some("claude-opus-4-1".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -319,12 +286,17 @@ fn test_handle_server_event_history_preserves_reasoning_effort_for_same_session_
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -372,14 +344,16 @@ fn test_handle_server_event_history_session_change_clears_streaming_preview_diag
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_new".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -400,12 +374,17 @@ fn test_handle_server_event_history_session_change_clears_streaming_preview_diag
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -460,17 +439,17 @@ fn test_handle_server_event_history_same_session_rewind_reapply_clears_streaming
     );
     // The client-side /rewind path arms a pending notice before the server's
     // History redelivery arrives (remote/key_handling.rs).
-    app.pending_remote_rewind_notice =
-        Some(crate::tui::app::PendingRemoteRewindNotice {
-            undo: false,
-            message_index: Some(1),
-            changed_messages: 2,
-        });
+    app.pending_remote_rewind_notice = Some(crate::tui::app::PendingRemoteRewindNotice {
+        undo: false,
+        message_index: Some(1),
+        changed_messages: 2,
+    });
 
     // Truncated payload after the rewind: same session id, fewer messages.
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
+            messages_base_count: None,
+            images_unchanged: false,
             id: 2,
             session_id: "session_rewind_preview".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
@@ -484,6 +463,7 @@ fn test_handle_server_event_history_same_session_rewind_reapply_clears_streaming
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -504,12 +484,17 @@ fn test_handle_server_event_history_same_session_rewind_reapply_clears_streaming
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -539,7 +524,8 @@ fn test_handle_server_event_history_same_session_rewind_reapply_clears_streaming
 }
 
 #[test]
-fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_and_keeps_preview() {
+fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_and_keeps_preview()
+{
     // Multi-client rewind fan-out pin (server side has NO fan-out: a /rewind
     // History redelivery is written only to the rewinding connection's socket,
     // per-client event channel, server/client_lifecycle.rs:521 and
@@ -580,7 +566,8 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
     // Same-session, rewind-truncated payload this client never requested.
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
+            messages_base_count: None,
+            images_unchanged: false,
             id: 3,
             session_id: "session_midstream_dup".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
@@ -594,6 +581,7 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -614,12 +602,17 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -632,9 +625,9 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
         "unsolicited same-session History must not replace a bootstrapped mid-stream transcript"
     );
     assert!(
-        !app.display_messages()
-            .iter()
-            .any(|m| m.content.contains("truncated payload from another client's rewind")),
+        !app.display_messages().iter().any(|m| m
+            .content
+            .contains("truncated payload from another client's rewind")),
         "unsolicited same-session History payload should be dropped, not applied"
     );
     // Live stream state preserved: preview and streaming text survive.
@@ -663,7 +656,8 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
         );
         app.handle_server_event(
             crate::protocol::ServerEvent::History {
-            applets: Default::default(),
+                messages_base_count: None,
+                images_unchanged: false,
                 id: 3,
                 session_id: "session_midstream_dup".to_string(),
                 messages: vec![crate::protocol::HistoryMessage {
@@ -677,6 +671,7 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
                 provider_name: Some("claude".to_string()),
                 provider_model: Some("claude-sonnet-4-20250514".to_string()),
                 subagent_model: None,
+                agent_model_overrides: Default::default(),
                 autoreview_enabled: None,
                 autojudge_enabled: None,
                 available_models: vec![],
@@ -697,12 +692,17 @@ fn test_handle_server_event_history_same_session_midstream_duplicate_is_dropped_
                 connection_type: None,
                 status_detail: None,
                 upstream_provider: None,
+                provider_oauth_email: None,
+                provider_oauth_account_label: None,
                 resolved_credential: None,
                 reasoning_effort: None,
                 service_tier: None,
+                available_service_tiers: None,
+            available_reasoning_efforts: None,
                 compaction_mode: crate::config::CompactionMode::Reactive,
                 activity: None,
                 side_panel: crate::side_panel::SidePanelSnapshot::default(),
+                applets: Default::default(),
             },
             &mut remote,
         );
@@ -766,7 +766,8 @@ fn test_handle_server_event_history_same_session_rewind_then_late_done_does_not_
     // Truncated payload after the rewind: same session id, fewer messages.
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
+            messages_base_count: None,
+            images_unchanged: false,
             id: 2,
             session_id: "session_rewind_done_race".to_string(),
             messages: vec![crate::protocol::HistoryMessage {
@@ -780,6 +781,7 @@ fn test_handle_server_event_history_same_session_rewind_then_late_done_does_not_
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -800,12 +802,17 @@ fn test_handle_server_event_history_same_session_rewind_then_late_done_does_not_
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -827,15 +834,11 @@ fn test_handle_server_event_history_same_session_rewind_then_late_done_does_not_
 
     // The stale Done from the rewound-away turn arrives AFTER the truncated
     // History (mpsc forwarder ordering).
-    app.handle_server_event(
-        crate::protocol::ServerEvent::Done { id: 7 },
-        &mut remote,
-    );
+    app.handle_server_event(crate::protocol::ServerEvent::Done { id: 7 }, &mut remote);
 
     assert!(!app.is_processing, "late Done should settle the turn");
     assert!(
-        !app
-            .display_messages()
+        !app.display_messages()
             .iter()
             .any(|m| m.content.contains("rewound-away assistant text")),
         "late Done must not resurrect assistant text that the rewind removed"
@@ -862,14 +865,16 @@ fn test_handle_server_event_history_session_change_clears_pending_interleaves() 
 
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_new".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -890,12 +895,17 @@ fn test_handle_server_event_history_session_change_clears_pending_interleaves() 
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -1136,404 +1146,7 @@ fn test_handle_post_connect_requests_client_reload_after_server_reload_even_with
     }
 }
 
-#[test]
-fn test_handle_server_event_token_usage_uses_per_call_deltas() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.streaming.streaming_tps_collect_output = true;
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 10,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 30,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 30,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    assert_eq!(app.streaming.streaming_output_tokens, 30);
-    assert_eq!(app.streaming.streaming_total_output_tokens, 30);
-    assert_eq!(app.token_accounting.total_input_tokens, 100);
-    assert_eq!(app.token_accounting.total_output_tokens, 30);
-}
-
-#[test]
-fn test_handle_server_event_tool_exec_pauses_tps_but_collects_final_tool_usage() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.streaming.streaming_tps_elapsed = Duration::from_secs(2);
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ToolStart {
-            id: "tool-1".to_string(),
-            name: "read".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_some());
-
-    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(3));
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ToolExec {
-            id: "tool-1".to_string(),
-            name: "read".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_none());
-    assert!(app.streaming.streaming_tps_elapsed >= Duration::from_secs(5));
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 25,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    assert_eq!(app.streaming.streaming_total_output_tokens, 25);
-    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 25);
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TextDelta {
-            text: "hello".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_some());
-}
-
-#[test]
-fn test_handle_server_event_kv_cache_request_resets_tps_output_watermark_for_next_api_call() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.streaming.streaming_tps_collect_output = true;
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 40,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::KvCacheRequest {
-            system_static_hash: 1,
-            tools_hash: 2,
-            messages_hash: 3,
-            message_hashes: vec![11, 22],
-            message_count: 2,
-            tool_count: 1,
-            system_static_chars: 10,
-            tools_json_chars: 20,
-            messages_json_chars: 30,
-            ephemeral_hash: None,
-            ephemeral_chars: 0,
-            ephemeral_message_count: 0,
-        },
-        &mut remote,
-    );
-
-    assert!(!app.streaming.streaming_tps_collect_output);
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "streaming".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(app.streaming.streaming_tps_collect_output);
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 120,
-            output: 15,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    assert_eq!(app.streaming.streaming_total_output_tokens, 55);
-    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 55);
-}
-
-#[test]
-fn test_handle_server_event_message_end_marks_stream_as_finalizing_without_stall_mode() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.is_processing = true;
-    app.status = ProcessingStatus::Streaming;
-    app.streaming.streaming_tps_collect_output = true;
-
-    let needs_redraw =
-        app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
-
-    assert!(needs_redraw);
-    assert!(app.stream_message_ended);
-    assert!(matches!(app.status, ProcessingStatus::Streaming));
-    assert!(app.streaming.streaming_tps_collect_output);
-}
-
-#[test]
-fn test_remote_done_waits_for_paced_backlog_and_one_live_frame() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.current_message_id = Some(42);
-    app.is_processing = true;
-    app.status = ProcessingStatus::Streaming;
-    let response = "paced text";
-    let ops = app.stream_buffer.push_text(response);
-    app.apply_stream_ops(ops);
-    assert!(!app.stream_buffer.is_empty());
-
-    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
-    app.handle_server_event(crate::protocol::ServerEvent::Done { id: 42 }, &mut remote);
-
-    assert!(app.is_processing, "Done must not force-flush the backlog");
-    assert_eq!(app.deferred_stream_done_id, Some(42));
-    assert!(app.display_messages.iter().all(|message| {
-        message.role != "assistant" || !message.content.contains(response)
-    }));
-
-    // The first tick drains the short backlog, but deliberately leaves the live
-    // streaming representation visible for one frame before committing it.
-    std::thread::sleep(Duration::from_millis(60));
-    rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
-    assert!(app.stream_buffer.is_empty());
-    assert!(app.is_processing);
-    assert_eq!(app.deferred_stream_done_id, Some(42));
-    assert_eq!(app.streaming.streaming_text, response);
-
-    // The following tick replays Done now that the preceding live frame was
-    // eligible to render, committing exactly the text that was paced out.
-    rt.block_on(crate::tui::app::remote::handle_tick(&mut app, &mut remote));
-    assert!(!app.is_processing);
-    assert_eq!(app.deferred_stream_done_id, None);
-    assert!(app.display_messages.iter().any(|message| {
-        message.role == "assistant" && message.content == response
-    }));
-}
-
-#[test]
-fn test_handle_server_event_tps_connection_phase_streaming_starts_collection_only_for_streaming() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "waiting for response".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(!app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_none());
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "streaming".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_some());
-    assert!(matches!(app.status, ProcessingStatus::Streaming));
-}
-
-#[test]
-fn test_connection_phase_elapsed_resets_per_attempt_not_per_turn() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    // Simulate a long-running turn: the whole-turn timer has been ticking for
-    // well over the "suspiciously long" yellow threshold.
-    app.is_processing = true;
-    app.processing_started = Some(Instant::now() - Duration::from_secs(120));
-    assert!(crate::tui::TuiState::elapsed(&app).unwrap() > Duration::from_secs(60));
-
-    // A later round-trip enters the connecting phase. The per-attempt timer
-    // must start fresh, so it reads as a brief connect (well under 10s) instead
-    // of inheriting the 120s whole-turn elapsed and rendering yellow.
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "connecting".to_string(),
-        },
-        &mut remote,
-    );
-
-    assert!(matches!(
-        app.status,
-        ProcessingStatus::Connecting(crate::message::ConnectionPhase::Connecting)
-    ));
-    let phase_elapsed = crate::tui::TuiState::connection_phase_elapsed(&app)
-        .expect("connection phase elapsed should be tracked");
-    assert!(
-        phase_elapsed < Duration::from_secs(5),
-        "per-attempt connection elapsed should be fresh, got {:?}",
-        phase_elapsed
-    );
-
-    // Sub-phase transitions within the same attempt must not restart the timer.
-    let started = app.connection_phase_started;
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "waiting for response".to_string(),
-        },
-        &mut remote,
-    );
-    assert_eq!(
-        app.connection_phase_started, started,
-        "sub-phase transitions should keep the same per-attempt start"
-    );
-
-    // Streaming clears the per-attempt timer.
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "streaming".to_string(),
-        },
-        &mut remote,
-    );
-    assert!(app.connection_phase_started.is_none());
-}
-
-#[test]
-fn test_handle_server_event_tps_message_end_counts_late_usage_without_timer_running() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "streaming".to_string(),
-        },
-        &mut remote,
-    );
-    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(4));
-
-    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
-
-    assert!(app.streaming.streaming_tps_collect_output);
-    assert!(app.streaming.streaming_tps_start.is_none());
-    assert!(app.streaming.streaming_tps_elapsed >= Duration::from_secs(4));
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 20,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    assert_eq!(app.streaming.streaming_total_output_tokens, 20);
-    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 20);
-    assert!(app.streaming.streaming_tps_observed_elapsed >= Duration::from_secs(4));
-    assert!(app.streaming.streaming_tps_start.is_none());
-}
-
-#[test]
-fn test_handle_server_event_tps_redundant_late_usage_after_message_end_does_not_double_count() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::ConnectionPhase {
-            phase: "streaming".to_string(),
-        },
-        &mut remote,
-    );
-    app.streaming.streaming_tps_start = Some(Instant::now() - Duration::from_secs(5));
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 10,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 30,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-    app.handle_server_event(
-        crate::protocol::ServerEvent::TokenUsage {
-            input: 100,
-            output: 30,
-            cache_read_input: None,
-            cache_creation_input: None,
-        },
-        &mut remote,
-    );
-
-    assert_eq!(app.streaming.streaming_total_output_tokens, 30);
-    assert_eq!(app.streaming.streaming_tps_observed_output_tokens, 30);
-    assert_eq!(*remote.call_output_tokens_seen(), 30);
-}
+include!("token_usage_streaming.rs");
 
 #[test]
 fn test_handle_server_event_interrupted_clears_stream_state_and_sets_idle() {
@@ -1551,7 +1164,9 @@ fn test_handle_server_event_interrupted_clears_stream_state_and_sets_idle() {
         id: "tool_1".to_string(),
         name: "bash".to_string(),
         input: serde_json::Value::Null,
-        intent: None, thought_signature: None, });
+        intent: None,
+        thought_signature: None,
+    });
     app.interleave_message = Some("queued interrupt".to_string());
     app.pending_soft_interrupts
         .push("pending soft interrupt".to_string());
@@ -1716,7 +1331,7 @@ fn test_remote_done_recovers_stranded_soft_interrupt_as_queued_followup() {
 }
 
 #[test]
-fn test_remote_done_auto_pokes_again_when_todos_remain() {
+fn test_remote_done_does_not_duplicate_daemon_pokes() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1726,6 +1341,10 @@ fn test_remote_done_auto_pokes_again_when_todos_remain() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                lane_after: None,
+                lane_owner: None,
+                stage: None,
+                details: None,
                 group: None,
                 id: "todo-1".to_string(),
                 content: "Continue working".to_string(),
@@ -1736,6 +1355,9 @@ fn test_remote_done_auto_pokes_again_when_todos_remain() {
                 confidence: None,
                 completion_confidence: None,
                 confidence_history: Vec::new(),
+                waiting_reason: None,
+                requires_user_auth: None,
+                waiting_on: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1750,9 +1372,9 @@ fn test_remote_done_auto_pokes_again_when_todos_remain() {
             app.handle_server_event(crate::protocol::ServerEvent::Done { id: 42 }, &mut remote);
 
         assert!(needs_redraw);
-        assert!(app.pending_queued_dispatch);
-        assert_eq!(app.queued_messages().len(), 1);
-        assert!(app.queued_messages()[0].contains("Continue working, or update the todo tool."));
+        assert!(!app.pending_queued_dispatch);
+        assert!(app.queued_messages().is_empty());
+        assert!(!app.is_processing);
     });
 }
 
@@ -1980,14 +1602,16 @@ fn test_pending_startup_notice_survives_history_bootstrap_for_fresh_session() {
     // The bootstrap for a brand-new session clears the transcript.
     app.handle_server_event(
         crate::protocol::ServerEvent::History {
-            applets: Default::default(),
             id: 1,
             session_id: "session_new".to_string(),
             messages: vec![],
+            messages_base_count: None,
+            images_unchanged: false,
             images: vec![],
             provider_name: Some("claude".to_string()),
             provider_model: Some("claude-sonnet-4-20250514".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -2008,12 +1632,17 @@ fn test_pending_startup_notice_survives_history_bootstrap_for_fresh_session() {
             connection_type: None,
             status_detail: None,
             upstream_provider: None,
+            provider_oauth_email: None,
+            provider_oauth_account_label: None,
             resolved_credential: None,
             reasoning_effort: None,
             service_tier: None,
+            available_service_tiers: None,
+            available_reasoning_efforts: None,
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );
@@ -2029,3 +1658,42 @@ fn test_pending_startup_notice_survives_history_bootstrap_for_fresh_session() {
         "startup notice should be re-applied exactly once after bootstrap"
     );
 }
+
+#[test]
+fn test_reload_recovery_turn_runs_before_user_queued_followups() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    // A user follow-up was queued before a mid-turn reload, and History
+    // reports the turn was interrupted, so a recovery continuation is queued.
+    app.queued_messages.push("queued before reload".to_string());
+    let directive = crate::tool::selfdev::ReloadRecoveryDirective {
+        reconnect_notice: None,
+        continuation_message: "continue interrupted turn".to_string(),
+    };
+    assert!(remote::queue_reload_continuation_once(
+        &mut app,
+        "session_reload_queue_order",
+        directive,
+        "Reload complete - continuing."
+    ));
+
+    rt.block_on(remote::process_remote_followups(&mut app, &mut remote));
+    assert!(
+        app.is_processing,
+        "recovery continuation should start a turn"
+    );
+    assert!(app.hidden_queued_system_messages.is_empty());
+    assert_eq!(
+        app.queued_messages(),
+        &["queued before reload"],
+        "user follow-up must wait for the recovery turn to finish"
+    );
+    assert!(!app.reload_recovery_blocks_queue());
+}
+
+#[path = "part_01_additional_tests.rs"]
+mod additional_test_local_bus_dictation_completion_ignores_other_session;

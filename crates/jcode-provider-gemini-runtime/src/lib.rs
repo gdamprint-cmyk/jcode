@@ -4,6 +4,8 @@
 //! spine. The binary's composition root registers [`GeminiProvider`] with
 //! `jcode_base::provider::external` at startup.
 
+mod catalog;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -70,45 +72,6 @@ struct CachedGeminiState {
 }
 
 impl GeminiProvider {
-    fn persisted_catalog_path() -> Result<std::path::PathBuf> {
-        Ok(jcode_base::storage::app_config_dir()?.join("gemini_models_cache.json"))
-    }
-
-    fn load_persisted_catalog() -> Option<PersistedCatalog> {
-        let path = Self::persisted_catalog_path().ok()?;
-        jcode_base::storage::read_json(&path)
-            .ok()
-            .filter(|catalog: &PersistedCatalog| !catalog.models.is_empty())
-    }
-
-    fn persist_catalog(models: &[String]) {
-        if models.is_empty() {
-            return;
-        }
-        let Ok(path) = Self::persisted_catalog_path() else {
-            return;
-        };
-        let payload = PersistedCatalog {
-            models: models.to_vec(),
-            fetched_at_rfc3339: Utc::now().to_rfc3339(),
-        };
-        if let Err(error) = jcode_base::storage::write_json(&path, &payload) {
-            jcode_base::logging::warn(&format!(
-                "Failed to persist Gemini model catalog {}: {}",
-                path.display(),
-                error
-            ));
-        }
-    }
-
-    fn seed_cached_catalog(&self) {
-        if let Some(catalog) = Self::load_persisted_catalog()
-            && let Ok(mut models) = self.fetched_models.write()
-        {
-            *models = catalog.models;
-        }
-    }
-
     pub fn new() -> Self {
         let model = std::env::var("JCODE_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         let provider = Self {
@@ -283,78 +246,6 @@ impl GeminiProvider {
         })
     }
 
-    async fn refresh_available_models(&self) -> Result<Vec<String>> {
-        if let GeminiAuthMode::ApiKey(api_key) = Self::auth_mode() {
-            return self.refresh_available_models_api_key(&api_key).await;
-        }
-        let project_id_env = gemini_auth::cloud_project();
-        let load_req = load_code_assist_request(
-            project_id_env.clone(),
-            client_metadata(project_id_env.clone()),
-        );
-        let response: Value = match self.post_json("loadCodeAssist", &load_req).await {
-            Ok(response) => response,
-            Err(err) if is_vpc_sc_error(&err) => Value::Null,
-            Err(err) => {
-                return Err(err).context("Gemini model discovery failed during loadCodeAssist");
-            }
-        };
-
-        let models = extract_gemini_model_ids(&response);
-        if !models.is_empty() {
-            jcode_base::logging::info(&format!(
-                "Discovered Gemini Code Assist models: {}",
-                models.join(", ")
-            ));
-            if let Ok(mut guard) = self.fetched_models.write() {
-                *guard = models.clone();
-            }
-            Self::persist_catalog(&models);
-        }
-        Ok(models)
-    }
-
-    /// Discover models via the official Developer API `ListModels` endpoint.
-    /// Returned names look like `models/gemini-2.5-pro`, so strip the prefix
-    /// before normalizing through the shared catalog merge.
-    async fn refresh_available_models_api_key(&self, api_key: &str) -> Result<Vec<String>> {
-        let url = format!("{}/models", Self::developer_api_base_url());
-        let response: Value = match self.get_json_api_key(&url, api_key, "ListModels").await {
-            Ok(response) => response,
-            Err(err) => {
-                jcode_base::logging::info(&format!(
-                    "Gemini Developer API model discovery failed: {err:#}"
-                ));
-                return Ok(Vec::new());
-            }
-        };
-
-        let raw: Vec<String> = response
-            .get("models")
-            .and_then(|models| models.as_array())
-            .map(|models| {
-                models
-                    .iter()
-                    .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
-                    .map(|name| name.trim_start_matches("models/").to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let models = merge_gemini_model_lists(raw);
-        if !models.is_empty() {
-            jcode_base::logging::info(&format!(
-                "Discovered Gemini Developer API models: {}",
-                models.join(", ")
-            ));
-            if let Ok(mut guard) = self.fetched_models.write() {
-                *guard = models.clone();
-            }
-            Self::persist_catalog(&models);
-        }
-        Ok(models)
-    }
-
     /// Send a request with a single transient-error retry, transparently
     /// rebuilding the HTTP client on the second attempt. The `make` closure
     /// produces a fully-configured (auth + body) request builder for each try.
@@ -391,8 +282,7 @@ impl GeminiProvider {
     ) -> Result<T> {
         let tokens = gemini_auth::load_or_refresh_tokens().await?;
         let url = format!("{}:{method}", Self::base_url());
-        let body_value =
-            serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+        let body_bytes = replayable_json_body(body)?;
         // Code Assist enforces a short-window burst limiter that returns 429
         // RESOURCE_EXHAUSTED with "quota will reset after 0s" even when the
         // daily bucket has plenty left. Those clear within seconds, so retry
@@ -409,7 +299,7 @@ impl GeminiProvider {
                             .post(&url)
                             .bearer_auth(&tokens.access_token)
                             .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .json(&body_value)
+                            .body(body_bytes.clone())
                     },
                     &url,
                 )
@@ -465,8 +355,7 @@ impl GeminiProvider {
         body: &impl Serialize,
         label: &str,
     ) -> Result<T> {
-        let body_value =
-            serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+        let body_bytes = replayable_json_body(body)?;
         let resp = self
             .send_with_retry(
                 |client| {
@@ -474,7 +363,7 @@ impl GeminiProvider {
                         .post(url)
                         .header("x-goog-api-key", api_key)
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
-                        .json(&body_value)
+                        .body(body_bytes.clone())
                 },
                 url,
             )
@@ -637,42 +526,7 @@ impl GeminiProvider {
             },
         };
 
-        let contents_value = serde_json::to_value(&request.request.contents).unwrap_or(Value::Null);
-        let content_items = contents_value.as_array().cloned().unwrap_or_default();
-        let system_value = request
-            .request
-            .system_instruction
-            .as_ref()
-            .and_then(|system| serde_json::to_value(system).ok());
-        let tools_value = request
-            .request
-            .tools
-            .as_ref()
-            .and_then(|tools| serde_json::to_value(tools).ok());
-        let payload = json!({
-            "model": &request.model,
-            "contents": contents_value,
-            "system_instruction": system_value.as_ref(),
-            "tools": tools_value.as_ref(),
-            "tool_config": &request.request.tool_config,
-        });
-        jcode_provider_core::fingerprint::log_provider_canonical_input(
-            "gemini",
-            model,
-            "gemini_generate_content",
-            &payload,
-            &content_items,
-            system_value.as_ref(),
-            tools_value.as_ref(),
-            request.request.tools.as_ref().map(|tools| tools.len()),
-            &[
-                (
-                    "session_id_present",
-                    request.request.session_id.is_some().to_string(),
-                ),
-                ("project_present", (!request.project.is_empty()).to_string()),
-            ],
-        );
+        log_canonical_input(model, &request);
 
         match Self::auth_mode() {
             GeminiAuthMode::ApiKey(api_key) => {
@@ -703,452 +557,184 @@ impl GeminiProvider {
     }
 }
 
+// Serialize through Value to retain the legacy recursively sorted object order.
+// Keep only replayable bytes across HTTP awaits, rather than a second JSON tree.
+fn replayable_json_body(body: &impl Serialize) -> Result<bytes::Bytes> {
+    let value = serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .context("Failed to serialize Gemini request body")
+}
+
+#[cfg(test)]
+mod request_body_tests;
+
+fn canonical_payload(request: &CodeAssistGenerateRequest) -> Value {
+    let mut payload = json!({
+        "model": &request.model,
+        "tool_config": &request.request.tool_config,
+    });
+    let Value::Object(object) = &mut payload else {
+        return Value::Null;
+    };
+    object.insert(
+        "contents".into(),
+        serde_json::to_value(&request.request.contents).unwrap_or(Value::Null),
+    );
+    object.insert(
+        "system_instruction".into(),
+        request
+            .request
+            .system_instruction
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "tools".into(),
+        request
+            .request
+            .tools
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or(Value::Null),
+    );
+    payload
+}
+
+// Keep diagnostic JSON trees in this synchronous frame, never across HTTP awaits.
+fn log_canonical_input(model: &str, request: &CodeAssistGenerateRequest) {
+    let payload = canonical_payload(request);
+    let items = payload["contents"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    jcode_provider_core::fingerprint::log_provider_canonical_input(
+        "gemini",
+        model,
+        "gemini_generate_content",
+        &payload,
+        items,
+        payload
+            .get("system_instruction")
+            .filter(|value| !value.is_null()),
+        payload.get("tools").filter(|value| !value.is_null()),
+        request.request.tools.as_ref().map(Vec::len),
+        &[
+            (
+                "session_id_present",
+                request.request.session_id.is_some().to_string(),
+            ),
+            ("project_present", (!request.project.is_empty()).to_string()),
+        ],
+    );
+}
+
+#[cfg(test)]
+mod canonical_input_tests {
+    use super::*;
+    use jcode_provider_gemini::{GeminiContent, GeminiFunctionDeclaration, GeminiPart, GeminiTool};
+
+    #[test]
+    fn canonical_payload_preserves_exact_schema_hashes_nulls_and_counts() {
+        for variant in 0..3 {
+            let content = GeminiContent {
+                role: "user".into(),
+                parts: vec![GeminiPart {
+                    text: Some("hello 雪".into()),
+                    ..Default::default()
+                }],
+            };
+            let request = CodeAssistGenerateRequest {
+                model: "fixture-model".into(),
+                project: "project".into(),
+                user_prompt_id: "volatile".into(),
+                request: VertexGenerateContentRequest {
+                    contents: vec![content.clone()],
+                    system_instruction: (variant > 0).then(|| content.clone()),
+                    tools: match variant {
+                        0 => None,
+                        1 => Some(vec![]),
+                        _ => Some(vec![GeminiTool {
+                            function_declarations: vec![GeminiFunctionDeclaration {
+                                name: "lookup".into(),
+                                description: "find".into(),
+                                parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                            }],
+                        }]),
+                    },
+                    tool_config: (variant > 0).then_some(GeminiToolConfig {
+                        function_calling_config: GeminiFunctionCallingConfig { mode: "AUTO" },
+                    }),
+                    session_id: Some("session".into()),
+                },
+            };
+            let original_wire = serde_json::to_vec(&request).unwrap();
+            assert_eq!(
+                replayable_json_body(&request).unwrap().as_ref(),
+                serde_json::to_vec(&serde_json::to_value(&request).unwrap()).unwrap()
+            );
+            let contents = serde_json::to_value(&request.request.contents).unwrap();
+            let system = request
+                .request
+                .system_instruction
+                .as_ref()
+                .map(|value| serde_json::to_value(value).unwrap());
+            let tools = request
+                .request
+                .tools
+                .as_ref()
+                .map(|value| serde_json::to_value(value).unwrap());
+            let legacy = json!({"model": request.model, "contents": contents, "system_instruction": system.as_ref(), "tools": tools.as_ref(), "tool_config": request.request.tool_config});
+            let payload = canonical_payload(&request);
+            assert_eq!(
+                serde_json::to_vec(&payload).unwrap(),
+                serde_json::to_vec(&legacy).unwrap()
+            );
+            assert_eq!(payload.as_object().unwrap().len(), 5);
+            assert!(!payload.to_string().contains("volatile"));
+            assert_eq!(payload["contents"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["system_instruction"].is_null(), variant == 0);
+            assert_eq!(payload["tools"].is_null(), variant == 0);
+            assert_eq!(
+                request.request.tools.as_ref().map(Vec::len),
+                match variant {
+                    0 => None,
+                    1 => Some(0),
+                    _ => Some(1),
+                }
+            );
+            let hash = jcode_provider_core::fingerprint::stable_hash_json;
+            assert_eq!(hash(&payload), hash(&legacy));
+            assert_eq!(hash(&payload["contents"]), hash(&contents));
+            assert_eq!(
+                payload
+                    .get("system_instruction")
+                    .filter(|value| !value.is_null())
+                    .map(hash),
+                system.as_ref().map(hash)
+            );
+            assert_eq!(
+                payload
+                    .get("tools")
+                    .filter(|value| !value.is_null())
+                    .map(hash),
+                tools.as_ref().map(hash)
+            );
+            log_canonical_input("fixture-model", &request);
+            assert_eq!(serde_json::to_vec(&request).unwrap(), original_wire);
+        }
+    }
+}
+
 impl Default for GeminiProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[async_trait]
-impl Provider for GeminiProvider {
-    async fn complete(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        system: &str,
-        resume_session_id: Option<&str>,
-    ) -> Result<EventStream> {
-        let model = self.model();
-        let messages = messages.to_vec();
-        let tools = tools.to_vec();
-        let system = system.to_string();
-        let resume_session_id = resume_session_id.map(|value| value.to_string());
-        let state_cache = self.state.clone();
-        let provider = self.clone();
-        let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
-
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(StreamEvent::ConnectionType {
-                    connection: "https".to_string(),
-                }))
-                .await;
-            let _ = tx
-                .send(Ok(StreamEvent::ConnectionPhase {
-                    phase: ConnectionPhase::Authenticating,
-                }))
-                .await;
-
-            let state = {
-                let provider = GeminiProvider {
-                    client: provider.client.clone(),
-                    model: provider.model.clone(),
-                    state: state_cache.clone(),
-                    fetched_models: provider.fetched_models.clone(),
-                };
-                match provider.ensure_state().await {
-                    Ok(state) => state,
-                    Err(err) => {
-                        let _ = tx.send(Err(err)).await;
-                        return;
-                    }
-                }
-            };
-
-            let _ = tx
-                .send(Ok(StreamEvent::SessionId(
-                    resume_session_id
-                        .clone()
-                        .unwrap_or_else(|| state.session_id.clone()),
-                )))
-                .await;
-            let _ = tx
-                .send(Ok(StreamEvent::ConnectionPhase {
-                    phase: ConnectionPhase::SendingRequest,
-                }))
-                .await;
-            let _ = tx
-                .send(Ok(StreamEvent::ConnectionPhase {
-                    phase: ConnectionPhase::WaitingForResponse,
-                }))
-                .await;
-
-            let response = match provider
-                .generate_content(
-                    &state,
-                    &model,
-                    &messages,
-                    &tools,
-                    &system,
-                    resume_session_id.as_deref(),
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(err) if is_gemini_model_not_found_error(&err) => {
-                    let mut fallback_response = None;
-                    let mut last_err = err;
-                    for fallback_model in gemini_fallback_models(&model) {
-                        jcode_base::logging::warn(&format!(
-                            "Gemini model '{}' was not found; retrying with fallback '{}'",
-                            model, fallback_model
-                        ));
-                        match provider
-                            .generate_content(
-                                &state,
-                                fallback_model,
-                                &messages,
-                                &tools,
-                                &system,
-                                resume_session_id.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(response) => {
-                                let _ = provider.set_model(fallback_model);
-                                fallback_response = Some(response);
-                                break;
-                            }
-                            Err(err) => {
-                                last_err = err;
-                            }
-                        }
-                    }
-
-                    match fallback_response {
-                        Some(response) => response,
-                        None => {
-                            let _ = tx.send(Err(last_err)).await;
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    // A tool schema `generateContent` rejects 400s every turn,
-                    // so the provider is unusable until jcode ships a new
-                    // keyword. Learn the rejected construct from the error,
-                    // persist it, and retry this turn without it. See
-                    // `jcode-schema-dialect`.
-                    match provider
-                        .retry_after_schema_rejection(
-                            &err.to_string(),
-                            &state,
-                            &model,
-                            &messages,
-                            &tools,
-                            &system,
-                            resume_session_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Some(Ok(response)) => response,
-                        Some(Err(retry_err)) => {
-                            let _ = tx.send(Err(retry_err)).await;
-                            return;
-                        }
-                        None => {
-                            let _ = tx.send(Err(err)).await;
-                            return;
-                        }
-                    }
-                }
-            };
-
-            let _ = tx
-                .send(Ok(StreamEvent::ConnectionPhase {
-                    phase: ConnectionPhase::Streaming,
-                }))
-                .await;
-
-            if let Some(usage) = response
-                .response
-                .as_ref()
-                .and_then(|response| response.usage_metadata.as_ref())
-            {
-                let _ = tx
-                    .send(Ok(StreamEvent::TokenUsage {
-                        input_tokens: usage.prompt_token_count,
-                        output_tokens: usage.candidates_token_count,
-                        cache_read_input_tokens: usage.cached_content_token_count,
-                        cache_creation_input_tokens: None,
-                    }))
-                    .await;
-            }
-
-            let response_body = response.response;
-
-            let candidate = response_body
-                .as_ref()
-                .and_then(|response| response.candidates.as_ref())
-                .and_then(|candidates| candidates.first())
-                .cloned();
-
-            if candidate.is_none() {
-                if let Some(feedback) = response_body
-                    .as_ref()
-                    .and_then(|response| response.prompt_feedback.as_ref())
-                {
-                    let block_reason = feedback.block_reason.as_deref().unwrap_or("unspecified");
-                    let detail = feedback
-                        .block_reason_message
-                        .as_deref()
-                        .filter(|msg| !msg.trim().is_empty())
-                        .map(|msg| format!(": {}", msg.trim()))
-                        .unwrap_or_default();
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "Gemini blocked the prompt ({}){}",
-                            block_reason,
-                            detail
-                        )))
-                        .await;
-                    return;
-                }
-
-                let _ = tx
-                    .send(Err(anyhow::anyhow!(
-                        "Gemini returned no candidates for generateContent"
-                    )))
-                    .await;
-                return;
-            }
-
-            let mut stop_reason = None;
-            if let Some(candidate) = candidate {
-                stop_reason = candidate
-                    .finish_reason
-                    .clone()
-                    .map(|reason| reason.to_lowercase());
-                if candidate.content.is_none()
-                    && matches!(
-                        candidate.finish_reason.as_deref(),
-                        Some("SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "RECITATION")
-                    )
-                {
-                    let reason = candidate.finish_reason.as_deref().unwrap_or("unknown");
-                    let detail = candidate
-                        .finish_message
-                        .as_deref()
-                        .filter(|msg| !msg.trim().is_empty())
-                        .map(|msg| format!(": {}", msg.trim()))
-                        .unwrap_or_default();
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "Gemini stopped without content ({}){}",
-                            reason,
-                            detail
-                        )))
-                        .await;
-                    return;
-                }
-                // Track whether this candidate produced any usable output (text or
-                // a tool call). Gemini-3 thinking models intermittently emit
-                // Python-style pseudo-code instead of a clean functionCall and
-                // finish with `MALFORMED_FUNCTION_CALL` and empty content; surface
-                // that as a retryable error below rather than a silent empty turn.
-                let mut produced_output = false;
-                if let Some(content) = candidate.content {
-                    // Gemini 3 attaches a `thoughtSignature` to function-call
-                    // parts (and occasionally to a standalone preceding part).
-                    // Replay it via a ToolUseSignature event so it is persisted
-                    // on the ToolUse block and resent on later turns; the API
-                    // rejects follow-up turns whose functionCall omits it
-                    // ("Function call is missing a thought_signature").
-                    let mut pending_signature: Option<String> = None;
-                    for part in content.parts {
-                        let part_signature = part
-                            .thought_signature
-                            .as_ref()
-                            .filter(|sig| !sig.is_empty())
-                            .cloned();
-                        if let Some(text) = part.text
-                            && !text.is_empty()
-                        {
-                            produced_output = true;
-                            let _ = tx.send(Ok(StreamEvent::TextDelta(text))).await;
-                        }
-                        if let Some(function_call) = part.function_call {
-                            produced_output = true;
-                            let signature =
-                                part_signature.clone().or_else(|| pending_signature.take());
-                            let raw_call_id = function_call
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let call_id = jcode_message_types::sanitize_tool_id(&raw_call_id);
-                            let _ = tx
-                                .send(Ok(StreamEvent::ToolUseStart {
-                                    id: call_id,
-                                    name: function_call.name,
-                                }))
-                                .await;
-                            let _ = tx
-                                .send(Ok(StreamEvent::ToolInputDelta(
-                                    function_call.args.to_string(),
-                                )))
-                                .await;
-                            let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
-                            if let Some(signature) = signature {
-                                let _ = tx.send(Ok(StreamEvent::ToolUseSignature(signature))).await;
-                            }
-                        } else if let Some(signature) = part_signature {
-                            // Standalone signature part; remember it for the next
-                            // function call in this candidate.
-                            pending_signature = Some(signature);
-                        }
-                    }
-                    // A thought signature not consumed by a following function
-                    // call (e.g. a pure-text reasoning turn) is still an opaque
-                    // reasoning signal. Surface it as a ThinkingSignatureDelta
-                    // instead of dropping it.
-                    if let Some(signature) = pending_signature.take() {
-                        let _ = tx
-                            .send(Ok(StreamEvent::ThinkingSignatureDelta(signature)))
-                            .await;
-                    }
-                }
-
-                // An abnormal finish (typically Gemini-3's intermittent
-                // `MALFORMED_FUNCTION_CALL`) that yielded no text and no tool call
-                // is a dead turn: surface it as a retryable error instead of a
-                // silent empty `MessageEnd`. `STOP`/`MAX_TOKENS` are normal.
-                if !produced_output {
-                    let abnormal = candidate
-                        .finish_reason
-                        .as_deref()
-                        .map(|reason| {
-                            !matches!(
-                                reason.to_ascii_uppercase().as_str(),
-                                "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
-                            )
-                        })
-                        .unwrap_or(false);
-                    if abnormal {
-                        let reason = candidate.finish_reason.as_deref().unwrap_or("unknown");
-                        let detail = candidate
-                            .finish_message
-                            .as_deref()
-                            .filter(|msg| !msg.trim().is_empty())
-                            .map(|msg| {
-                                format!(": {}", jcode_base::util::truncate_str(msg.trim(), 300))
-                            })
-                            .unwrap_or_default();
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
-                                "Gemini returned no usable output (finish_reason={reason}){detail}"
-                            )))
-                            .await;
-                        return;
-                    }
-                }
-            }
-
-            let _ = tx.send(Ok(StreamEvent::MessageEnd { stop_reason })).await;
-        });
-
-        Ok(Box::pin(ReceiverStream::new(rx)))
-    }
-
-    fn name(&self) -> &'static str {
-        "gemini"
-    }
-
-    fn model(&self) -> String {
-        self.model
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn supports_image_input(&self) -> bool {
-        true
-    }
-
-    fn set_model(&self, model: &str) -> Result<()> {
-        // See `strip_own_model_prefix`: `--provider gemini` routes through this
-        // runtime directly, so session restore hands it `gemini:<model>`.
-        let trimmed = jcode_provider_core::strip_own_model_prefix(model, "gemini:");
-        if trimmed.is_empty() {
-            anyhow::bail!("Gemini model cannot be empty");
-        }
-        *self
-            .model
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = trimmed.to_string();
-        Ok(())
-    }
-
-    fn available_models(&self) -> Vec<&'static str> {
-        AVAILABLE_MODELS.to_vec()
-    }
-
-    fn available_models_display(&self) -> Vec<String> {
-        let discovered = self
-            .fetched_models
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        if discovered.is_empty() {
-            return vec![self.model()];
-        }
-
-        merge_gemini_model_lists(
-            discovered
-                .into_iter()
-                .chain(std::iter::once(self.model()))
-                .collect(),
-        )
-    }
-
-    fn available_models_for_switching(&self) -> Vec<String> {
-        self.available_models_display()
-    }
-
-    fn model_routes(&self) -> Vec<jcode_provider_core::ModelRoute> {
-        self.available_models_display()
-            .into_iter()
-            .map(|model| jcode_provider_core::ModelRoute {
-                model,
-                provider: "Gemini".to_string(),
-                api_method: "code-assist-oauth".to_string(),
-                available: true,
-                detail: String::new(),
-                usage: None,
-                cheapness: None,
-            })
-            .collect()
-    }
-
-    async fn prefetch_models(&self) -> Result<()> {
-        let _ = self.refresh_available_models().await?;
-        Ok(())
-    }
-
-    fn supports_compaction(&self) -> bool {
-        // No native server-side compaction exists for this provider, so jcode's
-        // own summary compaction is the only thing standing between a long
-        // session and a hard context-limit rejection. Returning `false` here
-        // disabled the entire compaction block in `Agent::messages_for_provider`
-        // — including the emergency hard-compact and payload truncation at the
-        // critical threshold — leaving these sessions with no safety net at all.
-        true
-    }
-
-    fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(Self {
-            client: self.client.clone(),
-            model: Arc::new(RwLock::new(self.model())),
-            state: self.state.clone(),
-            fetched_models: self.fetched_models.clone(),
-        })
-    }
-
-    async fn invalidate_credentials(&self) {
-        let mut guard = self.state.lock().await;
-        *guard = None;
-    }
-}
-
+#[path = "lib_provider_impl.rs"]
+mod provider_impl;
 impl Clone for GeminiProvider {
     fn clone(&self) -> Self {
         Self {
@@ -1264,3 +850,6 @@ fn is_gemini_model_not_found_error(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 #[path = "gemini_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod catalog_tests;

@@ -4,7 +4,10 @@ fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> ChatMes
         content: vec![ContentBlock::ToolUse {
             id: id.to_string(),
             name: name.to_string(),
-            input, thought_signature: None, }],
+            input,
+            thought_signature: None,
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }
@@ -16,7 +19,8 @@ fn user_text(text: &str) -> ChatMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }
@@ -156,7 +160,8 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
                             .to_string(),
                     cache_control: None,
                 },
-            ],
+            ]
+            .into(),
             timestamp: None,
             tool_duration_ms: None,
         },
@@ -208,13 +213,14 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
 
 #[test]
 fn test_build_responses_input_replaces_oversized_native_compaction_with_text() {
-    let oversized =
-        "x".repeat(jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS + 1);
+    let oversized = "x"
+        .repeat(jcode_base::provider::openai_request::OPENAI_ENCRYPTED_CONTENT_SAFE_MAX_CHARS + 1);
     let messages = vec![ChatMessage {
         role: Role::User,
         content: vec![ContentBlock::OpenAICompaction {
             encrypted_content: oversized,
-        }],
+        }]
+        .into(),
         timestamp: None,
         tool_duration_ms: None,
     }];
@@ -317,7 +323,7 @@ fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flag
     assert_eq!(request["model"], serde_json::json!("gpt-5.4"));
     assert!(request.get("model_context_window").is_none());
     assert!(request.get("max_output_tokens").is_none());
-    assert!(request.get("prompt_cache_key").is_none());
+    assert_eq!(request["prompt_cache_key"], "unused");
     assert!(request.get("prompt_cache_retention").is_none());
     assert_eq!(
         request["reasoning"],
@@ -493,7 +499,7 @@ fn test_oauth_requests_never_send_api_cache_retention_controls() {
                 retention,
                 None,
             );
-            assert!(request.get("prompt_cache_key").is_none(), "{model}");
+            assert_eq!(request["prompt_cache_key"], "cache-key", "{model}");
             assert!(request.get("prompt_cache_retention").is_none(), "{model}");
             assert!(request.get("prompt_cache_options").is_none(), "{model}");
         }

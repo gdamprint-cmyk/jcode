@@ -26,9 +26,39 @@ pub fn clear_reload_marker() {
     let _ = std::fs::remove_file(reload_marker_path());
 }
 
-pub(super) fn clear_reload_marker_if_stale_for_pid(current_pid: u32) {
+/// Whether a server may delete a reload marker another process owns.
+///
+/// `jcode.reload` is one file per runtime dir, shared by every socket, but a
+/// reload belongs to the process that started it. The split is by *owner*, not
+/// by socket: advancing or clearing our own marker is always legitimate, while
+/// deleting a marker another live process wrote erases its in-flight
+/// `Starting` state and drops the guard that makes clients wait out its drain.
+///
+/// Guarding at the call site instead, skipping the marker calls wholesale for
+/// custom sockets, also suppressed a custom server's own socket-ready
+/// publish, stranding its marker in `Starting` after a reload and making it
+/// reject messages until the marker expired (review of #1768).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ForeignMarkerPolicy {
+    /// The shared daemon owns the runtime-dir marker and cleans up after
+    /// stale predecessors.
+    MayClear,
+    /// A custom-socket server shares the file but not the ownership.
+    Preserve,
+}
+
+impl ForeignMarkerPolicy {
+    fn preserves(self, state_pid: u32, current_pid: u32) -> bool {
+        self == Self::Preserve && state_pid != current_pid
+    }
+}
+
+pub(super) fn clear_reload_marker_if_stale_for_pid(current_pid: u32, policy: ForeignMarkerPolicy) {
     if let Some(state) = ReloadState::load() {
         if state.phase == ReloadPhase::Starting && state.pid == current_pid {
+            return;
+        }
+        if policy.preserves(state.pid, current_pid) {
             return;
         }
         clear_reload_marker();
@@ -85,7 +115,7 @@ pub fn write_reload_state(
     .write();
 }
 
-pub fn publish_reload_socket_ready() {
+pub(super) fn publish_reload_socket_ready(policy: ForeignMarkerPolicy) {
     let Some(state) = ReloadState::load() else {
         crate::logging::warn(
             "Server reached socket-ready publish point, but no reload marker was present",
@@ -119,6 +149,13 @@ pub fn publish_reload_socket_ready() {
             state.phase, state.pid, current_pid
         ));
     } else if state.pid != current_pid {
+        if policy.preserves(state.pid, current_pid) {
+            crate::logging::warn(&format!(
+                "Server reached socket-ready publish point, but reload marker pid {} did not match current pid {}; leaving it to its owner",
+                state.pid, current_pid
+            ));
+            return;
+        }
         crate::logging::warn(&format!(
             "Server reached socket-ready publish point, but reload marker pid {} did not match current pid {}; clearing stale marker",
             state.pid, current_pid
@@ -142,7 +179,31 @@ pub fn reload_process_alive(pid: u32) -> bool {
         matches!(err.raw_os_error(), Some(libc::EPERM))
     }
 
-    #[cfg(not(unix))]
+    // MEASURED 2026-11-17: this arm used to `let _ = pid; true`, so on Windows
+    // EVERY non-zero pid counted as alive - a stale or bogus reload pid could
+    // never be reported as dead, and inspect_reload_wait_status would return
+    // Waiting forever instead of Failed. Ask the OS instead. Same Win32 path as
+    // jcode-base's platform::is_process_running; the windows-sys features are
+    // already enabled for this crate (Cargo.toml:144).
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE as u32
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -167,6 +228,37 @@ pub async fn inspect_reload_wait_status(
             ReloadPhase::SocketReady => ReloadWaitStatus::Ready,
             ReloadPhase::Failed => ReloadWaitStatus::Failed(state.detail),
             ReloadPhase::Starting => {
+                // A live socket wins over the marker's pid.
+                //
+                // MEASURED 2026-11-22: on Windows `replace_process` is
+                // `spawn` + `exit(0)` (`jcode-base/src/platform.rs:664`), NOT an
+                // exec, so the pid does not survive the handoff: the old daemon
+                // dies while the replacement, which has a NEW pid, takes the
+                // socket. `CreateProcessW` "Creates a new process and its primary
+                // thread" and "The process is assigned a process identifier"
+                // (Microsoft Learn, processthreadsapiCreateProcessW), so there is
+                // no Windows equivalent of preserving the image's pid.
+                //
+                // The replacement then cleared the marker as foreign/stale on
+                // startup (`server.rs:2099`) and, finding nothing at the
+                // socket-ready publish point, never advanced it to `SocketReady`.
+                // The marker therefore stayed `Starting` with a DEAD pid, and this
+                // branch reported `Failed("reload process 20944 exited before
+                // becoming ready")` while the replacement was already serving
+                // (log 2026-11-22 08:00:10.035). A landing that trusted that answer
+                // rolled back and left the client channels on the old build.
+                //
+                // The socket is the observable the caller actually waits for, so
+                // it must be asked first: a live listener means the handoff
+                // landed, whatever pid the marker remembers.
+                if is_server_ready(socket_path).await || has_live_listener(socket_path).await {
+                    crate::logging::info(&format!(
+                        "inspect_reload_wait_status: socket {} is live while marker phase is Starting (pid={}); reporting ready",
+                        socket_path.display(),
+                        state.pid
+                    ));
+                    return ReloadWaitStatus::Ready;
+                }
                 if reload_process_alive(state.pid) {
                     ReloadWaitStatus::Waiting {
                         pid: Some(state.pid),
@@ -803,7 +895,7 @@ mod tests {
         }
         .write();
 
-        clear_reload_marker_if_stale_for_pid(current);
+        clear_reload_marker_if_stale_for_pid(current, ForeignMarkerPolicy::MayClear);
         assert!(
             reload_marker_exists(),
             "an in-flight Starting marker owned by this pid must survive cleanup"
@@ -829,7 +921,7 @@ mod tests {
             detail: None,
         }
         .write();
-        clear_reload_marker_if_stale_for_pid(current);
+        clear_reload_marker_if_stale_for_pid(current, ForeignMarkerPolicy::MayClear);
         assert!(
             !reload_marker_exists(),
             "a foreign Starting marker must be cleared"
@@ -845,7 +937,7 @@ mod tests {
             detail: None,
         }
         .write();
-        clear_reload_marker_if_stale_for_pid(current);
+        clear_reload_marker_if_stale_for_pid(current, ForeignMarkerPolicy::MayClear);
         assert!(
             !reload_marker_exists(),
             "a completed marker must be cleared on stale check"
@@ -865,7 +957,7 @@ mod tests {
             ReloadPhase::Failed,
             Some("boom".to_string()),
         );
-        publish_reload_socket_ready();
+        publish_reload_socket_ready(ForeignMarkerPolicy::MayClear);
 
         let state = ReloadState::load().expect("marker should still exist");
         assert_eq!(

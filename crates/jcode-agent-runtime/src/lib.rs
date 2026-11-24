@@ -8,6 +8,9 @@ pub struct SoftInterruptMessage {
     /// If true, can skip remaining tools when injected at point C.
     pub urgent: bool,
     pub source: SoftInterruptSource,
+    /// Opaque caller-supplied id. Echoed in the injection event and used to
+    /// cancel this one message while it is still queued.
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +18,9 @@ pub enum SoftInterruptSource {
     User,
     System,
     BackgroundTask,
+    /// A swarm peer changed a file this agent edited. Typed so clients can
+    /// render it without the notice text carrying an identifying prefix.
+    FileActivity,
 }
 
 /// Thread-safe soft interrupt queue that can be accessed without holding the agent lock.

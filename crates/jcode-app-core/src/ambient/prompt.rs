@@ -1,6 +1,16 @@
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-dead-letter-fix.md (measured write-only ambient queue: the prompt collapses the never-delivered ambient entries instead of rendering every one in full)
+// reference: crates/jcode-app-core/src/ambient/runner.rs (deliver_scheduled_direct_item -> notify_live_session -> handle_notify_session): the delivery path the new "Handing a result back to a session" instruction describes, including the busy-session soft-interrupt fallback.
 use chrono::{DateTime, Utc};
 
 use super::{AmbientState, Priority, ScheduleTarget, ScheduledItem, take_pending_directives};
+
+/// How many of the newest ambient entries are rendered in full in the ambient
+/// system prompt. Older ones are collapsed into a bounded summary block.
+pub const AMBIENT_PROMPT_FULL_ENTRIES: usize = 5;
+
+/// How many characters of the context each collapsed ambient entry contributes
+/// to the ambient system prompt.
+pub const AMBIENT_PROMPT_COLLAPSED_CHARS: usize = 240;
 
 // ---------------------------------------------------------------------------
 // Ambient System Prompt Builder
@@ -322,7 +332,23 @@ pub fn build_ambient_system_prompt(
     if queue.is_empty() {
         prompt.push_str("Empty -- do general ambient work.\n");
     } else {
-        for item in queue {
+        // Ambient-target entries are write-only: the runner only claims
+        // direct-delivery entries, so an ambient entry is never removed from
+        // the queue and the list grows without bound. Rendering one full block
+        // per entry therefore inflates every cycle's system prompt. Render the
+        // newest few ambient entries in full and collapse the rest into one
+        // bounded summary block whose full text stays readable on disk.
+        let (mut ambient, direct): (Vec<&ScheduledItem>, Vec<&ScheduledItem>) = queue
+            .iter()
+            .partition(|item| !item.target.is_direct_delivery());
+        ambient.sort_by_key(|item| item.scheduled_for);
+        let split_at = ambient.len().saturating_sub(AMBIENT_PROMPT_FULL_ENTRIES);
+        let (collapsed, ambient_full) = ambient.split_at(split_at);
+        let rendered: Vec<&ScheduledItem> = direct
+            .into_iter()
+            .chain(ambient_full.iter().copied())
+            .collect();
+        for item in rendered {
             let age = Utc::now() - item.created_at;
             let priority = match item.priority {
                 Priority::Low => "low",
@@ -361,6 +387,35 @@ pub fn build_ambient_system_prompt(
                 for line in ctx.lines() {
                     prompt.push_str(&format!("  {}\n", line));
                 }
+            }
+        }
+
+        if !collapsed.is_empty() {
+            prompt.push_str(&format!(
+                "- ({} older ambient entr{} collapsed into one summary; full text stays on disk in ~/.jcode/ambient/queue.json and queue_archive.jsonl)\n",
+                collapsed.len(),
+                if collapsed.len() == 1 { "y" } else { "ies" },
+            ));
+            for item in collapsed.iter().copied() {
+                let age = Utc::now() - item.created_at;
+                let priority = match item.priority {
+                    Priority::Low => "low",
+                    Priority::Normal => "normal",
+                    Priority::High => "HIGH",
+                };
+                let summary: String = item
+                    .context
+                    .replace('\n', " ")
+                    .chars()
+                    .take(AMBIENT_PROMPT_COLLAPSED_CHARS)
+                    .collect();
+                prompt.push_str(&format!(
+                    "  [{}] {} (scheduled {} ago, priority: {})\n",
+                    item.id,
+                    summary,
+                    format_duration_rough(age),
+                    priority,
+                ));
             }
         }
     }
@@ -472,7 +527,8 @@ pub fn build_ambient_system_prompt(
          Key tools for this cycle (use these exact names):\n\
          - `todo` — plan and track what you'll do this cycle.\n\
          - `end_ambient_cycle` — REQUIRED to finish the cycle (see below).\n\
-         - `schedule_ambient` — schedule your next wake time.\n\
+         - `schedule_ambient` — schedule your next wake time, or deliver a result \
+           to a specific interactive session with `session_id`.\n\
          - `request_permission` — get approval before any code change.\n\
          - `send_message` — keep the user informed.\n\
          Standard tools (`bash`, `read`, `write`, `edit`, `memory`, etc.) are \
@@ -505,6 +561,22 @@ pub fn build_ambient_system_prompt(
          - Canvas (via MCP) — check for upcoming assignments or deadlines\n\
          - Git history — recent commits, open branches, stale PRs\n\
          - Session history — patterns in what the user works on\n\n\
+         ## Handing a result back to a session\n\n\
+         Your own session id is a throwaway one-shot, so a task you schedule for \
+         yourself reaches nobody. When you finish something that materially \
+         improves the work of an interactive session, deliver it to that session \
+         with `schedule_ambient`, passing `session_id` (the interactive \
+         session's id, e.g. `session_...`), `wake_in_minutes: 0`, and a `context` \
+         that says what you did and what the session can reuse. The session's \
+         id is in the 'Recent Sessions' section above.\n\n\
+         Rules, because a background agent writing into someone's live session \
+         is noise if it is careless:\n\
+         - Only for work you actually completed and verified, never for a \
+           status ping, a question, or a routine re-check.\n\
+         - At most one delivery per session per cycle.\n\
+         - Say plainly WHAT you did and WHAT the session can reuse. No preamble.\n\
+         - If the session is busy, the delivery waits as a soft interrupt; keep \
+           it short so it does not derail the user's turn.\n\n\
          When done, you MUST call end_ambient_cycle with a summary of \
          everything you did, including compaction count. Always schedule \
          your next wake time with context for what you plan to do next.\n\n\

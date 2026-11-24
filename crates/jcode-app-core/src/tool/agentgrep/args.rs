@@ -61,6 +61,8 @@ pub(super) fn build_grep_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
         paths_only: params.paths_only.unwrap_or(false),
         hidden: params.hidden.unwrap_or(false),
         no_ignore: params.no_ignore.unwrap_or(false),
+        // Keep following symlinks (pre-v0.1.7 behavior); the guardrail is opt-in.
+        no_follow: false,
         path: scope.root,
         glob: scope.glob,
     })
@@ -93,6 +95,8 @@ pub(super) fn build_find_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
         max_files: params.max_files.unwrap_or(10),
         hidden: params.hidden.unwrap_or(false),
         no_ignore: params.no_ignore.unwrap_or(false),
+        // Keep following symlinks (pre-v0.1.7 behavior); the guardrail is opt-in.
+        no_follow: false,
         path: scope.root,
         glob: scope.glob,
     })
@@ -231,10 +235,72 @@ fn resolved_root_string(ctx: &ToolContext, path: Option<&str>) -> Option<String>
     path.map(|path| resolve_path_arg(ctx, path).display().to_string())
 }
 
+/// Suggest existing directories near a path that does not exist.
+///
+/// MEASURED 2026-11-16: `agentgrep` failed 83 times with "search path does
+/// not exist or is not a directory: ..." and the message named the bad path
+/// but offered NO way forward, so the agent kept retrying the same argument.
+/// The `read` tool already solves this shape ("File not found: X\nDid you
+/// mean: Y, Z"), so this reuses that pattern instead of inventing one.
+/// reference: C:\Users\WorkShop1\.jcode\research\2026-11-16-error-classes\error-classes-research.md
+///   (class B1: the ready-made solution already in this project)
+pub(super) fn find_similar_dirs(path: &Path) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let mut current = path.parent();
+    // Walk up to the first existing ancestor, then list its subdirectories.
+    while let Some(dir) = current {
+        if dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    if entry.path().is_dir() {
+                        suggestions.push(entry.path().display().to_string());
+                        if suggestions.len() >= 5 {
+                            return suggestions;
+                        }
+                    }
+                }
+            }
+            if !suggestions.is_empty() {
+                return suggestions;
+            }
+        }
+        current = dir.parent();
+    }
+    suggestions
+}
+
 pub(super) fn resolve_search_root(ctx: &ToolContext, path: Option<&str>) -> Result<PathBuf> {
-    path.map(PathBuf::from)
+    let root = path
+        .map(PathBuf::from)
         .or_else(|| ctx.working_dir.clone())
-        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))
+        .ok_or_else(|| anyhow::anyhow!("agentgrep requires a session working directory"))?;
+    // The search root must be an existing DIRECTORY: the agentgrep crate runs
+    // ripgrep with `current_dir(root)`, so a root that does not exist (or that
+    // is a file) fails with the raw OS error 267 ("Неверно задано имя папки" =
+    // "the directory name is invalid"), which reads like a broken tool rather
+    // than a bad argument.
+    //
+    // MEASURED 2026-11-16: 83 failures of this shape, and the message named
+    // the bad path but offered no way forward - the agent retried the same
+    // argument. The hint below is the same "Did you mean" shape the `read`
+    // tool already uses, applied to the nearest existing directory.
+    if !root.is_dir() {
+        let mut message = format!(
+            "agentgrep search path does not exist or is not a directory: {}",
+            root.display()
+        );
+        let suggestions = find_similar_dirs(&root);
+        if !suggestions.is_empty() {
+            message.push_str(&format!("\nDid you mean: {}", suggestions.join(", ")));
+        } else if let Some(parent) = root.parent().filter(|p| p.is_dir()) {
+            message.push_str(&format!(
+                "\nThe closest existing directory is: {}",
+                parent.display()
+            ));
+        }
+        return Err(anyhow::anyhow!(message));
+    }
+    Ok(root)
 }
 
 pub(super) fn summarize_agentgrep_request(

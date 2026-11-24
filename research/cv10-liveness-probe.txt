@@ -1,0 +1,5 @@
+self pid=33504 alive=True (expect True)
+bogus pid=655000 alive=False (expect False)
+pid 0 alive=False (expect False)
+negative_control_found_a_dead_pid_in_range=True (expect True)
+live_pids_seen=473
