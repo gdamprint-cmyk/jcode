@@ -92,13 +92,28 @@ fn infer_protocol_detects_kitty_family() {
 /// `env_protocol=None`, so every image took the Halfblocks fallback and
 /// showed the text fallback note.
 ///
+/// Platform split (measured 2026-11-24 on native Windows): that compositing
+/// travels over herdr's direct transport, which is unix-only
+/// (`server/headless/native_graphics.rs` `#![cfg(unix)]`, and
+/// `client::handshake::direct_graphics_profile_allowed` returns false under
+/// `cfg(not(unix))`). On native Windows a herdr pane advertised Kitty but
+/// painted nothing: the kitty output never reaches an outer terminal because
+/// ConPTY consumes the APC. Reporting no protocol there routes the image to
+/// the Unicode half-block path instead of reserving blank rows.
+///
 /// reference: https://fast-agent.ai/guides/tui/ ("Image rendering
 /// automatically uses reported terminal graphics support, including Kitty
 /// graphics inside Herdr")
+/// reference: ~/.jcode/research/2026-11-12-herdr-kitty-windows-diagnosis.md
 #[test]
 fn infer_protocol_reports_kitty_inside_herdr() {
     // The exact masked shape herdr puts in a pane: bland TERM, no graphics
     // identity, and HERDR_ENV=1.
+    // Kitty is reachable through herdr only on unix, where its direct
+    // transport composites the placement into the pane. On native Windows that
+    // transport does not exist (and ConPTY eats the kitty APC), so report no
+    // protocol and let the half-block path draw.
+    let expected = (!cfg!(windows)).then_some(ProtocolType::Kitty);
     assert_eq!(
         infer_protocol_from_env(
             Some("xterm-ghostty"),
@@ -107,10 +122,10 @@ fn infer_protocol_reports_kitty_inside_herdr() {
             None,
             Some("1")
         ),
-        Some(ProtocolType::Kitty)
+        expected
     );
-    // Without HERDR_ENV the same env must stay unknown, so this assertion
-    // cannot pass for an unrelated reason.
+    // Without HERDR_ENV the same env must stay unknown on every platform, so
+    // this assertion cannot pass for an unrelated reason.
     assert_eq!(
         infer_protocol_from_env(Some("xterm-ghostty"), Some("herdr"), None, None, None),
         None

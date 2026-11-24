@@ -265,13 +265,23 @@ pub(super) fn infer_protocol_from_env(
     // (herdr's direct-graphics gate: TERM_PROGRAM ghostty/wezterm, TERM
     // xterm-kitty/ghostty/wezterm, or KITTY_WINDOW_ID - all consumed here).
     //
-    // Without this branch a herdr pane takes the Halfblocks fallback and shows
-    // the text fallback note on every image: measured 2026-11-12 in
-    // `Mermaid picker init: mode=Fast multiplexer=herdr env_protocol=None`.
+    // That compositing needs herdr's *direct* transport, which exists only on
+    // unix (`server/headless/native_graphics.rs` starts with `#![cfg(unix)]`, and
+    // `client::handshake::direct_graphics_profile_allowed` returns false under
+    // `cfg(not(unix))`). On native Windows the pane therefore holds a kitty
+    // placement whose pixels never reach an outer terminal, and jcode's own
+    // kitty output is eaten by ConPTY, so the image area stays blank. Report no
+    // protocol there: `should_render_mermaid_block` then takes the Unicode
+    // half-block path (opt-in via `features.mermaid_halfblocks`) instead of
+    // reserving rows that can never be painted.
     //
-    // reference: ~/.jcode/research/2026-11-12-herdr-reload-and-images/
+    // Measured 2026-11-24 on this host: native Windows herdr 0.9.5 in a WezTerm
+    // window, `Mermaid picker init: mode=Fast multiplexer=herdr
+    // env_protocol=Some(Kitty)`, raw `ESC _ G ...` emitted into the pane produced
+    // ~0 CornflowerBlue pixels in a full-screen capture; reference:
+    // ~/.jcode/research/2026-11-12-herdr-kitty-windows-diagnosis.md
     if env_is_set(herdr_env) {
-        return Some(ProtocolType::Kitty);
+        return (!cfg!(windows)).then_some(ProtocolType::Kitty);
     }
 
     // WezTerm advertises several image protocols, but ratatui-image's Kitty
