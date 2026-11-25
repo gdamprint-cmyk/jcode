@@ -5,9 +5,9 @@ pub use jcode_tui_markdown::{
     extract_copy_targets_from_rendered_lines, handterm_native_latex_for_hash, highlight_file_lines,
     highlight_line, line_is_mermaid_pending_placeholder, mermaid_rendering_enabled, progress_bar,
     progress_line, recenter_structured_blocks_for_display, render_markdown, render_markdown_lazy,
-    render_markdown_with_width, render_table_with_width, reset_debug_stats, set_center_code_blocks,
-    thread_render_count, with_center_code_blocks, with_mermaid_rendering_override, wrap_line,
-    wrap_lines,
+    render_markdown_with_width, render_markdown_with_width_and_prose_color,
+    render_table_with_width, reset_debug_stats, set_center_code_blocks, thread_render_count,
+    with_center_code_blocks, with_mermaid_rendering_override, wrap_line, wrap_lines,
 };
 
 fn to_markdown_diagram_mode(
@@ -57,16 +57,21 @@ fn to_markdown_latex_mode(
 
 pub fn install_jcode_markdown_hooks() {
     jcode_tui_markdown::set_latex_log_hook(|error| {
-        crate::logging::warn(&format!(
-            "LaTeX image rendering fell back to Unicode: {error}"
-        ));
+        let message = format!("LaTeX image rendering fell back to Unicode: {error}");
+        if jcode_tui_markdown::latex_error_is_missing_toolchain(error) {
+            crate::logging::info(&message);
+        } else {
+            crate::logging::warn(&message);
+        }
     });
     jcode_tui_markdown::set_config_snapshot_hook(|| {
         let cfg = crate::config::config();
         jcode_tui_markdown::MarkdownConfigSnapshot {
             diagram_mode: to_markdown_diagram_mode(cfg.display.diagram_mode),
             markdown_spacing: to_markdown_spacing_mode(cfg.display.markdown_spacing),
+            show_link_urls: cfg.display.show_link_urls,
             mermaid_enabled: cfg.features.mermaid,
+            mermaid_halfblocks: cfg.features.mermaid_halfblocks,
             latex_rendering: to_markdown_latex_mode(cfg.display.latex_rendering),
         }
     });

@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod build_inputs;
+
 // Build metadata generator for the jcode workspace.
 //
 // This is the single source of truth for the JCODE_* compile-time values that
@@ -116,7 +118,7 @@ fn main() {
     //   Dirty:   v0.2.17-dev (abc1234, dirty)
     let is_release = std::env::var("JCODE_RELEASE_BUILD").is_ok();
     let version = if is_release {
-        format!("v{}.{}.{} ({})", major, minor, patch, git_hash)
+        format!("v{} ({})", build_semver, git_hash)
     } else if dirty {
         format!("v{}.{}.{}-dev ({}, dirty)", major, minor, patch, git_hash)
     } else {
@@ -175,6 +177,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_GIT_DATE");
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_GIT_TAG");
+    let metadata_path = std::env::var_os("JCODE_BUILD_METADATA_FILE");
+    for directive in build_inputs::metadata_rerun_inputs(metadata_path.as_deref()) {
+        println!("{directive}");
+    }
 }
 
 /// Workspace root, derived from this crate's manifest dir (`crates/jcode-build-meta`).
@@ -214,19 +220,13 @@ fn root_package_version(repo_root: &Path) -> Option<String> {
 }
 
 fn parse_semver(value: &str) -> Option<(u32, u32, u32)> {
-    let trimmed = value.trim().trim_start_matches('v');
-    let mut parts = trimmed.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
+    build_inputs::semver_core(value)
 }
 
 fn explicit_build_semver_override() -> Option<String> {
     std::env::var("JCODE_BUILD_SEMVER")
         .ok()
-        .map(|value| value.trim().trim_start_matches('v').to_string())
-        .filter(|value| parse_semver(value).is_some())
+        .and_then(|value| build_inputs::release_semver(&value))
 }
 
 fn resolve_build_semver(base_version: (u32, u32, u32)) -> Result<String, String> {
@@ -246,7 +246,20 @@ fn resolve_build_semver(base_version: (u32, u32, u32)) -> Result<String, String>
     // turn invalidated `jcode-build-meta` and force-recompiled the entire crate
     // graph (base -> app-core -> tui -> cli). Deriving the value deterministically
     // keeps incremental rebuilds incremental.
-    let offset = commits_since_base_tag(base_version).unwrap_or(0);
+    let offset = commits_since_base_tag(base_version)
+        .or_else(|| {
+            let description = match std::env::var("JCODE_BUILD_GIT_TAG") {
+                Ok(description) => Some(description),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    println!("cargo:warning=Ignoring non-Unicode JCODE_BUILD_GIT_TAG");
+                    None
+                }
+            }
+            .or_else(|| metadata_value("git_tag"))?;
+            build_inputs::base_tag_offset(&description, base_version)
+        })
+        .unwrap_or(0);
     let patch = base_version.2.saturating_add(offset);
     Ok(format!("{}.{}.{}", base_version.0, base_version.1, patch))
 }

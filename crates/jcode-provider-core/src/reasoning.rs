@@ -1,47 +1,34 @@
 //! Shared reasoning-effort ladders.
 //!
 //! Keep these in provider-core so provider runtimes and UI clients expose the
-//! same ordered values. `swarm` and `swarm-deep` are Jcode UI sentinels rather
-//! than wire-level provider values, but they belong in the selectable ladder.
+//! same ordered values. `swarm` is a Jcode UI sentinel rather than a
+//! wire-level provider value, but it belongs in the selectable ladder.
 
-/// OpenAI Responses API effort levels, followed by Jcode's swarm modes.
+/// OpenAI Responses API effort levels, followed by Jcode's swarm mode.
 pub const OPENAI_SELECTABLE_EFFORTS: &[&str] = &[
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-    "swarm",
-    "swarm-deep",
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "swarm",
 ];
 
 /// OpenRouter's unified reasoning effort levels.
 ///
 /// OpenRouter currently treats `max` as an alias for `xhigh`, so it is not a
 /// separate rung in this ladder.
-pub const OPENROUTER_SELECTABLE_EFFORTS: &[&str] = &[
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "swarm",
-    "swarm-deep",
-];
+pub const OPENROUTER_SELECTABLE_EFFORTS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "swarm"];
 
-/// Direct DeepSeek effort levels, followed by Jcode's swarm modes.
-pub const DEEPSEEK_SELECTABLE_EFFORTS: &[&str] = &[
-    "none",
-    "low",
-    "medium",
-    "high",
-    "max",
-    "swarm",
-    "swarm-deep",
-];
+/// Direct DeepSeek effort levels, followed by Jcode's swarm mode.
+pub const DEEPSEEK_SELECTABLE_EFFORTS: &[&str] = &["none", "low", "medium", "high", "max", "swarm"];
+
+/// MiniMax effort levels, followed by Jcode's swarm mode.
+///
+/// MiniMax documents `low | medium | high | xhigh | max` for the
+/// `reasoning_effort` request field (OpenAI-compatible protocol) and for
+/// `output_config.effort` (Anthropic-compatible protocol). `none` is NOT
+/// accepted: the API answers HTTP 400 with "requires adaptive thinking;
+/// reasoning effort none is not allowed". `minimal` is accepted by the live
+/// endpoint but is undocumented, so it is not offered as a selectable level
+/// (measured 2026-11-02 against `MiniMax-M3.1-Flash`).
+pub const MINIMAX_SELECTABLE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "swarm"];
 
 /// Convert a provider-advertised OpenAI/OpenRouter effort into the canonical
 /// static value used by the provider trait.
@@ -73,6 +60,21 @@ pub fn inferred_reasoning_efforts(
 
     if provider.contains("deepseek") || model.contains("deepseek") {
         return DEEPSEEK_SELECTABLE_EFFORTS.to_vec();
+    }
+
+    if provider.contains("minimax") {
+        // MiniMax's API reference: `reasoning_effort` is "effective for
+        // MiniMax-M3.1-Flash only". Other MiniMax models accept the field with
+        // HTTP 200 and silently ignore it, so offering a ladder there offers a
+        // dial that does nothing.
+        if model.is_empty() || model.contains("m3.1") {
+            return MINIMAX_SELECTABLE_EFFORTS.to_vec();
+        }
+        // A MiniMax model outside the documented scope ignores
+        // `reasoning_effort`, so it gets no effort rungs. The swarm sentinel
+        // stays: it is a Jcode UI mode rather than a wire-level effort, so
+        // `/effort swarm` keeps working on those models.
+        return vec!["swarm"];
     }
 
     if provider.contains("z.ai") || provider == "zai" || model.starts_with("glm-") {
@@ -107,7 +109,7 @@ pub fn inferred_reasoning_efforts(
         if caps.max_effort {
             efforts.push("max");
         }
-        efforts.extend(["swarm", "swarm-deep"]);
+        efforts.push("swarm");
         return efforts;
     }
 
@@ -154,31 +156,54 @@ mod tests {
     }
 
     #[test]
+    fn minimax_ladder_excludes_levels_the_api_rejects() {
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M3.1-Flash")),
+            MINIMAX_SELECTABLE_EFFORTS
+        );
+        // M3 accepts the field with HTTP 200 but does not honour it.
+        assert_eq!(
+            inferred_reasoning_efforts(Some("openai-compatible:minimax"), Some("MiniMax-M3")),
+            vec!["swarm"]
+        );
+        // `none` is answered with HTTP 400 by the live API, and `minimal` is
+        // undocumented, so neither belongs in the selectable ladder.
+        assert!(!MINIMAX_SELECTABLE_EFFORTS.contains(&"none"));
+        assert!(!MINIMAX_SELECTABLE_EFFORTS.contains(&"minimal"));
+        assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"max"));
+        // The swarm sentinel stays selectable so `/effort swarm` keeps working.
+        assert!(MINIMAX_SELECTABLE_EFFORTS.contains(&"swarm"));
+    }
+
+    #[test]
+    fn minimax_ladder_outside_the_documented_scope_keeps_only_the_swarm_sentinel() {
+        // A MiniMax model outside the documented scope (only M3.1-Flash is
+        // documented as honouring `reasoning_effort`) ignores the field, so it
+        // gets no effort rungs. The swarm sentinel is a Jcode UI mode, not a
+        // wire-level effort, so it stays and `/effort swarm` keeps working.
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M2.7")),
+            vec!["swarm"]
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("minimax"), Some("MiniMax-M3")),
+            vec!["swarm"]
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("openai-compatible:minimax"), Some("MiniMax-M2.5")),
+            vec!["swarm"]
+        );
+    }
+
+    #[test]
     fn anthropic_ladder_comes_from_model_capabilities() {
         assert_eq!(
             inferred_reasoning_efforts(Some("anthropic"), Some("claude-sonnet-4-6")),
-            vec![
-                "none",
-                "low",
-                "medium",
-                "high",
-                "max",
-                "swarm",
-                "swarm-deep"
-            ]
+            vec!["none", "low", "medium", "high", "max", "swarm"]
         );
         assert_eq!(
             inferred_reasoning_efforts(Some("anthropic"), Some("claude-opus-4-7")),
-            vec![
-                "none",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "max",
-                "swarm",
-                "swarm-deep"
-            ]
+            vec!["none", "low", "medium", "high", "xhigh", "max", "swarm"]
         );
     }
 }

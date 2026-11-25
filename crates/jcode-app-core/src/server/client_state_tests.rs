@@ -11,11 +11,356 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::BufRead as _;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 struct MockProvider(Option<&'static str>);
+
+#[tokio::test]
+async fn resume_todos_arrive_before_backpressured_large_history() {
+    let _env = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().unwrap();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let session_id = "session_early_todo_backpressure";
+    let item: crate::todo::TodoItem = serde_json::from_value(serde_json::json!({
+        "id": "resume", "content": "Authoritative remote plan", "status": "in_progress", "priority": "high"
+    })).unwrap();
+    crate::todo::save_todos(session_id, &[item]).unwrap();
+    let (stream, peer) = crate::transport::stream_pair().unwrap();
+    let (_, write) = stream.into_split();
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write);
+    let started = Instant::now();
+    let transfer = tokio::spawn(async move {
+        super::send_resume_todos(session_id, &writer).await.unwrap();
+        // An unread transcript cannot fit in the socket, reproducing the
+        // original head-of-line blocking without any model or cloud traffic.
+        // The single writer task drains the queue in order, so the todos frame
+        // reaches the socket before this oversized frame parks the writer.
+        writer.send_frame(vec![b'x'; 14_000_000]).unwrap();
+        std::future::pending::<()>().await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut reader = tokio::io::BufReader::new(peer);
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+    )
+    .await
+    .expect("todos must not wait for history transfer")
+    .unwrap();
+    let elapsed = started.elapsed();
+    let event: crate::protocol::ServerEvent = serde_json::from_str(&line).unwrap();
+    assert!(
+        matches!(event, crate::protocol::ServerEvent::Todos { session_id: id, payload, .. }
+        if id == session_id && payload.contains("Authoritative remote plan"))
+    );
+    assert!(
+        !transfer.is_finished(),
+        "large transcript should still be blocked while todos are usable"
+    );
+    eprintln!("authoritative todo arrival with 14 MB History blocked: {elapsed:?}");
+    transfer.abort();
+    let _ = transfer.await;
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+}
+
+#[derive(Clone)]
+struct StaticDiscoveryProvider(Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait]
+impl Provider for StaticDiscoveryProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("not used")
+    }
+    fn name(&self) -> &str {
+        "static-discovery-regression"
+    }
+    fn model(&self) -> String {
+        "static-fallback".into()
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+    fn available_models_display(&self) -> Vec<String> {
+        let mut models = vec![self.model()];
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            models.push("newly-published-model".into());
+        }
+        models
+    }
+    async fn prefetch_models(&self) -> Result<()> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn model_prefetch_discovers_new_models_despite_static_fallback_names() {
+    let _guard = crate::storage::lock_test_env();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(StaticDiscoveryProvider(Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )));
+            let agent = Arc::new(Mutex::new(Agent::new(provider.clone(), Registry::empty())));
+            assert!(!provider.model_capabilities_need_refresh());
+            assert_eq!(provider.available_models_display(), vec!["static-fallback"]);
+            let mut events = crate::bus::Bus::global().subscribe();
+            super::spawn_model_prefetch_update(provider.clone(), agent.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap(),
+                        crate::bus::BusEvent::ModelsUpdated
+                    ) && provider.available_models_display().len() == 2
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("static fallback names must not suppress discovery or publication");
+            let event =
+                crate::server::provider_control::available_models_updated_event(&agent).await;
+            let crate::protocol::ServerEvent::AvailableModelsUpdated {
+                available_models, ..
+            } = event
+            else {
+                panic!("expected picker catalog update")
+            };
+            assert!(
+                available_models
+                    .iter()
+                    .any(|model| model == "newly-published-model")
+            );
+        });
+}
+
+#[derive(Clone)]
+struct CapabilityRefreshProvider {
+    refreshed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Provider for CapabilityRefreshProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("not used")
+    }
+
+    fn name(&self) -> &str {
+        "capability-refresh-regression"
+    }
+    fn model(&self) -> String {
+        "known-model".into()
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+    fn available_models_display(&self) -> Vec<String> {
+        vec![self.model()]
+    }
+    fn model_capabilities_need_refresh(&self) -> bool {
+        !self.refreshed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn prefetch_models(&self) -> Result<()> {
+        self.refreshed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn available_service_tiers(&self) -> Vec<&'static str> {
+        if self.model_capabilities_need_refresh() {
+            Vec::new()
+        } else {
+            vec!["priority", "flex"]
+        }
+    }
+}
+
+#[test]
+fn model_prefetch_hydrates_capabilities_with_existing_model_names() {
+    let _guard = crate::storage::lock_test_env();
+    // Serialize process-wide environment outside the asynchronous runtime.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(async {
+            let temp_home = tempfile::TempDir::new().unwrap();
+            let prev_home = std::env::var_os("JCODE_HOME");
+            crate::env::set_var("JCODE_HOME", temp_home.path());
+            let provider: Arc<dyn Provider> = Arc::new(CapabilityRefreshProvider {
+                refreshed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            let session_id = "capability-refresh-session";
+            let session = crate::session::Session::create_with_id(session_id.into(), None, None);
+            let agent = Arc::new(Mutex::new(Agent::new_with_session(
+                provider.clone(),
+                Registry::empty(),
+                session,
+                None,
+            )));
+            assert!(!provider.available_models_display().is_empty());
+            assert!(provider.available_service_tiers().is_empty());
+            let mut events = crate::bus::Bus::global().subscribe();
+            super::spawn_model_prefetch_update(provider.clone(), agent.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap(),
+                        crate::bus::BusEvent::ModelsUpdated
+                    ) && !provider.model_capabilities_need_refresh()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("capability-only hydration must publish a catalog update");
+            assert_eq!(provider.available_models_display(), vec!["known-model"]);
+            assert_eq!(provider.available_service_tiers(), vec!["priority", "flex"]);
+
+            let (stream, mut peer) = crate::transport::stream_pair().unwrap();
+            let (_, writer) = stream.into_split();
+            let (writer, _writer_handle) =
+                crate::server::client_writer_task::spawn_test_client_writer(writer);
+            handle_get_model_catalog(44, session_id, &agent, &provider, &writer)
+                .await
+                .unwrap();
+            drop(writer);
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            let event: crate::protocol::ServerEvent = serde_json::from_slice(&bytes).unwrap();
+            let crate::protocol::ServerEvent::History {
+                available_service_tiers,
+                ..
+            } = event
+            else {
+                panic!("expected history")
+            };
+            assert_eq!(
+                available_service_tiers,
+                Some(vec!["priority".into(), "flex".into()])
+            );
+            if let Some(home) = prev_home {
+                crate::env::set_var("JCODE_HOME", home);
+            } else {
+                crate::env::remove_var("JCODE_HOME");
+            }
+        });
+}
+
+struct IdentityProvider {
+    credential: Option<jcode_provider_core::ResolvedCredential>,
+    label: Option<&'static str>,
+}
+
+#[async_trait]
+impl Provider for IdentityProvider {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("not used")
+    }
+    fn name(&self) -> &str {
+        "openai"
+    }
+    fn model(&self) -> String {
+        "test-model".into()
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            credential: self.credential,
+            label: self.label,
+        })
+    }
+    fn active_resolved_credential(&self) -> Option<jcode_provider_core::ResolvedCredential> {
+        self.credential
+    }
+    fn oauth_account_label(&self) -> Option<String> {
+        self.label.map(str::to_owned)
+    }
+    fn active_oauth_account_email(&self) -> Option<String> {
+        self.label.map(|label| format!("{label}@example.test"))
+    }
+}
+
+#[test]
+fn provider_oauth_email_uses_exact_live_account() {
+    let provider = IdentityProvider {
+        credential: Some(jcode_provider_core::ResolvedCredential::Oauth),
+        label: Some("work"),
+    };
+    let email = super::selected_provider_oauth_email(&provider, true, || {
+        provider.active_oauth_account_email()
+    })
+    .unwrap();
+    assert_eq!(email.as_str(), "work@example.test");
+}
+
+#[test]
+fn provider_oauth_email_never_probes_disabled_api_key_or_unknown_accounts() {
+    use jcode_provider_core::ResolvedCredential::{ApiKey, Oauth};
+    for (enabled, credential, label) in [
+        (false, Some(Oauth), Some("work")),
+        (true, Some(ApiKey), Some("work")),
+    ] {
+        let provider = IdentityProvider { credential, label };
+        assert!(
+            super::selected_provider_oauth_email(&provider, enabled, || {
+                panic!("identity lookup must not run")
+            })
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn provider_oauth_email_accepts_authoritative_oauth_only_and_skips_unknown_identity() {
+    let provider = IdentityProvider {
+        credential: None,
+        label: Some("effective"),
+    };
+    let email = super::selected_provider_oauth_email(&provider, true, || {
+        provider.active_oauth_account_email()
+    })
+    .unwrap();
+    assert_eq!(email.as_str(), "effective@example.test");
+    let unknown = IdentityProvider {
+        credential: Some(jcode_provider_core::ResolvedCredential::Oauth),
+        label: None,
+    };
+    assert!(
+        super::selected_provider_oauth_email(&unknown, true, || unknown
+            .active_oauth_account_email())
+        .is_none()
+    );
+}
 
 #[async_trait]
 impl Provider for MockProvider {
@@ -50,12 +395,24 @@ impl Provider for MockProvider {
         "mock-model".to_string()
     }
 
+    fn available_service_tiers(&self) -> Vec<&'static str> {
+        if self.0.is_some() {
+            vec!["priority", "flex"]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn service_tier(&self) -> Option<String> {
         self.0.map(str::to_string)
     }
 
     fn reasoning_effort(&self) -> Option<String> {
         Some("high".to_string())
+    }
+
+    fn oauth_account_label(&self) -> Option<String> {
+        self.0.map(|_| "daemon-work".to_string())
     }
 }
 
@@ -116,6 +473,96 @@ async fn session_activity_snapshot_uses_fallback_when_no_live_connection_is_mark
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "serialize test storage and intentionally keep Agent busy"
+)]
+async fn turn_identity_busy_history_bootstraps_active_turn_and_idle_watermark() {
+    let _env_guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().unwrap();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let session_id = "session_identity_busy_history";
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider(None));
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider.clone(),
+        Registry::empty(),
+        crate::session::Session::create_with_id(session_id.into(), None, None),
+        None,
+    )));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.to_string(), agent.clone())]),
+    ));
+    let connections = Arc::new(RwLock::new(HashMap::new()));
+    let count = Arc::new(RwLock::new(1));
+    let (stream, mut peer) = crate::transport::stream_pair().unwrap();
+    let (_, write_half) = stream.into_split();
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write_half);
+    let busy = agent.lock().await;
+    let lease = busy.claim_server_turn().unwrap();
+    let expected = lease.identity().clone();
+    let request = || {
+        handle_get_history(
+            1,
+            session_id,
+            true,
+            &agent,
+            &provider,
+            &sessions,
+            &connections,
+            &count,
+            &writer,
+            "test",
+            "test",
+            None,
+            false,
+            true,
+            None,
+        )
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), request())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(lease);
+    tokio::time::timeout(std::time::Duration::from_secs(2), request())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(busy);
+    drop(writer);
+    let mut bytes = Vec::new();
+    peer.read_to_end(&mut bytes).await.unwrap();
+    let events: Vec<crate::protocol::ServerEvent> = std::io::Cursor::new(bytes)
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    assert_eq!(events.len(), 4);
+    assert!(
+        matches!(&events[0], crate::protocol::ServerEvent::TurnState { runtime_generation, turn_id: Some(id), latest_turn_id, .. }
+        if runtime_generation == &expected.runtime_generation && *id == expected.turn_id && *latest_turn_id == expected.turn_id)
+    );
+    assert!(matches!(
+        &events[1],
+        crate::protocol::ServerEvent::History { .. }
+    ));
+    assert!(
+        matches!(&events[2], crate::protocol::ServerEvent::TurnState { runtime_generation, turn_id: None, latest_turn_id, .. }
+        if runtime_generation == &expected.runtime_generation && *latest_turn_id == expected.turn_id)
+    );
+    assert!(matches!(
+        &events[3],
+        crate::protocol::ServerEvent::History { .. }
+    ));
+    if let Some(home) = prev_home {
+        crate::env::set_var("JCODE_HOME", home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[tokio::test]
 async fn handle_get_history_falls_back_to_persisted_snapshot_when_agent_is_busy() {
     for tier in [Some("priority"), Some("flex"), None] {
         assert_history_service_tier_and_pdf_capability(tier, true, false, false).await;
@@ -147,15 +594,15 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
         !snapshot_path.exists(),
         "fresh empty sessions are not persisted"
     );
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        agent.clone(),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.to_string(), agent.clone())]),
+    ));
     let connections = Arc::new(RwLock::new(HashMap::new()));
     let count = Arc::new(RwLock::new(1));
     let (stream, mut peer) = crate::transport::stream_pair().unwrap();
-    let (_reader, write_half) = stream.into_split();
-    let writer = Arc::new(Mutex::new(write_half));
+    let (reader, write_half) = stream.into_split();
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(write_half);
     let busy_guard = agent.lock().await;
 
     // Keep the mutex held throughout, representing either idle prefetch or a
@@ -175,6 +622,8 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
             "test",
             None,
             false,
+            false,
+            None,
         )
     };
     for processing in [false, true] {
@@ -197,12 +646,16 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
     );
 
     // A nonexistent session is not the same as a registered, unsaved one.
-    sessions.write().await.clear();
+    sessions.clear_for_test().await;
     assert!(request(4, false).await.is_err());
+    // Publication captures the runtime observer from an idle Agent. Preserve
+    // that invariant, then hold the Agent busy again for the corruption check.
+    drop(busy_guard);
     sessions
-        .write()
+        .register_new(session_id.into(), agent.clone())
         .await
-        .insert(session_id.into(), agent.clone());
+        .unwrap();
+    let busy_guard = agent.lock().await;
     // Corrupt snapshots must not silently become empty history either.
     std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
     std::fs::write(&snapshot_path, b"not valid session json").unwrap();
@@ -210,6 +663,24 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
 
     drop(busy_guard);
     drop(writer);
+    // Close the server end's READ half before reading to EOF.
+    //
+    // On Unix the transport is a UnixStream pair: dropping the write half
+    // sends FIN, so `read_to_end` below sees EOF even though the read half of
+    // the same end is still open. A WINDOWS NAMED PIPE has no half-close -
+    // EOF is only signalled when the pipe instance is fully closed (the server
+    // closes it with DisconnectNamedPipe/CloseHandle). While this read half is
+    // still alive the pipe stays open, the client never observes EOF, and
+    // `read_to_end` blocks FOREVER. MEASURED 2026-11-10: this test hung the
+    // whole `cargo test -p jcode-app-core` binary on Windows (CPU frozen at
+    // 129.09 across three 15s samples); dropping this one handle makes it pass
+    // in 0.98s.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations
+    // reference: crates/jcode-transport/src/windows.rs (Stream::pair builds a
+    // named pipe) vs crates/jcode-transport/src/unix.rs (a UnixStream pair,
+    // which does half-close).
+    drop(reader);
     let mut bytes = Vec::new();
     peer.read_to_end(&mut bytes).await.unwrap();
     let events: Vec<crate::protocol::ServerEvent> = std::io::Cursor::new(bytes)
@@ -225,8 +696,10 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
                 images,
                 provider_name,
                 provider_model,
+                provider_oauth_account_label,
                 reasoning_effort,
                 service_tier,
+                available_service_tiers,
                 activity,
                 all_sessions,
                 client_count,
@@ -237,8 +710,13 @@ async fn handle_get_history_busy_fresh_session_returns_empty_without_waiting() {
                 assert!(images.is_empty());
                 assert_eq!(provider_name.as_deref(), Some("Mock Profile"));
                 assert_eq!(provider_model.as_deref(), Some("mock-model"));
+                assert_eq!(provider_oauth_account_label.as_deref(), Some("daemon-work"));
                 assert_eq!(reasoning_effort.as_deref(), Some("high"));
                 assert_eq!(service_tier.as_deref(), Some("priority"));
+                assert_eq!(
+                    available_service_tiers,
+                    Some(vec!["priority".to_string(), "flex".to_string()])
+                );
                 assert_eq!(
                     activity.is_some_and(|activity| activity.is_processing),
                     index >= 3
@@ -304,7 +782,8 @@ async fn assert_history_service_tier_and_pdf_capability(
         content: vec![crate::message::ContentBlock::Text {
             text: "persisted fallback history".to_string(),
             cache_control: None,
-        }],
+        }]
+        .into(),
         display_role: None,
         timestamp: None,
         tool_duration_ms: None,
@@ -325,7 +804,8 @@ async fn assert_history_service_tier_and_pdf_capability(
     live_session.messages[0].content = vec![crate::message::ContentBlock::Text {
         text: "live unsaved history".to_string(),
         cache_control: None,
-    }];
+    }]
+    .into();
     let agent = Arc::new(Mutex::new(Agent::new_with_session(
         provider.clone(),
         registry,
@@ -338,16 +818,16 @@ async fn assert_history_service_tier_and_pdf_capability(
     session.save().expect("restore persisted history snapshot");
     let busy_guard = if busy { Some(agent.lock().await) } else { None };
 
-    let sessions = Arc::new(RwLock::new(HashMap::from([(
-        session_id.to_string(),
-        Arc::clone(&agent),
-    )])));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(session_id.to_string(), Arc::clone(&agent))]),
+    ));
     let client_connections = Arc::new(RwLock::new(HashMap::<String, ClientConnectionInfo>::new()));
     let client_count = Arc::new(RwLock::new(1usize));
 
     let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
-    let (_reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
+    let (reader_a, writer_a) = stream_a.into_split();
+    let (writer, _writer_handle) =
+        crate::server::client_writer_task::spawn_test_client_writer(writer_a);
 
     if racing_turn {
         // Reproduce the exact decision/preparation boundary without scheduler
@@ -357,9 +837,12 @@ async fn assert_history_service_tier_and_pdf_capability(
         tokio::pin!(turn);
         assert!(futures::poll!(&mut turn).is_pending());
 
-        // Socket backpressure lets us inspect the lock lifetime after snapshot
-        // preparation, while the history request is still in flight.
-        let writer_guard = writer.lock().await;
+        // The snapshot must release the agent before the history is queued:
+        // the racing turn may then take the agent while the history is still
+        // in flight. `ClientWriter` queues without parking, so the whole
+        // history build completes on the first poll and the turn is polled
+        // only afterwards: the assertion that matters is that the history does
+        // NOT need the racing turn's agent lock to finish.
         let history = super::send_history_with_guard(
             42,
             session_id,
@@ -374,18 +857,20 @@ async fn assert_history_service_tier_and_pdf_capability(
             super::HistoryPayloadMode::Full,
             true,
             supports_pdf_panels,
+            false,
+            None,
         );
         tokio::pin!(history);
-        assert!(futures::poll!(&mut history).is_pending());
-        let turn_guard = match futures::poll!(&mut turn) {
-            std::task::Poll::Ready(guard) => guard,
-            std::task::Poll::Pending => panic!("snapshot must release agent before socket write"),
-        };
-        drop(writer_guard);
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut history)
             .await
             .expect("history must not reacquire the racing turn's lock")
             .expect("write live history");
+        let turn_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            &mut turn,
+        )
+        .await
+        .expect("racing turn must acquire the agent released after the snapshot");
         drop(turn_guard);
     } else {
         tokio::time::timeout(
@@ -404,6 +889,8 @@ async fn assert_history_service_tier_and_pdf_capability(
                 "🔥",
                 None,
                 supports_pdf_panels,
+                false,
+                None,
             ),
         )
         .await
@@ -413,6 +900,14 @@ async fn assert_history_service_tier_and_pdf_capability(
 
     drop(busy_guard);
     drop(writer);
+    // Close the server end's READ half before reading to EOF. A WINDOWS NAMED
+    // PIPE has no half-close: EOF arrives only when the pipe instance is
+    // fully closed, so while `reader_a` is alive `read_to_end` below blocks
+    // FOREVER. MEASURED 2026-11-10: this is the same hang that froze the
+    // whole `cargo test -p jcode-app-core` binary.
+    //
+    // reference: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-operations
+    drop(reader_a);
 
     let mut bytes = Vec::new();
     stream_b
@@ -460,10 +955,16 @@ async fn assert_history_service_tier_and_pdf_capability(
             messages,
             activity,
             service_tier,
+            available_service_tiers,
             side_panel,
+            provider_oauth_account_label,
             ..
         } => {
             assert_eq!(id, 42);
+            assert_eq!(
+                provider_oauth_account_label.as_deref(),
+                tier.map(|_| "daemon-work")
+            );
             assert_eq!(returned_session_id, session_id);
             assert_eq!(messages.len(), 1);
             assert_eq!(
@@ -475,6 +976,14 @@ async fn assert_history_service_tier_and_pdf_capability(
                 }
             );
             assert_eq!(service_tier.as_deref(), tier);
+            assert_eq!(
+                available_service_tiers,
+                Some(if tier.is_some() {
+                    vec!["priority".to_string(), "flex".to_string()]
+                } else {
+                    Vec::new()
+                })
+            );
             assert_eq!(
                 side_panel,
                 super::super::client_writer::side_panel_for_client(
@@ -502,107 +1011,8 @@ async fn assert_history_service_tier_and_pdf_capability(
     }
 }
 
-#[tokio::test]
-async fn handle_get_model_catalog_does_not_wait_for_busy_agent_lock() {
-    for tier in [Some("priority"), Some("flex"), None] {
-        assert_model_catalog_service_tier(tier, true).await;
-    }
-}
-
-#[tokio::test]
-async fn handle_get_model_catalog_preserves_live_service_tier() {
-    for tier in [Some("priority"), Some("flex"), None] {
-        assert_model_catalog_service_tier(tier, false).await;
-    }
-}
-
-#[expect(
-    clippy::await_holding_lock,
-    reason = "test intentionally keeps the agent busy lock held to exercise model-catalog fallback"
-)]
-async fn assert_model_catalog_service_tier(tier: Option<&'static str>, busy: bool) {
-    let _guard = crate::storage::lock_test_env();
-    let temp_home = tempfile::TempDir::new().expect("create temp home");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
-
-    let session_id = "session_busy_model_catalog_fallback";
-    let mut session = crate::session::Session::create_with_id(
-        session_id.to_string(),
-        None,
-        Some("busy model catalog".to_string()),
-    );
-    session.model = Some("persisted-model".to_string());
-    session.save().expect("save session");
-
-    let provider: Arc<dyn Provider> = Arc::new(MockProvider(tier));
-    let agent = Arc::new(Mutex::new(Agent::new_with_session(
-        provider.clone(),
-        Registry::empty(),
-        session.clone(),
-        None,
-    )));
-    let busy_guard = if busy { Some(agent.lock().await) } else { None };
-
-    let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
-    let (_reader_a, writer_a) = stream_a.into_split();
-    let writer = Arc::new(Mutex::new(writer_a));
-
-    tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        handle_get_model_catalog(43, session_id, &agent, &provider, &writer),
-    )
-    .await
-    .expect("model catalog must not wait for busy agent mutex")
-    .expect("model catalog fallback should write history event");
-
-    drop(busy_guard);
-    drop(writer);
-
-    let mut bytes = Vec::new();
-    stream_b
-        .read_to_end(&mut bytes)
-        .await
-        .expect("read model catalog event bytes");
-    let mut cursor = std::io::Cursor::new(bytes);
-    let mut line = String::new();
-    cursor.read_line(&mut line).expect("read first line");
-    let event: crate::protocol::ServerEvent =
-        serde_json::from_str(line.trim()).expect("decode model catalog event");
-
-    match event {
-        crate::protocol::ServerEvent::History {
-            id,
-            session_id: returned_session_id,
-            provider_name,
-            provider_model,
-            service_tier,
-            reasoning_effort,
-            ..
-        } => {
-            assert_eq!(id, 43);
-            assert_eq!(returned_session_id, session_id);
-            assert_eq!(provider_name.as_deref(), Some("Mock Profile"));
-            assert_eq!(
-                provider_model.as_deref(),
-                Some(if busy {
-                    "persisted-model"
-                } else {
-                    "mock-model"
-                })
-            );
-            assert_eq!(service_tier.as_deref(), tier);
-            assert_eq!(reasoning_effort.as_deref(), Some("high"));
-        }
-        other => panic!("expected history event, got {:?}", other),
-    }
-
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
-}
+#[path = "client_state_tests/model_catalog.rs"]
+mod model_catalog;
 
 struct ReloadHistoryEnvGuard {
     prev_home: Option<std::ffi::OsString>,
@@ -700,6 +1110,36 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
 }
 
 #[test]
+fn history_reload_recovery_infers_pending_assistant_tool_during_reload() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::TempDir::new()?;
+    let runtime = tempfile::TempDir::new()?;
+    let _guard = ReloadHistoryEnvGuard::new(home.path(), runtime.path());
+    let session_id = "session_history_pending_bg";
+    let mut session = crate::session::Session::create_with_id(session_id.into(), None, None);
+    session.status = crate::session::SessionStatus::Active;
+    session.add_message(
+        crate::message::Role::Assistant,
+        vec![crate::message::ContentBlock::ToolUse {
+            id: "wait_1".into(),
+            name: "bg".into(),
+            input: serde_json::json!({"action": "wait", "max_wait_seconds": 400}),
+            thought_signature: None,
+        }],
+    );
+    session.save()?;
+    assert!(super::history_reload_recovery_snapshot(session_id, None).is_none());
+    crate::server::write_reload_state(
+        "reload-pending-bg",
+        "test-hash",
+        crate::server::ReloadPhase::SocketReady,
+        None,
+    );
+    assert!(super::history_reload_recovery_snapshot(session_id, None).is_some());
+    Ok(())
+}
+
+#[test]
 fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepted() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
@@ -755,9 +1195,42 @@ fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepte
         !super::super::reload_recovery::has_pending_for_session(session_id),
         "accepted continuation should consume the durable pending intent"
     );
+    // Leftover initiating context and interrupted-session evidence must not
+    // recreate a continuation that the durable store says was consumed.
+    crate::tool::selfdev::ReloadContext {
+        task_context: Some("finish reload task".to_string()),
+        version_before: "before".to_string(),
+        version_after: "after".to_string(),
+        session_id: session_id.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }
+    .save()?;
+    assert!(
+        super::history_reload_recovery_snapshot(session_id, Some(true)).is_none(),
+        "delivered intent must override leftover context and interruption evidence"
+    );
     assert!(
         super::history_reload_recovery_snapshot(session_id, None).is_none(),
         "delivered server-owned recovery intent should no longer be emitted"
     );
+    super::super::reload_recovery::persist_intent(
+        "reload-next",
+        session_id,
+        super::super::reload_recovery::ReloadRecoveryRole::Initiator,
+        crate::tool::selfdev::ReloadRecoveryDirective {
+            reconnect_notice: None,
+            continuation_message: "new reload continuation".to_string(),
+        },
+        "next reload",
+    )?;
+    assert_eq!(
+        super::history_reload_recovery_snapshot(session_id, None)
+            .unwrap()
+            .continuation_message,
+        "new reload continuation"
+    );
     Ok(())
 }
+
+#[path = "client_state_tests/history_delta.rs"]
+mod history_delta;

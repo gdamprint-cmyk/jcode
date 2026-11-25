@@ -62,6 +62,26 @@ fn classify_text(text: &str) -> Option<String> {
         "connection closed before message completed",
         "unexpected eof",
         "end of file before message completed",
+        // HTTP/2 faults on an established connection. A Wi-Fi roam breaks the
+        // multiplexed stream without any timeout or reset wording: "client
+        // error (SendRequest): http2 error: stream error received: unspecific
+        // protocol error detected".
+        "client error (sendrequest)",
+        "http2 error",
+        // An upstream stall after the request was accepted. The gateway stops
+        // emitting and the stream reads as idle, so the failure is a dead
+        // connection, not a provider rejection: it recovers on a fresh request.
+        // Real shapes: "upstream idle for 60000ms without data" and the
+        // OpenAI-compatible stream wrapper "Stream read timeout: no data
+        // received for 180 seconds".
+        "upstream idle",
+        "no data received",
+        // A disaggregated-inference gateway losing its prefill instance mid
+        // request. The decode side reports it as a transfer failure with no
+        // network vocabulary at all: "KVTransferError ... Losing connection
+        // with prefill instance". Measured 2026-11-23 (session_tigress).
+        "losing connection with prefill instance",
+        "kvtransfererror",
     ];
     if network_markers.iter().any(|marker| text.contains(marker)) {
         return Some("the network connection appears to have dropped".to_string());
@@ -81,12 +101,12 @@ pub fn wait_plan() -> NetworkWaitPlan {
     }
     #[cfg(target_os = "macos")]
     {
-        return NetworkWaitPlan {
+        NetworkWaitPlan {
             reason: "stream interrupted by a likely network disconnect".to_string(),
             listener_summary:
                 "listening for macOS route/interface changes via `route -n monitor`; also verifying with reconnect probes"
                     .to_string(),
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -209,6 +229,10 @@ mod tests {
             "Failed to send request to Anthropic API: error sending request for url \
              (https://api.anthropic.com/v1/messages): client error (SendRequest): \
              http2 error: keep-alive timed out: operation timed out",
+            // Wi-Fi roam between access points mid-request.
+            "Failed to send request to Anthropic API: error sending request for url \
+             (https://api.anthropic.com/v1/messages?beta=true): client error (SendRequest): \
+             http2 error: stream error received: unspecific protocol error detected",
             // rustls abrupt-close shape (docs URL spells "unexpected-eof" so
             // the plain "unexpected eof" marker never matched it).
             "error sending request for url (https://generativelanguage.googleapis.com/v1beta/models): \
@@ -225,6 +249,14 @@ mod tests {
              client error (Connect): tls handshake eof",
             // Body cut off mid-stream.
             "error decoding response body: request or response body error: operation timed out",
+            // Upstream stall shapes observed on this host. They carried no
+            // timeout/reset wording, so the turn ended with no retry and no
+            // network wait until the user poked it.
+            "upstream idle for 60000ms without data",
+            "Stream read timeout: no data received for 180 seconds",
+            // Decode side losing its prefill instance mid request (session_tigress).
+            "KVTransferError(bootstrap_room=3147489392983313834, \
+             remote_endpoint=10.254.147.145:8998): Losing connection with prefill instance",
         ];
         for error in real_errors {
             assert!(

@@ -35,6 +35,30 @@ fn issue_922_heredoc_payload_does_not_trip_the_gate() {
 }
 
 #[test]
+fn heredoc_inside_double_quoted_command_substitution_is_data() {
+    // The common "pass a multiline body to a flag" idiom. The body is quoted
+    // heredoc data, so backticks, quotes and `>` inside it are prose.
+    for command in [
+        "echo \"$(cat <<'EOF'\n`\"p>\"` y\nEOF\n)\"",
+        "gh api repos/o/r/pulls -f body=\"$(cat <<'EOF'\nRan `tool resume X \"<pointer>\"` ok.\nEOF\n)\"",
+        "git commit -m \"$(cat <<'EOF'\nSummary with `rm -rf ~` in prose\nEOF\n)\"",
+    ] {
+        assert!(level(command).runs_immediately(), "{command:?}");
+    }
+
+    // A real command after the substitution is still assessed.
+    assert_eq!(
+        level("echo \"$(cat <<'EOF'\ninert\nEOF\n)\"; rm -rf ~"),
+        RiskLevel::Catastrophic
+    );
+    // `<<` inside single quotes is still not a heredoc.
+    assert_eq!(
+        level("echo '$(cat <<EOF'\nrm -rf ~\nEOF"),
+        RiskLevel::Catastrophic
+    );
+}
+
+#[test]
 fn the_issue_604_command_is_blocked_outright() {
     // The reported incident: "jcode just deleted everything in my ~".
     for command in [
@@ -156,10 +180,15 @@ fn assessment_is_total_over_garbage_input() {
 #[test]
 fn explanation_names_the_offending_target() {
     let assessment = assess("rm -rf ~", &ctx());
-    let text = assessment.explanation();
+    let target = assessment
+        .findings
+        .first()
+        .and_then(|finding| finding.target.as_deref())
+        .expect("the finding must name its target");
+    // `Path::display()` uses the host separator: `\home\u` on Windows.
     assert!(
-        text.contains("/home/u"),
-        "explanation should name the path: {text}"
+        target.contains("home") && target.contains("u"),
+        "explanation should name the path: {target}"
     );
 }
 
@@ -663,5 +692,39 @@ fn find_output_actions_write_only_their_destinations() {
         "find / -name '-exec'",
     ] {
         assert_eq!(level(command), RiskLevel::Safe, "{command}");
+    }
+}
+
+#[test]
+fn issue_1753_substitutions_are_assessed_like_top_level_commands() {
+    for command in [
+        "echo $(rm -rf ~)",
+        "x=$(rm -rf ~)",
+        "echo \"$(rm -rf ~)\"",
+        "echo `rm -rf ~`",
+        "echo \"`rm -rf ~`\"",
+        "cat <<EOF\n$(rm -rf ~)\nEOF",
+        "cat <<EOF\n`rm -rf ~`\nEOF",
+        "echo \"$(echo \"$(rm -rf ~)\")\"",
+        "git commit -m \"$(rm -rf ~)\"",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+}
+
+#[test]
+fn issue_1753_inert_text_stays_safe() {
+    for command in [
+        // The shell does not expand quoted heredocs or single quotes.
+        "cat <<'EOF'\n$(rm -rf ~)\nEOF",
+        "cat <<\"EOF\"\n`rm -rf ~`\nEOF",
+        "echo '$(rm -rf ~)'",
+        "echo '`rm -rf ~`'",
+        // Ordinary substitutions keep running immediately.
+        "echo \"$(git rev-parse HEAD)\"",
+        "echo `date`",
+        "git commit -m \"$(cat <<'EOF'\nfix: thing\n\nrm -rf ~ is mentioned here\nEOF\n)\"",
+    ] {
+        assert!(level(command).runs_immediately(), "{command:?}");
     }
 }

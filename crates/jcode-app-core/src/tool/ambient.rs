@@ -1,7 +1,7 @@
 use super::{Tool, ToolContext, ToolOutput};
 use crate::ambient::{
-    AmbientCycleResult, AmbientManager, AmbientState, CycleStatus, Priority, ScheduleRequest,
-    ScheduleTarget, ScheduledItem,
+    AmbientCycleResult, AmbientManager, CycleStatus, Priority, ScheduleRequest, ScheduleTarget,
+    ScheduledItem,
 };
 use crate::ambient_runner::AmbientRunnerHandle;
 use crate::safety::{self, PermissionRequest, PermissionResult, SafetySystem, Urgency};
@@ -233,35 +233,22 @@ impl Tool for EndAmbientCycleTool {
         // Store for the ambient runner to pick up
         store_cycle_result(result);
 
-        // Also persist state immediately so a crash after this tool but before
-        // the runner collects won't lose the cycle.
-        if let Ok(mut state) = AmbientState::load() {
-            let next_desc = if let Some(ref sched) = next_schedule {
-                let mins = sched.wake_in_minutes.unwrap_or(30);
-                format!("~{}", crate::ambient::format_minutes_human(mins))
-            } else {
-                "system default".to_string()
-            };
-
-            state.last_run = Some(now);
-            state.last_summary = Some(params.summary.clone());
-            state.last_compactions = Some(params.compactions);
-            state.last_memories_modified = Some(params.memories_modified);
-            state.total_cycles += 1;
-            let _ = state.save();
-
-            Ok(ToolOutput::new(format!(
-                "Ambient cycle ended. Memories modified: {}, compactions: {}. Next wake: {}",
-                params.memories_modified, params.compactions, next_desc
-            ))
-            .with_title("ambient cycle ended".to_string()))
+        // The runner is the ONLY writer of `state.json`: it persists the cycle
+        // exactly once, when the cycle completes. Persisting the cycle here as
+        // well incremented `total_cycles` a second time and published a
+        // transient overcount on disk (measured 2026-11-04).
+        let next_desc = if let Some(ref sched) = next_schedule {
+            let mins = sched.wake_in_minutes.unwrap_or(30);
+            format!("~{}", crate::ambient::format_minutes_human(mins))
         } else {
-            Ok(ToolOutput::new(format!(
-                "Ambient cycle ended (state save failed). Summary: {}",
-                params.summary
-            ))
-            .with_title("ambient cycle ended".to_string()))
-        }
+            "system default".to_string()
+        };
+
+        Ok(ToolOutput::new(format!(
+            "Ambient cycle ended. Memories modified: {}, compactions: {}. Next wake: {}",
+            params.memories_modified, params.compactions, next_desc
+        ))
+        .with_title("ambient cycle ended".to_string()))
     }
 }
 
@@ -295,6 +282,12 @@ struct ScheduleInput {
     context: String,
     #[serde(default)]
     priority: Option<String>,
+    /// Deliver this task to a specific interactive session instead of waking
+    /// the ambient agent. The ambient agent's own session id is a throwaway
+    /// one-shot (`ambient_<timestamp>`), so without an explicit target an
+    /// ambient-scheduled task can never reach the session it is about.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[async_trait]
@@ -329,6 +322,10 @@ impl Tool for ScheduleAmbientTool {
                     "type": "string",
                     "enum": ["low", "normal", "high"],
                     "description": "Priority for this scheduled task (default: normal)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Deliver to this interactive session instead of waking the ambient agent. Use it to hand a concrete result back to the session whose work you improved."
                 }
             }
         })
@@ -346,12 +343,28 @@ impl Tool for ScheduleAmbientTool {
             None
         };
 
+        let target = match params.session_id.as_deref().map(str::trim) {
+            Some(session_id) if !session_id.is_empty() => {
+                ScheduleTarget::Session {
+                    session_id: session_id.to_string(),
+                }
+            }
+            _ => ScheduleTarget::Ambient,
+        };
+
+        // Compute the destination BEFORE `target` is moved into the request:
+        // ScheduleTarget is not Copy, so a later borrow would not compile.
+        let destination = match &target {
+            ScheduleTarget::Session { session_id } => format!(" -> session {session_id}"),
+            _ => String::new(),
+        };
+
         let request = ScheduleRequest {
             wake_in_minutes: params.wake_in_minutes,
             wake_at,
             context: params.context.clone(),
             priority: parse_priority(params.priority.as_deref()),
-            target: ScheduleTarget::Ambient,
+            target,
             created_by_session: ctx.session_id,
             working_dir: None,
             task_description: None,
@@ -373,8 +386,11 @@ impl Tool for ScheduleAmbientTool {
         };
 
         Ok(
-            ToolOutput::new(format!("Scheduled ambient task {} for {}", id, when))
-                .with_title(format!("scheduled: {}", params.context)),
+            ToolOutput::new(format!(
+                "Scheduled ambient task {} for {}{}",
+                id, when, destination
+            ))
+            .with_title(format!("scheduled: {}", params.context)),
         )
     }
 }
@@ -750,6 +766,12 @@ struct ScheduleToolInput {
     success_criteria: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    /// Explicit session to deliver to. Required to reach a session other than
+    /// the caller's own: the ambient agent's session id is a throwaway
+    /// one-shot, so `target: "resume"` from an ambient cycle would deliver to
+    /// a session that is already closed.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[async_trait]
@@ -759,7 +781,7 @@ impl Tool for ScheduleTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule, list, or cancel future tasks."
+        "Schedule independent future tasks."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -799,6 +821,10 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "enum": ["resume", "spawn", "ambient"],
                     "description": "Delivery target. Defaults to resuming this session; 'spawn' runs one new child session."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Deliver to this specific session id. Required to reach a session other than your own."
                 }
             }
         })
@@ -868,7 +894,12 @@ impl ScheduleTool {
                 }
             });
 
-        let target = parse_schedule_target(params.target.as_deref(), &ctx.session_id)?;
+        let target = match params.session_id.as_deref().map(str::trim) {
+            Some(session_id) if !session_id.is_empty() => ScheduleTarget::Session {
+                session_id: session_id.to_string(),
+            },
+            _ => parse_schedule_target(params.target.as_deref(), &ctx.session_id)?,
+        };
         let target_summary = format_schedule_target(&target);
 
         let request = ScheduleRequest {
@@ -1011,7 +1042,7 @@ fn format_scheduled_item(item: &ScheduledItem) -> String {
     )
 }
 
-fn nudge_schedule_runner() {
+pub(super) fn nudge_schedule_runner() {
     let runner = SCHEDULE_RUNNER
         .get_or_init(|| Mutex::new(None))
         .lock()

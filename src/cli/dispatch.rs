@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
@@ -21,56 +21,9 @@ use super::{
 };
 use provider_init::ProviderChoice;
 
-#[cfg(any(target_os = "linux", test))]
-fn is_file_controlled_debug_client() -> bool {
-    std::env::var_os("JCODE_DEBUG_CMD_PATH").is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn is_orphan_adopter_name(name: &str) -> bool {
-    matches!(name.trim(), "init" | "systemd")
-}
-
-#[cfg(target_os = "linux")]
-fn parent_is_orphan_adopter(parent_pid: libc::pid_t) -> bool {
-    if parent_pid <= 1 {
-        return true;
-    }
-    std::fs::read_to_string(format!("/proc/{parent_pid}/comm"))
-        .is_ok_and(|name| is_orphan_adopter_name(&name))
-}
-
-/// Tie file-controlled debug clients to the process that launched them.
-///
-/// These clients are automation helpers, not user-owned terminals. Without a
-/// parent-death signal they are reparented to init when a verification script
-/// or debug server exits, retaining a full TUI and session history indefinitely.
-#[cfg(target_os = "linux")]
-fn arm_debug_client_parent_death_signal() {
-    if !is_file_controlled_debug_client() {
-        return;
-    }
-
-    // Capture the parent first, then check it again after prctl. This closes the
-    // race where the launcher exits immediately before the signal is armed.
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let parent_pid = unsafe { libc::getppid() };
-    // Safety: PR_SET_PDEATHSIG accepts a signal number as its scalar argument.
-    let armed = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } == 0;
-    // Safety: getppid has no preconditions and does not dereference pointers.
-    let current_parent_pid = unsafe { libc::getppid() };
-    if armed
-        && (parent_is_orphan_adopter(parent_pid)
-            || current_parent_pid != parent_pid
-            || parent_is_orphan_adopter(current_parent_pid))
-    {
-        std::process::exit(0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn arm_debug_client_parent_death_signal() {}
-
+#[path = "dispatch_debug_parent.rs"]
+mod debug_parent;
+use debug_parent::*;
 pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     arm_debug_client_parent_death_signal();
     if args.ssh.is_some() {
@@ -82,6 +35,20 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     // migrations, provider discovery, or unrelated credential imports first.
     if let Some(Command::Auth(AuthCommand::Import { json, .. })) = &args.command {
         return super::auth_import::run(&args.provider, *json);
+    }
+    // Explicit MCP management is independent of provider profiles, sessions,
+    // and the daemon. In particular, list must remain offline and scriptable.
+    if matches!(args.command, Some(Command::Mcp { .. })) {
+        let Some(Command::Mcp { action }) = args.command else {
+            unreachable!("MCP command checked above");
+        };
+        return super::mcp::run(action).await;
+    }
+    // The standalone picker is the entire command, not a resume ID lookup.
+    // In particular, cancelling it must not continue into provider/agent startup
+    // with an empty session ID.
+    if args.resume.as_deref() == Some("") {
+        return tui_launch::list_sessions();
     }
     resolve_resume_arg(&mut args)?;
 
@@ -103,7 +70,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         provider_catalog::apply_named_provider_profile_env(profile_name)?;
         crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", profile_name);
         crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
-        args.provider = ProviderChoice::OpenaiCompatible;
+        args.provider = provider_choice_for_named_profile(profile_name);
     }
 
     if let Some(tool_profile) = args.tool_profile.as_deref() {
@@ -135,6 +102,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     }
 
     match args.command {
+        Some(Command::Mcp { action }) => super::mcp::run(action).await?,
         Some(Command::Serve {
             temporary_server,
             owner_pid,
@@ -262,6 +230,10 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     println!("Jcode server is running.");
                 }
             }
+            ServerCommand::ExecWorker => {
+                crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
+                crate::tool::remote_exec::run_worker_stdio().await?;
+            }
             ServerCommand::Keepalive => {
                 run_server_keepalive(
                     &args.provider,
@@ -272,6 +244,12 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             }
             ServerCommand::Promote { version, json } => {
                 commands::run_server_promote_command(version.as_deref(), json)?;
+            }
+            ServerCommand::Build { json } => {
+                commands::run_server_build_command(json)?;
+            }
+            ServerCommand::Land { version, json } => {
+                commands::run_server_land_command(version.as_deref(), json).await?;
             }
             ServerCommand::Reload { force, json } => {
                 commands::run_server_reload_command(force, json).await?;
@@ -285,6 +263,11 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             json,
             ndjson,
         }) => {
+            register_on_demand_server_spawner_for_run(
+                args.provider,
+                args.model.clone(),
+                args.provider_profile.clone(),
+            );
             commands::run_single_message_command(
                 &args.provider,
                 args.model.as_deref(),
@@ -307,37 +290,34 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             flow_id,
             cancel,
             no_validate,
-            google_access_tier,
+            device_code,
+            google,
             api_base,
             api_key,
             api_key_env,
         }) => {
+            let mut options = login::LoginOptions {
+                no_browser,
+                print_auth_url,
+                callback_url,
+                auth_code,
+                json,
+                complete,
+                flow_id,
+                cancel,
+                no_validate,
+                device_code,
+                openai_compatible_api_base: api_base,
+                openai_compatible_api_key: api_key,
+                openai_compatible_api_key_env: api_key_env,
+                openai_compatible_default_model: args.model.clone(),
+                ..Default::default()
+            };
+            google.apply(&mut options)?;
             login::run_login(
                 &login_provider.unwrap_or(args.provider),
                 account.as_deref(),
-                login::LoginOptions {
-                    no_browser,
-                    print_auth_url,
-                    callback_url,
-                    auth_code,
-                    json,
-                    complete,
-                    flow_id,
-                    cancel,
-                    no_validate,
-                    google_access_tier: google_access_tier.map(|tier| match tier {
-                        super::args::GoogleAccessTierArg::Full => {
-                            auth::google::GmailAccessTier::Full
-                        }
-                        super::args::GoogleAccessTierArg::Readonly => {
-                            auth::google::GmailAccessTier::ReadOnly
-                        }
-                    }),
-                    openai_compatible_api_base: api_base,
-                    openai_compatible_api_key: api_key,
-                    openai_compatible_api_key_env: api_key_env,
-                    openai_compatible_default_model: args.model.clone(),
-                },
+                options,
             )
             .await?;
         }
@@ -349,6 +329,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             super::args::AccountCommand::Manage => account::run_manage()?,
             super::args::AccountCommand::Logout => account::run_logout().await?,
         },
+        Some(Command::Mobile { action }) => account::run_mobile(action).await?,
         Some(Command::Repl) => {
             let (provider, registry) =
                 provider_init::init_provider_and_registry(&args.provider, args.model.as_deref())
@@ -356,8 +337,8 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             let mut agent = agent::Agent::new(provider, registry);
             agent.repl().await?;
         }
-        Some(Command::Update) => {
-            hot_exec::run_update()?;
+        Some(Command::Update { channel }) => {
+            hot_exec::run_update(channel.as_deref())?;
         }
         Some(Command::Version { json }) => {
             commands::run_version_command(json)?;
@@ -450,8 +431,13 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::Ambient(subcmd)) => {
             commands::run_ambient_command(map_ambient_subcommand(subcmd)).await?;
         }
+        Some(Command::Cloud(CloudCommand::Sessions { action })) => {
+            commands::run_cloud_command(commands::CloudSubcommand::Sessions(
+                map_cloud_sessions_subcommand(action),
+            ))?;
+        }
         Some(Command::Cloud(subcmd)) => {
-            commands::run_cloud_command(map_cloud_subcommand(subcmd))?;
+            super::cloud_move::run_cli(subcmd)?;
         }
         Some(Command::Pair { list, revoke }) => {
             commands::run_pair_command(list, revoke)?;
@@ -465,6 +451,34 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             session,
         }) => {
             commands::run_transcript_command(text, map_transcript_mode(mode), session).await?;
+        }
+        Some(Command::Companion {
+            status,
+            no_voice,
+            no_voice_waveform,
+            no_voice_notifications,
+            no_jarvis_fn_key,
+            no_jarvis_fn_launch,
+            no_open,
+            no_spawn_terminal,
+            no_lid,
+            no_browser_updates,
+        }) => {
+            commands::run_companion_command(
+                status,
+                commands::CompanionFlags {
+                    no_voice,
+                    no_voice_waveform,
+                    no_voice_notifications,
+                    no_jarvis_fn_key,
+                    no_jarvis_fn_launch,
+                    no_open,
+                    no_spawn_terminal,
+                    no_lid,
+                    no_browser_updates,
+                },
+            )
+            .await?;
         }
         Some(Command::Dictate { r#type }) => {
             commands::run_dictate_command(r#type).await?;
@@ -636,6 +650,19 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Transport for `--provider-profile <name>` (issue #1560: this used to force
+/// OpenAI-compatible unconditionally). Anthropic-compatible profiles go
+/// through `Auto`, the same path as `default_provider = "<name>"`: the env
+/// applied by `apply_named_provider_profile_env` already selects the
+/// Anthropic Messages runtime with the profile's base URL and auth, while
+/// `AnthropicApi` would pin an Anthropic API-key credential the profile may
+/// not have (e.g. `auth = "none"`).
+#[path = "dispatch/named_profiles.rs"]
+mod named_profiles;
+use named_profiles::provider_choice_for_named_profile;
+#[cfg(test)]
+use named_profiles::provider_choice_for_named_profile_in;
+
 fn auth_doctor_provider_arg<'a>(
     positional_provider: Option<&'a str>,
     global_provider: &'a ProviderChoice,
@@ -649,265 +676,19 @@ fn auth_doctor_provider_arg<'a>(
     })
 }
 
-fn resolve_resume_arg(args: &mut Args) -> Result<()> {
-    if let Some(ref resume_id) = args.resume {
-        if resume_id.is_empty() {
-            return tui_launch::list_sessions();
-        }
+mod resume;
+use resume::resolve_resume_arg;
+#[cfg(test)]
+use resume::{ResumeResolutionFailureAction, resolve_resume_id, resume_resolution_failure_action};
 
-        let resume_id = resume_id.clone();
-        match resolve_resume_id(&resume_id) {
-            Ok(full_id) => {
-                args.resume = Some(full_id);
-            }
-            Err(e) => {
-                match resume_resolution_failure_action(&resume_id, |key| std::env::var_os(key)) {
-                    // During a reload/update/restart handoff the client re-execs
-                    // itself with `--resume <id>` and `JCODE_RESUMING=1`. In the
-                    // client/server architecture the shared server is the authority
-                    // for session lifecycle, so an id that is not in the local store
-                    // can still be valid server-side. Hard-exiting here dumped the
-                    // user back to a shell with "No session found matching ...",
-                    // making jcode unusable after an auto-update (issue #328).
-                    // Instead, keep the raw id and let the remote connection resolve
-                    // it; if the server cannot find it either, the TUI surfaces a
-                    // recoverable message and falls back to a fresh session rather
-                    // than killing the process.
-                    ResumeResolutionFailureAction::DeferToServer => {
-                        crate::logging::warn(&format!(
-                            "Resume id '{}' not found locally during reload handoff ({}); deferring resolution to the server instead of exiting",
-                            resume_id, e
-                        ));
-                        // Leave args.resume as the raw id for the server to resolve.
-                    }
-                    ResumeResolutionFailureAction::Exit => {
-                        eprintln!("Error: {}", e);
-                        if !output::quiet_enabled() {
-                            eprintln!("\nUse `jcode --resume` to list available sessions.");
-                        }
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// What to do when a `--resume <id>` cannot be resolved from the local session
-/// store. Extracted as a pure function so the reload-handoff recovery path can
-/// be unit-tested without invoking `std::process::exit` (issue #328).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResumeResolutionFailureAction {
-    /// Keep the raw id and let the shared server resolve it (reload handoff).
-    DeferToServer,
-    /// No live handoff in progress; the id is genuinely bad, so exit.
-    Exit,
-}
-
-fn resume_resolution_failure_action<F, V>(
-    _resume_id: &str,
-    var_os: F,
-) -> ResumeResolutionFailureAction
-where
-    F: Fn(&str) -> Option<V>,
-{
-    if var_os("JCODE_RESUMING").is_some() {
-        ResumeResolutionFailureAction::DeferToServer
-    } else {
-        ResumeResolutionFailureAction::Exit
-    }
-}
-
-fn resolve_resume_id(resume_id: &str) -> Result<String> {
-    match session::find_session_by_name_or_id(resume_id) {
-        Ok(full_id) => Ok(full_id),
-        Err(native_err) => match crate::import::import_external_resume_id(resume_id)? {
-            Some(imported_id) => Ok(imported_id),
-            None => Err(native_err),
-        },
-    }
-}
-
-fn map_memory_subcommand(subcmd: MemoryCommand) -> commands::MemorySubcommand {
-    match subcmd {
-        MemoryCommand::List { scope, tag } => commands::MemorySubcommand::List { scope, tag },
-        MemoryCommand::Search { query, semantic } => {
-            commands::MemorySubcommand::Search { query, semantic }
-        }
-        MemoryCommand::Export { output, scope } => {
-            commands::MemorySubcommand::Export { output, scope }
-        }
-        MemoryCommand::Import {
-            input,
-            scope,
-            overwrite,
-        } => commands::MemorySubcommand::Import {
-            input,
-            scope,
-            overwrite,
-        },
-        MemoryCommand::Stats => commands::MemorySubcommand::Stats,
-        MemoryCommand::ClearTest => commands::MemorySubcommand::ClearTest,
-    }
-}
-
-fn map_ambient_subcommand(subcmd: AmbientCommand) -> commands::AmbientSubcommand {
-    match subcmd {
-        AmbientCommand::Status => commands::AmbientSubcommand::Status,
-        AmbientCommand::Log => commands::AmbientSubcommand::Log,
-        AmbientCommand::Trigger => commands::AmbientSubcommand::Trigger,
-        AmbientCommand::Stop => commands::AmbientSubcommand::Stop,
-        AmbientCommand::RunVisible => commands::AmbientSubcommand::RunVisible,
-    }
-}
-
-fn map_cloud_subcommand(subcmd: CloudCommand) -> commands::CloudSubcommand {
-    match subcmd {
-        CloudCommand::Sessions { action } => {
-            commands::CloudSubcommand::Sessions(map_cloud_sessions_subcommand(action))
-        }
-    }
-}
-
-fn map_cloud_sessions_subcommand(
-    action: CloudSessionsCommand,
-) -> commands::CloudSessionsSubcommand {
-    match action {
-        CloudSessionsCommand::Configure {
-            api_base,
-            api_token,
-            api_token_env,
-            api_token_id,
-            user_id,
-            helper,
-            clear,
-        } => commands::CloudSessionsSubcommand::Configure {
-            api_base,
-            api_token,
-            api_token_env,
-            api_token_id,
-            user_id,
-            helper,
-            clear,
-        },
-        CloudSessionsCommand::Status { json } => commands::CloudSessionsSubcommand::Status { json },
-        CloudSessionsCommand::Upload {
-            session_file,
-            raw,
-            jade,
-        } => commands::CloudSessionsSubcommand::Upload {
-            session_file,
-            raw,
-            user_id: jade.user_id,
-            profile: jade.profile,
-            region: jade.region,
-            helper: jade.helper,
-        },
-        CloudSessionsCommand::UploadLatest {
-            sessions_dir,
-            raw,
-            jade,
-        } => commands::CloudSessionsSubcommand::UploadLatest {
-            sessions_dir,
-            raw,
-            user_id: jade.user_id,
-            profile: jade.profile,
-            region: jade.region,
-            helper: jade.helper,
-        },
-        CloudSessionsCommand::Sync {
-            sessions_dir,
-            since_days,
-            all,
-            max,
-            min_interval_mins,
-            raw,
-            dry_run,
-            force,
-            json,
-            jade,
-        } => commands::CloudSessionsSubcommand::Sync {
-            sessions_dir,
-            since_days,
-            all,
-            max,
-            min_interval_mins,
-            raw,
-            dry_run,
-            force,
-            json,
-            user_id: jade.user_id,
-            profile: jade.profile,
-            region: jade.region,
-            helper: jade.helper,
-        },
-        CloudSessionsCommand::List { limit, json, jade } => {
-            commands::CloudSessionsSubcommand::List {
-                limit,
-                json,
-                user_id: jade.user_id,
-                profile: jade.profile,
-                region: jade.region,
-                helper: jade.helper,
-            }
-        }
-        CloudSessionsCommand::Verify { session_id, jade } => {
-            commands::CloudSessionsSubcommand::Verify {
-                session_id,
-                user_id: jade.user_id,
-                profile: jade.profile,
-                region: jade.region,
-                helper: jade.helper,
-            }
-        }
-        CloudSessionsCommand::Dashboard {
-            limit,
-            output,
-            open,
-            with_view,
-            jade,
-        } => commands::CloudSessionsSubcommand::Dashboard {
-            limit,
-            output,
-            open,
-            with_view,
-            user_id: jade.user_id,
-            profile: jade.profile,
-            region: jade.region,
-            helper: jade.helper,
-        },
-        CloudSessionsCommand::View {
-            session_id,
-            format,
-            output,
-            open,
-            jade,
-        } => commands::CloudSessionsSubcommand::View {
-            session_id,
-            format: format.as_arg().to_string(),
-            output,
-            open,
-            user_id: jade.user_id,
-            profile: jade.profile,
-            region: jade.region,
-            helper: jade.helper,
-        },
-    }
-}
-
-fn map_transcript_mode(mode: TranscriptModeArg) -> crate::protocol::TranscriptMode {
-    match mode {
-        TranscriptModeArg::Insert => crate::protocol::TranscriptMode::Insert,
-        TranscriptModeArg::Append => crate::protocol::TranscriptMode::Append,
-        TranscriptModeArg::Replace => crate::protocol::TranscriptMode::Replace,
-        TranscriptModeArg::Send => crate::protocol::TranscriptMode::Send,
-    }
-}
+mod subcommand_mapping;
+use subcommand_mapping::*;
 
 async fn run_default_command(args: Args) -> Result<()> {
     startup_profile::mark("run_main_none_branch");
+    // The TUI's first frame reads the auth snapshot (welcome/onboarding gate).
+    // Probe it now on a side thread so it overlaps the setup work below.
+    crate::auth::AuthStatus::prewarm_fast_in_background();
 
     let explicit_provider_or_model = args.provider != ProviderChoice::Auto
         || args.model.is_some()
@@ -966,8 +747,25 @@ async fn run_default_command(args: Args) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let in_jcode_repo = build::is_jcode_repo(&cwd);
+    // A jcode checkout is discoverable from anywhere on this host: the
+    // compile-time manifest directory points at the source tree, and
+    // `JCODE_REPO_DIR` points at it for a published self-dev build. So the
+    // self-dev decision must NOT depend on the directory the session was
+    // opened from. Requiring the cwd to be the repo meant a session opened
+    // from a project directory silently ran as a normal session, even though
+    // the whole host is a self-dev checkout.
+    let selfdev_repo_available = build::get_repo_dir().is_some();
     startup_profile::mark("is_jcode_repo");
     let already_in_selfdev = crate::cli::selfdev::client_selfdev_requested();
+
+    // Record where the checkout is, so self-dev tooling in this session
+    // (build, reload, hot rebuild) finds the source tree instead of failing
+    // on a missing repository. Set it whenever a checkout is known, not only
+    // on the transition into self-dev: a resumed or already-self-dev session
+    // needs the same pointer.
+    if selfdev_repo_available && let Some(repo_dir) = build::get_repo_dir() {
+        crate::env::set_var("JCODE_REPO_DIR", &repo_dir);
+    }
 
     // Record where this interactive launch happened so the system-wide launch
     // hotkeys can reopen jcode in the last project directory (Cmd+') and the
@@ -978,7 +776,12 @@ async fn run_default_command(args: Args) -> Result<()> {
         setup_hints::record_launch_dirs(&cwd, repo_dir.as_deref());
     }
 
-    if in_jcode_repo && !already_in_selfdev && !args.no_selfdev {
+    if should_enable_selfdev(
+        in_jcode_repo,
+        selfdev_repo_available,
+        already_in_selfdev,
+        args.no_selfdev,
+    ) {
         output::stderr_info("📍 Detected jcode repository - enabling self-dev mode");
         output::stderr_info("   Using shared server with self-dev session mode");
         output::stderr_info("   (use --no-selfdev to disable auto-detection)");
@@ -1045,6 +848,12 @@ async fn run_default_command(args: Args) -> Result<()> {
         // can never disturb a running server.
         if server::reap_stale_socket_if_dead(&server::socket_path()).await {
             output::stderr_info("Removed a stale jcode socket from a previous server.");
+        }
+        // Dead servers leave their registry entries behind, the Windows analog
+        // of a stale socket file (issue #1887). Prune them before the spawn so
+        // this cannot race the new server's own registration.
+        if let Ok(mut registry) = crate::registry::ServerRegistry::load().await {
+            let _ = registry.cleanup_stale().await;
         }
 
         maybe_prompt_server_bootstrap_login(&args.provider).await?;
@@ -1197,6 +1006,18 @@ fn try_acquire_spawn_lock(path: &std::path::Path) -> Result<Option<SpawnLockGuar
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
 
+    // The client acquires this lock before the daemon creates its socket directory.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create JCode runtime directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -1336,11 +1157,121 @@ pub(crate) async fn spawn_server(
     spawn_server_with_executable(provider_choice, model, provider_profile, None).await
 }
 
+/// Lifecycle of a spawned `jcode serve` child.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ServerLifetime {
+    /// The long-lived shared daemon: survives this process and serves later
+    /// clients.
+    #[default]
+    Shared,
+    /// A server owned by this process: `jcode serve --temporary-server
+    /// --owner-pid <pid>` self-destructs once the owner exits, so a one-shot
+    /// run leaves no daemon behind.
+    OwnedByThisProcess,
+}
+
 async fn spawn_server_with_executable(
     provider_choice: &ProviderChoice,
     model: Option<&str>,
     provider_profile: Option<&str>,
     executable: Option<std::path::PathBuf>,
+) -> Result<()> {
+    spawn_server_with_lifetime(
+        provider_choice,
+        model,
+        provider_profile,
+        executable,
+        ServerLifetime::Shared,
+    )
+    .await
+}
+
+/// Start an ephemeral server owned by this process on the socket it dials.
+///
+/// Headless `jcode run` runs its agent in-process, so `--socket X` selects a
+/// path that nothing ever binds and the `swarm` tool has no server to talk to
+/// (issue #1748). This gives that run a server for as long as it lives: the
+/// child is marked `--temporary-server --owner-pid <our pid>`, so it shuts
+/// itself down within seconds of the run exiting.
+///
+/// The current executable is used deliberately instead of the shared-server
+/// update candidate: a run started from a locally built binary must be served
+/// by that same binary, or `--socket`-isolated self-dev checks would silently
+/// measure the installed build (see AGENTS.md, "Verifying a change at
+/// runtime").
+pub(crate) async fn spawn_owned_server(
+    provider_choice: &ProviderChoice,
+    model: Option<&str>,
+    provider_profile: Option<&str>,
+) -> Result<()> {
+    spawn_server_with_lifetime(
+        provider_choice,
+        model,
+        provider_profile,
+        std::env::current_exe().ok(),
+        ServerLifetime::OwnedByThisProcess,
+    )
+    .await
+}
+
+/// Let a headless one-shot `jcode run` start a server on demand.
+///
+/// `jcode run` hosts its agent in-process, so there is no server for tools
+/// that need one. Registering the spawner here (rather than at startup) keeps
+/// it to the `run` command: interactive and client launches already bootstrap
+/// a daemon through their own paths. Nothing is started by registering. The
+/// first tool that cannot reach a server triggers the spawn, so runs that never
+/// use `swarm` keep their current startup cost.
+///
+/// Which server gets started follows the dialed socket:
+///
+/// - Shared socket (no `--socket`): the long-lived daemon, exactly as
+///   `jcode server start` or a TUI launch would start it. An ephemeral server
+///   here would squat the path every later client uses and then vanish with
+///   this run.
+/// - Custom `--socket`: a server owned by this run. The caller asked for an
+///   isolated socket, so nobody else is waiting on it, and the run must not
+///   leave a daemon behind on a one-off path.
+fn register_on_demand_server_spawner_for_run(
+    provider_choice: ProviderChoice,
+    model: Option<String>,
+    provider_profile: Option<String>,
+) {
+    crate::server_spawn::register_on_demand_server_spawner(Box::new(move || {
+        let model = model.clone();
+        let provider_profile = provider_profile.clone();
+        Box::pin(async move {
+            let model = model.as_deref();
+            let provider_profile = provider_profile.as_deref();
+            if server::socket_path_is_custom() {
+                spawn_owned_server(&provider_choice, model, provider_profile).await
+            } else {
+                spawn_server(&provider_choice, model, provider_profile).await
+            }
+        })
+    }));
+}
+
+/// The `serve` subcommand argv for a spawned server of the given lifetime.
+///
+/// Split out so the contract with `Command::Serve` is testable without
+/// starting a process.
+fn serve_subcommand_args(lifetime: ServerLifetime, owner_pid: u32) -> Vec<String> {
+    let mut args = vec!["serve".to_string()];
+    if lifetime == ServerLifetime::OwnedByThisProcess {
+        args.push("--temporary-server".to_string());
+        args.push("--owner-pid".to_string());
+        args.push(owner_pid.to_string());
+    }
+    args
+}
+
+async fn spawn_server_with_lifetime(
+    provider_choice: &ProviderChoice,
+    model: Option<&str>,
+    provider_profile: Option<&str>,
+    executable: Option<std::path::PathBuf>,
+    lifetime: ServerLifetime,
 ) -> Result<()> {
     let socket_path = server::socket_path();
     if server_is_running_at(&socket_path).await {
@@ -1348,7 +1279,12 @@ async fn spawn_server_with_executable(
         return Ok(());
     }
 
-    if wait_for_existing_reload_server("server spawn").await {
+    // The reload marker describes the shared daemon's handoff. An owned server
+    // has no predecessor to wait for, and waiting on a marker written by the
+    // shared daemon would stall this run for the handoff timeout.
+    let awaits_reload_handoff = lifetime == ServerLifetime::Shared;
+
+    if awaits_reload_handoff && wait_for_existing_reload_server("server spawn").await {
         startup_profile::mark("server_ready");
         return Ok(());
     }
@@ -1361,13 +1297,19 @@ async fn spawn_server_with_executable(
         return Ok(());
     }
 
-    if wait_for_existing_reload_server("server spawn after lock").await {
+    if awaits_reload_handoff && wait_for_existing_reload_server("server spawn after lock").await {
         startup_profile::mark("server_ready");
         return Ok(());
     }
 
     startup_profile::mark("server_spawn_start");
-    output::stderr_info("Starting server...");
+    match lifetime {
+        ServerLifetime::Shared => output::stderr_info("Starting server..."),
+        ServerLifetime::OwnedByThisProcess => output::stderr_info(format!(
+            "Starting a temporary server on {} for this run...",
+            socket_path.display()
+        )),
+    }
     let client_requested_selfdev = selfdev::client_selfdev_requested();
     let exe = executable
         .or_else(|| {
@@ -1392,9 +1334,15 @@ async fn spawn_server_with_executable(
     if let Some(model) = model {
         cmd.arg("--model").arg(model);
     }
-    cmd.arg("serve")
+    cmd.args(serve_subcommand_args(lifetime, std::process::id()));
+    // The server must not share the client's console. A console's input mode
+    // belongs to the console, so a server sharing it also shares (and can
+    // reset) the client's input mode, and closing the client's terminal window
+    // kills the server with it. Measured 2026-11-10 on this host.
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    crate::platform::isolate_from_console(&mut cmd);
 
     #[cfg(unix)]
     {
@@ -1439,6 +1387,11 @@ async fn spawn_server_with_executable(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // A timed-out spawn must not leak the child. Dropping a
+        // `std::process::Child` does not terminate it, so the half-started
+        // daemon would stay alive as an orphan `jcode.exe` while the keepalive
+        // keeps producing new ones. Kill it before bailing.
+        let _ = child.kill();
         anyhow::bail!(
             "Timed out waiting for server to become ready at {} after {}ms",
             server::socket_path().display(),
@@ -1448,6 +1401,20 @@ async fn spawn_server_with_executable(
 
     #[cfg(unix)]
     Ok(())
+}
+
+/// True when the shared server accepts a fresh connection and answers a ping.
+///
+/// A Ping is a one-shot control request, so sending it over the held keepalive
+/// connection would make the server close that connection after replying.
+/// Probe through a short-lived client instead.
+async fn keepalive_server_answers_ping() -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut probe = server::Client::connect().await?;
+        probe.ping().await
+    })
+    .await
+    .is_ok_and(|result| result.unwrap_or(false))
 }
 
 async fn run_server_keepalive(
@@ -1467,6 +1434,11 @@ async fn run_server_keepalive(
     });
     let mut client: Option<server::Client> = None;
     let mut first_attempt = true;
+    let mut unhealthy_server_hold_skip = false;
+    // Consecutive failed spawns drive the retry delay. A daemon that cannot
+    // start used to be retried every second forever, and every attempt
+    // leaked a child process (see the timeout path in `spawn_server`).
+    let mut failed_spawns: u32 = 0;
 
     loop {
         let delay = if first_attempt {
@@ -1475,31 +1447,37 @@ async fn run_server_keepalive(
         } else if client.is_some() {
             std::time::Duration::from_secs(30)
         } else {
-            std::time::Duration::from_secs(1)
+            // 1s, 2s, 4s ... capped at 30s.
+            std::time::Duration::from_secs((1u64 << failed_spawns.min(5)).min(30))
         };
         tokio::select! {
             _ = &mut owner_closed => return Ok(()),
             _ = tokio::time::sleep(delay) => {
                 if client.is_some() {
-                    // A Ping is a one-shot control request, so sending it over
-                    // the held connection would make the server close that
-                    // connection after replying. Probe through a short-lived
-                    // client instead and leave the counted keepalive connected.
-                    let healthy = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        async {
-                            let mut probe = server::Client::connect().await?;
-                            probe.ping().await
-                        },
-                    )
-                    .await
-                    .is_ok_and(|result| result.unwrap_or(false));
-                    if healthy {
+                    if keepalive_server_answers_ping().await {
                         continue;
                     }
+                    // Release the hold before anything else. A server that has
+                    // a listener but no longer answers must not be pinned: the
+                    // held connection is what kept such zombies alive for days
+                    // (issue #1887). Without it the server's idle exit can run.
                     client = None;
+                    unhealthy_server_hold_skip = true;
                 }
-                if spawn_server(provider_choice, model, provider_profile).await.is_ok()
+                if !server::has_live_listener(&server::socket_path()).await {
+                    unhealthy_server_hold_skip = false;
+                    if spawn_server(provider_choice, model, provider_profile).await.is_err() {
+                        failed_spawns = failed_spawns.saturating_add(1);
+                        continue;
+                    }
+                    failed_spawns = 0;
+                } else if unhealthy_server_hold_skip {
+                    // Give the unresponsive server one full interval with no
+                    // hold so it can idle-exit before we probe it again.
+                    unhealthy_server_hold_skip = false;
+                    continue;
+                }
+                if keepalive_server_answers_ping().await
                     && let Ok(connected) = server::Client::connect().await
                 {
                     client = Some(connected);
@@ -1507,6 +1485,30 @@ async fn run_server_keepalive(
             }
         }
     }
+}
+
+/// Decide whether this session must run in self-dev mode.
+///
+/// The session directory is NOT the deciding factor. A checkout is
+/// discoverable from anywhere on this host (compile-time manifest path, or
+/// `JCODE_REPO_DIR` for a published self-dev build), so a session opened
+/// from an unrelated project directory still has to run self-dev. The old
+/// `is_jcode_repo(cwd)`-only rule silently ran such sessions as normal
+/// sessions.
+///
+/// `repo_available` is `build::get_repo_dir().is_some()`: a checkout was
+/// found. `in_jcode_repo` is `build::is_jcode_repo(cwd)`: the session was
+/// opened inside the checkout itself.
+fn should_enable_selfdev(
+    in_jcode_repo: bool,
+    repo_available: bool,
+    already_in_selfdev: bool,
+    no_selfdev: bool,
+) -> bool {
+    if no_selfdev || already_in_selfdev {
+        return false;
+    }
+    in_jcode_repo || repo_available
 }
 
 #[cfg(test)]

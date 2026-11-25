@@ -29,6 +29,54 @@ mod concurrency;
 
 struct MockProvider;
 
+#[tokio::test]
+async fn user_response_capability_does_not_block_busy_attachment() {
+    let _env = crate::storage::lock_test_env();
+    let agent = Arc::new(Mutex::new(Agent::new(
+        Arc::new(MockProvider),
+        Registry::empty(),
+    )));
+    let busy = agent.lock().await;
+    let registry = busy.registry();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        super::apply_or_defer_desktop_response_capability(&agent, true),
+    )
+    .await
+    .expect("busy attachment must not wait for the running turn");
+    assert!(
+        !registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|n| n == "user_response")
+    );
+    drop(busy);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if registry
+                .tool_names()
+                .await
+                .iter()
+                .any(|n| n == "user_response")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("capability applied after the turn releases the lock");
+    super::apply_or_defer_desktop_response_capability(&agent, false).await;
+    assert!(
+        !registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|n| n == "user_response")
+    );
+}
+
 struct IdlePrewarmProvider(Arc<tokio::sync::Notify>, bool);
 
 #[async_trait]
@@ -281,104 +329,174 @@ async fn collect_events_until_done(
     events
 }
 
+use crate::server::client_disconnect_grace_test_pause::Pause as SuccessorRacePause;
+
 #[tokio::test]
-async fn live_target_claim_is_atomic_with_detached_source_cleanup() {
+async fn successor_claim_in_window_keeps_detached_source_registered() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider.clone()).await;
+    let target_id = "session_window_target";
+    let source_id = "session_window_source";
+    let target_agent = Arc::new(Mutex::new(build_test_agent_with_id(
+        provider.clone(),
+        registry.clone(),
+        target_id,
+        Vec::new(),
+    )));
+    let source_agent = Arc::new(Mutex::new(build_test_agent_with_id(
+        provider.clone(),
+        registry.clone(),
+        source_id,
+        Vec::new(),
+    )));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([
+            (target_id.to_string(), Arc::clone(&target_agent)),
+            (source_id.to_string(), Arc::clone(&source_agent)),
+        ]),
+    ));
+    // Only the cleanup connection owns the source. Any other owner would make
+    // the cheap pre-filter return early, before the window under test.
+    let (cleanup_tx, _cleanup_rx) = mpsc::unbounded_channel();
+    let connections = Arc::new(RwLock::new(HashMap::from([(
+        "cleanup".to_string(),
+        ClientConnectionInfo {
+            client_id: "cleanup".to_string(),
+            session_id: source_id.to_string(),
+            client_instance_id: None,
+            debug_client_id: None,
+            connected_at: Instant::now(),
+            last_seen: Instant::now(),
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx: cleanup_tx,
+        },
+    )])));
 
-    for iteration in 0..32 {
-        let target_id = format!("session_atomic_target_{iteration}");
-        let source_id = format!("session_atomic_source_{iteration}");
-        let target_agent = Arc::new(Mutex::new(build_test_agent_with_id(
-            provider.clone(),
-            registry.clone(),
-            &target_id,
-            Vec::new(),
-        )));
-        let source_agent = Arc::new(Mutex::new(build_test_agent_with_id(
-            provider.clone(),
-            registry.clone(),
-            &source_id,
-            Vec::new(),
-        )));
-        let sessions = Arc::new(RwLock::new(HashMap::from([(
-            target_id.clone(),
-            Arc::clone(&target_agent),
-        )])));
-        let now = Instant::now();
-        let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
-        let connections = Arc::new(RwLock::new(HashMap::from([(
-            "incoming".to_string(),
-            ClientConnectionInfo {
-                client_id: "incoming".to_string(),
-                session_id: source_id,
-                client_instance_id: None,
-                debug_client_id: None,
-                connected_at: now,
-                last_seen: now,
-                is_processing: false,
-                current_tool_name: None,
-                terminal_env: Vec::new(),
-                disconnect_tx,
-            },
-        )])));
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let pause = SuccessorRacePause::new();
+    crate::server::client_disconnect_grace_test_pause::register(source_id, pause.clone());
+    let cleanup = {
+        let sessions = Arc::clone(&sessions);
+        let connections = Arc::clone(&connections);
+        let source_agent = Arc::clone(&source_agent);
+        tokio::spawn(async move {
+            remove_detached_source_if_unclaimed(
+                source_id,
+                "cleanup",
+                &source_agent,
+                &sessions,
+                &connections,
+            )
+            .await
+        })
+    };
 
-        let claim = {
-            let barrier = Arc::clone(&barrier);
-            let sessions = Arc::clone(&sessions);
-            let connections = Arc::clone(&connections);
-            let source_agent = Arc::clone(&source_agent);
-            let target_id = target_id.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                claim_live_target_agent(
-                    &target_id,
-                    "incoming",
-                    Some("instance-a"),
-                    &source_agent,
-                    &sessions,
-                    &connections,
-                )
-                .await
-                .is_some()
-            })
-        };
-        let cleanup = {
-            let barrier = Arc::clone(&barrier);
-            let sessions = Arc::clone(&sessions);
-            let connections = Arc::clone(&connections);
-            let target_agent = Arc::clone(&target_agent);
-            let target_id = target_id.clone();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                remove_detached_source_if_unclaimed(
-                    &target_id,
-                    "cleanup",
-                    &target_agent,
-                    &sessions,
-                    &connections,
-                )
-                .await
-            })
-        };
+    // Cleanup has done its cheap registry read (no other owner) and is about to
+    // take the claim gate. A real successor claims in exactly this window, through
+    // the production claim path (`claim_live_target_agent`), not a bare write.
+    pause.reached().await;
+    // `claim_live_target_agent` claims through an existing connection record, so
+    // register this successor's transport first, exactly as a real reconnect does.
+    connections.write().await.insert(
+        "successor".to_string(),
+        ClientConnectionInfo {
+            client_id: "successor".to_string(),
+            session_id: target_id.to_string(),
+            client_instance_id: None,
+            debug_client_id: None,
+            connected_at: Instant::now(),
+            last_seen: Instant::now(),
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx: mpsc::unbounded_channel().0,
+        },
+    );
+    let claimed = claim_live_target_agent(
+        source_id,
+        "successor",
+        None,
+        &source_agent,
+        &sessions,
+        &connections,
+    )
+    .await
+    .expect("live target must be claimable");
+    assert!(Arc::ptr_eq(&claimed, &source_agent));
+    // The claim rewrites the record onto the target session; drop the pre-claim
+    // transport entry for the temporary session so only the claim owns it.
+    assert_eq!(
+        connections
+            .read()
+            .await
+            .get("successor")
+            .map(|info| info.session_id.as_str()),
+        Some(source_id),
+        "the claim must publish the successor onto the source session"
+    );
 
-        barrier.wait().await;
-        let claimed = claim.await.expect("claim task should complete");
-        let removed = cleanup.await.expect("cleanup task should complete");
-        assert_ne!(claimed, removed, "exactly one transition must win");
-        assert_eq!(
-            sessions.read().await.contains_key(&target_id),
-            claimed,
-            "a successful claim must keep its target registered"
-        );
-        if claimed {
-            let connections = connections.read().await;
-            let incoming = connections.get("incoming").expect("incoming connection");
-            assert_eq!(incoming.session_id, target_id);
-            assert_eq!(incoming.client_instance_id.as_deref(), Some("instance-a"));
-        }
-    }
+    pause.release();
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+        .await
+        .expect("cleanup must finish")
+        .expect("cleanup task panicked");
+    assert!(
+        !removed,
+        "a source claimed in the check/removal window must not be removed"
+    );
+    assert!(
+        sessions.read().await.contains_key(source_id),
+        "the claimed source must stay registered"
+    );
+    crate::server::client_disconnect_grace_test_pause::forget(source_id);
+}
+
+/// Negative control for the same window: with no claim in flight, the detached
+/// source is removed. Without this, "cleanup always fails to remove" would
+/// satisfy the test above for the wrong reason.
+#[tokio::test]
+async fn detached_source_removal_still_runs_without_a_claim() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let source_id = "session_detached_source";
+    let source_agent = Arc::new(Mutex::new(build_test_agent_with_id(
+        provider.clone(),
+        registry.clone(),
+        source_id,
+        Vec::new(),
+    )));
+    let sessions = Arc::new(crate::server::session_manager::SessionManager::from_agents(
+        HashMap::from([(source_id.to_string(), Arc::clone(&source_agent))]),
+    ));
+    let now = Instant::now();
+    let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+    let connections = Arc::new(RwLock::new(HashMap::from([(
+        "cleanup".to_string(),
+        ClientConnectionInfo {
+            client_id: "cleanup".to_string(),
+            session_id: source_id.to_string(),
+            client_instance_id: None,
+            debug_client_id: None,
+            connected_at: now,
+            last_seen: now,
+            is_processing: false,
+            current_tool_name: None,
+            terminal_env: Vec::new(),
+            disconnect_tx,
+        },
+    )])));
+
+    let removed = remove_detached_source_if_unclaimed(
+        source_id,
+        "cleanup",
+        &source_agent,
+        &sessions,
+        &connections,
+    )
+    .await;
+    assert!(removed, "an unclaimed detached source must be removed");
+    assert!(!sessions.read().await.contains_key(source_id));
 }
 
 /// Issue #481: a subscribe cwd that is merely absolute is not enough. A client
@@ -515,3 +633,5 @@ mod clear_tests;
 mod reload_tests;
 #[path = "client_session_tests/resume.rs"]
 mod resume_tests;
+#[path = "client_session_tests/swarm_attribution.rs"]
+mod swarm_attribution_tests;

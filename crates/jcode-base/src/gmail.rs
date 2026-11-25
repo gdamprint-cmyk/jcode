@@ -171,7 +171,7 @@ impl GmailClient {
     /// Whether this backend has credentials available to talk to Gmail.
     pub fn is_configured(&self) -> bool {
         match &self.backend {
-            GmailBackend::Direct => google::has_tokens(),
+            GmailBackend::Direct => google::has_service(google::GoogleService::Gmail),
             GmailBackend::Composio(cfg) => !cfg.api_key.is_empty(),
         }
     }
@@ -203,7 +203,9 @@ impl GmailClient {
     pub fn not_configured_message(&self) -> &'static str {
         match &self.backend {
             GmailBackend::Direct => {
-                "Gmail is not configured. Run `jcode login google` to set up Gmail access."
+                "Gmail is not configured. Offer to set it up: follow jcode_docs \
+                 docs/GOOGLE_GUIDED_SETUP.md (you can drive the Google Cloud Console in the \
+                 user's browser), or have the user run `jcode login google`."
             }
             GmailBackend::Composio(_) => {
                 "Gmail (Composio backend) is not configured. Set COMPOSIO_API_KEY and connect your \
@@ -249,7 +251,7 @@ impl GmailClient {
 
         let link = self.create_link(cfg, &auth_config_id, &user_id).await?;
         if open_browser {
-            let _ = open::that(&link.redirect_url);
+            let _ = crate::companion_client::open_url(&link.redirect_url);
         }
         eprintln!(
             "\nOpening Gmail authorization in your browser. If it did not open, visit:\n{}\n",
@@ -292,13 +294,14 @@ impl GmailClient {
             "auth_config_id": auth_config_id,
             "user_id": user_id,
         });
-        let resp = self
+        let req = self
             .http
             .post(&endpoint)
             .header("x-api-key", &cfg.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+            .json(&payload);
+        // JSON serialization is eager, so only the request bytes need survive the await.
+        drop(payload);
+        let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -399,6 +402,7 @@ impl GmailClient {
         if let Some(ref b) = body {
             req = req.json(b);
         }
+        drop(body);
         let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -424,13 +428,14 @@ impl GmailClient {
     ) -> Result<Value> {
         let payload = build_composio_proxy_payload(cfg, method.as_str(), url, body);
         let endpoint = format!("{}/tools/execute/proxy", cfg.base_url.trim_end_matches('/'));
-        let resp = self
+        let req = self
             .http
             .post(&endpoint)
             .header("x-api-key", &cfg.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+            .json(&payload);
+        // JSON serialization is eager, so only the request bytes need survive the await.
+        drop(payload);
+        let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -440,7 +445,7 @@ impl GmailClient {
                 truncate_error(&text)
             ));
         }
-        let envelope: Value = serde_json::from_str(&text)?;
+        let mut envelope: Value = serde_json::from_str(&text)?;
         // Composio wraps the upstream response as { data, status, headers }.
         if let Some(inner) = envelope.get("status").and_then(|s| s.as_u64())
             && inner >= 400
@@ -462,7 +467,10 @@ impl GmailClient {
                 truncate_error(&err.to_string())
             ));
         }
-        Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
+        Ok(envelope
+            .get_mut("data")
+            .map(Value::take)
+            .unwrap_or(Value::Null))
     }
 
     pub async fn list_messages(
@@ -536,8 +544,15 @@ impl GmailClient {
         in_reply_to: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<Draft> {
-        self.create_draft_with_attachments(to, subject, body, in_reply_to, thread_id, &[])
-            .await
+        self.create_draft_with_attachments(
+            &Recipients::to(to),
+            subject,
+            body,
+            in_reply_to,
+            thread_id,
+            &[],
+        )
+        .await
     }
 
     /// Create a draft, optionally with file attachments. When `attachments` is
@@ -546,7 +561,7 @@ impl GmailClient {
     /// base64-encoded.
     pub async fn create_draft_with_attachments(
         &self,
-        to: &str,
+        recipients: &Recipients<'_>,
         subject: &str,
         body: &str,
         in_reply_to: Option<&str>,
@@ -555,7 +570,7 @@ impl GmailClient {
     ) -> Result<Draft> {
         let url = format!("{}/drafts", GMAIL_API_BASE);
 
-        let raw = build_raw_mime(to, subject, body, in_reply_to, attachments)?;
+        let raw = build_raw_mime(recipients, subject, body, in_reply_to, attachments)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
 
         let mut message = json!({ "raw": encoded });
@@ -581,6 +596,60 @@ impl GmailClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// List drafts, newest first, returning lightweight refs.
+    pub async fn list_drafts(&self, max_results: u32) -> Result<Vec<Draft>> {
+        let url = format!("{}/drafts?maxResults={}", GMAIL_API_BASE, max_results);
+        #[derive(Deserialize)]
+        struct DraftList {
+            drafts: Option<Vec<Draft>>,
+        }
+        let value = self.request(reqwest::Method::GET, &url, None).await?;
+        let list: DraftList = serde_json::from_value(value)?;
+        Ok(list.drafts.unwrap_or_default())
+    }
+
+    /// Fetch a single draft including its full message (headers + body).
+    pub async fn get_draft(&self, draft_id: &str) -> Result<DraftFull> {
+        let url = format!("{}/drafts/{}?format=full", GMAIL_API_BASE, draft_id);
+        let value = self.request(reqwest::Method::GET, &url, None).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Replace a draft's content in place. Gmail drafts are immutable
+    /// messages under a stable draft ID, so updating means PUTting a full new
+    /// message; the draft ID stays the same.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_draft(
+        &self,
+        draft_id: &str,
+        recipients: &Recipients<'_>,
+        subject: &str,
+        body: &str,
+        in_reply_to: Option<&str>,
+        thread_id: Option<&str>,
+        attachments: &[std::path::PathBuf],
+    ) -> Result<Draft> {
+        let url = format!("{}/drafts/{}", GMAIL_API_BASE, draft_id);
+        let raw = build_raw_mime(recipients, subject, body, in_reply_to, attachments)?;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+        let mut message = json!({ "raw": encoded });
+        if let Some(tid) = thread_id {
+            message["threadId"] = Value::String(tid.to_string());
+        }
+        let payload = json!({ "id": draft_id, "message": message });
+        let value = self
+            .request(reqwest::Method::PUT, &url, Some(payload))
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Permanently delete a draft (drafts do not go to Trash).
+    pub async fn delete_draft(&self, draft_id: &str) -> Result<()> {
+        let url = format!("{}/drafts/{}", GMAIL_API_BASE, draft_id);
+        self.request(reqwest::Method::DELETE, &url, None).await?;
+        Ok(())
+    }
+
     pub async fn send_message(
         &self,
         to: &str,
@@ -589,8 +658,15 @@ impl GmailClient {
         in_reply_to: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<Message> {
-        self.send_message_with_attachments(to, subject, body, in_reply_to, thread_id, &[])
-            .await
+        self.send_message_with_attachments(
+            &Recipients::to(to),
+            subject,
+            body,
+            in_reply_to,
+            thread_id,
+            &[],
+        )
+        .await
     }
 
     /// Send a message, optionally with file attachments. When `attachments` is
@@ -599,7 +675,7 @@ impl GmailClient {
     /// base64-encoded.
     pub async fn send_message_with_attachments(
         &self,
-        to: &str,
+        recipients: &Recipients<'_>,
         subject: &str,
         body: &str,
         in_reply_to: Option<&str>,
@@ -608,7 +684,7 @@ impl GmailClient {
     ) -> Result<Message> {
         let url = format!("{}/messages/send", GMAIL_API_BASE);
 
-        let raw = build_raw_mime(to, subject, body, in_reply_to, attachments)?;
+        let raw = build_raw_mime(recipients, subject, body, in_reply_to, attachments)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
 
         let mut message = json!({ "raw": encoded });
@@ -645,147 +721,50 @@ impl GmailClient {
     }
 }
 
-/// Build a raw RFC 5322 message, optionally `multipart/mixed` with file
-/// attachments. Returns the full message including headers, suitable for
-/// base64url-encoding into the Gmail API `raw` field.
-fn build_raw_mime(
-    to: &str,
-    subject: &str,
-    body: &str,
-    in_reply_to: Option<&str>,
-    attachments: &[std::path::PathBuf],
-) -> Result<String> {
-    let subject = encode_header_value(subject);
-    let mut reply_headers = String::new();
-    if let Some(reply_to) = in_reply_to {
-        // The In-Reply-To/References headers require an RFC 5322 Message-ID in
-        // angle brackets. Callers should already have resolved Gmail API IDs.
-        let reply_to = if reply_to.starts_with('<') {
-            reply_to.to_string()
-        } else {
-            format!("<{}>", reply_to)
-        };
-        reply_headers.push_str(&format!(
-            "In-Reply-To: {}\r\nReferences: {}\r\n",
-            reply_to, reply_to
-        ));
-    }
-
-    if attachments.is_empty() {
-        return Ok(format!(
-            "To: {}\r\nSubject: {}\r\n{}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}",
-            to, subject, reply_headers, body
-        ));
-    }
-
-    let boundary = format!(
-        "jcode_boundary_{}",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    );
-    let mut raw = format!(
-        "To: {}\r\nSubject: {}\r\n{}MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n",
-        to, subject, reply_headers, boundary
-    );
-
-    // Body part.
-    raw.push_str(&format!("--{}\r\n", boundary));
-    raw.push_str(
-        "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n",
-    );
-    raw.push_str(body);
-    raw.push_str("\r\n");
-
-    // Attachment parts.
-    for path in attachments {
-        let data = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read attachment {}: {}", path.display(), e))?;
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("attachment");
-        let mime_type = guess_mime_type(path);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-
-        raw.push_str(&format!("--{}\r\n", boundary));
-        raw.push_str(&format!(
-            "Content-Type: {}; name=\"{}\"\r\n",
-            mime_type, file_name
-        ));
-        raw.push_str("Content-Transfer-Encoding: base64\r\n");
-        raw.push_str(&format!(
-            "Content-Disposition: attachment; filename=\"{}\"\r\n\r\n",
-            file_name
-        ));
-        // Wrap base64 at 76 chars per RFC 2045.
-        for chunk in encoded.as_bytes().chunks(76) {
-            raw.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-            raw.push_str("\r\n");
-        }
-    }
-
-    raw.push_str(&format!("--{}--\r\n", boundary));
-    Ok(raw)
-}
-
-/// RFC 2047 encode a header value when it contains non-ASCII text.
+/// Recipient headers for an outgoing message or draft. Each field is a
+/// comma-separated address list as it should appear in the header.
 ///
-/// Gmail stores the `raw` payload verbatim, so a bare UTF-8 subject line gets
-/// reinterpreted as Latin-1 by receiving clients (mojibake like "Ã¢Â€Â”") and
-/// defeats Gmail's subject-based fallback threading. Encoded words are chunked
-/// so each stays within the RFC 2047 limit of 75 characters.
-fn encode_header_value(value: &str) -> String {
-    if value.is_ascii() {
-        return value.to_string();
-    }
-    // 45 input bytes -> 60 base64 chars -> 72 chars with the =?UTF-8?B?...?=
-    // wrapper, under the 75-char encoded-word limit.
-    const MAX_CHUNK_BYTES: usize = 45;
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for ch in value.chars() {
-        if current.len() + ch.len_utf8() > MAX_CHUNK_BYTES && !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
+/// Gmail reads the `Bcc` header from the raw message to decide delivery and
+/// strips it from the copies other recipients receive, while keeping it on
+/// the sender's own copy (and on drafts), so writing it into the MIME is the
+/// supported way to Bcc through the API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recipients<'a> {
+    pub to: &'a str,
+    pub cc: Option<&'a str>,
+    pub bcc: Option<&'a str>,
+}
+
+impl<'a> Recipients<'a> {
+    pub fn to(to: &'a str) -> Self {
+        Self {
+            to,
+            cc: None,
+            bcc: None,
         }
-        current.push(ch);
     }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-        .iter()
-        .map(|chunk| {
-            format!(
-                "=?UTF-8?B?{}?=",
-                base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes())
-            )
-        })
-        .collect::<Vec<_>>()
-        // Folding whitespace between encoded words is not rendered.
-        .join("\r\n ")
-}
 
-/// Best-effort MIME type from a file extension for email attachments.
-fn guess_mime_type(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("pdf") => "application/pdf",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("txt") | Some("md") => "text/plain",
-        Some("csv") => "text/csv",
-        Some("json") => "application/json",
-        Some("zip") => "application/zip",
-        Some("doc") => "application/msword",
-        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        _ => "application/octet-stream",
+    /// Render the address headers, skipping empty Cc/Bcc lists.
+    fn header_lines(&self) -> Result<String> {
+        let mut out = String::new();
+        for (name, value) in [("To", Some(self.to)), ("Cc", self.cc), ("Bcc", self.bcc)] {
+            let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            // A raw CR/LF would let a value inject arbitrary extra headers.
+            if value.contains(['\r', '\n']) {
+                anyhow::bail!("{} header must not contain line breaks", name);
+            }
+            out.push_str(&format!("{}: {}\r\n", name, value));
+        }
+        Ok(out)
     }
 }
-
+#[path = "gmail/mime_helpers.rs"]
+mod mime_helpers;
+use mime_helpers::build_raw_mime;
+#[cfg(test)]
+use mime_helpers::encode_header_value;
 /// Build the request body for Composio's `proxy-execute` endpoint, which makes
 /// an authenticated HTTP call to the connected toolkit (Gmail) on our behalf.
 fn build_composio_proxy_payload(
@@ -1034,68 +1013,18 @@ pub struct Draft {
     pub message: Option<MessageRef>,
 }
 
-pub fn format_message_summary(msg: &Message) -> String {
-    let from = msg.from().unwrap_or("(unknown)");
-    let subject = msg.subject().unwrap_or("(no subject)");
-    let date = msg.date().unwrap_or("");
-    let snippet = msg.snippet.as_deref().unwrap_or("");
-    let labels = msg
-        .label_ids
-        .as_ref()
-        .map(|l| l.join(", "))
-        .unwrap_or_default();
-
-    format!(
-        "From: {}\nSubject: {}\nDate: {}\nLabels: {}\nSnippet: {}\nID: {}",
-        from, subject, date, labels, snippet, msg.id
-    )
+/// A draft fetched with its full message, used to merge partial updates.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DraftFull {
+    pub id: String,
+    pub message: Option<Message>,
 }
 
-pub fn format_message_full(msg: &Message) -> String {
-    let mut out = format_message_summary(msg);
-    let attachments = msg.attachments();
-    if !attachments.is_empty() {
-        out.push_str(&format!("\nAttachments ({}):\n", attachments.len()));
-        out.push_str(&format_attachment_lines(&attachments));
-    }
-    if let Some(body) = msg.body_text() {
-        out.push_str("\n\n--- Body ---\n");
-        out.push_str(&body);
-    }
-    out
-}
-
-/// One "  - name (mime, size)" line per attachment.
-pub fn format_attachment_lines(attachments: &[AttachmentInfo]) -> String {
-    attachments
-        .iter()
-        .map(|a| {
-            let mut details = Vec::new();
-            if let Some(ref mime) = a.mime_type {
-                details.push(mime.clone());
-            }
-            if let Some(size) = a.size {
-                details.push(format_size(size));
-            }
-            if details.is_empty() {
-                format!("  - {}", a.filename)
-            } else {
-                format!("  - {} ({})", a.filename, details.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn format_size(bytes: u32) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
+#[path = "gmail/message_formatting.rs"]
+mod message_formatting;
+pub use message_formatting::{
+    format_attachment_lines, format_message_full, format_message_summary, format_recipient_lines,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1109,6 +1038,181 @@ mod tests {
             user_id: Some("me".to_string()),
             auth_config_id: Some("ac_123".to_string()),
         }
+    }
+
+    // Explicit dummy credentials and a proxy-free client keep these tests entirely local.
+    async fn loopback_composio(
+        status: u16,
+        response: &str,
+        path: &'static str,
+        expected: Value,
+    ) -> (GmailClient, ComposioConfig, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = cfg();
+        config.base_url = format!("http://{}/api/v3.1/", listener.local_addr().unwrap());
+        let client = GmailClient {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            backend: GmailBackend::Composio(config.clone()),
+        };
+        let response = response.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (headers_end, content_length) = loop {
+                let mut buf = [0; 4096];
+                let read = stream.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < headers_end + content_length {
+                let mut buf = [0; 4096];
+                let read = stream.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                format!("POST {path} HTTP/1.1")
+            );
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("\r\nx-api-key: test-key\r\n"));
+            assert!(headers.contains("\r\ncontent-type: application/json\r\n"));
+            assert!(!headers.contains("authorization:"));
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &request[headers_end..headers_end + content_length]
+                )
+                .unwrap(),
+                expected
+            );
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (client, config, server)
+    }
+
+    #[tokio::test]
+    async fn composio_loopback_proxy_data_variants_and_exact_requests() {
+        let url = "https://gmail.invalid/messages?maxResults=10&q=a%20b";
+        for (envelope, expected) in [
+            (
+                json!({"status":200,"data":{"messages":[{"id":"m1"}]}}),
+                json!({"messages":[{"id":"m1"}]}),
+            ),
+            (
+                json!({"data":[1, {"nested":true}]}),
+                json!([1, {"nested":true}]),
+            ),
+            (json!({"data":"text","error":null}), json!("text")),
+            (json!({"data":false}), json!(false)),
+            (json!({"data":42}), json!(42)),
+            (json!({"data":null}), Value::Null),
+            (json!({"status":204}), Value::Null),
+            (json!(null), Value::Null),
+            (json!([]), Value::Null),
+        ] {
+            for body in [None, Some(json!({"nested":{"items":[1,2,3]}}))] {
+                let method = if body.is_some() {
+                    reqwest::Method::POST
+                } else {
+                    reqwest::Method::GET
+                };
+                let mut request = json!({"endpoint":url,"method":method.as_str(),"connected_account_id":"ca_123","user_id":"me"});
+                if let Some(body) = &body {
+                    request["body"] = body.clone();
+                }
+                let (client, config, server) = loopback_composio(
+                    200,
+                    &envelope.to_string(),
+                    "/api/v3.1/tools/execute/proxy",
+                    request,
+                )
+                .await;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.request_composio(&config, method, url, body),
+                )
+                .await
+                .unwrap();
+                server.await.unwrap();
+                assert_eq!(result.unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn composio_loopback_proxy_errors_preserve_precedence() {
+        for (status, response, expected) in [
+            (
+                503,
+                "unavailable",
+                "Composio proxy error 503 Service Unavailable: unavailable",
+            ),
+            (
+                200,
+                r#"{"status":404,"data":{"reason":"missing"},"error":"secondary"}"#,
+                r#"Gmail API error 404 (via Composio): {"reason":"missing"}"#,
+            ),
+            (
+                200,
+                r#"{"status":400}"#,
+                "Gmail API error 400 (via Composio): ",
+            ),
+            (
+                200,
+                r#"{"error":{"reason":"denied"}}"#,
+                r#"Composio error: {"reason":"denied"}"#,
+            ),
+            (200, r#"{"error":false}"#, "Composio error: false"),
+            (200, r#"{"error":""}"#, "Composio error: \"\""),
+        ] {
+            let (client, config, server) = loopback_composio(status, response, "/api/v3.1/tools/execute/proxy", json!({"endpoint":"https://gmail.invalid/labels","method":"GET","connected_account_id":"ca_123","user_id":"me"})).await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.request_composio(
+                    &config,
+                    reqwest::Method::GET,
+                    "https://gmail.invalid/labels",
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(result.unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn composio_loopback_create_link_exact_request() {
+        let (client, config, server) = loopback_composio(200, r#"{"redirect_url":"https://example.invalid/consent","connected_account_id":"ca_dummy"}"#, "/api/v3.1/connected_accounts/link", json!({"auth_config_id":"ac_dummy","user_id":"dummy-user"})).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.create_link(&config, "ac_dummy", "dummy-user"),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let link = result.unwrap();
+        assert_eq!(link.redirect_url, "https://example.invalid/consent");
+        assert_eq!(link.connected_account_id, "ca_dummy");
     }
 
     #[test]
@@ -1300,7 +1404,7 @@ mod mime_tests {
     #[test]
     fn reply_headers_use_angle_bracketed_message_id() {
         let raw = build_raw_mime(
-            "a@b.c",
+            &Recipients::to("a@b.c"),
             "Re: hi",
             "body",
             Some("CAOU+8LMfxVaPMmigYAtdJK0z0Y@mail.gmail.com"),
@@ -1310,7 +1414,14 @@ mod mime_tests {
         assert!(raw.contains("In-Reply-To: <CAOU+8LMfxVaPMmigYAtdJK0z0Y@mail.gmail.com>"));
         assert!(raw.contains("References: <CAOU+8LMfxVaPMmigYAtdJK0z0Y@mail.gmail.com>"));
         // Already-bracketed IDs are not double wrapped.
-        let raw2 = build_raw_mime("a@b.c", "Re: hi", "body", Some("<x@y.z>"), &[]).unwrap();
+        let raw2 = build_raw_mime(
+            &Recipients::to("a@b.c"),
+            "Re: hi",
+            "body",
+            Some("<x@y.z>"),
+            &[],
+        )
+        .unwrap();
         assert!(raw2.contains("In-Reply-To: <x@y.z>"));
         assert!(!raw2.contains("<<"));
     }
@@ -1318,7 +1429,7 @@ mod mime_tests {
     #[test]
     fn utf8_subject_in_raw_mime_is_ascii_only() {
         let raw = build_raw_mime(
-            "a@b.c",
+            &Recipients::to("a@b.c"),
             "caf\u{e9} \u{2014} r\u{e9}sum\u{e9}",
             "body",
             None,
@@ -1327,5 +1438,66 @@ mod mime_tests {
         .unwrap();
         let subject_line = raw.lines().find(|l| l.starts_with("Subject:")).unwrap();
         assert!(subject_line.is_ascii(), "subject header leaked raw UTF-8");
+    }
+
+    #[test]
+    fn cc_and_bcc_headers_are_written_when_present() {
+        let recipients = Recipients {
+            to: "david@hey.com",
+            cc: Some("cc@x.y"),
+            bcc: Some("bflora@ycombinator.com, other@x.y"),
+        };
+        let raw = build_raw_mime(&recipients, "Re: intro", "body", None, &[]).unwrap();
+        let headers = raw.split("\r\n\r\n").next().unwrap();
+        assert!(headers.contains("To: david@hey.com\r\n"));
+        assert!(headers.contains("Cc: cc@x.y\r\n"));
+        assert!(headers.contains("Bcc: bflora@ycombinator.com, other@x.y\r\n"));
+
+        // Multipart messages carry the same address headers.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+        let raw = build_raw_mime(&recipients, "s", "b", None, &[file]).unwrap();
+        let headers = raw.split("\r\n\r\n").next().unwrap();
+        assert!(headers.contains("Bcc: bflora@ycombinator.com, other@x.y\r\n"));
+    }
+
+    #[test]
+    fn empty_cc_and_bcc_are_omitted() {
+        let recipients = Recipients {
+            to: "a@b.c",
+            cc: Some("  "),
+            bcc: None,
+        };
+        let raw = build_raw_mime(&recipients, "s", "b", None, &[]).unwrap();
+        assert!(!raw.contains("Cc:"));
+        assert!(!raw.contains("Bcc:"));
+    }
+
+    #[test]
+    fn recipient_header_injection_is_rejected() {
+        let recipients = Recipients {
+            to: "a@b.c",
+            cc: None,
+            bcc: Some("x@y.z\r\nX-Evil: 1"),
+        };
+        assert!(build_raw_mime(&recipients, "s", "b", None, &[]).is_err());
+    }
+
+    #[test]
+    fn summary_lists_recipient_headers() {
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "id": "m1",
+            "payload": {"headers": [
+                {"name": "From", "value": "me@x.y"},
+                {"name": "To", "value": "david@hey.com"},
+                {"name": "Bcc", "value": "bflora@ycombinator.com"}
+            ]}
+        }))
+        .unwrap();
+        let summary = format_message_summary(&msg);
+        assert!(summary.contains("To: david@hey.com"));
+        assert!(summary.contains("Bcc: bflora@ycombinator.com"));
+        assert!(!summary.contains("Cc: \n"));
     }
 }

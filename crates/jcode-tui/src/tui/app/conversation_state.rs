@@ -18,6 +18,24 @@ impl App {
         }
     }
 
+    /// Rebuild the in-memory provider snapshot from the authoritative stored
+    /// transcript after that transcript was rewritten underneath us.
+    ///
+    /// `strip_oversized_images`/`strip_all_images` mutate `session.messages`
+    /// and deliberately leave `messages` (the materialized scratch copy) alone:
+    /// `run_compaction_retry_turn` clears it itself. A recovery path that reports
+    /// success without refreshing the snapshot would leave the next request
+    /// rebuilding from the OLD copy, so the 413 would repeat with every image
+    /// still attached. Measured 2026-11-23 while fixing the humpback 413.
+    pub(super) fn refresh_provider_messages_from_session(&mut self) {
+        if self.is_remote || !self.messages.is_empty() {
+            return;
+        }
+        let provider_messages = self.session.messages_for_provider_uncached();
+        self.messages = provider_messages;
+        self.reset_tool_output_tracking();
+    }
+
     pub(super) fn local_transcript_message_count(&self) -> usize {
         if self.is_remote {
             self.messages.len()
@@ -40,10 +58,7 @@ impl App {
 
     pub(super) fn format_compaction_started_message(trigger: &str) -> String {
         let strategy = Self::format_compaction_strategy_label(trigger);
-        format!(
-            "📦 Compacting context ({}) - summarizing older messages in the background to stay within the context window.",
-            strategy
-        )
+        format!("📦 Compacting context ({strategy})")
     }
 
     pub(super) fn format_compaction_progress_notice(elapsed: std::time::Duration) -> String {
@@ -77,114 +92,53 @@ impl App {
             return Self::format_emergency_compaction_message(event, context_limit);
         }
 
-        let reason = match event.trigger.as_str() {
-            "auto_recovery" => "after the context window filled up",
-            _ => "to stay within the context window",
-        };
         let strategy = Self::format_compaction_strategy_label(&event.trigger);
-        let mut message = format!(
-            "📦 Context compacted ({}) - older messages were summarized {}.",
-            strategy, reason
-        );
-        let details = Self::format_compaction_detail_segments(event, context_limit, false);
-        if !details.is_empty() {
-            message.push_str("\n\n");
-            message.push_str(&details.join(" · "));
-        }
-        message
+        Self::format_compaction_usage_message(event, context_limit, strategy)
     }
 
     pub(super) fn format_emergency_compaction_message(
         event: &crate::compaction::CompactionEvent,
         context_limit: u64,
     ) -> String {
-        let mut message =
-            "📦 Emergency compaction - older messages were dropped to recover from context pressure. Recent context was kept.".to_string();
-        let details = Self::format_compaction_detail_segments(event, context_limit, true);
-        if !details.is_empty() {
-            message.push_str("\n\n");
-            message.push_str(&details.join(" · "));
-        }
-        message
+        Self::format_compaction_usage_message(event, context_limit, "emergency")
     }
 
-    fn format_compaction_detail_segments(
+    fn format_compaction_usage_message(
         event: &crate::compaction::CompactionEvent,
         context_limit: u64,
-        emergency: bool,
-    ) -> Vec<String> {
-        let mut details = Vec::new();
-
-        if let Some(duration_ms) = event.duration_ms {
-            details.push(format!(
-                "Took {}",
-                crate::message::Message::format_duration(duration_ms)
-            ));
-        }
-        if let Some(tokens) = event.pre_tokens {
-            details.push(format!(
-                "before ~{} tokens",
-                Self::format_compaction_number(tokens)
-            ));
-        }
-        if let Some(tokens) = event.post_tokens {
-            let mut segment = format!("now ~{} tokens", Self::format_compaction_number(tokens));
+        strategy: &str,
+    ) -> String {
+        let usage = |tokens: u64| {
             if context_limit > 0 {
-                segment.push_str(&format!(
-                    " ({})",
-                    Self::format_compaction_usage(tokens, context_limit)
-                ));
-            }
-            details.push(segment);
-        }
-        if let Some(saved) = event.tokens_saved.filter(|saved| *saved > 0) {
-            details.push(format!(
-                "saved ~{} tokens",
-                Self::format_compaction_number(saved)
-            ));
-        }
-
-        let message_count = event.messages_dropped.or(event.messages_compacted);
-        if let Some(count) = message_count {
-            let noun = if count == 1 { "message" } else { "messages" };
-            let verb = if emergency { "dropped" } else { "summarized" };
-            details.push(format!(
-                "{} {} {}",
-                verb,
-                Self::format_compaction_number(count as u64),
-                noun
-            ));
-        }
-
-        if let Some(summary_chars) = event.summary_chars.filter(|chars| *chars > 0) {
-            details.push(format!(
-                "summary {} chars",
-                Self::format_compaction_number(summary_chars as u64)
-            ));
-        }
-
-        if let Some(active_messages) = event.active_messages {
-            let noun = if active_messages == 1 {
-                "recent message"
+                format!(
+                    "~{} tokens ({:.1}%)",
+                    Self::format_compaction_number(tokens),
+                    tokens as f64 / context_limit as f64 * 100.0,
+                )
             } else {
-                "recent messages"
-            };
-            details.push(format!(
-                "kept {} {} live",
-                Self::format_compaction_number(active_messages as u64),
-                noun
-            ));
-        }
-
-        details
-    }
-
-    fn format_compaction_usage(tokens: u64, context_limit: u64) -> String {
-        let percent = (tokens as f64 / context_limit.max(1) as f64) * 100.0;
-        if percent >= 10.0 {
-            format!("{percent:.0}% of window")
-        } else {
-            format!("{percent:.1}% of window")
+                format!("~{} tokens", Self::format_compaction_number(tokens))
+            }
+        };
+        // Show whatever is known. Never print "unavailable": a missing side is
+        // simply omitted, and with no counts at all the message count is used.
+        match (event.pre_tokens, event.post_tokens) {
+            (Some(pre), Some(post)) => {
+                format!(
+                    "📦 Compacted ({strategy}): {} → {}",
+                    usage(pre),
+                    usage(post)
+                )
+            }
+            (Some(pre), None) => format!("📦 Compacted ({strategy}): from {}", usage(pre)),
+            (None, Some(post)) => format!("📦 Compacted ({strategy}): now {}", usage(post)),
+            (None, None) => match event.messages_compacted.filter(|count| *count > 0) {
+                Some(count) => format!(
+                    "📦 Compacted ({strategy}): {} older message{} summarized",
+                    Self::format_compaction_number(count as u64),
+                    if count == 1 { "" } else { "s" },
+                ),
+                None => format!("📦 Compacted ({strategy})"),
+            },
         }
     }
 
@@ -243,10 +197,11 @@ impl App {
             return;
         }
         let provider_messages = self.materialized_provider_messages();
+        let context_budget = self.context_limit as usize;
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
             manager.reset();
-            manager.set_budget(self.context_limit as usize);
+            manager.set_budget(context_budget);
             if let Some(state) = self.session.compaction.as_ref() {
                 manager.restore_persisted_state_with(state, &provider_messages);
             } else {
@@ -262,9 +217,8 @@ impl App {
         &mut self,
         manager: &crate::compaction::CompactionManager,
     ) {
-        let new_state = manager.persisted_state();
-        if self.session.compaction != new_state {
-            self.session.compaction = new_state;
+        if !manager.persisted_state_matches(self.session.compaction.as_deref()) {
+            self.session.compaction = manager.persisted_state().map(Arc::new);
             if let Err(err) = self.session.save() {
                 crate::logging::error(&format!(
                     "Failed to persist compaction state for session {}: {}",
@@ -299,17 +253,18 @@ impl App {
             };
         let state = crate::session::StoredCompactionState {
             summary_text,
-            openai_encrypted_content,
+            openai_encrypted_content: openai_encrypted_content.map(Into::into),
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
         };
 
-        self.session.compaction = Some(state.clone());
+        self.session.compaction = Some(Arc::new(state.clone()));
         let provider_messages = self.materialized_provider_messages();
+        let context_budget = self.context_limit as usize;
         let compaction = self.registry.compaction();
         if let Ok(mut manager) = compaction.try_write() {
-            manager.set_budget(self.context_limit as usize);
+            manager.set_budget(context_budget);
             manager.restore_persisted_state_with(&state, &provider_messages);
         }
 
@@ -376,8 +331,13 @@ impl App {
     }
 
     pub(super) fn handle_compaction_event(&mut self, event: CompactionEvent) {
+        self.commit_pending_streaming_assistant_message();
         self.invalidate_kv_cache_after_compaction();
-        if let Err(err) = self.session.save() {
+        // Remote clients hold a transcript-stripped stub; the server owns the
+        // session file and already persisted the compaction.
+        if !self.is_remote
+            && let Err(err) = self.session.save()
+        {
             crate::logging::warn(&format!(
                 "Failed to persist provider session reset after compaction for session {}: {}",
                 self.session.id, err
@@ -401,6 +361,7 @@ impl App {
         // pre-compaction request that completes later cannot restore stale state.
         self.kv_cache.cache_generation = self.kv_cache.cache_generation.wrapping_add(1);
         self.kv_cache.kv_cache_baseline = None;
+        self.token_accounting.cache_next_optimal_input_tokens = None;
         self.kv_cache.cold_cache_warned_baseline_completed_at = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -418,6 +379,25 @@ impl App {
 
     pub fn set_status_notice(&mut self, text: impl Into<String>) {
         self.status_notice = Some((text.into(), Instant::now()));
+    }
+
+    /// Drop a status notice whose display window has passed and report whether
+    /// that changed the screen.
+    ///
+    /// The renderer already hides expired notices, but nothing else asks for a
+    /// frame at that moment. A freshly reloaded client counts as deep idle (no
+    /// stream activity, no keypress yet), so periodic redraws are skipped and
+    /// the last painted notice, e.g. "Waiting for reload handoff...", stayed on
+    /// screen until the user pressed a key.
+    pub(super) fn retire_expired_status_notice(&mut self) -> bool {
+        let expired = self
+            .status_notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > STATUS_NOTICE_TTL);
+        if expired {
+            self.status_notice = None;
+        }
+        expired
     }
 
     /// Stash a persistent startup notice card and show it immediately.
@@ -771,14 +751,14 @@ impl App {
                 };
                 let inserted_message = Message {
                     role: Role::User,
-                    content: vec![tool_block.clone()],
+                    content: vec![tool_block.clone()].into(),
                     timestamp: None,
                     tool_duration_ms: None,
                 };
                 let stored_message = crate::session::StoredMessage {
                     id: id::new_id("message"),
                     role: Role::User,
-                    content: vec![tool_block],
+                    content: vec![tool_block].into(),
                     display_role: None,
                     timestamp: Some(chrono::Utc::now()),
                     tool_duration_ms: None,
@@ -836,6 +816,7 @@ impl App {
         // re-registering them if we cleared the registry here.
         self.clear_streaming_render_state();
         self.queued_messages.clear();
+        self.queued_images.clear();
         self.pasted_contents.clear();
         self.pending_images.clear();
         self.active_skill = None;
@@ -857,7 +838,7 @@ impl App {
             }
             self.add_provider_message(Message {
                 role: role.clone(),
-                content: kept_blocks.clone(),
+                content: kept_blocks.clone().into(),
                 timestamp: None,
                 tool_duration_ms: None,
             });
@@ -895,6 +876,67 @@ impl App {
 mod tests {
     use super::*;
     use crate::message::ToolCall;
+
+    #[test]
+    fn compaction_message_is_one_line_with_method_and_usage() {
+        let mut event = crate::compaction::CompactionEvent {
+            trigger: "reactive".to_string(),
+            pre_tokens: Some(180_000),
+            post_tokens: Some(40_000),
+            tokens_saved: Some(140_000),
+            duration_ms: Some(1500),
+            messages_dropped: None,
+            messages_compacted: Some(100),
+            summary_chars: Some(500),
+            active_messages: Some(10),
+        };
+        for method in ["reactive", "proactive", "semantic", "manual", "automatic"] {
+            event.trigger = method.to_string();
+            assert_eq!(
+                App::format_compaction_complete_message(&event, 200_000),
+                format!(
+                    "📦 Compacted ({method}): ~180,000 tokens (90.0%) → ~40,000 tokens (20.0%)"
+                )
+            );
+        }
+        event.trigger = "hard_compact".to_string();
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency): ~180,000 tokens (90.0%) → ~40,000 tokens (20.0%)"
+        );
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 0),
+            "📦 Compacted (emergency): ~180,000 tokens → ~40,000 tokens"
+        );
+        event.pre_tokens = None;
+        event.post_tokens = None;
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency): 100 older messages summarized"
+        );
+        event.messages_compacted = None;
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency)"
+        );
+        event.post_tokens = Some(40_000);
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency): now ~40,000 tokens (20.0%)"
+        );
+        event.pre_tokens = Some(180_000);
+        event.post_tokens = None;
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency): from ~180,000 tokens (90.0%)"
+        );
+        event.pre_tokens = Some(0);
+        event.post_tokens = Some(0);
+        assert_eq!(
+            App::format_compaction_complete_message(&event, 200_000),
+            "📦 Compacted (emergency): ~0 tokens (0.0%) → ~0 tokens (0.0%)"
+        );
+    }
 
     #[test]
     fn experimental_feature_key_marks_swarm_spawn_actions() {

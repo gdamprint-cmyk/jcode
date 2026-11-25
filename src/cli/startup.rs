@@ -19,12 +19,20 @@ pub async fn run() -> Result<()> {
     // Parse once, before startup side effects. Invalid arguments and --help
     // must not harden credential files or create configuration/telemetry state.
     let args = Args::parse();
-    // Credential import must refuse existing stores without normal startup
-    // hardening, migrations, telemetry, or provider discovery touching them.
+    // Data belongs to the executable, not to the application/TUI dependency
+    // chain. Every entrypoint using this startup path gets version-matched docs.
+    crate::register_bundled_docs();
+    // Interactive login prompts (masked secrets, QR codes) are a terminal
+    // concern. The shared auth flows reach them through this presenter.
+    super::login::install_terminal_login_presenter();
+    // Snapshot user-supplied provider env before provider init rewrites it.
+    super::provider_init::capture_user_openrouter_model_env();
+    // Credential import and explicit MCP management do not need normal agent
+    // startup hardening, migrations, telemetry, or provider discovery.
     if args.ssh.is_none()
         && matches!(
             args.command,
-            Some(Command::Auth(super::args::AuthCommand::Import { .. }))
+            Some(Command::Auth(super::args::AuthCommand::Import { .. }) | Command::Mcp { .. })
         )
     {
         if let Some(cwd) = &args.cwd {
@@ -52,7 +60,16 @@ pub async fn run() -> Result<()> {
         .name("jcode-session-bak-prune".to_string())
         .spawn(crate::session::prune_old_session_backups)
         .ok();
-    logging::info("jcode starting");
+    // Record which binary actually launched. Stale copies earlier on PATH (or a
+    // shortcut pinned to an old install) otherwise look identical to the
+    // updated launcher in logs, and keep re-offering the same update (#1626).
+    logging::info(&format!(
+        "jcode starting (version={}, exe={})",
+        jcode_build_meta::version(),
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    ));
 
     // Wire config-reload reactions without making config depend on auth/bus:
     // when the config cache reloads, invalidate the auth-status cache and
@@ -293,6 +310,21 @@ fn parse_and_prepare_args(args: Args) -> Result<Args> {
     }
 
     output::set_quiet_enabled(args.quiet);
+    if args.jarvis || args.jarvis_always_on || args.jarvis_screen {
+        anyhow::ensure!(
+            args.command.is_none(),
+            "--jarvis currently supports the interactive TUI only"
+        );
+        // Validate the selected backend before entering raw terminal mode.
+        drop(crate::tui::jarvis::create_speech_player()?);
+        crate::tui::jarvis::enable();
+        if args.jarvis_always_on {
+            crate::tui::jarvis::enable_always_on();
+        }
+        if args.jarvis_screen {
+            crate::tui::jarvis::enable_screen();
+        }
+    }
 
     if let Some(cwd) = &args.cwd {
         std::env::set_current_dir(cwd)?;
@@ -482,7 +514,7 @@ fn should_spawn_background_update_check_with_config(args: &Args, check_updates: 
         && !args.no_update
         && !matches!(
             args.command,
-            Some(Command::Update)
+            Some(Command::Update { .. })
                 | Some(Command::Serve { .. })
                 | Some(Command::Server { .. })
                 | Some(Command::Acp)
@@ -733,7 +765,7 @@ mod tests {
     #[test]
     fn update_command_still_skips_background_check_before_auto_install_logic() {
         let args = parse_args(&["jcode", "update"]);
-        assert!(matches!(args.command, Some(Command::Update)));
+        assert!(matches!(args.command, Some(Command::Update { .. })));
         assert!(!should_spawn_background_update_check(&args));
         assert!(should_auto_install_update(&args));
     }

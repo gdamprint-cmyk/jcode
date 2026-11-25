@@ -49,6 +49,12 @@ enum MathDelimiter {
 /// environments, and fenced `math`/`latex`/`tex`/`katex` blocks. Generic code
 /// spans and code fences are intentionally left byte-for-byte unchanged.
 pub fn normalize_latex_math(text: &str) -> String {
+    // Every pass below rewrites only around `$`, a backslash command or a
+    // fenced math block. Plain prose (most streamed text) has none, and the
+    // four passes otherwise copy it four times per render.
+    if !text.contains(['$', '\\']) && !text.contains("```") && !text.contains("~~~") {
+        return text.to_string();
+    }
     let fenced = normalize_math_fences(text);
     let normalized = normalize_latex_delimiters_and_environments(&fenced);
     let promoted = promote_standalone_inline_math(&normalized);
@@ -559,6 +565,7 @@ fn normalize_latex_delimiters_and_environments(text: &str) -> String {
             && rest.starts_with("\\(")
             && !is_escaped_at(text, index)
             && has_unescaped_delimiter(&rest[2..], "\\)")
+            && !delimited_content_looks_like_prose(rest, "\\)")
         {
             out.push('$');
             math_delimiter = Some(MathDelimiter::LatexInline);
@@ -579,6 +586,7 @@ fn normalize_latex_delimiters_and_environments(text: &str) -> String {
             && !is_escaped_at(text, index)
             && has_unescaped_delimiter(&rest[2..], "\\]")
             && !looks_like_escaped_markdown_link(rest)
+            && !delimited_content_looks_like_prose(rest, "\\]")
         {
             out.push_str("$$");
             math_delimiter = Some(MathDelimiter::LatexDisplay);
@@ -713,12 +721,65 @@ fn looks_like_escaped_markdown_link(rest: &str) -> bool {
     rest[2 + close + 2..].starts_with('(')
 }
 
+/// Models often escape literal brackets in prose, e.g.
+/// `\[Attached image associated with ...\]`. That is Markdown punctuation, not
+/// LaTeX. Treat the delimited body as prose when it has no math signal at all
+/// and reads like a sequence of words.
+fn delimited_content_looks_like_prose(rest: &str, close_delimiter: &str) -> bool {
+    let Some(close) = find_unescaped_delimiter(&rest[2..], close_delimiter) else {
+        return false;
+    };
+    let body = &rest[2..2 + close];
+    if body.chars().any(|ch| {
+        matches!(
+            ch,
+            '\\' | '^' | '_' | '=' | '{' | '}' | '+' | '<' | '>' | '|' | '&'
+        )
+    }) {
+        return false;
+    }
+    // A single-line body with any run of four or more letters and no LaTeX
+    // command or operator is escaped Markdown brackets around words, e.g. a
+    // TOML table header like `\[workspace\]`, or a placeholder like
+    // `\[pasted N lines\]`. Real math would typeset that as an italic product
+    // of variables. Multiline `\[ ... \]` blocks stay math.
+    if !body.contains('\n')
+        && body
+            .split(|ch: char| !ch.is_alphabetic())
+            .any(|run| run.chars().count() >= 4)
+    {
+        return true;
+    }
+    // Short prose lists like `\[old, new\]` have no four-letter word.
+    // Preserve them without changing mathematical tuples like `\[x, y\]`.
+    if !body.contains('\n')
+        && body.contains(',')
+        && body
+            .split(',')
+            .filter(|entry| {
+                let entry = entry.trim();
+                entry.chars().count() >= 3 && entry.chars().all(char::is_alphabetic)
+            })
+            .count()
+            >= 2
+    {
+        return true;
+    }
+    body.split_whitespace()
+        .filter(|word| word.chars().filter(|ch| ch.is_alphabetic()).count() >= 2)
+        .count()
+        >= 3
+}
+
 /// Escape dollar signs that look like currency amounts (`$` immediately
 /// followed by an ASCII digit) into `\$`, so the math extension does not treat
 /// them as inline math. Dollars inside inline code spans and fenced code blocks
 /// are left untouched, and already-escaped `\$` is preserved. Display-math
 /// `$$` runs are passed through unchanged.
 pub fn escape_currency_dollars(text: &str) -> String {
+    if !text.contains('$') {
+        return text.to_string();
+    }
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut out = String::with_capacity(text.len());
@@ -878,6 +939,18 @@ mod tests {
     }
 
     #[test]
+    fn text_without_math_markers_is_returned_unchanged() {
+        for text in [
+            "",
+            "Plain prose.\n\n- a list\n- of `code` items\n\n> quote\r\n\ttabbed\n",
+            "trailing spaces  \nand a ~~strike~~ plus `` two ticks ``\n\n",
+        ] {
+            assert_eq!(normalize_latex_math(text), text);
+            assert_eq!(escape_currency_dollars(text), text);
+        }
+    }
+
+    #[test]
     fn leaves_real_math() {
         assert_eq!(escape_currency_dollars("$a+b$"), "$a+b$");
     }
@@ -965,5 +1038,36 @@ mod tests {
             normalize_latex_math(r"Costs $35. Then \[x^2\]."),
             r"Costs $35. Then $$x^2$$."
         );
+    }
+
+    #[test]
+    fn escaped_bracketed_prose_is_not_math() {
+        let bracketed = r#"fold in the adjacent "\[Attached image associated...\]" label text"#;
+        assert_eq!(normalize_latex_math(bracketed), bracketed);
+        let parenthesized = r"see \(the optional part\) here";
+        assert_eq!(normalize_latex_math(parenthesized), parenthesized);
+        assert_eq!(normalize_latex_math(r"\[a b\]"), r"$$a b$$");
+        assert_eq!(
+            normalize_latex_math(r"\[\text{area} = \pi r^2\]"),
+            r"$$\text{area} = \pi r^2$$"
+        );
+        assert_eq!(normalize_latex_math(r"\(x\)"), r"$x$");
+    }
+
+    #[test]
+    fn escaped_single_word_brackets_are_not_math() {
+        for input in [
+            r"the nested directory's own \[workspace\] declaration",
+            r"even though I added \[workspace\] to make this a root",
+            r"set \[package.metadata\] keys",
+            r"see \(optional\) here",
+            r"collapsed into a placeholder like \[pasted N lines\] by jcode",
+            r"\[image 1\]",
+        ] {
+            assert_eq!(normalize_latex_math(input), input);
+        }
+        assert_eq!(normalize_latex_math(r"\[xy\]"), r"$$xy$$");
+        assert_eq!(normalize_latex_math(r"\[x+y\]"), r"$$x+y$$");
+        assert_eq!(normalize_latex_math(r"\[\alpha\]"), r"$$\alpha$$");
     }
 }

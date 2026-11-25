@@ -85,6 +85,19 @@ pub fn is_transient_transport_error(error_str: &str) -> bool {
         || lower.contains("goaway")
         || lower.contains("go away")
         || lower.contains("sendrequest")
+        // An upstream stall after the request was accepted: the gateway stops
+        // emitting and the stream reads as idle. Not a provider rejection, so a
+        // fresh request on a new connection recovers it. Real shapes:
+        // "upstream idle for 60000ms without data" and "Stream read timeout: no
+        // data received for 180 seconds".
+        || lower.contains("upstream idle")
+        || lower.contains("no data received")
+        // Disaggregated-inference gateway losing its prefill instance mid
+        // request. No network vocabulary, so without this marker the provider's
+        // own retry loop never engaged. Measured 2026-11-23 (session_tigress):
+        // "KVTransferError ... Losing connection with prefill instance".
+        || lower.contains("losing connection with prefill instance")
+        || lower.contains("kvtransfererror")
 }
 
 #[cfg(test)]
@@ -180,6 +193,13 @@ mod tests {
             "client error (SendRequest): connection error: timed out",
             "client error (Connect): tls handshake eof",
             "error decoding response body: request or response body error: operation timed out",
+            // Upstream stalls observed on this host. They carried no timeout/reset
+            // wording, so the provider's own retry loop never engaged.
+            "upstream idle for 60000ms without data",
+            "Stream read timeout: no data received for 180 seconds",
+            // Decode side losing its prefill instance mid request (session_tigress).
+            "KVTransferError(bootstrap_room=3147489392983313834, \
+             remote_endpoint=10.254.147.145:8998): Losing connection with prefill instance",
         ];
         for error in real_errors {
             assert!(

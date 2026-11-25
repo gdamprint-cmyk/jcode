@@ -22,6 +22,10 @@ thread_local! {
     /// Thread-local (not process-global) so tests that disable mermaid cannot
     /// race other test threads that rely on the process-env default.
     static MERMAID_RENDERING_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Thread-local override for the `features.mermaid_halfblocks` opt-in.
+    /// The config snapshot hook is process-global, so a scoped override is the
+    /// only way to test both sides of the half-block gate without racing.
+    static MERMAID_HALFBLOCKS_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     /// Scoped, thread-local diagram display mode. Takes precedence over the
     /// process-global override so render paths (e.g. the side panel, which
     /// renders with diagrams inline) can pin a mode for one render without
@@ -101,6 +105,22 @@ pub fn mermaid_rendering_enabled() -> bool {
 /// parallel tests cannot observe each other's override.
 pub fn with_mermaid_rendering_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
     MERMAID_RENDERING_OVERRIDE.with(|ctx| with_scoped_cell_value(ctx, enabled, f))
+}
+
+/// Whether the user opted into rendering Mermaid diagrams through the Unicode
+/// half-block fallback (a raster renderer that needs no terminal image
+/// protocol).
+pub fn mermaid_halfblocks_enabled() -> bool {
+    if let Some(enabled) = MERMAID_HALFBLOCKS_OVERRIDE.with(|ctx| ctx.get()) {
+        return enabled;
+    }
+    crate::config_snapshot().mermaid_halfblocks
+}
+
+/// Run `f` with the half-block opt-in forced on/off (or `None` to restore the
+/// config-based default) on the current thread.
+pub fn with_mermaid_halfblocks_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
+    MERMAID_HALFBLOCKS_OVERRIDE.with(|ctx| with_scoped_cell_value(ctx, enabled, f))
 }
 
 #[cfg(test)]

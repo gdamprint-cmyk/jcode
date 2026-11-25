@@ -87,6 +87,33 @@ pub use active_pids::{
     unregister_active_pid, user_session_counts, user_session_presence,
 };
 
+mod session_lease;
+pub use session_lease::{
+    SessionLease, SessionLeaseBlock, read_session_lease, remove_session_lease, session_lease_block,
+    session_leases_dir, write_session_lease,
+};
+
+/// Serialize this crate's tests that mutate `JCODE_HOME`.
+#[cfg(test)]
+pub(crate) fn test_jcode_home_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Stamp a rate-limiter marker file so its mtime actually moves.
+///
+/// `std::fs::write(path, b"")` truncates the file but issues NO `WriteFile`
+/// call for the empty buffer, so on Windows the mtime does not advance and
+/// every `prune_due` / `claim_*_slot` check keeps reporting "due". The
+/// interval then never elapses and the guarded work runs on every pass.
+///
+/// Writing a single non-empty byte makes the write reach the filesystem, so
+/// the marker behaves as a real timestamp. The file's content is never read
+/// back, so the payload is only a carrier.
+pub fn touch_stamp(path: &Path) -> std::io::Result<()> {
+    std::fs::write(path, b"1")
+}
+
 /// Platform-aware runtime directory for sockets and ephemeral state.
 ///
 /// - Linux: `$XDG_RUNTIME_DIR` (typically `/run/user/<uid>`)
@@ -530,11 +557,28 @@ fn write_json_inner<T: Serialize + ?Sized>(
     durable: bool,
     secret: bool,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    write_bytes_inner(path, &bytes, durable, secret)
+    // Serialize directly into the atomic temporary file. Materializing the
+    // entire JSON document first duplicates large transcripts and picker indexes
+    // on every save and leaves those transient allocations in allocator arenas.
+    write_atomic_inner(path, durable, secret, |writer| {
+        serde_json::to_writer(writer, value)?;
+        Ok(())
+    })
 }
 
 fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> Result<()> {
+    write_atomic_inner(path, durable, secret, |writer| {
+        writer.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+fn write_atomic_inner(
+    path: &Path,
+    durable: bool,
+    secret: bool,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<()>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
         if secret {
@@ -556,7 +600,7 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> 
             jcode_core::fs::set_permissions_owner_only(&tmp_path)?;
         }
         let mut writer = std::io::BufWriter::new(file);
-        writer.write_all(bytes)?;
+        write(&mut writer)?;
         let file = writer
             .into_inner()
             .map_err(|e| anyhow::anyhow!("flush failed: {}", e))?;
@@ -618,6 +662,9 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool, secret: bool) -> 
 
     result
 }
+
+#[cfg(test)]
+mod atomic_write_tests;
 
 pub enum StorageRecoveryEvent<'a> {
     CorruptPrimary {
@@ -784,6 +831,57 @@ mod env_file_tests {
         assert_eq!(
             std::fs::read_to_string(&path).expect("unchanged env"),
             "SAFE_KEY=safe-value\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn touch_stamp_writes_a_non_empty_payload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("probe.stamp");
+
+        touch_stamp(&marker).expect("touch_stamp should succeed");
+
+        let bytes = std::fs::read(&marker).expect("read marker");
+        assert!(
+            !bytes.is_empty(),
+            "the marker payload must be non-empty: an empty write never reaches \
+             the filesystem, so the mtime would not advance and the rate limiter \
+             would never consume its slot"
+        );
+    }
+
+    #[test]
+    fn touch_stamp_advances_the_marker_mtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("probe.stamp");
+
+        // An empty write is the defect being guarded against: prove that it
+        // leaves the mtime untouched on this platform, so the test below is
+        // actually exercising the difference.
+        let mut empty = std::fs::File::create(&marker).expect("create");
+        use std::io::Write;
+        empty.write_all(b"").expect("empty write");
+        drop(empty);
+        let empty_mtime = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("mtime after empty write");
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        touch_stamp(&marker).expect("touch_stamp should succeed");
+        let stamped_mtime = std::fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("mtime after touch_stamp");
+
+        assert!(
+            stamped_mtime > empty_mtime,
+            "touch_stamp must advance the marker mtime (empty write: {empty_mtime:?}, \
+             stamped: {stamped_mtime:?})"
         );
     }
 }

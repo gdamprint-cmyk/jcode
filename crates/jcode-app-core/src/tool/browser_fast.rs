@@ -2,6 +2,7 @@
 //! action results. Executable actions come from trusted browser code or the parent,
 //! never from page instructions or model-generated JavaScript.
 use super::*;
+use crate::process_memory::estimate_json_bytes;
 use serde::Serialize;
 use std::future::Future;
 use std::time::Duration;
@@ -73,11 +74,13 @@ pub(super) async fn handoff(
         }
         Err(error) => Ok(outcome(
             "hand_back",
-            &format!("Decision transport unavailable: {error}"),
+            &format!(
+                "The fast browser agent (handoff) is unavailable: {error}. The browser itself still works: complete this task with direct browser actions (snapshot, click, type, open) in the same tab."
+            ),
             &[],
             &Value::Null,
-            "typesafe/jev-1.13",
-            Some("uncertain"),
+            &crate::jev::browser_jev_model_label(),
+            Some("direct_actions"),
         )),
     }
 }
@@ -158,6 +161,15 @@ fn outcome(
         .with_metadata(result)
 }
 
+#[derive(Debug)]
+struct HandoffCancelled;
+impl std::fmt::Display for HandoffCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handoff cancelled.")
+    }
+}
+impl std::error::Error for HandoffCancelled {}
+
 async fn bounded<T>(
     ctx: &ToolContext,
     timeout: Duration,
@@ -171,8 +183,8 @@ async fn bounded<T>(
     };
     tokio::select! {
         biased;
-        _ = cancel => anyhow::bail!("Handoff cancelled. An in-flight browser action may already have taken effect."),
-        result = tokio::time::timeout(timeout, future) => result.context("Handoff operation timed out; an in-flight action may already have taken effect")?,
+        _ = cancel => Err(HandoffCancelled.into()),
+        result = tokio::time::timeout(timeout, future) => result.context("Handoff operation timed out")?,
     }
 }
 
@@ -219,6 +231,7 @@ fn scoped(mut input: BrowserInput, parent: &BrowserInput) -> Result<BrowserInput
     input.window_id = parent.window_id;
     input.frame_id = Some(parent.frame_id.unwrap_or(0));
     input.all_frames = Some(false);
+    input.browser = parent.browser.clone();
     // Raw provider params replace common targeting in bridge_request. Restrict commands and
     // keys, reject alternate/nested scope knobs, then inject our authoritative scope.
     if input.action == "provider_command" {
@@ -326,7 +339,7 @@ struct Candidate {
 }
 
 fn retain_result(result: Value, trace: &mut [Value]) -> Value {
-    let bytes = result.to_string().len();
+    let bytes = estimate_json_bytes(&result);
     let omitted = || json!({"omitted":"Result exceeds the per-action or rolling 32000-byte retention budget. Inspect current state with a read-only direct browser action. Do not repeat side effects."});
     if bytes > 16_000 {
         return omitted();
@@ -334,16 +347,16 @@ fn retain_result(result: Value, trace: &mut [Value]) -> Value {
     let mut retained: usize = trace
         .iter()
         .filter_map(|entry| entry.get("result"))
-        .map(|value| value.to_string().len())
+        .map(estimate_json_bytes)
         .sum();
     for entry in trace {
         if retained + bytes <= 32_000 {
             break;
         }
         if let Some(old) = entry.get_mut("result") {
-            let old_size = old.to_string().len();
+            let old_size = estimate_json_bytes(old);
             let marker = json!({"omitted":"Older result evicted. Inspect read-only state. Do not repeat side effects."});
-            let marker_size = marker.to_string().len();
+            let marker_size = estimate_json_bytes(&marker);
             if old_size > marker_size {
                 retained -= old_size - marker_size;
                 *old = marker;
@@ -385,11 +398,12 @@ fn parse_observation(output: ToolOutput) -> Result<Value> {
         "Malformed DOM observation"
     );
     anyhow::ensure!(
-        page.to_string().len() <= MAX_OBSERVATION,
+        estimate_json_bytes(&page) <= MAX_OBSERVATION,
         "DOM observation exceeds safe size limit"
     );
     if redact_credentials(&mut page) {
         page["sensitive"] = json!(true);
+        page["credentials_redacted"] = json!(true);
     }
     Ok(page)
 }
@@ -401,7 +415,8 @@ async fn observe_page(
     timeout: Duration,
     deadline: tokio::time::Instant,
 ) -> Result<Value> {
-    let deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(8));
+    let deadline = deadline.min(tokio::time::Instant::now() + timeout.min(Duration::from_secs(8)));
+    let mut last_disconnect = None;
     loop {
         let remaining =
             timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
@@ -410,7 +425,9 @@ async fn observe_page(
             Err(error)
                 if transition_disconnect(&error) && tokio::time::Instant::now() < deadline =>
             {
-                bounded(
+                let disconnect_details = format!("{error:#}");
+                last_disconnect = Some(error);
+                if let Err(error) = bounded(
                     ctx,
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                     async {
@@ -418,9 +435,17 @@ async fn observe_page(
                         Ok(())
                     },
                 )
-                .await?;
+                .await {
+                    return Err(error.context(format!(
+                        "Page observation could not reconnect; last connection error: {:#}. The page may have no content script; navigate to a supported page first",
+                        disconnect_details
+                    )));
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(match last_disconnect {
+                Some(last) => error.context(format!("Page observation could not reconnect; last connection error: {last:#}. The page may have no content script; navigate to a supported page first")),
+                None => error,
+            }),
         }
     }
 }
@@ -435,7 +460,7 @@ fn task_history(trace: &[Value]) -> Vec<Value> {
         let mut item = json!({"step":entry["step"],"action":entry["action"],"label":entry["label"],"status":entry["status"]});
         for key in ["result", "after", "before"] {
             if let Some(value) = entry.get(key) {
-                let size = value.to_string().len();
+                let size = estimate_json_bytes(value);
                 if size <= remaining {
                     item[key] = value.clone();
                     remaining -= size;
@@ -568,6 +593,7 @@ pub(super) async fn run(
     let mut images = Vec::new();
     let mut used_exact = std::collections::HashSet::new();
     let mut requested_help = Some("uncertain");
+    let mut decision_failed = false;
     let result: Result<(&str,String)> = async {
         anyhow::ensure!(input.tab_id.is_some(),"handoff requires explicit tab_id");
         anyhow::ensure!(input.all_frames!=Some(true),"handoff must target a single frame");
@@ -585,10 +611,10 @@ pub(super) async fn run(
         candidates(input,&Value::Null)?;
         let timeout=Duration::from_millis(input.timeout_ms.unwrap_or(20_000).clamp(1,60_000));
         let deadline=tokio::time::Instant::now()+Duration::from_secs(600);
-        let status=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),provider.status(ctx)).await?;
+        let status=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),provider.status_for(input.browser.as_deref(),ctx)).await?;
         anyhow::ensure!(status.metadata.as_ref().is_some_and(|m|m["ready"]==true),"Browser not ready; check status and use setup only if needed");
         if let Some(window)=input.window_id {
-            let listing=BrowserInput{action:"list_tabs".into(),tab_id:input.tab_id,frame_id:Some(0),all_frames:Some(false),..Default::default()};
+            let listing=BrowserInput{action:"list_tabs".into(),browser:input.browser.clone(),tab_id:input.tab_id,frame_id:Some(0),all_frames:Some(false),..Default::default()};
             let tabs=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),provider.execute("list_tabs",&listing,ctx)).await?;
             let metadata=tabs.metadata.context("Cannot verify tab/window membership")?;
             let matched=metadata["windows"].as_array().is_some_and(|windows| windows.iter().any(|w|w["windowId"].as_i64()==Some(window)
@@ -618,7 +644,15 @@ pub(super) async fn run(
                 // than aborting the whole task or reusing them on another page.
                 used_exact.extend(0..input.candidates.len());
             }
-            if observation["sensitive"]==true {return Ok(("hand_back","Credential material, password, OTP, CAPTCHA, or account recovery requires the main agent/user. Never reset passwords.".into()));}
+            if observation["credentials_redacted"]==true {
+                requested_help=Some("direct_actions");
+                return Ok(("hand_back","Page credentials were redacted before reaching the browser decision service. Continue with direct browser actions using the same tab_id.".into()));
+            }
+            if observation["sensitive"]==true {
+                // CAPTCHA challenges need the user in the same browser tab.
+                requested_help=Some("user_login");
+                return Ok(("hand_back","The page needs the user to complete a CAPTCHA. Ask the user to complete it in this browser tab, wait for them to confirm, then re-run this same handoff with the same tab_id to continue.".into()));
+            }
             if stale>=3 {return Ok(("hand_back","Browser stalled: repeated unchanged observations".into()));}
             if trace.len()==budget {return Ok(("hand_back","Action step budget exhausted; final action has been observed".into()));}
             let choices:Vec<_>=candidates(input,&observation)?.into_iter().filter(|c| c.exact_index.is_none_or(|i|!used_exact.contains(&i))).filter(|c|!explore_only || (c.exact_index.is_none() && matches!(c.input.action.as_str(),"scroll"|"wait"))).collect();
@@ -630,7 +664,9 @@ pub(super) async fn run(
             let capabilities:Vec<_>=choices.iter().enumerate().filter(|(_,choice)|choice.exact_index.is_some()).map(|(index,choice)|json!({"action_id":format!("a{index}"),"operation":choice.input.action,"source":"trusted_caller","executable_now":true,"requires_code_generation":false})).collect();
             let request=DecisionRequest{goal:goal.into(),observation:json!({"task_context":input.context,"caller_capabilities":capabilities,"page":observation,"supplied_text_values":input.text_values,"action_history":task_history(&trace),"controller_note":task_note,"remaining_actions":budget-trace.len()}),options};
             anyhow::ensure!(serde_json::to_vec(&request)?.len()<=MAX_REQUEST,"Decision state exceeds safe size limit");
-            let decision=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),transport.decide(&request)).await?;
+            let decision=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),transport.decide(&request)).await.inspect_err(|error| {
+                decision_failed = !error.is::<HandoffCancelled>();
+            })?;
             anyhow::ensure!(decision.confidence.is_finite() && (0.0..=1.0).contains(&decision.confidence),"Invalid decision probability/confidence");
             anyhow::ensure!(decision.reason.len()<=2000,"Decision reason exceeds limit");
             let index=request.options.iter().position(|o|o.id==decision.choice).context("Decision selected an unknown action ID")?;
@@ -680,7 +716,7 @@ pub(super) async fn run(
             if let Some(index)=chosen.exact_index {used_exact.insert(index);}
             trace.push(json!({"step":trace.len()+1,"id":decision.choice,"action":chosen.input.action,"label":chosen.label,"confidence":decision.confidence,"status":"started","before":page_evidence(&observation)}));
             let navigation=chosen.input.action=="open" || (chosen.input.action=="click" && chosen.input.url.is_some()) || chosen.input.submit==Some(true) || chosen.input.provider_action.as_deref()==Some("navigate");
-            let executed=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),provider.execute(&chosen.input.action,&chosen.input,ctx)).await;
+            let executed=bounded(ctx,timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),provider.execute(&chosen.input.action,&chosen.input,ctx)).await.context("An in-flight browser action may already have taken effect; inspect current state before retrying");
             let executed=match executed {
                 Ok(output) => Ok(output),
                 // Only ordinary navigation/search can be verified this way. Never
@@ -729,10 +765,20 @@ pub(super) async fn run(
             if let Some(quota) = crate::subscription_notice::from_error(&error) {
                 // A plan limit cannot be fixed by retrying. Tell the agent to
                 // relay the upgrade prompt to the user and use direct actions.
+                crate::subscription_notice::show_upgrade_card(quota, &ctx.session_id);
                 requested_help = Some("upgrade");
                 (
                     "hand_back",
                     format!("{quota} Tell the user this and continue with direct browser actions."),
+                )
+            } else if decision_failed {
+                // A decision service failure is not a page/task blocker.
+                requested_help = Some("direct_actions");
+                (
+                    "hand_back",
+                    format!(
+                        "The handoff decision service failed: {error:#}. Continue the same task with direct browser actions (snapshot, click, type, open) using the same tab_id and frame_id. Use final_observation and action_trace to preserve progress, refresh the page observation before acting, and do not replay completed actions. Do not ask the user to sign in or switch paid providers merely because this decision service failed. Still respect page sign-in, authorization, and safety blockers."
+                    ),
                 )
             } else {
                 ("hand_back", format!("{error:#}"))
@@ -753,6 +799,12 @@ pub(super) async fn run(
         transport.model(),
         requested_help,
     );
+    if let Some(metadata) = output.metadata.as_mut() {
+        metadata["tab_id"] = json!(input.tab_id);
+        metadata["frame_id"] = json!(input.frame_id.unwrap_or(0));
+        metadata["window_id"] = json!(input.window_id);
+        output.output = serde_json::to_string(metadata)?;
+    }
     output.images = images;
     Ok(output)
 }
@@ -760,3 +812,7 @@ pub(super) async fn run(
 #[cfg(test)]
 #[path = "browser_fast_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "browser_size_tests.rs"]
+mod size_tests;

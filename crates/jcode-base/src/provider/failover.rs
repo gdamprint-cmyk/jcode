@@ -11,9 +11,12 @@ impl MultiProvider {
         provider: ActiveProvider,
     ) -> Option<String> {
         match provider {
-            ActiveProvider::Claude if self.is_claude_usage_exhausted() => Some(
-                crate::provider::account_failover::usage_exhausted_reason(provider),
-            ),
+            ActiveProvider::Claude
+                if self.provider_uses_oauth_accounts(provider)
+                    && self.is_claude_usage_exhausted() =>
+            {
+                Some("OAuth usage exhausted".to_string())
+            }
             _ => None,
         }
     }
@@ -31,6 +34,7 @@ impl MultiProvider {
             from_label: Self::provider_label(from).to_string(),
             to_provider: Self::provider_key(to).to_string(),
             to_label: Self::provider_label(to).to_string(),
+            target_route: None,
             reason,
             estimated_input_chars,
             estimated_input_tokens,

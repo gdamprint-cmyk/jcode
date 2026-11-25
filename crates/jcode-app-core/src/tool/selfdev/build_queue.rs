@@ -85,13 +85,86 @@ export -f cargo
         }
     }
 
+    /// Move a LOCKED self-dev binary aside so the compile can replace it.
+    ///
+    /// Returns the path the binary was moved to, or `None` when nothing was
+    /// locked. The holder is NEVER killed: renaming is the only operation used.
+    ///
+    /// This is the same helper `run_deterministic_build` uses
+    /// (crates/jcode-build-support/src/deterministic_build.rs:127); the
+    /// self-dev build path is the one that was missing it, and it is the path
+    /// every self-dev session uses.
+    ///
+    /// reference: crates/jcode-build-support/src/binary_lock.rs:58
+    pub(super) fn quarantine_locked_selfdev_binary(repo_dir: &Path) -> Option<std::path::PathBuf> {
+        let binary = build::selfdev_binary_path(repo_dir);
+        match build::prepare_binary_for_overwrite(&binary) {
+            Ok(Some(aside)) => Some(aside),
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!(
+                    "warning: could not move the locked self-dev binary {} aside: {err}",
+                    binary.display()
+                );
+                None
+            }
+        }
+    }
+
     async fn stream_build_command(
         repo_dir: PathBuf,
         command: SelfDevBuildCommand,
         output_path: PathBuf,
     ) -> Result<TaskResult> {
+        // THE SELF-LOCK. The binary that runs `selfdev build` is usually the
+        // binary cargo must REPLACE: a self-dev session lives at
+        // `target/selfdev/jcode.exe`, and the compile writes a fresh file to
+        // that same path. MEASURED 2026-11-16 on this host: a live
+        // `jcode.exe self-dev --resume` session holds a Windows handle on
+        // `target/selfdev/jcode.exe`, so cargo's `remove_file` fails with
+        // "failed to remove file ..." / "Отказано в доступе. (os error 5)"
+        // (access denied) and the build dies with exit 101.
+        //
+        // Windows semantics, from the PRIMARY SOURCE:
+        //   * DeleteFileA fails when the file has other handles open for
+        //     normal I/O unless `FILE_SHARE_DELETE` was specified when those
+        //     handles were opened. A running image is opened exactly that
+        //     way, so DELETE fails with ERROR_ACCESS_DENIED - which is what
+        //     cargo hits.
+        //     reference: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilea
+        //   * `fs::rename` on Windows is `MoveFileExW` (with a
+        //     `SetFileInformationByHandle` fallback), and renaming needs only
+        //     "delete permission on the file, or delete child permission in
+        //     the parent directory" - so the RENAME of a running image
+        //     SUCCEEDS and the open handle follows the renamed file.
+        //     reference: https://doc.rust-lang.org/std/fs/fn.rename.html
+        //
+        // The rename is the only operation used, so the holder is NEVER
+        // killed: the running sessions stay alive on the renamed image and
+        // cargo writes a fresh binary at the original path.
+        //
+        // reference: crates/jcode-build-support/src/binary_lock.rs:58
+        // `prepare_binary_for_overwrite`. The SAME helper is already used by
+        // `run_deterministic_build`
+        // (crates/jcode-build-support/src/deterministic_build.rs:127) and by
+        // the Harbor bootstrap (~/.jcode/harbor/harbor_build.py:613
+        // `quarantine_locked_binary`); the self-dev build path was the one
+        // that missed it, and it is the path every self-dev session uses.
+        //
+        // Only the SELFDEV profile output is quarantined: that is the exact
+        // file this build command writes
+        // (`cargo build --profile selfdev -p jcode --bin jcode`), and
+        // `prepare_binary_for_overwrite` is a no-op when the file is absent.
+        if let Some(aside) = Self::quarantine_locked_selfdev_binary(&repo_dir) {
+            eprintln!(
+                "note: the running self-dev binary was locked; it was moved aside to {} so the compile could replace it",
+                aside.display()
+            );
+        }
+
         let mut cmd = tokio::process::Command::new(&command.program);
         cmd.args(&command.args)
+            .envs(command.env.iter().cloned())
             .current_dir(&repo_dir)
             .env(
                 "JCODE_DEV_CARGO_SCRIPT",
@@ -373,6 +446,7 @@ export -f cargo
         let result = if Self::is_test_session() {
             Self::run_test_build(output_path.clone(), &reason).await?
         } else {
+            let prerelease = build::linux_prerelease_candidate(&repo_dir, &actual_source);
             let result =
                 Self::stream_build_command(repo_dir.clone(), command.clone(), output_path.clone())
                     .await?;
@@ -383,7 +457,17 @@ export -f cargo
                             &repo_dir,
                             &source_after_build,
                         )?;
-                        let published = build::publish_local_current_build_for_source(
+                        // A BUILD only STAGES: it installs the immutable
+                        // versioned binary and records it as the landing
+                        // target. It does NOT move `current` or the launcher.
+                        //
+                        // Moving the client channels at build time is what
+                        // opened the desync window: a new client would attach
+                        // to a daemon still running the previous build. The
+                        // channels now move only inside a landing
+                        // transaction, after the daemon has been proven to run
+                        // the target.
+                        let published = build::stage_local_current_build_for_source(
                             &repo_dir,
                             &source_after_build,
                         )?;
@@ -394,8 +478,17 @@ export -f cargo
                         })?;
                         request.published_version = Some(published.version.clone());
                         request.validated = true;
-                        request.last_progress = Some("published and smoke-tested".to_string());
+                        request.last_progress = Some(
+                            "staged and smoke-tested (not yet landed)".to_string(),
+                        );
                         request.save()?;
+                        if prerelease && result.status == Some(BackgroundTaskStatus::Completed) {
+                            build::dispatch_linux_prerelease(
+                                &repo_dir,
+                                &source_after_build,
+                                request.public_build_notes().as_deref(),
+                            );
+                        }
                         result
                     }
                     Err(err) => {
@@ -450,6 +543,7 @@ export -f cargo
     pub(super) async fn do_build(
         &self,
         reason: Option<String>,
+        release_notes: Option<String>,
         target: Option<String>,
         notify: Option<bool>,
         wake: Option<bool>,
@@ -463,6 +557,10 @@ export -f cargo
                     "`selfdev build` requires a non-empty `reason` so other queued agents can see why the build is needed."
                 )
             })?;
+        let release_notes = release_notes
+            .map(|notes| notes.trim().to_owned())
+            .filter(|notes| !notes.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("`selfdev build` and `build-reload` require nonblank `release_notes` suitable for public release."))?;
         let repo_dir =
             SelfDevTool::resolve_repo_dir(ctx.working_dir.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!("Could not find the jcode repository directory for selfdev build")
@@ -491,6 +589,7 @@ export -f cargo
                 repo_dir: repo_dir.display().to_string(),
                 repo_scope: requested_source.repo_scope.clone(),
                 worktree_scope: requested_source.worktree_scope.clone(),
+                release_notes: Some(release_notes),
                 command: command.display.clone(),
                 requested_at: Utc::now().to_rfc3339(),
                 started_at: None,
@@ -543,7 +642,7 @@ export -f cargo
                 "Completion delivery is disabled for this watcher."
             };
             let output = format!(
-                "Matching self-dev build already queued/running, so this request was attached instead of spawning a duplicate build.\n\n- Your request ID: `{}`\n- Watcher task ID: `{}`\n- Existing request: `{}`\n- Requested by: {}\n- Reason: {}\n- Target version: `{}`\n- Source fingerprint: `{}`\n\n{}",
+                "Matching self-dev build already queued/running, so this request was attached instead of spawning a duplicate build.\n\n- Your request ID: `{}`\n- Watcher task ID: `{}`\n- Existing request: `{}`\n- Requested by: {}\n- Reason: {}\n- Target version: `{}`\n- Source fingerprint: `{}`\n\n{}\n\n{}",
                 request_id,
                 info.task_id,
                 existing.request_id,
@@ -551,7 +650,8 @@ export -f cargo
                 existing.reason,
                 requested_source.version_label,
                 requested_source.fingerprint,
-                delivery
+                delivery,
+                crate::tool::BACKGROUND_WAIT_GUIDANCE
             );
 
             return Ok(ToolOutput::new(output).with_metadata(json!({
@@ -587,6 +687,7 @@ export -f cargo
             repo_dir: repo_dir.display().to_string(),
             repo_scope: requested_source.repo_scope.clone(),
             worktree_scope: requested_source.worktree_scope.clone(),
+            release_notes: Some(release_notes),
             command: command.display.clone(),
             requested_at: Utc::now().to_rfc3339(),
             started_at: None,
@@ -658,6 +759,8 @@ export -f cargo
             info.status_file.display(),
             delivery
         );
+        output.push_str("\n\n");
+        output.push_str(crate::tool::BACKGROUND_WAIT_GUIDANCE);
 
         if let Some(ref blocker) = blocker {
             output.push_str(&format!(
@@ -667,11 +770,7 @@ export -f cargo
             ));
         }
 
-        output.push_str(&format!(
-            "\n\nUse `bg action=\"wait\" task_id=\"{}\"` to wait for completion/checkpoints, `bg action=\"status\" task_id=\"{}\"` to check progress immediately, or `selfdev status` to inspect the build queue.\nAfter it finishes, use `selfdev reload` when you want to restart onto the new binary.",
-            info.task_id,
-            info.task_id
-        ));
+        output.push_str("\n\nAfter it finishes, use `selfdev reload` when you want to restart onto the new binary.");
 
         Ok(ToolOutput::new(output).with_metadata(json!({
             "background": true,
@@ -703,6 +802,7 @@ export -f cargo
     pub(super) async fn do_build_reload(
         &self,
         reason: Option<String>,
+        release_notes: Option<String>,
         target: Option<String>,
         context: Option<String>,
         ctx: &ToolContext,
@@ -711,7 +811,7 @@ export -f cargo
         // waits inline for completion, so a separate completion notification
         // would be redundant noise.
         let build_output = self
-            .do_build(reason, target, Some(false), Some(false), ctx)
+            .do_build(reason, release_notes, target, Some(false), Some(false), ctx)
             .await?;
 
         let metadata = build_output.metadata.clone().unwrap_or_else(|| json!({}));
@@ -748,10 +848,9 @@ export -f cargo
 
         if !finished {
             return Ok(ToolOutput::new(format!(
-                "{}\n\nThe build is still running after waiting {}s, so the automatic reload was not started yet. Use `bg action=\"wait\" task_id=\"{}\"` to keep waiting, then `selfdev reload` once it finishes.",
+                "{}\n\nThe build is still running after waiting {}s, so the automatic reload was not started yet. After it finishes, use `selfdev reload`.",
                 build_output.output,
-                wait.as_secs(),
-                task_id
+                wait.as_secs()
             ))
             .with_metadata(json!({
                 "phase": "build",
@@ -879,6 +978,7 @@ export -f cargo
                 SelfDevTool::optimized_test_shell_command(&command),
             ],
             display: command.clone(),
+            env: Vec::new(),
         };
         let dedupe_key = format!(
             "test:{}:{}:{}",
@@ -900,6 +1000,7 @@ export -f cargo
             repo_dir: repo_dir.display().to_string(),
             repo_scope: requested_source.repo_scope.clone(),
             worktree_scope: requested_source.worktree_scope.clone(),
+            release_notes: None,
             command: shell_command.display.clone(),
             requested_at: Utc::now().to_rfc3339(),
             started_at: None,
@@ -975,10 +1076,8 @@ export -f cargo
                 blocker.reason
             ));
         }
-        output.push_str(&format!(
-            "\n\nUse `bg action=\"wait\" task_id=\"{}\"` to wait for completion/checkpoints, or `selfdev status` to inspect the queue.",
-            info.task_id
-        ));
+        output.push_str("\n\n");
+        output.push_str(crate::tool::BACKGROUND_WAIT_GUIDANCE);
 
         Ok(ToolOutput::new(output).with_metadata(json!({
             "background": true,

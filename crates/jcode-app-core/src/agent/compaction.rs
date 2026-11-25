@@ -1,8 +1,30 @@
 use super::*;
 
 impl Agent {
+    /// Flush an idle session before optional process replacement. Never abandon
+    /// a pending compaction or lose a completed summary that has not been polled.
+    pub(crate) fn checkpoint_idle_runtime_upgrade(&mut self) -> Result<()> {
+        self.poll_compaction_completion_event();
+        let compaction = self.registry.compaction();
+        let manager = compaction
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("compaction state is busy"))?;
+        anyhow::ensure!(!manager.is_compacting(), "compaction is still running");
+        self.session.compaction = manager.persisted_state().map(Arc::new);
+        // Prepared blank sessions also have externally visible IDs. Ordinary
+        // save intentionally skips these until the first user message.
+        self.session.save_prepared()?;
+        let pending = self
+            .soft_interrupt_queue
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("queued input is busy or poisoned"))?;
+        crate::soft_interrupt_store::overwrite(self.session_id(), &pending)?;
+        Ok(())
+    }
+
     pub(super) fn note_compaction_applied(&mut self) {
         self.cache_tracker.reset();
+        self.kv_cache_monitor.reset();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -121,6 +143,9 @@ impl Agent {
         if self.try_recover_after_payload_too_large(error) {
             return true;
         }
+        if self.try_recover_after_image_rejection(error) {
+            return true;
+        }
         if !Self::is_context_limit_error(error) {
             return false;
         }
@@ -137,6 +162,9 @@ impl Agent {
                     let all_messages = self.session.provider_messages();
                     manager.update_observed_input_tokens(context_limit);
                     let usage_pct = manager.context_usage_with(all_messages) * 100.0;
+                    // The provider rejected the request, so the context was at
+                    // least the limit even if the local estimate is lower.
+                    let pre_tokens = manager.effective_token_count_with(all_messages) as u64;
                     let dropped = match manager.hard_compact_with(all_messages) {
                         Ok(dropped) => dropped,
                         Err(reason) => {
@@ -147,6 +175,8 @@ impl Agent {
                             return false;
                         }
                     };
+                    let post_tokens = manager.token_estimate_with(all_messages) as u64;
+                    self.last_recovery_compaction = Some((pre_tokens, post_tokens, dropped));
                     (dropped, usage_pct)
                 };
                 self.sync_session_compaction_state_from_manager(&manager);
@@ -159,6 +189,7 @@ impl Agent {
         };
 
         self.cache_tracker.reset();
+        self.kv_cache_monitor.reset();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
@@ -182,6 +213,23 @@ impl Agent {
         true
     }
 
+    /// Client notice for the context-limit auto-recovery that just ran,
+    /// carrying its measured before/after token counts.
+    pub(super) fn take_recovery_compaction_event(&mut self) -> crate::protocol::ServerEvent {
+        let stats = self.last_recovery_compaction.take();
+        crate::protocol::ServerEvent::Compaction {
+            trigger: "auto_recovery".to_string(),
+            pre_tokens: stats.map(|(pre, _, _)| pre),
+            post_tokens: stats.map(|(_, post, _)| post),
+            tokens_saved: stats.map(|(pre, post, _)| pre.saturating_sub(post)),
+            duration_ms: None,
+            messages_dropped: stats.map(|(_, _, dropped)| dropped),
+            messages_compacted: None,
+            summary_chars: None,
+            active_messages: None,
+        }
+    }
+
     /// Best-effort recovery after a provider HTTP 413 "request too large" error.
     ///
     /// This failure is caused by the serialized request body (dominated by inline
@@ -189,6 +237,26 @@ impl Agent {
     /// the token context window. We strip oversized images from the persisted
     /// transcript, oldest-first, down to a conservative byte budget and reset the
     /// provider session/cache so the caller can retry the same turn immediately.
+    ///
+    /// The cap is on the whole body, not on each image. An aggregator such as Nous
+    /// Research's `inference-api.nousresearch.com` answers
+    /// `413 Request in excess of 10MB` for a body whose images are each far below
+    /// `PAYLOAD_IMAGE_CHAR_BUDGET` (measured 2026-11-23: 24 screenshots of ~0.42
+    /// MiB, every one under the per-image cap). When that strip therefore removes
+    /// nothing, dropping every remaining inline image is the same deterministic
+    /// move the image-rejection recovery already makes (#1712) and is what gets
+    /// the retry under the ceiling. Only a body with no images left at all is
+    /// handed back to the caller.
+    ///
+    /// reference: request-body size ceilings are provider policy.
+    ///   Anthropic Messages API: 128 MB max request size, 413 `request_too_large`
+    ///   (https://docs.claude.com/en/api/errors, "Request size limits").
+    ///   HTTP 413 constrains the request content, not any single field
+    ///   (https://www.rfc-editor.org/rfc/rfc9110.html#name-413-content-too-large).
+    ///   Nous Research inference-api.nousresearch.com: measured 413
+    ///   "Request in excess of 10MB. That's too big." on 2026-11-23; no public
+    ///   page states the limit, the value comes from the observed gateway
+    ///   response and the request-body character counts in the session log.
     fn try_recover_after_payload_too_large(&mut self, error: &str) -> bool {
         if !crate::compaction::is_request_payload_too_large_error(error) {
             return false;
@@ -197,32 +265,24 @@ impl Agent {
         let stripped = self
             .session
             .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
-        if stripped == 0 {
+        let stripped_all = if stripped == 0 {
+            let all = self.session.strip_all_images();
+            if all > 0 {
+                logging::warn(
+                    "Request-too-large recovery: no image exceeded the per-image budget; dropped every inline image so the whole body fits",
+                );
+            }
+            all
+        } else {
+            0
+        };
+        if stripped == 0 && stripped_all == 0 {
             logging::warn(
                 "Request-too-large recovery skipped: no oversized inline images to strip",
             );
             return false;
         }
-
-        // The transcript changed; reseed compaction bookkeeping and reset
-        // provider session/cache state so the retry sends the reduced payload.
-        let compaction = self.registry.compaction();
-        if let Ok(mut manager) = compaction.try_write() {
-            let provider_messages = self.session.messages_for_provider();
-            manager.reset();
-            manager.set_budget(self.provider.context_window());
-            if let Some(state) = self.session.compaction.as_ref() {
-                manager.restore_persisted_state_with(state, &provider_messages);
-            } else {
-                manager.seed_restored_messages_with(&provider_messages);
-            }
-            self.sync_session_compaction_state_from_manager(&manager);
-        }
-
-        self.cache_tracker.reset();
-        self.locked_tools = None;
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
+        self.reset_after_transcript_image_rewrite();
 
         logging::warn(&format!(
             "Request body exceeded provider size limit; stripped {} oversized inline image(s) and retrying",
@@ -234,11 +294,71 @@ impl Agent {
                 "request_payload_too_large",
             )
             .with_session_id(self.session.id.clone())
-            .with_detail(format!("images_stripped={stripped}"))
+            .with_detail(format!(
+                "images_stripped={stripped},all_images_stripped={stripped_all}"
+            ))
             .force_attribution(),
         );
 
         true
+    }
+
+    /// A provider rejected an inline image with a deterministic 400 (bad
+    /// media type, undecodable data, a limit jcode does not model). Every
+    /// retry would replay the same image, so replace stored images with text
+    /// notes and retry once (#1712). The outbound clamp normally prevents
+    /// this; this catches provider rules it does not know about.
+    fn try_recover_after_image_rejection(&mut self, error: &str) -> bool {
+        if !crate::compaction::is_image_rejection_error(error) {
+            return false;
+        }
+        let stripped = self.session.strip_all_images();
+        if stripped == 0 {
+            return false;
+        }
+        self.reset_after_transcript_image_rewrite();
+        if let Err(err) = self.session.save() {
+            logging::warn(&format!(
+                "Image-rejection recovery: failed to persist stripped transcript: {err}"
+            ));
+        }
+        logging::warn(&format!(
+            "Provider rejected an inline image; replaced {stripped} image(s) with text notes and retrying"
+        ));
+        crate::runtime_memory_log::emit_event(
+            crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
+                "image_rejection_recovered",
+                "provider_image_rejected",
+            )
+            .with_session_id(self.session.id.clone())
+            .with_detail(format!("images_stripped={stripped}"))
+            .force_attribution(),
+        );
+        true
+    }
+
+    /// The transcript's images changed; reseed compaction bookkeeping and
+    /// reset provider session/cache state so the retry sends the new payload.
+    fn reset_after_transcript_image_rewrite(&mut self) {
+        let compaction = self.registry.compaction();
+        if let Ok(mut manager) = compaction.try_write() {
+            let provider_messages = self.session.messages_for_provider();
+            manager.reset();
+            manager.set_context_cap_override(self.session.context_cap);
+            manager.set_budget(self.provider.context_window());
+            if let Some(state) = self.session.compaction.as_ref() {
+                manager.restore_persisted_state_with(state, &provider_messages);
+            } else {
+                manager.seed_restored_messages_with(&provider_messages);
+            }
+            self.sync_session_compaction_state_from_manager(&manager);
+        }
+
+        self.cache_tracker.reset();
+        self.kv_cache_monitor.reset();
+        self.locked_tools = None;
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
     }
 
     fn try_recover_oversized_openai_native_compaction(&mut self) -> bool {
@@ -264,6 +384,7 @@ impl Agent {
         }
 
         self.cache_tracker.reset();
+        self.kv_cache_monitor.reset();
         self.locked_tools = None;
         self.provider_session_id = None;
         self.session.provider_session_id = None;

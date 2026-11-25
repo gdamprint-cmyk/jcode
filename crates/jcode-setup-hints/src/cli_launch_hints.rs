@@ -166,17 +166,17 @@ fn binary_on_path(binary: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|dir| {
-        if dir.join(binary).is_file() {
-            return true;
-        }
         #[cfg(windows)]
         {
-            return dir.join(format!("{binary}.exe")).is_file()
+            dir.join(binary).is_file()
+                || dir.join(format!("{binary}.exe")).is_file()
                 || dir.join(format!("{binary}.cmd")).is_file()
-                || dir.join(format!("{binary}.bat")).is_file();
+                || dir.join(format!("{binary}.bat")).is_file()
         }
         #[cfg(not(windows))]
-        false
+        {
+            dir.join(binary).is_file()
+        }
     })
 }
 
@@ -331,11 +331,26 @@ fn send_desktop_notification(title: &str, body: &str) {
         fn escape(value: &str) -> String {
             value.replace('\\', "\\\\").replace('"', "\\\"")
         }
-        let script = format!(
+        let mut script = format!(
             "display notification \"{}\" with title \"{}\"",
             escape(body),
             escape(title)
         );
+        // Attribute to the host terminal app so clicking the banner activates
+        // the terminal rather than Script Editor.
+        let launching_bundle_id = std::env::var_os("__CFBundleIdentifier");
+        if let Some(bundle_id) = launching_bundle_id
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "com.apple.Terminal.osascript")
+        {
+            script = format!(
+                "tell application id \"{}\" to {}",
+                escape(bundle_id),
+                script
+            );
+        }
         if let Ok(child) = std::process::Command::new("osascript")
             .args(["-e", &script])
             .stdin(std::process::Stdio::null())

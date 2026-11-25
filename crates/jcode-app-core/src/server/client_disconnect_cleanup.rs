@@ -4,15 +4,16 @@ use super::{
     remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, unregister_session_event_sender, update_member_status,
 };
+#[cfg(test)]
 use crate::agent::Agent;
 use anyhow::Result;
 use jcode_agent_runtime::InterruptSignal;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 
 const RELOAD_DISCONNECT_MARKER_MAX_AGE: Duration = Duration::from_secs(30);
@@ -21,16 +22,52 @@ pub(super) const IDLE_RECONNECT_GRACE: Duration = Duration::from_secs(30);
 // The last registered event sender remains on the member after it detaches.
 // It is therefore also an ownership witness: an old grace timer must not
 // remove a successor's session even if that successor has disconnected again.
+//
+// A connection can also disconnect before its subscribe registered a swarm
+// member at all (e.g. the window closed while subscribe was in flight). In
+// that case an absent member is the original state, not evidence of a
+// successor. Treating it as replaced made the grace loop return early and
+// skip destructive cleanup, leaking the live Agent for the server's lifetime.
 async fn attachment_was_replaced(
     members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     session_id: &str,
     original: &mpsc::UnboundedSender<crate::protocol::ServerEvent>,
+    originally_registered: bool,
 ) -> bool {
-    members
+    match members.read().await.get(session_id) {
+        Some(member) => !member.event_tx.same_channel(original),
+        None => originally_registered,
+    }
+}
+
+/// Is some client attached to this session, or has a successor replaced this
+/// connection's swarm attachment? Cleanup answers this twice: once before it
+/// takes the per-session claim gate, and once while holding it, because a
+/// successor may claim in that window.
+async fn successor_is_connected(
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    session_id: &str,
+    client_event_tx: &mpsc::UnboundedSender<crate::protocol::ServerEvent>,
+    allow_reconnect: bool,
+    originally_registered: bool,
+) -> bool {
+    if client_connections
         .read()
         .await
-        .get(session_id)
-        .is_none_or(|member| !member.event_tx.same_channel(original))
+        .values()
+        .any(|info| info.session_id == session_id)
+    {
+        return true;
+    }
+    allow_reconnect
+        && attachment_was_replaced(
+            swarm_members,
+            session_id,
+            client_event_tx,
+            originally_registered,
+        )
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +102,26 @@ fn disconnected_while_processing(
         .unwrap_or(client_is_processing)
 }
 
+/// Capture EOF before agent cleanup, including turns retained after disconnect.
+/// Explicit protocol Detach does not call this. Serializes with resume claims,
+/// and removing the connection makes repeated cleanup idempotent.
+pub(super) async fn record_transport_closed(
+    session_id: &str,
+    connection_id: &str,
+    client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
+) {
+    let mut connections = client_connections.write().await;
+    let removed = connections.remove(connection_id);
+    if removed.is_some_and(|info| info.session_id == session_id)
+        && !connections
+            .values()
+            .any(|info| info.session_id == session_id)
+        && !crate::server::reload_marker_active(RELOAD_DISCONNECT_MARKER_MAX_AGE)
+    {
+        crate::session::record_window_closed(session_id);
+    }
+}
+
 /// Release transport-owned state without changing the live session or turn.
 pub(super) async fn detach_client_attachment(
     session_id: &str,
@@ -88,6 +145,7 @@ pub(super) async fn cleanup_client_connection(
     sessions: &SessionAgents,
     client_session_id: &str,
     client_is_processing: bool,
+    continue_on_disconnect: bool,
     processing_task: &mut Option<tokio::task::JoinHandle<()>>,
     event_handle: tokio::task::JoinHandle<()>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
@@ -125,6 +183,12 @@ pub(super) async fn cleanup_client_connection(
     } else {
         false
     };
+    if disposition == DisconnectDisposition::Closed {
+        crate::agents_status::session_closed(client_session_id);
+    }
+    let originally_registered = swarm_members.read().await.contains_key(client_session_id);
+
+    record_transport_closed(client_session_id, client_connection_id, client_connections).await;
 
     detach_client_attachment(
         client_session_id,
@@ -135,6 +199,18 @@ pub(super) async fn cleanup_client_connection(
         swarm_members,
     )
     .await;
+
+    if continue_on_disconnect {
+        // Remote continuation is a session lifetime policy, not merely a
+        // promise to finish the current turn. Idle coordinators must remain
+        // addressable for worker reports and future wake turns after EOF.
+        // Only transport-owned state was released above.
+        if processing_task.is_some() {
+            return Ok(Some(event_handle));
+        }
+        event_handle.abort();
+        return Ok(None);
+    }
 
     if allow_reconnect {
         // Empty roots intentionally have no snapshot. A replacement UI/SDK
@@ -149,7 +225,13 @@ pub(super) async fn cleanup_client_connection(
         ));
         let deadline = tokio::time::Instant::now() + idle_reconnect_grace;
         loop {
-            if attachment_was_replaced(swarm_members, client_session_id, client_event_tx).await
+            if attachment_was_replaced(
+                swarm_members,
+                client_session_id,
+                client_event_tx,
+                originally_registered,
+            )
+            .await
                 || client_connections
                     .read()
                     .await
@@ -173,17 +255,24 @@ pub(super) async fn cleanup_client_connection(
     // reclaim the same session without tripping duplicate-attach guards.
     tokio::task::yield_now().await;
 
-    // Resume claims use this same lock before accessing the sessions map.
-    // Keep it through destructive cleanup so a successor cannot be claimed
-    // between the check and session/status/control-handle removal.
-    let connections = client_connections.write().await;
-    let successor_connected = connections
-        .values()
-        .any(|info| info.session_id == client_session_id);
-    if successor_connected
-        || (allow_reconnect
-            && attachment_was_replaced(swarm_members, client_session_id, client_event_tx).await)
-    {
+    // First successor check. This read deliberately does not serialize the
+    // window: a claim may attach right after it. The authoritative answer is
+    // taken under the per-session claim gate below, and only that one gates
+    // destructive teardown. Holding the write lock here across the agent mutex,
+    // swarm teardown and channel/file cleanup made every other connection's
+    // subscribe wait for one disconnect's whole teardown (measured 2026-11-19:
+    // 248 subscribes acked, 0 reached the handler's end during the reconnect
+    // storm, p50 2.35 s).
+    let successor_connected = successor_is_connected(
+        client_connections,
+        swarm_members,
+        client_session_id,
+        client_event_tx,
+        allow_reconnect,
+        originally_registered,
+    )
+    .await;
+    if successor_connected {
         crate::logging::info(&format!(
             "Skipping destructive disconnect cleanup for {} because another client is still attached",
             client_session_id
@@ -192,6 +281,49 @@ pub(super) async fn cleanup_client_connection(
         // its writer handle so it can retain and await the task using the same
         // continuation path as an explicitly detached remote turn. Merely
         // dropping the JoinHandle here would lose completion/status handling.
+        if processing_task.is_some() {
+            return Ok(Some(event_handle));
+        }
+        event_handle.abort();
+        return Ok(None);
+    }
+
+    // Test-only observation point: cleanup has answered the first ownership
+    // question and is about to take the per-session claim gate.
+    #[cfg(test)]
+    if let Some(pause) =
+        crate::server::client_disconnect_grace_test_pause::take(client_session_id)
+    {
+        pause.wait_for_release().await;
+    }
+
+    // This reservation does not lock the registry, so it does not by itself
+    // exclude another writer, and it is NOT the mechanism that protects the
+    // re-read below. It is taken on the session being cleaned up, while a resume
+    // claim holds the reservation of its own target and releases it before its
+    // teardown. What protects the re-read is that it scans the same id a claim
+    // publishes into `client_connections`, and the claim is the sole writer of a
+    // live session id there. The reservation still buys ordering against a claim
+    // already publishing THIS id, and claims for other sessions proceed
+    // independently.
+    let _successor_claim_gate = sessions.reserve(client_session_id).await;
+    // Re-check under the gate. The first check released the registry guard, so
+    // a successor could have claimed in between; removing now would take a
+    // session that is already owned again.
+    if successor_is_connected(
+        client_connections,
+        swarm_members,
+        client_session_id,
+        client_event_tx,
+        allow_reconnect,
+        originally_registered,
+    )
+    .await
+    {
+        crate::logging::info(&format!(
+            "Skipping destructive disconnect cleanup for {} because a successor claimed it during disconnect",
+            client_session_id
+        ));
         if processing_task.is_some() {
             return Ok(Some(event_handle));
         }
@@ -214,6 +346,14 @@ pub(super) async fn cleanup_client_connection(
 
             match lock_result {
                 Ok(mut agent) => {
+                    // Concurrency telemetry delivery blocks (bounded at
+                    // ~800ms) and is pure reporting. Finishing it inline held
+                    // the server-wide connections lock for ~250ms on every
+                    // disconnect, stalling the next client's attach. Detach
+                    // the guard and finish it on a blocking worker instead.
+                    if let Some(mut concurrency) = agent.take_concurrency_session() {
+                        tokio::task::spawn_blocking(move || concurrency.finish());
+                    }
                     match disposition {
                         DisconnectDisposition::Closed => {
                             agent.mark_closed();
@@ -311,6 +451,7 @@ pub(super) async fn cleanup_client_connection(
             }
         };
         crate::session_metrics::forget(client_session_id);
+        super::live_status::forget(client_session_id);
         crate::session_effort::forget_session_effort(client_session_id);
 
         if let Some(ref swarm_id) = swarm_id {
@@ -352,10 +493,18 @@ pub(super) async fn cleanup_client_connection(
     remove_background_tool_signal(client_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, client_session_id).await;
 
-    drop(connections);
+    #[cfg(test)]
+    if let Some(pause) = crate::server::client_disconnect_grace_test_pause::take(client_session_id)
+    {
+        pause.mark_finished();
+    }
     event_handle.abort();
     Ok(None)
 }
+
+#[cfg(test)]
+#[path = "window_closure_tests.rs"]
+mod window_closure_tests;
 
 #[cfg(test)]
 #[path = "client_disconnect_grace_tests.rs"]

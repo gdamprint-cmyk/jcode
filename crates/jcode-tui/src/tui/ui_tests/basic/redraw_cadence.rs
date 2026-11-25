@@ -31,6 +31,22 @@ fn static_chrome_state(notice: Option<&str>) -> TestState {
     }
 }
 
+#[test]
+fn oauth_notice_owns_the_rendered_status_line_while_processing() {
+    let _guard = viewport_snapshot_test_lock();
+    let notice = crate::telemetry::OAUTH_ACCOUNT_NOTICE_TEXT;
+    let mut state = static_chrome_state(Some(notice));
+    state.status = ProcessingStatus::Sending;
+    let backend = ratatui::backend::TestBackend::new(80, 1);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    crate::tui::app::oauth_telemetry::begin_frame();
+    terminal.draw(|frame| crate::tui::ui::input_ui::draw_status(frame, &state, frame.area(), 3)).unwrap();
+    let text = terminal.backend().buffer().content.iter()
+        .map(|cell| cell.symbol()).collect::<String>();
+    assert!(text.contains(notice), "{text}");
+    assert!(!text.contains("Sending"), "{text}");
+}
+
 fn full_tier_policy() -> crate::perf::TuiPerfPolicy {
     // Build from the real policy so a new field cannot silently drift, then pin
     // the parts these assertions depend on. The host's load average must not
@@ -303,4 +319,76 @@ fn a_notice_screen_left_alone_still_reaches_deep_idle() {
         crate::tui::REDRAW_DEEP_IDLE,
         "a dormant notice screen must tick at the deep-idle crawl"
     );
+}
+
+/// A turn that already streamed text and is now thinking or running a tool
+/// shows a fully revealed transcript. Repainting it at the fast cadence redrew
+/// identical cells 66 times a second on a live client (about 0.2 cores per
+/// waiting session). Only the spinner and timer change, so it must drop to the
+/// spinner cadence, while a pending reveal backlog keeps the fast cadence.
+#[test]
+fn fully_revealed_stream_waiting_on_the_turn_drops_to_spinner_cadence() {
+    let policy = full_tier_policy();
+    let fast_interval = Duration::from_millis(1000 / u64::from(policy.redraw_fps.max(1)));
+
+    let mut waiting = static_chrome_state(None);
+    waiting.status = ProcessingStatus::Streaming;
+    waiting.streaming_text = "partial assistant answer".to_string();
+    waiting.stream_reveal_pending = Some(false);
+    // TestState::is_processing derives from status.
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&waiting, &policy),
+        crate::tui::REDRAW_STATIC_STREAM,
+        "fully revealed streamed text must not repaint at the fast cadence"
+    );
+
+    let mut revealing = waiting.clone();
+    revealing.stream_reveal_pending = Some(true);
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&revealing, &policy),
+        fast_interval,
+        "a reveal backlog must keep the smooth fast cadence"
+    );
+}
+
+/// Background panes stay live but must not repaint at full frame rate: a swarm
+/// keeps many unfocused clients streaming at once.
+#[test]
+fn unfocused_streaming_client_is_capped_but_focused_is_not() {
+    let policy = full_tier_policy();
+    let mut state = TestState {
+        status: ProcessingStatus::Streaming,
+        streaming_text: "partial reply".to_string(),
+        stream_reveal_pending: Some(true),
+        ..Default::default()
+    };
+    let focused = crate::tui::redraw_interval_with_policy(&state, &policy);
+    assert!(focused < crate::tui::redraw_schedule::REDRAW_UNFOCUSED_MIN);
+    state.unfocused = true;
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        crate::tui::redraw_schedule::REDRAW_UNFOCUSED_STREAM
+    );
+}
+
+/// A background turn with nothing left to reveal (thinking, running a tool)
+/// only moves a spinner, so it ticks at the 1s liveness rate. Measured live:
+/// such sessions held 10 full frames/s each before.
+#[test]
+fn unfocused_turn_without_reveal_backlog_ticks_at_liveness_rate() {
+    let policy = full_tier_policy();
+    for text in ["", "already revealed reply"] {
+        let state = TestState {
+            status: ProcessingStatus::Streaming,
+            streaming_text: text.to_string(),
+            stream_reveal_pending: Some(false),
+            unfocused: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::tui::redraw_interval_with_policy(&state, &policy),
+            crate::tui::redraw_schedule::REDRAW_PASSIVE_LIVENESS,
+            "text={text:?}"
+        );
+    }
 }

@@ -1,3 +1,8 @@
+// reference: in-repo prior art - `read_current_version` /
+// `read_shared_server_version` in this same file (the marker-file pattern:
+// one file per channel under `builds_dir()`, holding the channel's version
+// label, written when the channel moves). `staged_version_file` follows that
+// exact pattern for the staging marker.
 use super::{MigrationContext, binary_name};
 use anyhow::Result;
 use jcode_storage as storage;
@@ -38,6 +43,47 @@ fn resolve_builds_dir(
 /// Get path to build manifest
 pub fn manifest_path() -> Result<PathBuf> {
     Ok(builds_dir()?.join("manifest.json"))
+}
+
+/// Get path to the APPEND-ONLY publication ledger.
+///
+/// The ledger records every version that was PUBLISHED, one JSON object per
+/// line, and is never truncated or garbage collected.
+///
+/// WHY IT EXISTS: the manifest history truncates to 20 rows
+/// (`BuildManifest::add_to_history`) and `builds/versions/` is garbage
+/// collected by the daily version GC
+/// (`crates/jcode-build-support/src/version_gc.rs`). Both are lossy under
+/// exactly the operation a landing performs (a daemon restart). Measured
+/// 2026-11-16 on this host: a landing that restarted the daemon ran that GC,
+/// which removed 9 version directories and evicted 2 more rows from the
+/// truncated history, so four Harbor queue entries from other sessions lost
+/// their ONLY publication proof and the acceptance checker reported 8 failures
+/// for fixes that were demonstrably live.
+///
+/// This ledger is the durable proof that a version label was installed. It is
+/// appended at the SINGLE point where a version directory is created
+/// (`install_binary_at_version`), so every publishing path that goes through
+/// that function - the session build request, the debug `reload`, the self-dev
+/// `reload`, `/rebuild`, the release updater and `landing::stage_build` -
+/// leaves a record. The session build request additionally writes a
+/// build-request record, but the two reload paths did not, which left one
+/// published version (`ac6859a22-dirty-a2b2105c06c0`) provable only by its
+/// garbage-collectible directory.
+///
+/// The tarball release path (`crates/jcode-app-core/src/update.rs`) installs
+/// the binary DIRECTLY, without going through `install_binary_at_version`, so
+/// it records its row explicitly.
+///
+/// A row without `validated: true` proves INSTALLATION only: the ledger row is
+/// written before the post-install smoke test and hash check. The staging path
+/// appends a second, validated row once those pass.
+///
+/// reference: in-repo prior art - the marker-file pattern of
+/// `read_current_version` in this same file, and the append-only semantics of
+/// the session journal (`crates/jcode-base/src/session/persistence.rs`).
+pub fn publication_ledger_path() -> Result<PathBuf> {
+    Ok(builds_dir()?.join("published-versions.jsonl"))
 }
 
 /// Get path to a specific version's binary
@@ -88,6 +134,21 @@ pub fn current_version_file() -> Result<PathBuf> {
 /// Get path to the shared server version file (approved daemon marker).
 pub fn shared_server_version_file() -> Result<PathBuf> {
     Ok(builds_dir()?.join("shared-server-version"))
+}
+
+/// Get path to the staged version file (the newest BUILT build).
+///
+/// The staged marker is what makes a BUILD staging-only. A build installs
+/// its immutable versioned binary and records the label here; it does NOT
+/// touch the `current` channel or the launcher. The landing then moves every
+/// channel onto the staged build in one transaction, so a client can never
+/// attach to a daemon running a different build.
+///
+/// Before this marker existed, the `current` channel doubled as "the newest
+/// build" and "the build the clients run", and those two are different
+/// things: the first is a build output, the second is a release decision.
+pub fn staged_version_file() -> Result<PathBuf> {
+    Ok(builds_dir()?.join("staged-version"))
 }
 
 /// Save migration context before switching to canary
@@ -150,6 +211,33 @@ pub fn read_current_version() -> Result<Option<String>> {
 /// Read the current shared-server version.
 pub fn read_shared_server_version() -> Result<Option<String>> {
     let path = shared_server_version_file()?;
+    if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        let hash = content.trim();
+        if hash.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hash.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Record the version a BUILD produced, without moving any channel.
+///
+/// This is the staging half of the landing split. The build's output becomes
+/// the landing's TARGET, but it does not become the build the clients run:
+/// that happens only when the landing commits.
+pub fn write_staged_version(version: &str) -> Result<()> {
+    let path = staged_version_file()?;
+    std::fs::write(path, version)?;
+    Ok(())
+}
+
+/// Read the version of the newest STAGED build, if any.
+pub fn read_staged_version() -> Result<Option<String>> {
+    let path = staged_version_file()?;
     if path.exists() {
         let content = std::fs::read_to_string(path)?;
         let hash = content.trim();

@@ -4,18 +4,30 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod directives;
+mod harbor;
 mod manager;
-mod paths;
+pub(crate) mod paths;
 mod persistence;
 mod prompt;
 pub mod runner;
 pub mod scheduler;
 
+#[cfg(test)]
+#[path = "ambient/counter_regression_tests.rs"]
+mod counter_regression_tests;
+
+#[cfg(test)]
+#[path = "ambient/ambient_dead_letter_tests.rs"]
+mod ambient_dead_letter_tests;
+
 pub use directives::{
     UserDirective, add_directive, has_pending_directives, load_directives, take_pending_directives,
 };
+pub use harbor::{HarborStatus, harbor_dir, prompt_section as harbor_prompt_section, run_pass as harbor_run_pass};
 pub use manager::AmbientManager;
 pub use persistence::{AmbientLock, ScheduledQueue};
+#[cfg(test)]
+pub(crate) use persistence::{StateWrite, reset_state_writes, state_writes_all_for};
 #[cfg(test)]
 pub(crate) use prompt::format_duration_rough;
 pub use prompt::{
@@ -63,6 +75,60 @@ impl VisibleCycleContext {
             .join("ambient")
             .join("cycle_result.json"))
     }
+
+    /// Path of the start marker written by the visible TUI process.
+    pub fn start_path() -> Result<PathBuf> {
+        Ok(storage::jcode_dir()?
+            .join("ambient")
+            .join("cycle_started.json"))
+    }
+
+    /// Record that the visible TUI process is up.
+    ///
+    /// The result file alone cannot separate three states:
+    /// - the TUI wrote `cycle_result.json` -> the cycle result is available;
+    /// - the TUI started, then exited without writing a result -> the user
+    ///   closed the window;
+    /// - the TUI never started -> the terminal opened, but
+    ///   `jcode ambient run-visible` failed to launch.
+    ///
+    /// Only the PID makes the second and third states observable before the
+    /// result file appears.
+    pub fn write_start(pid: u32) -> Result<()> {
+        let path = Self::start_path()?;
+        if let Some(parent) = path.parent() {
+            storage::ensure_dir(parent)?;
+        }
+        storage::write_json(
+            &path,
+            &VisibleCycleStart {
+                pid,
+                started_at: chrono::Utc::now(),
+            },
+        )
+    }
+
+    /// Read the start marker, if the visible TUI process reported itself.
+    pub fn read_start() -> Option<VisibleCycleStart> {
+        let path = Self::start_path().ok()?;
+        storage::read_json(&path).ok()
+    }
+
+    /// Remove a stale start marker.
+    pub fn clear_start() {
+        if let Ok(path) = Self::start_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Start marker written by the visible TUI process once it is running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisibleCycleStart {
+    /// PID of the visible TUI process.
+    pub pid: u32,
+    /// When the TUI process started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Ambient mode status
@@ -109,8 +175,16 @@ impl ScheduleTarget {
     }
 }
 
+/// The maximum number of entries kept live in the ambient scheduled queue.
+///
+/// Entries whose target is `Ambient` are write-only: the runner only claims
+/// direct-delivery entries, so an ambient entry is never removed from the queue
+/// by production code. Without a bound the queue grows monotonically forever
+/// and every ambient cycle renders the whole list into its system prompt.
+pub const AMBIENT_QUEUE_MAX_LIVE_ENTRIES: usize = 50;
+
 /// A scheduled ambient task
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledItem {
     pub id: String,
     pub scheduled_for: DateTime<Utc>,

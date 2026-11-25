@@ -9,6 +9,34 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Selected model-provider OAuth identity for the telemetry notice handshake.
+/// Debug formatting must never disclose this personal information.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ProviderOAuthEmail(String);
+
+impl ProviderOAuthEmail {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ProviderOAuthEmail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProviderOAuthEmail([REDACTED])")
+    }
+}
+
+mod screen;
+pub use screen::*;
 mod comm_format;
 mod notifications;
 
@@ -44,12 +72,202 @@ pub enum TranscriptMode {
     Send,
 }
 
+/// Push-to-talk state captured outside the TUI (for example `jcode companion`),
+/// shown in the target session's status line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum VoiceActivity {
+    /// Microphone open. `levels` holds recent RMS levels (`0.0..=1.0`),
+    /// oldest first. `live` is the partial transcript so far.
+    Recording {
+        #[serde(default)]
+        elapsed_ms: u64,
+        #[serde(default)]
+        levels: Vec<f32>,
+        #[serde(default)]
+        live: String,
+    },
+    /// Key released, waiting for the final transcript.
+    Transcribing {
+        #[serde(default)]
+        live: String,
+    },
+    /// Capture ended (sent, cancelled or failed). Clears the indicator.
+    Idle,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommDeliveryMode {
     Notify,
     Interrupt,
     Wake,
+}
+
+/// A client's claim about the transcript prefix it already holds, used to
+/// request only the remaining History messages.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryBase {
+    /// Number of leading History messages the client holds.
+    pub count: usize,
+    /// [`history_prefix_fingerprint`] of those messages.
+    pub fingerprint: u64,
+    /// [`history_images_fingerprint`] of the rendered images the client holds.
+    /// When it matches, History omits `images` and sets `images_unchanged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images_fingerprint: Option<u64>,
+    /// Opt into a recent rendered-history window on a full bootstrap. Only
+    /// honored when `count` is zero, never combined with prefix validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_messages: Option<usize>,
+}
+
+/// Synthetic lazy-window marker used by remote transcript bootstraps.
+pub const RECENT_HISTORY_MARKER_PREFIX: &str = "Earlier remote history - ";
+
+/// `Pong.capabilities` entry of servers that accept `Request::ClientFocus`.
+pub const CLIENT_FOCUS_CAPABILITY: &str = "client_focus";
+
+impl HistoryBase {
+    /// Request a bounded initial view. Older servers ignore this hint and
+    /// return their ordinary full History payload.
+    pub fn recent(visible: usize) -> Self {
+        Self {
+            count: 0,
+            fingerprint: 0,
+            images_fingerprint: None,
+            recent_messages: Some(visible),
+        }
+    }
+}
+
+/// Stable fingerprint of a History image set (order, metadata and data).
+pub fn history_images_fingerprint(images: &[jcode_session_types::RenderedImage]) -> u64 {
+    let mut fingerprinter = HistoryFingerprinter::default();
+    for image in images {
+        fingerprinter.feed(image.media_type.as_bytes());
+        fingerprinter.feed(image.data.as_bytes());
+        fingerprinter.feed(image.label.as_deref().unwrap_or("\u{0}").as_bytes());
+        fingerprinter.feed(
+            serde_json::to_string(&(&image.source, &image.anchor, &image.history_message_index))
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        fingerprinter.count += 1;
+    }
+    fingerprinter.finish()
+}
+
+/// Stable, process-independent fingerprint of History messages, shared by the
+/// client (to describe what it has) and the server (to verify the claim).
+/// Covers every field the client renders, so any divergence falls back to a
+/// full transcript.
+pub fn history_prefix_fingerprint<'a>(
+    messages: impl IntoIterator<Item = HistoryMessageRef<'a>>,
+) -> u64 {
+    let mut fingerprinter = HistoryFingerprinter::default();
+    for message in messages {
+        fingerprinter.push(message);
+    }
+    fingerprinter.finish()
+}
+
+/// Streaming form of [`history_prefix_fingerprint`], so a client can extend
+/// the fingerprint of an applied transcript with a delta tail without
+/// re-hashing (or retaining) the prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryFingerprinter {
+    hash: u64,
+    count: usize,
+}
+
+impl Default for HistoryFingerprinter {
+    fn default() -> Self {
+        // FNV-1a 64: deterministic across processes and builds, unlike
+        // std's randomized DefaultHasher.
+        Self {
+            hash: 0xcbf2_9ce4_8422_2325,
+            count: 0,
+        }
+    }
+}
+
+impl HistoryFingerprinter {
+    fn feed(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        // Separator so field boundaries cannot alias.
+        self.hash ^= 0xff;
+        self.hash = self.hash.wrapping_mul(0x0100_0000_01b3);
+    }
+
+    pub fn push(&mut self, message: HistoryMessageRef<'_>) {
+        self.count += 1;
+        self.feed(message.role.as_bytes());
+        self.feed(message.content.as_bytes());
+        for call in message.tool_calls {
+            self.feed(call.as_bytes());
+        }
+        self.feed(&(message.tool_calls.len() as u64).to_le_bytes());
+        match message.tool_data {
+            Some(tool) => {
+                self.feed(b"tool");
+                self.feed(tool.id.as_bytes());
+                self.feed(tool.name.as_bytes());
+                self.feed(
+                    serde_json::to_string(&tool.input)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+            }
+            None => self.feed(b"-"),
+        }
+    }
+
+    /// Number of messages pushed so far.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Fingerprint of everything pushed so far. Does not consume, so more
+    /// messages can be pushed afterwards.
+    pub fn finish(&self) -> u64 {
+        let mut done = *self;
+        done.feed(&(self.count as u64).to_le_bytes());
+        done.hash
+    }
+
+    pub fn base(&self) -> HistoryBase {
+        HistoryBase {
+            count: self.count,
+            fingerprint: self.finish(),
+            images_fingerprint: None,
+            recent_messages: None,
+        }
+    }
+}
+
+/// Borrowed view of the fields [`history_prefix_fingerprint`] covers, so the
+/// client can fingerprint its rendered transcript without converting it.
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryMessageRef<'a> {
+    pub role: &'a str,
+    pub content: &'a str,
+    pub tool_calls: &'a [String],
+    pub tool_data: Option<&'a ToolCall>,
+}
+
+impl<'a> From<&'a HistoryMessage> for HistoryMessageRef<'a> {
+    fn from(message: &'a HistoryMessage) -> Self {
+        Self {
+            role: &message.role,
+            content: &message.content,
+            tool_calls: message.tool_calls.as_deref().unwrap_or(&[]),
+            tool_data: message.tool_data.as_ref(),
+        }
+    }
 }
 
 /// A message in conversation history (for sync)
@@ -183,8 +401,8 @@ impl AuthChanged {
 pub type ReloadRecoverySnapshot = jcode_selfdev_types::ReloadRecoveryDirective;
 
 mod wire;
-pub use wire::{Request, ServerEvent};
-pub use wire::{SessionToolConfig, SessionToolDefinition, TaskGraphNodeSpec};
+pub use wire::{AccountUsageSnapshot, AccountUsageWindow, Request, ServerEvent, TurnIdentity};
+pub use wire::{SessionToolConfig, SessionToolDefinition};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallSummary {
@@ -198,6 +416,23 @@ pub struct ToolCallSummary {
 pub struct SwarmChannelInfo {
     pub channel: String,
     pub member_count: usize,
+}
+
+/// Directory entry for one live swarm, used for cross-swarm discovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmInfo {
+    pub swarm_id: String,
+    /// Human-readable, unique swarm label, when one has been set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_name: Option<String>,
+    pub member_count: usize,
+    /// Whether the requesting session belongs to this swarm.
+    #[serde(default)]
+    pub is_own: bool,
 }
 
 /// A shared context entry
@@ -251,6 +486,10 @@ pub struct AgentInfo {
     /// the agent is actually doing work right now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_age_secs: Option<u64>,
+    /// Set when the stalled-worker watchdog flags this member: seconds it has
+    /// been running with no activity and no tool executing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_secs: Option<u64>,
     /// Live activity (whether processing + current tool name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivitySnapshot>,
@@ -310,6 +549,9 @@ pub struct AgentStatusSnapshot {
     /// or swarm task heartbeats), independent of lifecycle transitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_age_secs: Option<u64>,
+    /// Seconds stalled, when the stalled-worker watchdog flags this member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -358,30 +600,6 @@ pub struct PlanGraphStatus {
     pub next_ready_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub newly_ready_ids: Vec<String>,
-    /// Completed (non-gate) items whose artifact self-reported LOW confidence.
-    /// Shaky coverage the coordinator should widen with follow-up nodes; deep
-    /// gates are also blocked from passing over these while unaddressed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub low_confidence_ids: Vec<String>,
-    /// Engine mode for this plan: "deep" (comprehensive, gated, wide fan-out) or
-    /// "light" (cheap fan-out). Lets schedulers like `run_plan` pick a
-    /// mode-appropriate concurrency policy. Defaults to "light" for legacy plans.
-    #[serde(default = "default_plan_mode")]
-    pub mode: String,
-    /// Growth accounting: nodes from the initial seed (legacy/unknown origins
-    /// count as seeded).
-    #[serde(default)]
-    pub seeded_count: usize,
-    /// Growth accounting: machinery-generated nodes (expand children, gate-
-    /// injected gaps, and the gates themselves). `seeded_count + grown_count ==
-    /// item_count`. A deep plan with `grown_count == 0` never decomposed or
-    /// gated anything, which almost always means under-exploration.
-    #[serde(default)]
-    pub grown_count: usize,
-}
-
-fn default_plan_mode() -> String {
-    "light".to_string()
 }
 
 impl PlanGraphStatus {
@@ -400,10 +618,6 @@ impl PlanGraphStatus {
             unresolved_dependency_ids: Vec::new(),
             next_ready_ids: Vec::new(),
             newly_ready_ids: Vec::new(),
-            low_confidence_ids: Vec::new(),
-            mode: default_plan_mode(),
-            seeded_count: 0,
-            grown_count: 0,
         }
     }
 
@@ -414,7 +628,6 @@ impl PlanGraphStatus {
         newly_ready_ids: Vec<String>,
     ) -> Self {
         let graph = summarize_plan_graph(&plan.items);
-        let growth = jcode_plan::bridge::growth_stats(plan);
         let failed_reasons: BTreeMap<String, String> = graph
             .failed_ids
             .iter()
@@ -439,10 +652,6 @@ impl PlanGraphStatus {
             unresolved_dependency_ids: graph.unresolved_dependency_ids,
             next_ready_ids: next_runnable_item_ids(&plan.items, next_ready_limit),
             newly_ready_ids,
-            low_confidence_ids: jcode_plan::bridge::low_confidence_completed_ids(plan),
-            mode: plan.mode.clone(),
-            seeded_count: growth.seeded,
-            grown_count: growth.grown(),
         }
     }
 }
@@ -500,6 +709,24 @@ pub struct SwarmMemberStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwarmMemberRuntime {
+    /// Current turn's event-derived status. Absent for older producers and
+    /// sessions that have not emitted live telemetry. Never session totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_status: Option<SwarmLiveStatus>,
+    /// Foreground blocking operation or user-authorization todo pause. A display reason,
+    /// not an automatically waking durable dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    /// Complete blocker derived from the worker's own unfinished todos. Kept
+    /// separate so stale foreground waits can never masquerade as todo gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_blocked_reason: Option<String>,
+    /// Monotonic seconds spent in the current blocking operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_age_secs: Option<u64>,
+    /// Full ordered todo statuses, independent of the capped detail snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todo_statuses: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,16 +738,59 @@ pub struct SwarmMemberRuntime {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<u64>,
+    /// Seconds since the worker's last tool event or token, so clients can
+    /// tell a working agent from one that has gone quiet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_age_secs: Option<u64>,
+    /// Tokens in the worker's context window as of its latest response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// Context window size for the worker's model, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    /// Cumulative output tokens produced by the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
 }
 
 impl SwarmMemberRuntime {
     fn is_empty(&self) -> bool {
-        self.model.is_none()
+        self.live_status.is_none()
+            && self.wait_reason.is_none()
+            && self.todo_blocked_reason.is_none()
+            && self.wait_age_secs.is_none()
+            && self.todo_statuses.is_empty()
+            && self.model.is_none()
             && self.provider.is_none()
             && self.auth_method.is_none()
             && self.effort.is_none()
             && self.elapsed_secs.is_none()
+            && self.activity_age_secs.is_none()
+            && self.context_tokens.is_none()
+            && self.context_limit.is_none()
+            && self.output_tokens.is_none()
     }
+}
+
+/// The same provider/tool event stream used by an opened worker, projected for
+/// lightweight observers. Unknown provider values stay absent, not inferred.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwarmLiveStatus {
+    pub phase: String,
+    pub elapsed_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Tokens per second multiplied by 1000, measured over active streaming
+    /// time, excluding tools and connection establishment.
+    pub output_tps_milli: Option<u64>,
+    pub connection_type: Option<String>,
+    pub connection_phase: Option<String>,
+    pub status_detail: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_intent: Option<String>,
+    pub stop_reason: Option<String>,
+    pub stream_message_ended: bool,
 }
 
 /// One compact todo entry crossing the swarm status boundary. Only the
@@ -575,19 +845,23 @@ pub struct AwaitedMemberStatus {
 impl Request {
     pub fn id(&self) -> u64 {
         match self {
-            Request::ConfigureTools { id, .. }
+            Request::RuntimeCommand { id, .. } => *id,
+            Request::ScreenContext { id, .. }
+            | Request::ConfigureTools { id, .. }
             | Request::ListTools { id }
             | Request::ToolResult { id, .. } => *id,
             Request::Message { id, .. } => *id,
             Request::Cancel { id } => *id,
             Request::BackgroundTool { id } => *id,
             Request::SoftInterrupt { id, .. } => *id,
-            Request::CancelSoftInterrupts { id } => *id,
+            Request::CancelSoftInterrupts { id, .. } => *id,
             Request::Clear { id } => *id,
             Request::Rewind { id, .. } => *id,
             Request::RewindUndo { id } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,
+            Request::GetTodos { id } => *id,
+            Request::ClientFocus { id, .. } => *id,
             Request::DebugCommand { id, .. } => *id,
             Request::ClientDebugCommand { id, .. } => *id,
             Request::ClientDebugResponse { id, .. } => *id,
@@ -596,18 +870,21 @@ impl Request {
             Request::GetModelCatalog { id, .. } => *id,
             Request::GetCompactedHistory { id, .. } => *id,
             Request::Reload { id, .. } => *id,
+            Request::UpgradeRuntime { id, .. } => *id,
             Request::ResumeSession { id, .. } => *id,
             Request::ResumeAllSessions { id } => *id,
             Request::NotifySession { id, .. } => *id,
             Request::AppletAction { id, .. } => *id,
             Request::CloseApplet { id, .. } => *id,
             Request::Transcript { id, .. } => *id,
+            Request::VoiceActivity { id, .. } => *id,
             Request::InputShell { id, .. } => *id,
             Request::CycleModel { id, .. } => *id,
             Request::RefreshModels { id } => *id,
             Request::SetModel { id, .. } => *id,
+            Request::SetContextCap { id, .. } => *id,
             Request::SetRoute { id, .. } => *id,
-            Request::SetSubagentModel { id, .. } => *id,
+            Request::SetSubagentModel { id, .. } | Request::SetAgentModel { id, .. } => *id,
             Request::RunSubagent { id, .. } => *id,
             Request::SetReasoningEffort { id, .. } => *id,
             Request::SetServiceTier { id, .. } => *id,
@@ -616,7 +893,9 @@ impl Request {
             Request::SetFeature { id, .. } => *id,
             Request::SetCompactionMode { id, .. } => *id,
             Request::RenameSession { id, .. } => *id,
+            Request::SetSessionEnv { id, .. } => *id,
             Request::SetSessionSaved { id, .. } => *id,
+            Request::PersistSession { id } => *id,
             Request::Split { id } => *id,
             Request::Transfer { id } => *id,
             Request::Compact { id } => *id,
@@ -624,6 +903,7 @@ impl Request {
             Request::NotifyAuthChanged { id, .. } => *id,
             Request::SwitchAnthropicAccount { id, .. } => *id,
             Request::SwitchOpenAiAccount { id, .. } => *id,
+            Request::AccountUsage { id } => *id,
             Request::InvalidateOpenAiUsage { id, .. } => *id,
             Request::InvalidateAnthropicUsage { id, .. } => *id,
             Request::StdinResponse { id, .. } => *id,
@@ -636,14 +916,12 @@ impl Request {
             Request::CommMessage { id, .. } => *id,
             Request::CommList { id, .. } => *id,
             Request::CommListChannels { id, .. } => *id,
+            Request::CommListSwarms { id, .. } => *id,
+            Request::CommSetSwarmLabel { id, .. } => *id,
             Request::CommChannelMembers { id, .. } => *id,
             Request::CommProposePlan { id, .. } => *id,
             Request::CommApprovePlan { id, .. } => *id,
             Request::CommRejectPlan { id, .. } => *id,
-            Request::CommSeedGraph { id, .. } => *id,
-            Request::CommExpandNode { id, .. } => *id,
-            Request::CommCompleteNode { id, .. } => *id,
-            Request::CommInjectGap { id, .. } => *id,
             Request::CommSpawn { id, .. } => *id,
             Request::CommListModels { id, .. } => *id,
             Request::CommStop { id, .. } => *id,
@@ -667,10 +945,16 @@ impl Request {
         matches!(
             self,
             Request::Ping { .. }
+                | Request::UpgradeRuntime { .. }
                 // Usage invalidation only touches process-wide caches, so a
                 // one-shot client can send it without subscribing to a session.
+                | Request::AccountUsage { .. }
                 | Request::InvalidateOpenAiUsage { .. }
                 | Request::InvalidateAnthropicUsage { .. }
+                // One-shot login clients report new credentials without a
+                // session. Subscribed connections still take the
+                // session-local path that also switches their model.
+                | Request::NotifyAuthChanged { .. }
                 | Request::NotifySession { .. }
                 | Request::AppletAction { .. }
                 | Request::CloseApplet { .. }
@@ -679,14 +963,12 @@ impl Request {
                 | Request::CommMessage { .. }
                 | Request::CommList { .. }
                 | Request::CommListChannels { .. }
+                | Request::CommListSwarms { .. }
+                | Request::CommSetSwarmLabel { .. }
                 | Request::CommChannelMembers { .. }
                 | Request::CommProposePlan { .. }
                 | Request::CommApprovePlan { .. }
                 | Request::CommRejectPlan { .. }
-                | Request::CommSeedGraph { .. }
-                | Request::CommExpandNode { .. }
-                | Request::CommCompleteNode { .. }
-                | Request::CommInjectGap { .. }
                 | Request::CommSpawn { .. }
                 | Request::CommListModels { .. }
                 | Request::CommStop { .. }
@@ -716,6 +998,23 @@ pub fn encode_event(event: &ServerEvent) -> String {
     let mut json = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
     json.push('\n');
     json
+}
+
+/// Encode the same newline-terminated JSON as [`encode_event`], reusing storage
+/// for ordinary streaming events. Oversized snapshots are not retained on the
+/// next call. Callers should also release buffers over 64 KiB after writing to
+/// avoid retaining a large final snapshot while the connection is idle.
+pub fn encode_event_into(event: &ServerEvent, buffer: &mut Vec<u8>) {
+    if buffer.capacity() > 64 * 1024 {
+        *buffer = Vec::new();
+    } else {
+        buffer.clear();
+    }
+    if serde_json::to_writer(&mut *buffer, event).is_err() {
+        buffer.clear();
+        buffer.extend_from_slice(b"{}");
+    }
+    buffer.push(b'\n');
 }
 
 /// Decode a request from a JSON string.

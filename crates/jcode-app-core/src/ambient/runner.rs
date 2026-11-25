@@ -5,6 +5,18 @@
 //! Spawned by the server when ambient mode is enabled. Manages the lifecycle of
 //! ambient cycles: scheduling, spawning agent sessions, handling results, and
 //! providing status for the TUI widget and debug socket.
+//!
+//! reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+//! (2026-11-04 incident: a `Running` status persisted by a process that died
+//! mid-cycle blocked `AmbientManager::should_run()` forever). The liveness
+//! probe reuses this crate's own lock-pid check in `ambient/persistence.rs`
+//! (`AmbientLock::try_acquire` + `is_pid_alive`).
+
+// reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+// reference: no prior art for "recover a persisted Running status", searched
+// crates/jcode-app-core/src/ambient/ and crates/jcode-app-core/src/server/ for
+// an existing stale-status recovery path; the fix reuses this crate's own
+// lock-pid liveness check in ambient/persistence.rs.
 
 use crate::agent::Agent;
 use crate::ambient::{
@@ -24,9 +36,27 @@ use crate::tool::ambient as ambient_tools;
 use chrono::Utc;
 use jcode_agent_runtime::{SoftInterruptMessage, SoftInterruptQueue, SoftInterruptSource};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 const MAX_IDLE_POLL_SECS: u64 = 30;
+
+/// How long a visible ambient cycle may run before it is declared finished.
+///
+/// A visible cycle ends when the TUI writes its result file or the TUI
+/// process is gone. This bound is the last resort for the case where the TUI
+/// keeps running without ever reporting anything.
+///
+/// reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+const VISIBLE_CYCLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// How long the visible TUI may take to report itself before the cycle is
+/// treated as never having started (and falls back to headless).
+///
+/// A terminal window opens fast, and `jcode ambient run-visible` writes its
+/// start marker immediately, so this only has to cover a slow disk or a busy
+/// machine.
+const VISIBLE_STARTUP_GRACE: Duration = Duration::from_secs(30);
 
 /// Re-read enabled on each loop iteration, without overriding an explicit stop.
 /// Config edits take effect on the next wake, not on the config cache's cadence.
@@ -115,6 +145,7 @@ impl AmbientRunnerHandle {
                 images: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::User,
+                client_id: None,
             });
             logging::info(&format!(
                 "{} message injected into active ambient cycle: {}",
@@ -134,15 +165,69 @@ impl AmbientRunnerHandle {
         false
     }
 
+    /// Reset a persisted `Running` status left behind by a dead process.
+    ///
+    /// `AmbientStatus::Running` is written to disk before a cycle starts
+    /// (`set_running_detail`) and cleared only when the cycle finishes. If the
+    /// process dies mid-cycle, the status survives the restart, and
+    /// `AmbientManager::should_run()` treats `Running` as "a cycle is already
+    /// in flight" and returns false forever — the runner then logs "not time
+    /// to run" on every wake and never runs a cycle again.
+    ///
+    /// The ambient lock is the authority on whether a cycle is really in
+    /// flight: it records the pid of the process that acquired it, and that
+    /// pid is alive only while the owning process lives. So:
+    ///
+    /// * lock held by a live pid -> a cycle really is running, keep `Running`.
+    /// * lock absent, or held by a dead pid -> the status is a leftover from a
+    ///   process that is gone, so reset it to `Idle` and let the loop proceed.
+    ///
+    /// This is only called when the runner has not started a cycle itself
+    /// (process startup), so it cannot cut short a live cycle of this process.
+    ///
+    // reference: ~/.jcode/research/2026-11-04-always-on/ambient-stuck-running.md
+    // reference: no prior art, searched crates/jcode-app-core/src/ambient/ and
+    // crates/jcode-app-core/src/server/ for an existing stale-status recovery
+    // path; this reuses this crate's own lock-pid liveness check in
+    // ambient/persistence.rs (`AmbientLock::try_acquire` + `is_pid_alive`).
+    async fn reset_stale_running_status(&self) {
+        let stale = {
+            let state = self.inner.state.read().await;
+            if !matches!(state.status, AmbientStatus::Running { .. }) {
+                return;
+            }
+            // A live lock holder means the cycle is genuinely in flight.
+            AmbientLock::live_holder_pid().is_none()
+        };
+
+        if !stale {
+            return;
+        }
+
+        let mut state = self.inner.state.write().await;
+        if !matches!(state.status, AmbientStatus::Running { .. }) {
+            return;
+        }
+        state.status = AmbientStatus::Idle;
+        let _ = state.save();
+        logging::info("Ambient runner: cleared a stale Running status left by a previous process");
+    }
+
     /// Manually trigger an ambient cycle (returns immediately, cycle runs async).
     pub async fn trigger(&self) {
-        // Set status to idle so should_run returns true
+        // Set status to idle so should_run returns true.
+        //
+        // `Disabled` is included so a stopped ambient loop can be revived.
+        // `stop()` sets that status, and `ambient_allowed()` returns false
+        // for it, so the (infinite) loop stopped running cycles and only a
+        // process restart could bring ambient back. Measured 2026-11-03.
         let mut state = self.inner.state.write().await;
         if matches!(
             state.status,
-            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle
+            AmbientStatus::Scheduled { .. } | AmbientStatus::Idle | AmbientStatus::Disabled
         ) {
             state.status = AmbientStatus::Idle;
+            let _ = state.save();
         }
         drop(state);
         self.inner.wake_notify.notify_one();
@@ -162,6 +247,20 @@ impl AmbientRunnerHandle {
     pub async fn start(&self, provider: Arc<dyn Provider>) -> bool {
         let already_running = *self.inner.running.read().await;
         if already_running {
+            // The loop task is alive but blocked: `stop()` set the persisted
+            // status to `Disabled`, and `ambient_allowed()` is false for it,
+            // so the loop kept spinning without running a cycle. Returning
+            // false here made a stopped ambient mode unrevivable except by
+            // restarting the process. Revive it instead: reset the status to
+            // Idle and nudge the live loop. Measured 2026-11-03.
+            let mut state = self.inner.state.write().await;
+            if matches!(state.status, AmbientStatus::Disabled) {
+                state.status = AmbientStatus::Idle;
+                let _ = state.save();
+                drop(state);
+                self.inner.wake_notify.notify_one();
+                return true;
+            }
             return false;
         }
         {
@@ -197,9 +296,14 @@ impl AmbientRunnerHandle {
                 let items = mgr.queue().items();
                 let queue_count = items.len();
                 let next_item = items.iter().min_by_key(|item| item.scheduled_for);
+                // Overdue means "due and not delivered". Ambient-target entries
+                // are write-only: the runner only claims direct-delivery
+                // entries, so an overdue ambient entry is a dead letter, not
+                // pending work. Counting it here reported a permanently
+                // growing backlog that nothing could ever clear.
                 let overdue_queue_count = items
                     .iter()
-                    .filter(|item| item.scheduled_for <= now)
+                    .filter(|item| item.scheduled_for <= now && item.target.is_direct_delivery())
                     .count();
                 let reminder_items: Vec<_> = items
                     .iter()
@@ -432,7 +536,13 @@ impl AmbientRunnerHandle {
                 child.compaction = parent.compaction.clone();
                 child.provider_key = parent.provider_key.clone();
                 child.route_api_method = parent.route_api_method.clone();
-                child.model = parent.model.clone();
+                child.model = parent
+                    .effective_agent_model("ambient", crate::config::Config::load().ambient.model)
+                    .filter(|model| {
+                        !crate::config::AgentsConfig::is_swarm_inherit_sentinel(model)
+                    })
+                    .or_else(|| parent.model.clone());
+                child.agent_model_overrides = parent.agent_model_overrides.clone();
                 child.subagent_model = parent.subagent_model.clone();
                 child.improve_mode = parent.improve_mode;
                 child.autoreview_enabled = parent.autoreview_enabled;
@@ -459,6 +569,14 @@ impl AmbientRunnerHandle {
                     ),
                 );
                 child.working_dir = item.working_dir.clone();
+                // The parent could not be loaded, so its flag cannot be copied.
+                // Every ambient parent is a debug session (the ambient agent is
+                // created with set_debug(true)), and the picker hides a session
+                // by its OWN flag
+                // (crates/jcode-tui/src/tui/session_picker/filter.rs). Leaving
+                // the child at the Session::create default (false) would put an
+                // ambient worker into the user's visible session list.
+                child.is_debug = true;
                 child
             }
         };
@@ -553,6 +671,14 @@ impl AmbientRunnerHandle {
             *running = true;
         }
         logging::info("Ambient runner: starting background loop");
+
+        // A `Running` status on disk can be a leftover from a cycle that was
+        // cut short when the previous process died. `should_run()` treats
+        // `Running` as "a cycle is already in flight", so without this reset
+        // the loop would never run a cycle again. The reset is guarded by the
+        // ambient lock's liveness, so a genuinely running cycle is untouched.
+        // Measured 2026-11-04.
+        self.reset_stale_running_status().await;
 
         // Spawn reply pollers only when ambient mode is enabled at startup; scheduled
         // session-targeted scheduled tasks should still work without the ambient-only reply
@@ -735,20 +861,34 @@ impl AmbientRunnerHandle {
 
             match cycle_result {
                 Ok(result) => {
-                    logging::info(&format!(
-                        "Ambient cycle complete: {} memories modified, {} compactions",
-                        result.memories_modified, result.compactions
-                    ));
+                    // A cycle that never called end_ambient_cycle is NOT a
+                    // completed cycle: the agent did not finish its work, and
+                    // on this host it usually means the provider stream died
+                    // (MEASURED 2026-11-10: 10 consecutive cycles ended this
+                    // way, every one with the same OpenRouter/MiniMax stream
+                    // error). Counting it as success reset the backoff, so the
+                    // same dead provider was retried every 30 minutes for
+                    // five hours. An incomplete cycle must back off instead.
+                    let incomplete = matches!(result.status, CycleStatus::Incomplete);
+                    if incomplete {
+                        logging::warn(&format!(
+                            "Ambient cycle incomplete (not counted as success): {}",
+                            result.summary
+                        ));
+                        scheduler.on_rate_limit_hit();
+                    } else {
+                        logging::info(&format!(
+                            "Ambient cycle complete: {} memories modified, {} compactions",
+                            result.memories_modified, result.compactions
+                        ));
+                        scheduler.on_successful_cycle();
+                    }
 
                     // Update state
                     if let Ok(mut mgr) = AmbientManager::new() {
                         let _ = mgr.record_cycle_result(result.clone());
                     }
-                    let mut s = self.inner.state.write().await;
-                    s.record_cycle(&result);
-                    let _ = s.save();
-
-                    scheduler.on_successful_cycle();
+                    self.apply_completed_cycle(&result).await;
 
                     // Save transcript
                     let transcript = crate::safety::AmbientTranscript {
@@ -830,6 +970,24 @@ impl AmbientRunnerHandle {
         let _ = s.save();
     }
 
+    /// Record a completed cycle into the runner state and persist it.
+    ///
+    /// The runner is the SINGLE writer of the ambient state's cycle
+    /// accounting: this is the only place that increments `total_cycles` and
+    /// writes the resulting `state.json`. The ambient tool
+    /// (`crate::tool::ambient`) and `AmbientManager::record_cycle_result` used
+    /// to persist the same cycle as well, which incremented the counter twice
+    /// per cycle and published a transient overcount on disk
+    /// (measured 2026-11-04).
+    pub(super) async fn apply_completed_cycle(&self, result: &AmbientCycleResult) {
+        let mut state = self.inner.state.write().await;
+        state.record_cycle(result);
+        #[cfg(test)]
+        let _ = state.save_as("runner");
+        #[cfg(not(test))]
+        let _ = state.save();
+    }
+
     /// Build the ambient system prompt and initial message for a cycle.
     async fn build_cycle_context(
         &self,
@@ -855,7 +1013,12 @@ impl AmbientRunnerHandle {
 
         let active_sessions = *self.inner.active_user_sessions.read().await;
 
-        let system_prompt = ambient::build_ambient_system_prompt(
+        // Harbor's deterministic landing pass runs before the prompt is built so its
+        // result is visible to the agent this cycle. Safe: it never builds, never
+        // reloads, and its own acceptance checker gates it.
+        let harbor = ambient::harbor_run_pass();
+
+        let mut system_prompt = ambient::build_ambient_system_prompt(
             &state,
             &queue_items,
             &graph_health,
@@ -864,6 +1027,11 @@ impl AmbientRunnerHandle {
             &budget,
             active_sessions,
         );
+        let harbor_section = ambient::harbor_prompt_section(&harbor);
+        if !harbor_section.is_empty() {
+            system_prompt.push('\n');
+            system_prompt.push_str(&harbor_section);
+        }
 
         let initial_message = "Begin your ambient cycle. Check the scheduled queue, assess memory graph health, and plan your work using the `todo` tool.".to_string();
 
@@ -876,19 +1044,41 @@ impl AmbientRunnerHandle {
             let jcode_bin =
                 std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("jcode"));
 
-            std::process::Command::new("kitty")
-                .args([
-                    "--title",
-                    "🤖 jcode ambient cycle",
-                    "-e",
-                    &jcode_bin.to_string_lossy(),
-                    "ambient",
-                    "run-visible",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+            // Spawn the visible TUI through the shared terminal-launch
+            // infrastructure instead of hardcoding one emulator.
+            //
+            // reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+            // (2026-11-15 incident: `kitty` was hardcoded here, but on Windows
+            // `kitty.exe` is KiTTY 0.76, a PuTTY fork that does not understand
+            // kitty's `--title`/`-e` flags. It opened a modal "KiTTY Command
+            // Line Error" window that never closed, and the server then sat in
+            // `child.wait()` for 9+ minutes per cycle.)
+            //
+            // `spawn_command_in_new_terminal` picks the platform's own
+            // candidates (Windows: wt/wezterm/cmd; macOS: ghostty/kitty/...),
+            // honours `JCODE_TERMINAL` and `[terminal] spawn_hook`, and falls
+            // back cleanly when no terminal exists.
+            let command = crate::terminal_launch::TerminalCommand::new(
+                jcode_bin,
+                vec!["ambient".to_string(), "run-visible".to_string()],
+            )
+            .title("jcode ambient cycle")
+            .kind("ambient");
+
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            crate::terminal_launch::spawn_command_in_new_terminal(&command, &cwd)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+                .and_then(|spawned| {
+                    if spawned {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no terminal available for the ambient visible cycle",
+                        ))
+                    }
+                })
         })
         .await
     }
@@ -900,7 +1090,30 @@ impl AmbientRunnerHandle {
         launch_visible: F,
     ) -> anyhow::Result<AmbientCycleResult>
     where
-        F: FnOnce() -> std::io::Result<std::process::Child> + Send,
+        F: FnOnce() -> std::io::Result<()> + Send,
+    {
+        self.run_cycle_with_visible_launcher_and_timeouts(
+            provider,
+            visible,
+            launch_visible,
+            VISIBLE_STARTUP_GRACE,
+            VISIBLE_CYCLE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Same as [`Self::run_cycle_with_visible_launcher`], with the visible-cycle
+    /// deadlines injectable so tests can exercise them without waiting.
+    async fn run_cycle_with_visible_launcher_and_timeouts<F>(
+        &self,
+        provider: &Arc<dyn Provider>,
+        visible: bool,
+        launch_visible: F,
+        startup_grace: Duration,
+        cycle_timeout: Duration,
+    ) -> anyhow::Result<AmbientCycleResult>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send,
     {
         let started_at = Utc::now();
 
@@ -915,6 +1128,8 @@ impl AmbientRunnerHandle {
                     system_prompt.clone(),
                     initial_message.clone(),
                     launch_visible,
+                    startup_grace,
+                    cycle_timeout,
                 )
                 .await?
             {
@@ -963,8 +1178,11 @@ impl AmbientRunnerHandle {
         }
 
         // Agent didn't call end_ambient_cycle - try continuation
-        if run_result.is_err() {
-            logging::warn("Ambient cycle: agent error without calling end_ambient_cycle");
+        let first_error = run_result.err();
+        if let Some(ref error) = first_error {
+            logging::warn(&format!(
+                "Ambient cycle: agent error without calling end_ambient_cycle: {error}"
+            ));
         }
 
         self.set_running_detail("continuation turn").await;
@@ -974,7 +1192,7 @@ impl AmbientRunnerHandle {
             what you accomplished and schedule your next wake. \
             If you are not done, continue what you were doing.";
 
-        let _ = agent.run_once_capture(continuation).await;
+        let continuation_result = agent.run_once_capture(continuation).await;
 
         // Check again
         if let Some(result) = ambient_tools::take_cycle_result() {
@@ -992,9 +1210,30 @@ impl AmbientRunnerHandle {
         // Forced end
         ambient_tools::unregister_ambient_session(&ambient_session_id);
         logging::warn("Ambient cycle: forced end after 2 attempts without end_ambient_cycle");
+        // Name the provider failure in the summary. The bare forced-end sentence
+        // ("ended without calling end_ambient_cycle") hides WHY, and the same
+        // sentence repeated ten times is what made this read as a harness bug
+        // instead of a dead provider.
+        // reference: OpenRouter API error handling docs
+        // (https://openrouter.ai/docs/api-reference/errors) - a mid-stream
+        // provider failure arrives as finish_reason="error" with
+        // error.metadata.error_type (provider_unavailable, timeout,
+        // rate_limit_exceeded, ...), so the upstream error text is the
+        // actionable part and must survive into the summary.
+        let forced_error = first_error
+            .or_else(|| continuation_result.err())
+            .map(|error| error.to_string());
+        let summary = match &forced_error {
+            Some(error) => format!(
+                "Cycle failed before end_ambient_cycle (forced end after 2 attempts). Last provider error: {error}"
+            ),
+            None => {
+                "Cycle ended without calling end_ambient_cycle (forced end after 2 attempts)"
+                    .to_string()
+            }
+        };
         let forced = AmbientCycleResult {
-            summary: "Cycle ended without calling end_ambient_cycle (forced end after 2 attempts)"
-                .to_string(),
+            summary,
             memories_modified: 0,
             compactions: 0,
             proactive_work: None,
@@ -1008,16 +1247,18 @@ impl AmbientRunnerHandle {
         Ok(forced)
     }
 
-    /// Run a visible ambient cycle by spawning a full TUI in a kitty window.
+    /// Run a visible ambient cycle by spawning a full TUI in a terminal window.
     async fn run_cycle_visible<F>(
         &self,
         started_at: chrono::DateTime<Utc>,
         system_prompt: String,
         initial_message: String,
         launch_visible: F,
+        startup_grace: Duration,
+        cycle_timeout: Duration,
     ) -> anyhow::Result<VisibleCycleOutcome>
     where
-        F: FnOnce() -> std::io::Result<std::process::Child> + Send,
+        F: FnOnce() -> std::io::Result<()> + Send,
     {
         use crate::ambient::VisibleCycleContext;
 
@@ -1034,40 +1275,66 @@ impl AmbientRunnerHandle {
         if let Ok(result_path) = VisibleCycleContext::result_path() {
             let _ = std::fs::remove_file(&result_path);
         }
+        // Clear any previous start marker, so a stale PID from an earlier cycle
+        // cannot be mistaken for this cycle's TUI.
+        VisibleCycleContext::clear_start();
 
-        // Spawn kitty with `jcode ambient run-visible`
-        logging::info("Ambient visible: spawning kitty with jcode TUI");
-        let child = launch_visible();
+        // Spawn the visible TUI in a terminal window.
+        logging::info("Ambient visible: spawning jcode TUI in a new terminal");
+        match launch_visible() {
+            Ok(()) => {}
+            Err(e) => {
+                logging::warn(&format!(
+                    "Ambient visible: failed to spawn a terminal ({}), falling back to headless",
+                    e
+                ));
+                // Fall back to headless mode
+                return Ok(VisibleCycleOutcome::FallBackHeadless);
+            }
+        }
 
-        match child {
-            Ok(mut child) => {
-                self.set_running_detail("waiting for TUI cycle").await;
+        self.set_running_detail("waiting for TUI cycle").await;
 
-                // Wait for the kitty process to exit (user closes window or cycle completes)
-                let status = tokio::task::spawn_blocking(move || child.wait()).await?;
-                match status {
-                    Ok(s) => logging::info(&format!("Ambient visible: TUI exited with {}", s)),
-                    Err(e) => logging::warn(&format!("Ambient visible: wait error: {}", e)),
-                }
+        // The terminal launcher is not the TUI: `wt`/`wezterm`/`cmd` return as
+        // soon as the window is created, so waiting on the launcher tells us
+        // nothing about the cycle. The TUI reports its own PID through the
+        // start marker and writes the result file when it is done, so the
+        // cycle ends when EITHER the result file appears OR the reported TUI
+        // process is gone without producing one.
+        //
+        // reference: ~/.jcode/research/2026-11-15-kitty-command-line-error.md
+        // (2026-11-15 incident: the old code waited on the spawned child's
+        // exit with no timeout. A modal terminal error window kept the child
+        // alive for 9+ minutes and the server was blocked the whole time.)
+        let deadline = std::time::Instant::now() + cycle_timeout;
+        let start_grace = std::time::Instant::now() + startup_grace;
 
-                // Try to read the cycle result from the file
-                if let Ok(result_path) = VisibleCycleContext::result_path()
-                    && result_path.exists()
-                    && let Ok(result) =
-                        crate::storage::read_json::<AmbientCycleResult>(&result_path)
-                {
-                    let _ = std::fs::remove_file(&result_path);
-                    return Ok(VisibleCycleOutcome::Completed(Box::new(
-                        AmbientCycleResult {
-                            started_at,
-                            ended_at: Utc::now(),
-                            ..result
-                        },
-                    )));
-                }
+        loop {
+            if let Ok(result_path) = VisibleCycleContext::result_path()
+                && result_path.exists()
+                && let Ok(result) = crate::storage::read_json::<AmbientCycleResult>(&result_path)
+            {
+                let _ = std::fs::remove_file(&result_path);
+                VisibleCycleContext::clear_start();
+                return Ok(VisibleCycleOutcome::Completed(Box::new(
+                    AmbientCycleResult {
+                        started_at,
+                        ended_at: Utc::now(),
+                        ..result
+                    },
+                )));
+            }
 
-                // No result file — user closed the window without end_ambient_cycle
-                Ok(VisibleCycleOutcome::Completed(Box::new(
+            // The TUI reported its PID and that process is gone, but no result
+            // was written: the user closed the window (or the TUI died).
+            if let Some(start) = VisibleCycleContext::read_start()
+                && !crate::platform::is_process_running(start.pid)
+            {
+                VisibleCycleContext::clear_start();
+                logging::info(
+                    "Ambient visible: TUI process exited without a result file; treating the cycle as closed",
+                );
+                return Ok(VisibleCycleOutcome::Completed(Box::new(
                     AmbientCycleResult {
                         summary: "Visible cycle ended (user closed window)".to_string(),
                         memories_modified: 0,
@@ -1079,16 +1346,43 @@ impl AmbientRunnerHandle {
                         status: CycleStatus::Incomplete,
                         conversation: None,
                     },
-                )))
+                )));
             }
-            Err(e) => {
+
+            // The TUI never reported itself: the terminal opened, but
+            // `jcode ambient run-visible` failed to launch. Fall back to
+            // headless instead of blocking the whole cycle budget.
+            if std::time::Instant::now() >= start_grace && VisibleCycleContext::read_start().is_none()
+            {
+                VisibleCycleContext::clear_start();
+                logging::warn(
+                    "Ambient visible: the TUI never started; falling back to headless",
+                );
+                return Ok(VisibleCycleOutcome::FallBackHeadless);
+            }
+
+            if std::time::Instant::now() >= deadline {
+                VisibleCycleContext::clear_start();
                 logging::warn(&format!(
-                    "Ambient visible: failed to spawn kitty ({}), falling back to headless",
-                    e
+                    "Ambient visible: timed out after {} seconds; treating the cycle as closed",
+                    cycle_timeout.as_secs()
                 ));
-                // Fall back to headless mode
-                Ok(VisibleCycleOutcome::FallBackHeadless)
+                return Ok(VisibleCycleOutcome::Completed(Box::new(
+                    AmbientCycleResult {
+                        summary: "Visible cycle timed out".to_string(),
+                        memories_modified: 0,
+                        compactions: 0,
+                        proactive_work: None,
+                        next_schedule: None,
+                        started_at,
+                        ended_at: Utc::now(),
+                        status: CycleStatus::Incomplete,
+                        conversation: None,
+                    },
+                )));
             }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }

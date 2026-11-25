@@ -10,6 +10,8 @@ struct PersistedSoftInterrupt {
     images: Vec<(String, String)>,
     urgent: bool,
     source: PersistedSoftInterruptSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -18,6 +20,7 @@ enum PersistedSoftInterruptSource {
     User,
     System,
     BackgroundTask,
+    FileActivity,
 }
 
 impl From<SoftInterruptSource> for PersistedSoftInterruptSource {
@@ -26,6 +29,7 @@ impl From<SoftInterruptSource> for PersistedSoftInterruptSource {
             SoftInterruptSource::User => Self::User,
             SoftInterruptSource::System => Self::System,
             SoftInterruptSource::BackgroundTask => Self::BackgroundTask,
+            SoftInterruptSource::FileActivity => Self::FileActivity,
         }
     }
 }
@@ -36,6 +40,7 @@ impl From<PersistedSoftInterruptSource> for SoftInterruptSource {
             PersistedSoftInterruptSource::User => Self::User,
             PersistedSoftInterruptSource::System => Self::System,
             PersistedSoftInterruptSource::BackgroundTask => Self::BackgroundTask,
+            PersistedSoftInterruptSource::FileActivity => Self::FileActivity,
         }
     }
 }
@@ -47,6 +52,7 @@ impl From<SoftInterruptMessage> for PersistedSoftInterrupt {
             images: value.images,
             urgent: value.urgent,
             source: value.source.into(),
+            client_id: value.client_id,
         }
     }
 }
@@ -58,6 +64,7 @@ impl From<PersistedSoftInterrupt> for SoftInterruptMessage {
             images: value.images,
             urgent: value.urgent,
             source: value.source.into(),
+            client_id: value.client_id,
         }
     }
 }
@@ -118,6 +125,24 @@ pub fn append(session_id: &str, interrupt: SoftInterruptMessage) -> Result<()> {
 
 pub fn clear(session_id: &str) -> Result<()> {
     overwrite(session_id, &[])
+}
+
+/// Drop persisted interrupts whose caller id is in `client_ids`, returning the
+/// ids that were removed.
+pub fn remove_by_client_ids(session_id: &str, client_ids: &[String]) -> Result<Vec<String>> {
+    let mut current = load(session_id)?;
+    let mut removed = Vec::new();
+    current.retain(|message| match &message.client_id {
+        Some(id) if client_ids.contains(id) => {
+            removed.push(id.clone());
+            false
+        }
+        _ => true,
+    });
+    if !removed.is_empty() {
+        overwrite(session_id, &current)?;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

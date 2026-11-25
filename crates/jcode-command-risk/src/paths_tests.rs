@@ -172,6 +172,24 @@ fn missing_home_context_does_not_panic_or_misfire() {
 }
 
 #[test]
+fn windows_userprofile_is_the_home_directory() {
+    // `from_env` reads `USERPROFILE` on Windows; without it `rm -rf C:/Users/<u>`
+    // cannot be recognised as catastrophic. `set_var` is unsafe in Rust 2024, so
+    // this asserts the production fallback directly rather than mutating the
+    // process environment.
+    let previous = std::env::var_os("USERPROFILE");
+    let ctx = RiskContext::from_env(None);
+    match previous {
+        Some(home) => {
+            let home = PathBuf::from(home);
+            assert_eq!(ctx.home_dir.as_deref(), Some(home.as_path()));
+            assert!(is_catastrophic_target(&home, &ctx));
+        }
+        None => assert!(ctx.home_dir.is_none()),
+    }
+}
+
+#[test]
 fn normalize_never_escapes_above_root() {
     // Pathological input must not underflow into an empty or relative path.
     let ctx = ctx();

@@ -17,6 +17,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+#[path = "launch_upgrade.rs"]
+mod shared_upgrade;
+
 const CREDENTIAL_FILES: &[&str] = &[
     "auth.json",
     "openai-auth.json",
@@ -167,6 +171,7 @@ impl Drop for LaunchedInstance {
 }
 
 /// Start an isolated daemon and API bridge and return once its socket accepts.
+/// The instance runs the launching binary and never auto-updates, so it stays on that jcode version.
 pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
     let ephemeral = options.jcode_home.is_none();
     let jcode_home = match &options.jcode_home {
@@ -207,13 +212,24 @@ pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
         return Err(error);
     }
 
+    // A caller-supplied home may already register a daemon for this runtime
+    // directory. Record it so a failed launch never stops a daemon it did not start.
+    let registered_before = registered_daemon_pid(&jcode_home, &runtime_dir);
+
     let binary = options
         .binary
         .clone()
         .unwrap_or_else(|| PathBuf::from("jcode"));
     let mut command = Command::new(&binary);
+    crate::process::no_console_window(&mut command);
     command
-        .args([OsStr::new("api-bridge"), OsStr::new("--api-socket")])
+        // `--no-update` turns off the bridge's own background update check, which
+        // also runs for source builds.
+        .args([
+            OsStr::new("--no-update"),
+            OsStr::new("api-bridge"),
+            OsStr::new("--api-socket"),
+        ])
         .arg(&socket_path)
         .current_dir(
             options
@@ -225,6 +241,12 @@ pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
         .env("JCODE_RUNTIME_DIR", &runtime_dir)
         .env("JCODE_API_SOCKET", &socket_path)
         .env("JCODE_SOCKET", runtime_dir.join("jcode.sock"))
+        // An empty private home always looks out of date, so the release updater
+        // would replace and restart the runtime mid-session: the client's turn fails
+        // and the restarted server is orphaned. The variable is inherited by every
+        // jcode process the instance spawns (argv is not), so it keeps the release
+        // auto-installer off in those too. The shared runtime still updates.
+        .env("JCODE_NO_AUTO_UPDATE", "1")
         .envs(options.env.iter())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -293,6 +315,10 @@ pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                // The daemon is a separate process the bridge spawned, so the bridge
+                // exiting does not stop it. Stop it before joining stderr: a daemon
+                // that inherited the pipe would keep the reader blocked.
+                stop_daemon_started_by_failed_launch(&jcode_home, &runtime_dir, registered_before);
                 if let Some(reader) = stderr_reader.take() {
                     let _ = reader.join();
                 }
@@ -308,6 +334,7 @@ pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
             }
             Ok(None) => {}
             Err(cause) => {
+                stop_daemon_started_by_failed_launch(&jcode_home, &runtime_dir, registered_before);
                 terminate_child(&mut child);
                 cleanup_on_error();
                 return Err(Error::new(ErrorKind::StartupFailed, cause.to_string()));
@@ -316,6 +343,7 @@ pub fn launch_instance(options: &LaunchOptions) -> Result<LaunchedInstance> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    stop_daemon_started_by_failed_launch(&jcode_home, &runtime_dir, registered_before);
     terminate_child(&mut child);
     if let Some(reader) = stderr_reader.take() {
         let _ = reader.join();
@@ -340,150 +368,9 @@ pub fn user_jcode_home() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".jcode"))
 }
 
-/// Share rotating login records with an instance and copy mutable config.
-/// Returns the instance-relative paths which were inherited.
-pub fn inherit_credentials(from_home: &Path, to_home: &Path) -> Result<Vec<PathBuf>> {
-    fs::create_dir_all(to_home).map_err(launch_io)?;
-    let metadata = fs::symlink_metadata(to_home).map_err(launch_io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Error::new(
-            ErrorKind::InvalidInstanceHome,
-            format!(
-                "instance home must be a real directory, not a link or file: {}",
-                to_home.display()
-            ),
-        ));
-    }
-    if from_home.exists() && fs::canonicalize(from_home).ok() == fs::canonicalize(to_home).ok() {
-        return Err(Error::new(
-            ErrorKind::InvalidInstanceHome,
-            "instance home must be different from the user's jcode home",
-        ));
-    }
-
-    let mut inherited = Vec::new();
-    for name in CREDENTIAL_FILES {
-        let source = from_home.join(name);
-        if !source.is_file() {
-            continue;
-        }
-        let destination = to_home.join(name);
-        if *name == "config.toml" {
-            fs::copy(&source, &destination).map_err(launch_io)?;
-            set_owner_only_file(&destination)?;
-        } else {
-            link_credential_file(&source, to_home, Path::new(name))?;
-        }
-        inherited.push(PathBuf::from(name));
-    }
-
-    // Provider env files live in the platform config directory. Link exact
-    // files, never the directory, so cleanup cannot traverse into user data.
-    if let Ok(entries) = fs::read_dir(user_app_config_dir()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if !name.to_string_lossy().ends_with(".env") || !entry.path().is_file() {
-                continue;
-            }
-            let relative = PathBuf::from("config").join("jcode").join(&name);
-            link_credential_file(&entry.path(), to_home, &relative)?;
-            inherited.push(relative);
-        }
-    }
-
-    let home = home_dir();
-    for relative in EXTERNAL_CREDENTIAL_FILES {
-        let source = home.join(relative);
-        if !source.is_file() {
-            continue;
-        }
-        let instance_relative = PathBuf::from("external").join(relative);
-        link_credential_file(&source, to_home, &instance_relative)?;
-        inherited.push(instance_relative);
-    }
-
-    // OpenClaw's current credential store is per-agent. Enumerate only one
-    // agent-id level and only the two filenames its loader recognizes.
-    if let Ok(agents) = fs::read_dir(home.join(".openclaw/agents")) {
-        for agent in agents.flatten().filter(|entry| entry.path().is_dir()) {
-            for name in ["auth-profiles.json", "auth.json"] {
-                let relative = PathBuf::from(".openclaw")
-                    .join("agents")
-                    .join(agent.file_name())
-                    .join("agent")
-                    .join(name);
-                let source = home.join(&relative);
-                if source.is_file() {
-                    let instance_relative = PathBuf::from("external").join(&relative);
-                    link_credential_file(&source, to_home, &instance_relative)?;
-                    inherited.push(instance_relative);
-                }
-            }
-        }
-    }
-    Ok(inherited)
-}
-
-fn link_credential_file(source: &Path, root: &Path, relative: &Path) -> Result<()> {
-    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
-    let parent = ensure_instance_directory(root, parent_relative)?;
-    let destination = parent.join(relative.file_name().unwrap_or_default());
-    let _ = fs::remove_file(&destination);
-    link_file(source, &destination)
-}
-
-#[cfg(unix)]
-fn link_file(source: &Path, destination: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source, destination).map_err(launch_io)
-}
-
-#[cfg(windows)]
-fn link_file(source: &Path, destination: &Path) -> Result<()> {
-    // Preserve rotating credentials rather than silently creating a stale copy.
-    // Windows may require Developer Mode or symlink privileges; report that OS
-    // error to the caller when links are unavailable.
-    std::os::windows::fs::symlink_file(source, destination).map_err(launch_io)
-}
-
-fn ensure_instance_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidInstanceHome,
-            format!("unsafe instance path: {}", relative.display()),
-        ));
-    }
-    let mut current = root.to_path_buf();
-    for part in relative.components() {
-        current.push(part);
-        match fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                fs::remove_file(&current).map_err(launch_io)?;
-                fs::create_dir(&current).map_err(launch_io)?;
-            }
-            Ok(meta) if !meta.is_dir() => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInstanceHome,
-                    format!(
-                        "instance credential path is not a directory: {}",
-                        current.display()
-                    ),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(launch_io)?;
-            }
-            Err(error) => return Err(launch_io(error)),
-        }
-        set_owner_only_dir(&current)?;
-    }
-    Ok(current)
-}
-
+#[path = "launch_credential_links.rs"]
+mod credential_links;
+pub use credential_links::inherit_credentials;
 /// Progress while a shared runtime comes up.
 pub type Progress<'a> = dyn Fn(&str) + 'a;
 
@@ -494,9 +381,13 @@ pub fn socket_accepts(path: &Path) -> bool {
 
 /// Locate a sibling executable next to our own, falling back to `$PATH`.
 fn sibling_exe(name: &str) -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+    sibling_exe_next_to(std::env::current_exe().ok().as_deref(), name)
+}
+
+fn sibling_exe_next_to(current: Option<&Path>, name: &str) -> PathBuf {
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    current
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
         .filter(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from(name))
 }
@@ -507,14 +398,21 @@ pub fn ensure_runtime(options: &LaunchOptions, progress: &Progress<'_>) -> Resul
         .api_socket
         .clone()
         .unwrap_or_else(jcode_harness_api::api_socket_path);
-    if socket_accepts(&api) {
-        return Ok(());
-    }
-    let legacy = jcode_harness_api::legacy_socket_path();
     let jcode = options
         .binary
         .clone()
         .unwrap_or_else(|| sibling_exe("jcode"));
+    let legacy = jcode_harness_api::legacy_socket_path();
+    // A custom API socket may be a forwarded remote endpoint. Only the normal
+    // local shared runtime can be offered our explicit packaged companion. A
+    // PATH fallback is intentionally not an upgrade candidate.
+    #[cfg(unix)]
+    if shared_upgrade::is_local_shared(&api, &legacy, &jcode) && socket_accepts(&legacy) {
+        shared_upgrade::offer(&legacy, &jcode, options.start_timeout, progress);
+    }
+    if socket_accepts(&api) {
+        return Ok(());
+    }
     if !socket_accepts(&legacy) {
         progress("starting jcode runtime...");
         spawn_detached(&jcode, &["serve"]).map_err(|error| {
@@ -527,14 +425,12 @@ pub fn ensure_runtime(options: &LaunchOptions, progress: &Progress<'_>) -> Resul
     }
     progress("starting harness API bridge...");
     let standalone_bridge = sibling_exe("jcode-harness-api-bridge");
-    let (bridge, bridge_args): (&Path, &[&str]) = if standalone_bridge.is_file() {
-        (&standalone_bridge, &[])
-    } else {
-        // Current Jcode distributions host the bridge as a CLI subcommand so a
-        // desktop bundle only needs to ship one companion executable. Keep the
-        // standalone lookup above for compatibility with older installations.
-        (&jcode, &["api-bridge"])
-    };
+    let (bridge, bridge_args) = shared_bridge_launch(
+        &jcode,
+        &standalone_bridge,
+        options.binary.is_some(),
+        CLI_SERVES_API_BRIDGE,
+    );
     spawn_detached(bridge, bridge_args).map_err(|error| {
         Error::new(
             ErrorKind::LaunchFailed,
@@ -544,14 +440,52 @@ pub fn ensure_runtime(options: &LaunchOptions, progress: &Progress<'_>) -> Resul
     wait_for_socket(&api, "harness API bridge", options.start_timeout)
 }
 
+/// Whether the `jcode` CLI on this platform has the `api-bridge` subcommand.
+/// It is compiled for Unix only, so elsewhere `jcode api-bridge` exits on an
+/// unknown subcommand and no API socket ever appears.
+const CLI_SERVES_API_BRIDGE: bool = cfg!(unix);
+
+/// Keep the bridge aligned with the selected runtime. An old standalone left
+/// beside Desktop must not silently disable newer routing and identity support.
+/// Standalone-only bundles remain supported when no CLI companion was selected.
+///
+/// Where the CLI cannot serve the bridge (Windows), the packaged standalone is
+/// the only bridge there is, so it wins whenever it exists. Preferring the CLI
+/// there left Desktop waiting for a socket that nothing was going to create.
+fn shared_bridge_launch<'a>(
+    jcode: &'a Path,
+    standalone: &'a Path,
+    explicit_runtime: bool,
+    cli_serves_bridge: bool,
+) -> (&'a Path, &'static [&'static str]) {
+    if !cli_serves_bridge && standalone.is_file() {
+        return (standalone, &[]);
+    }
+    if explicit_runtime || jcode.is_file() || !standalone.is_file() {
+        (jcode, &["api-bridge"])
+    } else {
+        (standalone, &[])
+    }
+}
+
 fn spawn_detached(program: &Path, args: &[&str]) -> std::io::Result<()> {
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(drop)
+        .stderr(Stdio::null());
+    // A GUI host (Jcode Desktop) has no console to share, so each
+    // console-subsystem child would open its own window. CREATE_NO_WINDOW
+    // gives the daemon a hidden console its own children inherit, and a new
+    // process group keeps the host's Ctrl+C or exit from reaching it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | crate::process::CREATE_NO_WINDOW);
+    }
+    command.spawn().map(drop)
 }
 
 /// Block until `path` accepts connections, or the timeout expires.
@@ -594,9 +528,35 @@ fn read_daemon_pid(home: &Path, runtime_dir: &Path) -> Option<i32> {
 
 #[cfg(unix)]
 fn stop_instance_daemon(home: &Path, runtime_dir: &Path) {
-    let Some(pid) = read_daemon_pid(home, runtime_dir) else {
-        return;
-    };
+    if let Some(pid) = read_daemon_pid(home, runtime_dir) {
+        stop_daemon_pid(pid);
+    }
+}
+
+/// Pid of a daemon already registered for this runtime directory before the
+/// launch started. A failed launch must not stop that daemon.
+#[cfg(unix)]
+fn registered_daemon_pid(home: &Path, runtime_dir: &Path) -> Option<i32> {
+    read_daemon_pid(home, runtime_dir)
+}
+
+/// Stop the daemon a failed launch registered. A daemon that was already
+/// registered before the launch belongs to someone else and is left alone.
+#[cfg(unix)]
+fn stop_daemon_started_by_failed_launch(
+    home: &Path,
+    runtime_dir: &Path,
+    registered_before: Option<i32>,
+) {
+    if let Some(pid) = read_daemon_pid(home, runtime_dir)
+        && Some(pid) != registered_before
+    {
+        stop_daemon_pid(pid);
+    }
+}
+
+#[cfg(unix)]
+fn stop_daemon_pid(pid: i32) {
     signal_process_group(pid, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -610,6 +570,19 @@ fn stop_instance_daemon(home: &Path, runtime_dir: &Path) {
     while Instant::now() < deadline && process_exists(pid) {
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(not(unix))]
+fn registered_daemon_pid(_home: &Path, _runtime_dir: &Path) -> Option<i32> {
+    None
+}
+
+#[cfg(not(unix))]
+fn stop_daemon_started_by_failed_launch(
+    _home: &Path,
+    _runtime_dir: &Path,
+    _registered_before: Option<i32>,
+) {
 }
 
 #[cfg(not(unix))]
@@ -700,14 +673,14 @@ fn home_dir() -> PathBuf {
 pub fn user_app_config_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        return home_dir().join("Library/Application Support/jcode");
+        home_dir().join("Library/Application Support/jcode")
     }
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join("AppData/Roaming"))
-            .join("jcode");
+            .join("jcode")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -744,6 +717,95 @@ fn set_owner_only_file(_path: &Path) -> Result<()> {
 
 fn launch_io(error: std::io::Error) -> Error {
     Error::new(ErrorKind::LaunchFailed, error.to_string())
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+
+    #[test]
+    fn selected_runtime_bridge_wins_over_stale_standalone() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("jcode");
+        let standalone = root.path().join("jcode-harness-api-bridge");
+        fs::write(&standalone, b"obsolete bridge").unwrap();
+        // An explicit command can also be a bare name resolved through PATH.
+        assert_eq!(
+            shared_bridge_launch(&runtime, &standalone, true, true),
+            (runtime.as_path(), &["api-bridge"][..])
+        );
+        fs::write(&runtime, b"current runtime").unwrap();
+        assert_eq!(
+            shared_bridge_launch(&runtime, &standalone, false, true),
+            (runtime.as_path(), &["api-bridge"][..])
+        );
+    }
+
+    /// Regression: Desktop 0.6.6-beta.12 on Windows launched `jcode.exe
+    /// api-bridge`, a subcommand that build does not have, and timed out
+    /// waiting for the API pipe with the working standalone bridge beside it.
+    #[test]
+    fn standalone_bridge_is_used_where_the_cli_cannot_serve_one() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("jcode");
+        let standalone = root.path().join("jcode-harness-api-bridge");
+        fs::write(&runtime, b"runtime without api-bridge").unwrap();
+        fs::write(&standalone, b"packaged bridge").unwrap();
+        for explicit_runtime in [true, false] {
+            assert_eq!(
+                shared_bridge_launch(&runtime, &standalone, explicit_runtime, false),
+                (standalone.as_path(), &[][..])
+            );
+        }
+        // With no standalone packaged there is nothing better to try.
+        fs::remove_file(&standalone).unwrap();
+        assert_eq!(
+            shared_bridge_launch(&runtime, &standalone, true, false),
+            (runtime.as_path(), &["api-bridge"][..])
+        );
+    }
+
+    #[test]
+    fn standalone_only_bundle_and_path_runtime_remain_supported() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("jcode");
+        let standalone = root.path().join("jcode-harness-api-bridge");
+        assert_eq!(
+            shared_bridge_launch(&runtime, &standalone, false, true),
+            (runtime.as_path(), &["api-bridge"][..])
+        );
+        fs::write(&standalone, b"standalone-only bundle").unwrap();
+        assert_eq!(
+            shared_bridge_launch(&runtime, &standalone, false, true),
+            (standalone.as_path(), &[][..])
+        );
+    }
+
+    #[test]
+    fn sibling_executable_uses_platform_suffix_in_bundle_with_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Jcode package with spaces 雪");
+        fs::create_dir(&bundle).unwrap();
+        let current = bundle.join(format!("jcode-desktop{}", std::env::consts::EXE_SUFFIX));
+        for name in ["jcode", "jcode-harness-api-bridge"] {
+            let companion = bundle.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            fs::write(&companion, b"test executable").unwrap();
+            assert_eq!(sibling_exe_next_to(Some(&current), name), companion);
+        }
+    }
+
+    #[test]
+    fn sibling_executable_fallback_uses_platform_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("jcode-desktop");
+        for name in ["jcode", "jcode-harness-api-bridge"] {
+            let expected = PathBuf::from(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            assert_eq!(sibling_exe_next_to(None, name), expected);
+            assert_eq!(sibling_exe_next_to(Some(&current), name), expected);
+            fs::create_dir(root.path().join(&expected)).unwrap();
+            assert_eq!(sibling_exe_next_to(Some(&current), name), expected);
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -825,6 +887,47 @@ mod tests {
         assert_eq!(fs::read_to_string(captured).unwrap(), "external");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_instances_disable_auto_update() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let binary = sandbox.path().join("capture-env");
+        let captured = sandbox.path().join("auto-update.txt");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s|%s' \"${JCODE_NO_AUTO_UPDATE-unset}\" \"$*\" > \"$CAPTURE_PATH\"\nexit 1\n",
+        )
+        .expect("write fake runtime");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make fake runtime executable");
+
+        let mut options = LaunchOptions {
+            jcode_home: Some(sandbox.path().join("instance")),
+            inherit_logins: false,
+            binary: Some(binary),
+            startup_timeout: Duration::from_secs(2),
+            ..LaunchOptions::default()
+        };
+        options.env.insert(
+            OsString::from("CAPTURE_PATH"),
+            captured.as_os_str().to_owned(),
+        );
+
+        assert!(
+            launch_instance(&options).is_err(),
+            "fake runtime should fail startup"
+        );
+        assert_eq!(
+            fs::read_to_string(captured).expect("captured bridge invocation"),
+            format!(
+                "1|--no-update api-bridge --api-socket {}",
+                sandbox.path().join("instance/run/jcode-api.sock").display()
+            )
+        );
+    }
+
     #[test]
     fn dropping_an_ephemeral_instance_stops_its_bridge_and_removes_its_home() {
         let home = tempfile::Builder::new()
@@ -853,5 +956,171 @@ mod tests {
 
         assert!(!process_exists(pid), "owned bridge process survived Drop");
         assert!(!home.exists(), "ephemeral instance home survived Drop");
+    }
+
+    /// A daemon owned by the test. Its reaper thread reaps the child as soon as it
+    /// exits, so a stopped daemon is never left as a zombie that still answers
+    /// `kill(pid, 0)`. The reaper runs on its own thread because `launch_instance`
+    /// stops daemons synchronously, before it returns to the test.
+    struct StandInDaemon {
+        pid: i32,
+        exited: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl StandInDaemon {
+        fn spawn() -> Self {
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("stand-in daemon");
+            let pid = child.id() as i32;
+            let (exited_tx, exited) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match child.try_wait() {
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                        Ok(Some(_)) => break,
+                        // Never leak the stand-in, even when nothing stopped it.
+                        _ => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                    }
+                }
+                let _ = exited_tx.send(());
+            });
+            Self { pid, exited }
+        }
+
+        fn is_running(&self) -> bool {
+            matches!(
+                self.exited.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            )
+        }
+
+        fn wait_for_exit(&self, timeout: Duration) -> bool {
+            self.exited.recv_timeout(timeout).is_ok()
+        }
+    }
+
+    impl Drop for StandInDaemon {
+        fn drop(&mut self) {
+            if self.is_running() {
+                // SAFETY: the reaper has not reaped the child yet, so this pid still names it.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Registers the stand-in daemon for this runtime, as a real bridge's daemon would.
+    const REGISTER_DAEMON: &str = r#"printf '{"x":{"socket":"%s","pid":%s}}' "$JCODE_RUNTIME_DIR/jcode.sock" "$DAEMON_PID" > "$JCODE_HOME/servers.json""#;
+
+    /// Launch a fake `jcode` whose body is `script`; `DAEMON_PID` names `daemon`.
+    fn launch_with_fake_runtime(
+        sandbox: &Path,
+        script: &str,
+        daemon: &StandInDaemon,
+        jcode_home: Option<PathBuf>,
+        startup_timeout: Duration,
+    ) -> Result<LaunchedInstance> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = sandbox.join("fake-jcode");
+        fs::write(&binary, format!("#!/bin/sh\n{script}\n")).expect("write fake runtime");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make fake runtime executable");
+        let mut options = LaunchOptions {
+            jcode_home,
+            inherit_logins: false,
+            binary: Some(binary),
+            startup_timeout,
+            ..LaunchOptions::default()
+        };
+        options.env.insert(
+            OsString::from("DAEMON_PID"),
+            OsString::from(daemon.pid.to_string()),
+        );
+        launch_instance(&options)
+    }
+
+    #[test]
+    fn failed_startup_stops_daemon_when_jcode_exits() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let daemon = StandInDaemon::spawn();
+        let error = launch_with_fake_runtime(
+            sandbox.path(),
+            &format!("{REGISTER_DAEMON}\nexit 1"),
+            &daemon,
+            None,
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("a runtime that exits should fail startup");
+        assert_eq!(error.kind, ErrorKind::StartupFailed);
+        assert!(
+            daemon.wait_for_exit(Duration::from_secs(2)),
+            "daemon registered by the failed runtime survived startup failure"
+        );
+    }
+
+    #[test]
+    fn failed_startup_stops_daemon_when_socket_never_appears() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let daemon = StandInDaemon::spawn();
+        let error = launch_with_fake_runtime(
+            sandbox.path(),
+            &format!("{REGISTER_DAEMON}\nexec sleep 30"),
+            &daemon,
+            None,
+            Duration::from_secs(2),
+        )
+        .err()
+        .expect("a runtime without an API socket should time out");
+        assert_eq!(error.kind, ErrorKind::StartupTimeout);
+        assert!(
+            daemon.wait_for_exit(Duration::from_secs(2)),
+            "daemon registered by the timed-out runtime survived startup failure"
+        );
+    }
+
+    #[test]
+    fn failed_startup_leaves_a_daemon_registered_before_the_launch_running() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let home = sandbox.path().join("instance");
+        let runtime_dir = home.join("run");
+        fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        let daemon = StandInDaemon::spawn();
+        // A caller-supplied home can already register a daemon from an earlier run.
+        let registry = serde_json::json!({
+            "x": {
+                "socket": runtime_dir.join("jcode.sock").display().to_string(),
+                "pid": daemon.pid,
+            }
+        });
+        fs::write(home.join("servers.json"), registry.to_string()).expect("registry");
+        let error = launch_with_fake_runtime(
+            sandbox.path(),
+            "exit 1",
+            &daemon,
+            Some(home),
+            Duration::from_secs(5),
+        )
+        .err()
+        .expect("a runtime that exits should fail startup");
+        assert_eq!(error.kind, ErrorKind::StartupFailed);
+        assert!(
+            daemon.is_running(),
+            "failed launch stopped a daemon it did not start"
+        );
     }
 }

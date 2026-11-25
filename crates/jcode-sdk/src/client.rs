@@ -40,6 +40,8 @@ pub struct ConnectOptions {
     /// On by default: an app that only works once the user has launched two
     /// daemons by hand is indistinguishable from a broken one.
     pub ensure_runtime: bool,
+    /// Desktop inline Markdown response renderer. Other clients leave false.
+    pub supports_user_response: bool,
 }
 
 impl Default for ConnectOptions {
@@ -49,6 +51,7 @@ impl Default for ConnectOptions {
             client_name: concat!("jcode-sdk-rs/", env!("CARGO_PKG_VERSION")).to_string(),
             request_timeout: Some(Duration::from_secs(30)),
             ensure_runtime: true,
+            supports_user_response: false,
         }
     }
 }
@@ -93,18 +96,18 @@ impl UnixTransport {
                 ErrorKind::ConnectFailed,
                 match cause.kind() {
                     std::io::ErrorKind::NotFound => format!(
-                        "no harness API socket at {}: the jcode harness is not running. \
-                         Start it with `jcode serve` and `jcode-harness-api-bridge`, or \
-                         connect with ensure_runtime enabled.",
+                        "harness not running (no socket at {}). Start `jcode-harness-api-bridge` \
+                         or connect with ensure_runtime.",
                         path.display()
                     ),
+                    // Also seen briefly while the bridge restarts, so do not
+                    // claim the socket is stale.
                     std::io::ErrorKind::ConnectionRefused => format!(
-                        "{} exists but refuses connections: a previous harness left a \
-                         stale socket behind. Remove it and start the harness again.",
+                        "harness refused the connection at {}. It may be restarting or stopped.",
                         path.display()
                     ),
                     std::io::ErrorKind::PermissionDenied => format!(
-                        "permission denied on {}: the socket belongs to another user.",
+                        "permission denied on {}. The socket belongs to another user.",
                         path.display()
                     ),
                     _ => format!("could not connect to {}: {cause}", path.display()),
@@ -126,9 +129,10 @@ impl Transport for UnixTransport {
         }
         #[cfg(windows)]
         {
-            // Closing the reader and writer handles interrupts named-pipe I/O.
-            // They are owned by the client and dropped during shutdown.
-            None
+            let pipe = self.0.try_clone().ok()?;
+            Some(Arc::new(move || {
+                let _ = pipe.shutdown(std::net::Shutdown::Both);
+            }))
         }
     }
 
@@ -333,6 +337,7 @@ struct Inner {
     next_id: AtomicU64,
     next_sub: AtomicU64,
     closed: AtomicBool,
+    disconnect_reason: Mutex<Option<Error>>,
     request_timeout: Option<Duration>,
     socket_path: std::path::PathBuf,
     client_name: String,
@@ -410,6 +415,7 @@ impl JcodeClient {
         let connect = ConnectOptions {
             socket_path: None,
             client_name: options.client_name.clone(),
+            supports_user_response: options.supports_user_response,
             request_timeout: options.request_timeout,
             ensure_runtime: false,
         };
@@ -458,6 +464,7 @@ impl JcodeClient {
         let instance = Arc::new(launch_instance(&options)?);
         let connect = ConnectOptions {
             socket_path: Some(instance.socket_path.clone()),
+            supports_user_response: false,
             client_name: options.client_name.clone(),
             request_timeout: options.request_timeout,
             ensure_runtime: false,
@@ -516,6 +523,7 @@ impl JcodeClient {
             next_id: AtomicU64::new(1),
             next_sub: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            disconnect_reason: Mutex::new(None),
             request_timeout: options.request_timeout,
             socket_path,
             client_name: options.client_name.clone(),
@@ -539,6 +547,7 @@ impl JcodeClient {
                 min_version: API_VERSION_MAJOR,
                 max_version: API_VERSION_MAJOR,
                 client: options.client_name.clone(),
+                supports_user_response: options.supports_user_response,
             },
             hello_timeout,
         )?;
@@ -632,7 +641,25 @@ impl JcodeClient {
         })
     }
 
+    /// The terminal reader failure, once known. Malformed frames carry
+    /// `ErrorKind::Protocol` so callers can stop retrying corrupt history.
+    /// An ordinary EOF remains reconnectable (`ErrorKind::Disconnected`).
+    pub fn disconnect_reason(&self) -> Option<Error> {
+        // A poisoned lock still holds the recorded cause. Report it rather
+        // than degrading to a generic disconnect.
+        match self.inner.disconnect_reason.lock() {
+            Ok(reason) => reason.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     fn disconnect_error(&self) -> Error {
+        if let Some(mut error) = self.disconnect_reason() {
+            if let Some(process) = &self.inner.ssh_process {
+                error.message = format!("{}; {}", error.message, process.diagnostic());
+            }
+            return error;
+        }
         match &self.inner.ssh_process {
             Some(process) => Error::new(ErrorKind::Disconnected, process.diagnostic()),
             None => closed_error(),
@@ -802,6 +829,18 @@ impl JcodeClient {
     }
 
     /// Clone a session's complete persisted context into a new idle session.
+    pub fn transfer_session(&self, session_id: &str) -> Result<SessionInfo> {
+        match self
+            .request_ok(ApiRequest::TransferSession {
+                session_id: session_id.into(),
+            })?
+            .event
+        {
+            ApiEvent::SessionForked { session } => Ok(session),
+            other => Err(unexpected("session_forked", &other)),
+        }
+    }
+
     pub fn fork_session(&self, session_id: &str) -> Result<SessionInfo> {
         match self
             .request_ok(ApiRequest::ForkSession {
@@ -847,13 +886,30 @@ impl JcodeClient {
         images: Vec<(String, String)>,
         wait_for_accept: Option<Duration>,
     ) -> Result<()> {
+        self.send_message_with_reminder(session_id, content, images, None, wait_for_accept)
+    }
+
+    /// [`send_message`](Self::send_message) with a hidden system reminder
+    /// for this turn only, such as a collection's instructions. The reminder
+    /// guides the model without appearing in the visible transcript.
+    pub fn send_message_with_reminder(
+        &self,
+        session_id: &str,
+        content: &str,
+        images: Vec<(String, String)>,
+        system_reminder: Option<&str>,
+        wait_for_accept: Option<Duration>,
+    ) -> Result<()> {
         // Subscribe *before* writing: an ack that lands between the write and
         // the subscribe would otherwise be missed and time out a healthy turn.
         let stream = wait_for_accept.map(|_| self.events(Some(session_id)));
         self.notify(ApiRequest::SendMessage {
             session_id: session_id.to_string(),
             content: content.to_string(),
-            system_reminder: None,
+            system_reminder: system_reminder
+                .map(str::trim)
+                .filter(|reminder| !reminder.is_empty())
+                .map(str::to_owned),
             images,
             no_reply: false,
         })?;
@@ -892,11 +948,29 @@ impl JcodeClient {
         images: Vec<(String, String)>,
         urgent: bool,
     ) -> Result<()> {
+        self.soft_interrupt_with_id(session_id, content, images, urgent, None)
+    }
+
+    /// Queue a soft interrupt tagged with an opaque `client_id`.
+    ///
+    /// The id comes back in [`ApiEvent::SoftInterruptInjected`] when the model
+    /// receives the message, and [`Self::cancel_soft_interrupt`] can take it
+    /// back before then. Needs the `soft_interrupt_ids` capability; an older
+    /// server accepts the message but drops the id.
+    pub fn soft_interrupt_with_id(
+        &self,
+        session_id: &str,
+        content: &str,
+        images: Vec<(String, String)>,
+        urgent: bool,
+        client_id: Option<&str>,
+    ) -> Result<()> {
         self.request_ok(ApiRequest::SoftInterrupt {
             session_id: session_id.to_string(),
             content: content.to_string(),
             images,
             urgent,
+            client_id: client_id.map(str::to_string),
         })
         .map(drop)
     }
@@ -986,6 +1060,39 @@ impl JcodeClient {
 
     /// Runtime identity, route catalog, protocol metadata, and a live health
     /// check for a session.
+    pub fn runtime_command(
+        &self,
+        session_id: &str,
+        command: jcode_harness_api::RuntimeCommand,
+        args: Vec<String>,
+    ) -> Result<jcode_harness_api::RuntimeCommandOutput> {
+        // Hello capabilities describe a point-in-time probe. A busy daemon may
+        // omit this capability temporarily, and an updated bridge can recheck
+        // it without disturbing the attached session. Send the typed request
+        // once and let the bridge enforce support before forwarding it.
+        match self
+            .request_ok(ApiRequest::RuntimeCommand {
+                session_id: session_id.into(),
+                command,
+                args,
+            })?
+            .event
+        {
+            ApiEvent::RuntimeCommandResult {
+                session_id,
+                command,
+                data,
+                message,
+            } => Ok(jcode_harness_api::RuntimeCommandOutput {
+                session_id,
+                command,
+                data,
+                message,
+            }),
+            other => Err(unexpected("runtime_command_result", &other)),
+        }
+    }
+
     pub fn get_runtime_info(&self, session_id: &str) -> Result<RuntimeInfo> {
         self.ping()?;
         match self
@@ -999,6 +1106,8 @@ impl JcodeClient {
                 provider,
                 model,
                 reasoning_effort,
+                auth_method,
+                account_label,
                 routes,
             } => {
                 let mut providers = Vec::new();
@@ -1019,6 +1128,8 @@ impl JcodeClient {
                     provider,
                     model,
                     reasoning_effort,
+                    auth_method,
+                    account_label,
                     providers,
                     routes,
                 })
@@ -1159,6 +1270,36 @@ impl JcodeClient {
     }
 
     /// Read safe filesystem metadata for a path under the session root.
+    /// The session's persisted todo state for the auto-poke and quality-gate
+    /// policy. Requires the `todo_state` capability.
+    pub fn todo_state(&self, session_id: &str) -> Result<jcode_todo_policy::TodoSnapshot> {
+        match self
+            .request_ok(ApiRequest::GetTodoState {
+                session_id: session_id.to_string(),
+            })?
+            .event
+        {
+            ApiEvent::TodoState { state, .. } => Ok(state),
+            other => Err(unexpected("todo_state", &other)),
+        }
+    }
+
+    /// Apply a follow-up decision's persistent effects. A no-op when empty.
+    pub fn ack_todo_follow_up(
+        &self,
+        session_id: &str,
+        effects: jcode_todo_policy::TodoEffects,
+    ) -> Result<()> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+        self.request_ok(ApiRequest::AckTodoFollowUp {
+            session_id: session_id.to_string(),
+            effects,
+        })
+        .map(drop)
+    }
+
     pub fn file_status(&self, session_id: &str, path: &str) -> Result<FileStatus> {
         match self
             .request_ok(ApiRequest::FileStatus {
@@ -1251,6 +1392,27 @@ impl JcodeClient {
         .map(drop)
     }
 
+    /// Override the context budget. None or zero clears it. Returns the
+    /// authoritative effective budget after applying the override.
+    pub fn set_context_cap(
+        &self,
+        session_id: &str,
+        max_context_tokens: Option<usize>,
+    ) -> Result<usize> {
+        match self
+            .request_ok(ApiRequest::SetContextCap {
+                session_id: session_id.to_string(),
+                max_context_tokens,
+            })?
+            .event
+        {
+            ApiEvent::ContextCapChanged {
+                effective_budget, ..
+            } => Ok(effective_budget),
+            other => Err(unexpected("context_cap_changed", &other)),
+        }
+    }
+
     /// Set how much the model deliberates before answering. The accepted set
     /// is per-provider, so this takes a string rather than a union that would
     /// go stale.
@@ -1281,6 +1443,19 @@ impl JcodeClient {
         self.request_ok(ApiRequest::RenameSession {
             session_id: session_id.to_string(),
             title,
+        })
+        .map(drop)
+    }
+
+    /// Replace the session's process-local environment overlay. Empty clears it.
+    pub fn set_session_env(
+        &self,
+        session_id: &str,
+        env: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        self.request_ok(ApiRequest::SetSessionEnv {
+            session_id: session_id.to_string(),
+            env,
         })
         .map(drop)
     }
@@ -1340,8 +1515,65 @@ impl JcodeClient {
     pub fn cancel_soft_interrupts(&self, session_id: &str) -> Result<()> {
         self.request_ok(ApiRequest::CancelSoftInterrupts {
             session_id: session_id.to_string(),
+            client_ids: None,
         })
         .map(drop)
+    }
+
+    /// Take back specific queued soft interrupts by `client_id`.
+    ///
+    /// Returns `(cancelled, not_queued)`. The server decides against injection
+    /// atomically, so an id in `cancelled` was never seen by the model, and an
+    /// id in `not_queued` was already delivered (or never queued).
+    pub fn cancel_soft_interrupts_by_id(
+        &self,
+        session_id: &str,
+        client_ids: &[&str],
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let request = ApiRequest::CancelSoftInterrupts {
+            session_id: session_id.to_string(),
+            client_ids: Some(client_ids.iter().map(|id| id.to_string()).collect()),
+        };
+        match self.request_ok(request)?.event {
+            ApiEvent::SoftInterruptsCancelled {
+                cancelled,
+                not_queued,
+            } => Ok((cancelled, not_queued)),
+            other => Err(unexpected("soft_interrupts_cancelled", &other)),
+        }
+    }
+
+    /// Take back one queued soft interrupt. `true` means it was removed before
+    /// the model saw it, `false` that it was already delivered (or unknown).
+    pub fn cancel_soft_interrupt(&self, session_id: &str, client_id: &str) -> Result<bool> {
+        self.cancel_soft_interrupts_by_id(session_id, &[client_id])
+            .map(|(cancelled, _)| !cancelled.is_empty())
+    }
+
+    /// Move the running tool call to the background (the TUI's Alt+B).
+    pub fn background_tool(&self, session_id: &str) -> Result<()> {
+        self.background_tool_result(session_id).map(drop)
+    }
+
+    /// Move the running tool call to the background and report what moved.
+    ///
+    /// Returns `(moved, tool_call_id)`. A server without the
+    /// `background_tool_result` capability answers only `Ok`, reported here as
+    /// `(false, None)` even if a tool was moved.
+    pub fn background_tool_result(&self, session_id: &str) -> Result<(bool, Option<String>)> {
+        match self
+            .request_ok(ApiRequest::BackgroundTool {
+                session_id: session_id.to_string(),
+            })?
+            .event
+        {
+            ApiEvent::BackgroundToolResult {
+                moved,
+                tool_call_id,
+                ..
+            } => Ok((moved, tool_call_id)),
+            _ => Ok((false, None)),
+        }
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -1400,6 +1632,7 @@ impl JcodeClient {
                     output,
                     cache_read_input,
                     cache_creation_input,
+                    effective_budget,
                     ..
                 } => {
                     result.usage = Some(Usage {
@@ -1407,6 +1640,7 @@ impl JcodeClient {
                         output,
                         cache_read_input,
                         cache_creation_input,
+                        effective_budget,
                     })
                 }
                 ApiEvent::PermissionRequest { request_id, .. } if options.auto_approve => {
@@ -1437,88 +1671,8 @@ impl JcodeClient {
     }
 }
 
-/// Options for a one-shot turn.
-#[derive(Default)]
-pub struct RunOptions {
-    pub images: Vec<(String, String)>,
-    /// Called for every event of the turn, for progress rendering.
-    #[allow(clippy::type_complexity)]
-    pub on_event: Option<Box<dyn Fn(&ApiEvent) + Send>>,
-    /// Auto-answer permission prompts. Only meaningful when the server
-    /// advertises the `permissions` capability.
-    pub auto_approve: bool,
-}
-
-/// Runtime identity and protocol metadata returned by [`JcodeClient::get_runtime_info`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct RuntimeInfo {
-    pub server: String,
-    pub protocol_version: u32,
-    pub capabilities: Vec<String>,
-    pub healthy: bool,
-    pub session_id: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    /// Reasoning effort, e.g. `high`, when the provider exposes it.
-    pub reasoning_effort: Option<String>,
-    pub providers: Vec<String>,
-    pub routes: Vec<ModelRouteInfo>,
-}
-
-/// Content and truncation metadata returned by [`JcodeClient::read_file`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileContent {
-    pub path: String,
-    pub content: String,
-    pub size: u64,
-    pub truncated: bool,
-}
-
-/// Optional constraints for [`JcodeClient::search_text`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SearchTextOptions {
-    /// Restrict the search to this relative path under the session root.
-    pub path: Option<String>,
-    /// Maximum number of matches to return.
-    pub limit: Option<u32>,
-}
-
-/// Safe filesystem metadata returned by [`JcodeClient::file_status`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileStatus {
-    pub path: String,
-    pub exists: bool,
-    pub kind: String,
-    pub size: Option<u64>,
-    pub modified_ms: Option<u64>,
-}
-
-/// What one turn produced.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct TurnResult {
-    /// None for natural completion. Failures still return Err and are also
-    /// delivered to on_event as TurnStopped before the legacy Error event.
-    pub stop_reason: Option<jcode_harness_api::TurnStopReason>,
-    pub stop_message: Option<String>,
-    /// All assistant text in the turn, including tool narration.
-    pub text: String,
-    /// Last completed assistant message, or aggregate text on older bridges.
-    pub final_text: String,
-    /// Framed messages. Empty when connected to an older, unframed bridge.
-    pub messages: Vec<AssistantTextMessage>,
-    pub reasoning: String,
-    pub tool_calls: Vec<ToolCall>,
-    /// Usage from the latest provider call in this turn, not a sum of calls.
-    pub usage: Option<Usage>,
-}
-
-/// One assistant text message, excluding interleaved reasoning.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AssistantTextMessage {
-    /// Stream-local correlator, not a persisted history message id.
-    pub message_id: Option<String>,
-    pub text: String,
-}
+mod types;
+pub use types::*;
 
 #[derive(Default)]
 struct TextCollector {
@@ -1565,234 +1719,13 @@ impl TextCollector {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub output: String,
-    pub error: Option<String>,
-}
+#[path = "client/global_session_workers.rs"]
+mod global_session_workers;
+use global_session_workers::discover_global_sessions;
 
-/// Provider-reported counters. Cache counters may be separate from input
-/// (Anthropic) or a subset of it (OpenAI), so do not blindly add them together.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Usage {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read_input: Option<u64>,
-    pub cache_creation_input: Option<u64>,
-}
-
-fn discover_global_sessions(
-    parent: JcodeClient,
-    control: Arc<GlobalEventControl>,
-    interval: Duration,
-) {
-    loop {
-        if control.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        let sessions = match parent
-            .request_ok(ApiRequest::ListSessions {
-                include_archived: true,
-                limit: None,
-            })
-            .and_then(|frame| match frame.event {
-                ApiEvent::Sessions { sessions } => Ok(sessions),
-                other => Err(unexpected("sessions", &other)),
-            }) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                stop_global_stream(&control, Some(error));
-                return;
-            }
-        };
-
-        for session in sessions {
-            if control.stopped.load(Ordering::Acquire) {
-                return;
-            }
-            start_global_child(&parent, &control, session.session_id);
-        }
-
-        if interval.is_zero() {
-            return;
-        }
-        let Ok(guard) = control.wake_lock.lock() else {
-            stop_global_stream(
-                &control,
-                Some(Error::new(
-                    ErrorKind::Transport,
-                    "global event lock poisoned",
-                )),
-            );
-            return;
-        };
-        let _ = control.wake.wait_timeout(guard, interval);
-    }
-}
-
-fn start_global_child(parent: &JcodeClient, control: &Arc<GlobalEventControl>, session_id: String) {
-    if control
-        .children
-        .lock()
-        .map(|children| children.contains_key(&session_id))
-        .unwrap_or(true)
-    {
-        return;
-    }
-
-    let connection = if let Some(options) = &parent.ssh_options {
-        let mut options = options.clone();
-        options.client_name = format!("{}/global-events", parent.inner.client_name);
-        #[cfg(unix)]
-        let shared = parent.shared_ssh_transport();
-        #[cfg(unix)]
-        if let Some(shared) = shared {
-            shared.connect()
-        } else if parent
-            .inner
-            .ssh_process
-            .as_ref()
-            .is_some_and(|process| process.was_shared)
-        {
-            Err(Error::new(
-                ErrorKind::Disconnected,
-                "shared SSH parent channel is closed",
-            ))
-        } else {
-            JcodeClient::connect_ssh(options)
-        }
-        #[cfg(not(unix))]
-        JcodeClient::connect_ssh(options)
-    } else {
-        JcodeClient::connect(ConnectOptions {
-            socket_path: Some(parent.inner.socket_path.clone()),
-            client_name: format!("{}/global-events", parent.inner.client_name),
-            request_timeout: parent.inner.request_timeout,
-            ensure_runtime: false,
-        })
-    };
-    let child = match connection {
-        Ok(child) => child,
-        Err(error) => {
-            stop_global_stream(control, Some(error));
-            return;
-        }
-    };
-    let stream = child.events(Some(&session_id));
-    if let Err(error) = child.attach_session(&session_id) {
-        if !matches!(
-            error.kind,
-            ErrorKind::Harness(jcode_harness_api::ErrorCode::UnknownSession)
-        ) {
-            stop_global_stream(control, Some(error));
-        }
-        return;
-    }
-    if control.stopped.load(Ordering::Acquire) {
-        return;
-    }
-    if let Ok(mut children) = control.children.lock() {
-        children.insert(session_id.clone(), child);
-    } else {
-        stop_global_stream(
-            control,
-            Some(Error::new(
-                ErrorKind::Transport,
-                "global event lock poisoned",
-            )),
-        );
-        return;
-    }
-
-    let pump_control = Arc::clone(control);
-    std::thread::spawn(move || {
-        while let Some(event) = stream.next() {
-            if pump_control.stopped.load(Ordering::Acquire) {
-                break;
-            }
-            match pump_control.tx.try_send(event) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    stop_global_stream(
-                        &pump_control,
-                        Some(Error::new(
-                            ErrorKind::EventBufferOverflow,
-                            format!(
-                                "global_events consumer fell behind {} buffered events",
-                                pump_control.max_buffered_events
-                            ),
-                        )),
-                    );
-                    break;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    stop_global_stream(&pump_control, None);
-                    break;
-                }
-            }
-        }
-        if let Ok(mut children) = pump_control.children.lock() {
-            children.remove(&session_id);
-        }
-    });
-}
-
-/// The reader thread: correlates replies, fans stream events out.
-fn spawn_reader(inner: Arc<Inner>, mut reader: Box<dyn BufRead + Send>) {
-    std::thread::spawn(move || {
-        while let Ok(frame) = read_frame::<_, ServerFrame>(&mut reader) {
-            // Unknown kinds are skipped silently, per the protocol's
-            // forward-compatibility rule.
-            if matches!(frame.event, ApiEvent::Unknown) {
-                continue;
-            }
-            if let Some(reply_to) = frame.reply_to {
-                let waiter = inner
-                    .pending
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| pending.remove(&reply_to));
-                if let Some(waiter) = waiter {
-                    let _ = waiter.send(frame);
-                    continue;
-                }
-            }
-            // Not a reply anyone is waiting on: a stream event. Dead
-            // subscriptions are dropped here as well as in `EventStream::drop`,
-            // so a leaked stream cannot grow the fan-out list forever.
-            if let Ok(mut subs) = inner.subscribers.lock() {
-                let session = event_session(&frame.event);
-                subs.retain(|(_, filter, sink)| {
-                    match (filter, session) {
-                        // A filtered subscription only wants its own session's
-                        // events. Events that name *no* session still go to it:
-                        // `error` is the one that matters, since the harness
-                        // sends it instead of `turn_done`, and dropping it
-                        // leaves a turn waiting forever for an end that will
-                        // never come.
-                        (Some(want), Some(got)) if want != got => true,
-                        _ => sink.send(frame.event.clone()).is_ok(),
-                    }
-                });
-            }
-        }
-        if let Some(shutdown) = &inner.shutdown {
-            shutdown();
-        }
-        inner.closed.store(true, Ordering::Relaxed);
-        // Fail everything in flight rather than leaving callers blocked on a
-        // reply that can never arrive.
-        if let Ok(mut pending) = inner.pending.lock() {
-            pending.clear();
-        }
-        if let Ok(mut subs) = inner.subscribers.lock() {
-            subs.clear();
-        }
-    });
-}
-
+#[path = "client_reader.rs"]
+mod reader;
+use reader::*;
 /// The session an event belongs to, when it names one.
 fn event_session(event: &ApiEvent) -> Option<&str> {
     use ApiEvent::*;
@@ -1810,7 +1743,10 @@ fn event_session(event: &ApiEvent) -> Option<&str> {
         | Tools { session_id, .. }
         | SidePanelState { session_id, .. }
         | TokenUsage { session_id, .. }
+        | ContextCapChanged { session_id, .. }
+        | KvCacheMiss { session_id, .. }
         | TurnDone { session_id, .. }
+        | SoftInterruptInjected { session_id, .. }
         | TurnStopped { session_id, .. }
         | BackgroundProgress { session_id, .. }
         | MessageAccepted { session_id, .. }

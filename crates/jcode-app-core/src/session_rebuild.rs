@@ -22,7 +22,7 @@ pub fn hot_rebuild(session_id: &str) -> Result<()> {
         anyhow::bail!("Binary not found at {:?}", exe);
     }
 
-    update::print_centered(&format!("Restarting with session {}...", session_id));
+    eprintln!("Restarting with session {}...", session_id);
     exec_rebuilt_session(&exe, session_id, &cwd, is_selfdev)
 }
 
@@ -86,7 +86,7 @@ fn exec_rebuilt_session(exe: &Path, session_id: &str, cwd: &Path, is_selfdev: bo
         cmd.arg("self-dev");
     }
     cmd.arg("--resume").arg(session_id).current_dir(cwd);
-    let err = crate::platform::replace_process(&mut cmd);
+    let err = crate::platform::replace_process_reparented(&mut cmd);
 
     Err(anyhow::anyhow!("Failed to exec {:?}: {}", exe, err))
 }

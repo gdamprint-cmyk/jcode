@@ -4,6 +4,9 @@ use super::{
     shared_server_binary_path, stable_binary_path,
 };
 use anyhow::Result;
+// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the Unix wrapper that
+// exports JCODE_BUILD_GIT_HASH/JCODE_BUILD_GIT_DATE; this file mirrors it for the
+// native Windows Cargo path.
 use chrono::{DateTime, Utc};
 use jcode_storage as storage;
 use std::path::{Path, PathBuf};
@@ -127,7 +130,46 @@ fn wrapper_payload_sibling(path: &Path) -> Option<PathBuf> {
             payload = Some(entry.path());
         }
     }
-    payload.filter(|p| p.is_file())
+    if let Some(payload) = payload.filter(|p| p.is_file()) {
+        return Some(payload);
+    }
+    // A channel entry is a COPY of the version's wrapper (Windows cannot keep a
+    // symlink to a running executable), so the payload is NOT its sibling: the
+    // channel directory holds only `jcode.exe`. The copy still names its payload
+    // in the `exec` line, so follow that. Without this, the channel wrapper is
+    // compared against the running payload and a freshly installed release looks
+    // strictly newer than itself forever.
+    //
+    // reference: MoveFileExA, MOVEFILE_REPLACE_EXISTING, "If lpNewFileName names
+    // an existing directory, an error is reported" (MS Learn) - the same reason
+    // the channel entry is staged as a copy rather than a symlink.
+    // reference: scripts/build_linux_compat.sh (wrapper `exec "$self_dir/<artifact>.bin"`)
+    wrapper_exec_payload(path)
+}
+
+/// The payload a release wrapper script execs, when that payload sits next to the
+/// script. Only `<dir>/<artifact>.bin` targets are followed.
+fn wrapper_exec_payload(wrapper: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(wrapper).ok()?;
+    let dir = wrapper.parent()?;
+    let mut found: Option<PathBuf> = None;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("exec ") else {
+            continue;
+        };
+        for token in rest.split_whitespace() {
+            let token = token.trim_matches('"');
+            let payload = dir.join(token);
+            if payload.extension().is_some_and(|ext| ext == "bin") && payload.is_file() {
+                if found.is_some() {
+                    // Ambiguous: two different payloads named. Refuse to guess.
+                    return None;
+                }
+                found = Some(payload);
+            }
+        }
+    }
+    found
 }
 
 fn profile_binary_path(repo_dir: &Path, profile: &str) -> PathBuf {
@@ -211,6 +253,7 @@ fn selfdev_build_command_for_target_on_platform(
             program: "bash".to_string(),
             args: vec!["-lc".to_string(), command],
             display: display_build_command("scripts/dev_cargo.sh", &specs),
+            env: Vec::new(),
         };
     }
 
@@ -220,6 +263,7 @@ fn selfdev_build_command_for_target_on_platform(
             program: "cargo".to_string(),
             args: cargo_build_args(&specs),
             display: command,
+            env: git_build_env(repo_dir),
         };
     }
 
@@ -227,7 +271,42 @@ fn selfdev_build_command_for_target_on_platform(
         program: "bash".to_string(),
         args: vec!["-lc".to_string(), command.clone()],
         display: command,
+        env: Vec::new(),
     }
+}
+
+/// Environment for a native Cargo build that carries the current git identity.
+///
+/// `scripts/dev_cargo.sh` exports these on Unix, but the Windows build path
+/// invokes Cargo directly (no wrapper), so `jcode-build-meta`'s build script
+/// never sees a fresh `JCODE_BUILD_GIT_HASH` and keeps embedding the hash from
+/// the previous commit. `build.rs` declares
+/// `cargo:rerun-if-env-changed=JCODE_BUILD_GIT_HASH`, so exporting the current
+/// value here makes the metadata refresh exactly when HEAD moves.
+fn git_build_env(repo_dir: &Path) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Ok(hash) = super::current_git_hash(repo_dir)
+        && !hash.is_empty()
+    {
+        env.push(("JCODE_BUILD_GIT_HASH".to_string(), hash));
+    }
+    if let Ok(date) = git_output(repo_dir, &["log", "-1", "--format=%ci"])
+        && !date.is_empty()
+    {
+        env.push(("JCODE_BUILD_GIT_DATE".to_string(), date));
+    }
+    env
+}
+
+fn git_output(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("git {} failed", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn cargo_build_args(specs: &[(&str, &str)]) -> Vec<String> {
@@ -308,6 +387,7 @@ pub fn run_selfdev_build(repo_dir: &Path) -> Result<SelfDevBuildCommand> {
     let build = selfdev_build_command(repo_dir);
     let status = Command::new(&build.program)
         .args(&build.args)
+        .envs(build.env.iter().cloned())
         .current_dir(repo_dir)
         .status()?;
 
@@ -475,7 +555,8 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
             return Some(shared_server);
         }
     } else if let Some(shared_server) = shared_server
-        && shared_server_channel_is_current_enough()
+        && (shared_server_channel_is_current_enough()
+            || shared_server_channel_newer_than_stable())
     {
         return Some(shared_server);
     }
@@ -485,6 +566,42 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
+}
+
+// reference: in-repo prior art - `repair_stale_shared_server_channel` in crates/jcode-build-support/src/lib.rs
+// (same "compare the approved shared-server channel against stable by mtime" decision, applied on the daemon side).
+//
+// True when the approved `shared-server` channel is strictly newer than the
+// `stable` channel on disk.
+//
+// The marker gate ([`shared_server_channel_is_current_enough`]) compares the
+// shared-server version marker against the `stable`/`current` markers. That
+// comparison is wrong whenever a LOCAL build advanced `current` after the
+// shared-server channel was promoted: the markers legitimately disagree, the
+// gate rejects the approved channel, and the selection falls back to `stable` -
+// which on this host is a much older release (v0.84.0). The client then spawns
+// that ancient daemon, sees a server older than its own client, and asks for
+// a reload; the reload execs into `shared-server`, the client reconnects, the
+// next client start spawns the old `stable` daemon again - a reload loop that
+// interrupts every session.
+//
+// mtime is the same directional signal the rest of the reload machinery uses
+// (see `server_has_newer_binary`), so an approved channel that is strictly
+// newer than `stable` must be preferred over the older `stable` fallback. A
+// deliberately pinned OLD self-dev channel stays pinned: it is not newer.
+fn shared_server_channel_newer_than_stable() -> bool {
+    let (Ok(shared), Ok(stable)) = (shared_server_binary_path(), stable_binary_path()) else {
+        return false;
+    };
+    let shared = resolve_binary_payload(&shared);
+    let stable = resolve_binary_payload(&stable);
+    match (binary_mtime(&shared), binary_mtime(&stable)) {
+        (Some(shared), Some(stable)) => shared > stable,
+        // An unreadable stable mtime means we cannot prove the fallback is
+        // older, so keep the approved channel (it was explicitly promoted).
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn shared_server_channel_is_current_enough() -> bool {
@@ -621,6 +738,10 @@ pub fn is_jcode_repo(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `same_binary_content` is a TEST-ONLY helper: the product compares
+    // channels by path, and only the assertions need content comparison
+    // (on Windows a channel entry is a copy, not a symlink).
+    use crate::same_binary_content;
 
     fn repo_fixture(git_file: bool) -> tempfile::TempDir {
         let temp = tempfile::TempDir::new().expect("temp repo");
@@ -635,6 +756,36 @@ mod tests {
             "[package]\nname = \"jcode\"\nversion = \"0.1.0\"\n",
         )
         .expect("Cargo.toml");
+        temp
+    }
+
+    /// A real git repository with one commit, so `git rev-parse --short HEAD`
+    /// resolves to a known hash.
+    /// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the same git
+    /// metadata the Unix wrapper exports, mirrored for the native Windows path.
+    fn git_repo_fixture() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().expect("temp repo");
+        let path = temp.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(
+            path.join("Cargo.toml"),
+            "[package]\nname = \"jcode\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("Cargo.toml");
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-m", "init"]);
         temp
     }
 
@@ -705,6 +856,49 @@ mod tests {
     }
 
     #[test]
+    /// The Windows build path invokes Cargo directly (no `scripts/dev_cargo.sh`
+    /// wrapper), so the current git hash must travel in the command's own
+    /// environment. Without it `jcode-build-meta` keeps embedding the previous
+    /// commit's hash and the publish guard refuses the binary.
+    /// reference: scripts/dev_cargo.sh (export_git_build_metadata) - the contract
+    /// the native Windows Cargo path has to satisfy on its own.
+    fn windows_selfdev_build_carries_the_current_git_hash() {
+        let repo = git_repo_fixture();
+        let expected = crate::current_git_hash(repo.path()).expect("git hash");
+
+        let command = selfdev_build_command_for_target_on_platform(
+            repo.path(),
+            SelfDevBuildTarget::Tui,
+            true,
+        );
+
+        let serialized = serde_json::to_value(&command).expect("serialize command");
+        let hash = serialized
+            .get("env")
+            .and_then(|value| value.as_array())
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    let pair = entry.as_array()?;
+                    if pair.first()?.as_str()? == "JCODE_BUILD_GIT_HASH" {
+                        pair.get(1)?.as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        assert_eq!(
+            hash.as_deref(),
+            Some(expected.as_str()),
+            "windows selfdev build must carry JCODE_BUILD_GIT_HASH={expected}"
+        );
+    }
+
+    // Unix-only behaviour: on Windows the build runs cargo directly (see
+    // `windows_cargo_args_build_the_tui_for_all`), so there is no wrapper and
+    // no bash. The assertion below only holds where the wrapper exists.
+    #[cfg(unix)]
+    #[test]
     fn unix_selfdev_build_keeps_using_the_wrapper() {
         let repo = repo_fixture(false);
         let scripts = repo.path().join("scripts");
@@ -719,11 +913,14 @@ mod tests {
 
         assert_eq!(command.program, "bash");
         assert_eq!(command.args.first().map(String::as_str), Some("-lc"));
+        // `shell_escape` emits the host path with the host separator, so the
+        // wrapper path is "scripts/dev_cargo.sh" on Unix and
+        // "scripts\dev_cargo.sh" on Windows. Compare separators-agnostically.
         assert!(
             command
                 .args
                 .last()
-                .is_some_and(|arg| arg.contains("scripts/dev_cargo.sh"))
+                .is_some_and(|arg| arg.replace('\\', "/").contains("scripts/dev_cargo.sh"))
         );
     }
 
@@ -844,9 +1041,23 @@ mod tests {
         std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
         #[cfg(not(unix))]
         std::fs::copy(&wrapper, &link).map(|_| ()).expect("copy");
-        assert_eq!(
-            resolve_binary_payload(&link),
-            std::fs::canonicalize(&payload).expect("canonical payload")
+        // On Unix the symlink resolves to the payload.
+        //
+        // On Windows the channel entry is a COPY (Windows keeps a running
+        // executable open, so the installer cannot symlink it - see
+        // `platform_support::atomic_symlink_swap`). A copy carries no link
+        // target, so the payload can only be found as the SIBLING of the
+        // copy: the install directory holds the wrapper and its payload
+        // together. The fixture reproduces that by placing the payload next
+        // to the copied channel entry.
+        #[cfg(not(unix))]
+        std::fs::copy(&payload, channel_dir.join("jcode-linux-x86_64.bin"))
+            .map(|_| ())
+            .expect("copy payload next to the channel copy");
+        let resolved = resolve_binary_payload(&link);
+        assert!(
+            same_binary_content(&resolved, &payload),
+            "the channel entry must resolve to the payload, got {resolved:?}"
         );
     }
 

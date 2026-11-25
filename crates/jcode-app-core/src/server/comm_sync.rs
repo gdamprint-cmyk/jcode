@@ -2,15 +2,14 @@ use super::{
     ClientConnectionInfo, FileTouchService, SwarmEvent, SwarmEventType, SwarmMember, SwarmState,
     VersionedPlan, broadcast_swarm_plan, persist_swarm_state_for, record_swarm_event,
 };
-use crate::agent::Agent;
 use crate::protocol::{
     AgentStatusSnapshot, NotificationType, PlanGraphStatus, ServerEvent, SessionActivitySnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
-type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+use super::SessionAgents;
 
 pub(super) struct CommResyncPlanContext<'a> {
     pub(super) client_event_tx: &'a mpsc::UnboundedSender<ServerEvent>,
@@ -274,9 +273,12 @@ pub(super) async fn handle_comm_status(
         return;
     }
 
+    // Release the member guard before taking client_connections: disconnect
+    // cleanup holds client_connections.write while waiting on swarm_members.write,
+    // so nesting them here wedged every resume and swarm call on the server.
+    let member = swarm_members.read().await.get(&target_session).cloned();
     let snapshot = {
-        let members = swarm_members.read().await;
-        let Some(member) = members.get(&target_session) else {
+        let Some(member) = member else {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
                 message: format!("Unknown session '{target_session}'"),
@@ -318,6 +320,7 @@ pub(super) async fn handle_comm_status(
             live_attachments: Some(member.event_txs.len()),
             status_age_secs: Some(member.last_status_change.elapsed().as_secs()),
             last_activity_age_secs: crate::session_metrics::last_activity_age_secs(&target_session),
+            stalled_secs: super::swarm_watchdog::stalled_for_secs(&target_session),
             joined_age_secs: Some(member.joined_at.elapsed().as_secs()),
             files_touched,
             activity,

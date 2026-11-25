@@ -386,10 +386,18 @@ fn image_state_cache_enforces_source_byte_budget() {
 
 #[test]
 fn png_dimension_probe_needs_only_the_header() {
+    // Thread names contain `::` (module path), which Windows rejects as a path
+    // component (os error 123, InvalidFilename). Sanitise before it reaches a
+    // filename, so the fixture is writable on Windows and the test is not
+    // silently skipped as infrastructure noise.
     let path = std::env::temp_dir().join(format!(
         "jcode-png-header-{}-{}.png",
         std::process::id(),
-        std::thread::current().name().unwrap_or("test")
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace("::", "_")
+            .replace(['/', '\\'], "_")
     ));
     let mut header = [0u8; 24];
     header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");

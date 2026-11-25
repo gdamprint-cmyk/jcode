@@ -11,9 +11,12 @@ pub mod models;
 pub mod openai_schema;
 pub mod pricing;
 pub mod reasoning;
+pub mod request_compression;
 pub mod retry_after;
 pub mod selection;
+pub mod service_tier;
 pub mod transport;
+pub mod ws_deflate;
 
 pub use jcode_usage_types::{ModelUsage, compare_model_usage};
 pub use transport::is_transient_transport_error;
@@ -22,8 +25,7 @@ pub use anthropic::{
     ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,
     AnthropicReasoningCaps, anthropic_context_mode, anthropic_effectively_1m,
     anthropic_is_1m_model, anthropic_map_tool_name_for_oauth, anthropic_map_tool_name_from_oauth,
-    anthropic_oauth_beta_headers, anthropic_reasoning_caps, anthropic_stainless_arch,
-    anthropic_stainless_os, anthropic_strip_1m_suffix,
+    anthropic_oauth_beta_headers, anthropic_reasoning_caps, anthropic_strip_1m_suffix,
 };
 pub use auth_mode::{
     AuthMode, AuthRoute, DualAuthProvider, pinned_mode_for, runtime_env_auth_route,
@@ -32,11 +34,12 @@ pub use auth_mode::{
 pub use catalog_refresh::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
 pub use failover::{
     FailoverDecision, ProviderFailoverPrompt, classify_failover_error_message,
-    parse_failover_prompt_message,
+    is_definitive_usage_exhaustion, parse_failover_prompt_message,
 };
 pub use fallback_pick::{
-    FallbackPickOptions, error_looks_like_credential_failure, pick_next_fallback_route,
-    pick_next_fallback_route_with_options,
+    FallbackPickOptions, error_looks_like_credential_failure, model_generation_rank,
+    pick_next_fallback_route, pick_next_fallback_route_with_options, rank_fallback_routes,
+    route_pool_key,
 };
 pub use fingerprint::{log_provider_canonical_input, stable_hash_json, stable_hash_str};
 pub use models::{
@@ -49,8 +52,8 @@ pub use models::{
     provider_for_model_with_hint as core_provider_for_model_with_hint, provider_key_from_hint,
 };
 pub use reasoning::{
-    DEEPSEEK_SELECTABLE_EFFORTS, OPENAI_SELECTABLE_EFFORTS, OPENROUTER_SELECTABLE_EFFORTS,
-    canonical_reasoning_effort, inferred_reasoning_efforts,
+    DEEPSEEK_SELECTABLE_EFFORTS, MINIMAX_SELECTABLE_EFFORTS, OPENAI_SELECTABLE_EFFORTS,
+    OPENROUTER_SELECTABLE_EFFORTS, canonical_reasoning_effort, inferred_reasoning_efforts,
 };
 pub use selection::{
     ActiveProvider, ProviderAvailability, auto_default_provider, cli_provider_arg_for_session_key,
@@ -76,6 +79,11 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 /// Provider trait for LLM backends.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Bind requests to a stable application session for provider-side affinity.
+    /// This is distinct from a provider response id used to resume a stream.
+    /// Backends without session-affinity support can retain the default no-op.
+    fn set_session_id(&self, _session_id: &str) {}
+
     /// Prepare provider-specific request state before the foreground completion.
     ///
     /// The default is intentionally a no-op. Implementations must not send user
@@ -126,6 +134,17 @@ pub trait Provider: Send + Sync {
         self.name().to_string()
     }
 
+    /// Opaque process-local identity for safely sharing a complete catalog.
+    ///
+    /// Equal identities must imply equal catalog rows, availability, display
+    /// names and active selection. Include configuration scope and every auth,
+    /// account and catalog revision affecting those values. Never include raw
+    /// credentials. Consumers must still bound reuse by a short TTL and account
+    /// for their own enrichment revisions. Arbitrary providers opt out by default.
+    fn catalog_sharing_identity(&self) -> Option<String> {
+        None
+    }
+
     /// Get the model identifier being used.
     fn model(&self) -> String {
         "unknown".to_string()
@@ -167,6 +186,34 @@ pub trait Provider: Send + Sync {
     /// info widget) use it to reflect an explicit OAuth<->API switch instantly
     /// while leaving the cheap cached heuristic to handle the auto case.
     fn active_explicit_credential(&self) -> Option<ResolvedCredential> {
+        None
+    }
+
+    /// Bind this runtime to a saved OAuth account without changing the global login.
+    /// Implementations must preserve the binding through credential refresh and forks.
+    fn set_oauth_account(&self, label: Option<&str>) -> Result<()> {
+        if label.is_some() {
+            anyhow::bail!("This provider does not support named OAuth accounts");
+        }
+        Ok(())
+    }
+
+    /// The explicitly bound OAuth account, independent of the global active login.
+    fn oauth_account_label(&self) -> Option<String> {
+        None
+    }
+
+    /// Saved OAuth account this runtime's cached credential actually belongs
+    /// to, bound or not. For display and usage attribution only; an unbound
+    /// session keeps the login it loaded even after the global account moves.
+    fn serving_oauth_account_label(&self) -> Option<String> {
+        self.oauth_account_label()
+    }
+
+    /// Email belonging to this runtime's actual cached OAuth credential.
+    /// Return `None` for API keys, unknown credentials, or unknown identity.
+    /// Implementations must not fall back to the globally active saved account.
+    fn active_oauth_account_email(&self) -> Option<String> {
         None
     }
 
@@ -241,9 +288,28 @@ pub trait Provider: Send + Sync {
         Vec::new()
     }
 
+    /// Capture the owned catalog at a single provider boundary. Providers with
+    /// shared catalog storage can override this to reuse one memo lookup.
+    fn model_catalog_snapshot(&self) -> ModelCatalogSnapshot {
+        ModelCatalogSnapshot::new(
+            Some(self.display_name()),
+            Some(self.model()),
+            self.available_models_display(),
+            self.model_routes(),
+        )
+    }
+
     /// Prefetch any dynamic model lists (default: no-op).
     async fn prefetch_models(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Whether cached model names lack capabilities needed by this provider.
+    /// Allows startup to refresh legacy snapshots without fetching every
+    /// provider's catalog unconditionally. Implementations must not block on
+    /// async locks from this synchronous UI-facing probe.
+    fn model_capabilities_need_refresh(&self) -> bool {
+        false
     }
 
     /// Force-refresh model catalog data and return a before/after summary.
@@ -390,6 +456,24 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// The OpenAI-compatible profile that owns `model` on this runtime
+    /// instance, independent of any process-global environment state.
+    ///
+    /// A named provider profile's constructor sets `JCODE_OPENROUTER_CACHE_NAMESPACE`
+    /// process-wide, so a *different* session's model switch can leave the
+    /// namespace pointing at that profile while this runtime still serves
+    /// another profile. A session's persisted provider identity must come from
+    /// the runtime instance, not from the environment.
+    // reference: no prior art, searched this repo for an instance-scoped
+    // profile resolver (crates/jcode-base/src/provider/mod.rs
+    // openai_compatible_profile_owning_model, crates/jcode-base/src/provider/
+    // selection.rs default_model_selection_from_route) and the Rust trait-object
+    // dispatch guidance at https://siddharthqs.com/design-patterns-in-rust
+    // (dynamic dispatch through a trait object; avoid global mutable state).
+    fn openai_compatible_profile_id_for_model(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// The explicit upstream-provider pin for the current model, when the
     /// user pinned one on an aggregator runtime.
     fn explicit_provider_pin_for_current_model(&self) -> Option<String> {
@@ -474,31 +558,236 @@ pub trait Provider: Send + Sync {
 
     /// Simple completion that returns text directly (no streaming).
     async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
-        use futures::StreamExt;
+        collect_simple_completion(self, prompt, system)
+            .await
+            .map(|(text, _)| text)
+    }
 
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }];
+    /// Like [`Provider::complete_simple`], but also returns the provider-reported
+    /// token usage so side calls (compaction summaries, memory sidecar) can be
+    /// accounted for.
+    ///
+    /// Internal callers use this method, so a provider that customizes simple
+    /// completion must override this method (and may override `complete_simple`
+    /// to match). The default streams through `complete`.
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        system: &str,
+    ) -> Result<(String, SimpleCompletionUsage)> {
+        collect_simple_completion(self, prompt, system).await
+    }
+}
 
-        let response = self.complete(&messages, &[], system, None).await?;
-        let mut result = String::new();
-        tokio::pin!(response);
+/// Drive `Provider::complete` for a single user prompt and collect the text and
+/// provider-reported usage.
+pub async fn collect_simple_completion<P: Provider + ?Sized>(
+    provider: &P,
+    prompt: &str,
+    system: &str,
+) -> Result<(String, SimpleCompletionUsage)> {
+    use futures::StreamExt;
 
-        while let Some(event) = response.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
-                Ok(_) => {}
-                Err(err) => return Err(err),
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: prompt.to_string(),
+            cache_control: None,
+        }]
+        .into(),
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    // Cache counter semantics belong to the API transport, not the reseller
+    // or compute backend named by an UpstreamProvider event.
+    let provider_name = provider.name().to_string();
+    let model = provider.model();
+    let response = provider.complete(&messages, &[], system, None).await?;
+    let mut result = String::new();
+    let mut usage = SimpleCompletionUsage {
+        requested_model: Some(model.clone()),
+        ..Default::default()
+    };
+    tokio::pin!(response);
+
+    while let Some(event) = response.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
+            Ok(StreamEvent::TextSuffixReplace { old_text, new_text }) => {
+                jcode_message_types::replace_text_suffix(&mut result, &old_text, &new_text);
+            }
+            Ok(StreamEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            }) => {
+                usage.observe(
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                );
+            }
+            Ok(StreamEvent::ResolvedModel { model }) => {
+                if let Some(model) = nonempty_response_model(Some(&model)) {
+                    usage.resolved_model = Some(model.to_owned());
+                }
+            }
+            Ok(StreamEvent::RetryRollback { .. }) => {
+                result.clear();
+                usage = SimpleCompletionUsage {
+                    requested_model: Some(model.clone()),
+                    ..Default::default()
+                };
+            }
+            Ok(StreamEvent::UpstreamProvider { .. }) => {}
+            Ok(StreamEvent::MessageEnd { stop_reason })
+                if is_guardrail_stop_reason(stop_reason.as_deref()) =>
+            {
+                // A refusal or content-filter stop is not a usable answer. Callers
+                // such as compaction would otherwise persist the refusal text as
+                // if it were real output (issue #2089).
+                return Err(SimpleCompletionError {
+                    usage,
+                    provider: provider_name,
+                    model,
+                    source: anyhow::anyhow!(
+                        "simple completion stopped by provider guardrail (stop_reason={})",
+                        stop_reason.as_deref().unwrap_or("")
+                    ),
+                }
+                .into());
+            }
+            Ok(StreamEvent::Error { message, .. }) => {
+                return Err(SimpleCompletionError {
+                    usage,
+                    provider: provider_name,
+                    model,
+                    source: anyhow::anyhow!(message),
+                }
+                .into());
+            }
+            Ok(_) => {}
+            Err(source) => {
+                return Err(SimpleCompletionError {
+                    usage,
+                    provider: provider_name,
+                    model,
+                    source,
+                }
+                .into());
             }
         }
+    }
 
-        Ok(result)
+    Ok((result, usage))
+}
+
+/// True when a provider stop reason is a model-side refusal, safety, or
+/// content-filter stop rather than a normal end of turn or truncation.
+pub fn is_guardrail_stop_reason(stop_reason: Option<&str>) -> bool {
+    let Some(reason) = stop_reason else {
+        return false;
+    };
+    let reason = reason.trim().to_ascii_lowercase();
+    matches!(reason.as_str(), "refusal" | "content_filter" | "safety")
+        || reason.contains("guardrail")
+        || reason.contains("policy_violation")
+}
+
+/// Failed simple completion with the usage already observed before failure.
+/// Dropping the completion future (for example on timeout) cannot return this
+/// snapshot. Cancellation accounting requires a separate observer lifecycle.
+#[derive(Debug)]
+pub struct SimpleCompletionError {
+    pub usage: SimpleCompletionUsage,
+    /// Request API transport, retained for correct usage/cache normalization.
+    /// This is not the upstream compute vendor returned by a gateway.
+    pub provider: String,
+    pub model: String,
+    source: anyhow::Error,
+}
+
+impl SimpleCompletionError {
+    pub fn new(
+        source: anyhow::Error,
+        usage: SimpleCompletionUsage,
+        provider: String,
+        model: String,
+    ) -> Self {
+        Self {
+            usage,
+            provider,
+            model,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for SimpleCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for SimpleCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Provider-reported usage for a non-agent completion.
+///
+/// Streams may report usage more than once (for example a start event with
+/// input tokens and a final event with output tokens). Each field keeps the
+/// latest value reported, matching how the agent turn loop treats repeated
+/// `TokenUsage` events (they are cumulative snapshots, not deltas).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimpleCompletionUsage {
+    /// Model requested before the call, including private routing aliases.
+    pub requested_model: Option<String>,
+    /// Actual model explicitly reported by this response, never inferred.
+    pub resolved_model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+/// Normalize optional response metadata without falling back to a configured ID.
+pub fn nonempty_response_model(model: Option<&str>) -> Option<&str> {
+    model.map(str::trim).filter(|model| !model.is_empty())
+}
+
+impl SimpleCompletionUsage {
+    pub fn observe(
+        &mut self,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_creation: Option<u64>,
+    ) {
+        if input.is_some() {
+            self.input_tokens = input;
+        }
+        if output.is_some() {
+            self.output_tokens = output;
+        }
+        if cache_read.is_some() {
+            self.cache_read_input_tokens = cache_read;
+        }
+        if cache_creation.is_some() {
+            self.cache_creation_input_tokens = cache_creation;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
     }
 }
 
@@ -602,89 +891,18 @@ impl NativeToolResult {
 
 /// Canonical User-Agent for generic outbound Jcode HTTP requests.
 pub const JCODE_USER_AGENT: &str = concat!("jcode/", env!("CARGO_PKG_VERSION"));
-
-/// Read an HTTP error body without hiding failures behind an empty string.
-///
-/// This is useful after a non-success status when the response is about to be
-/// converted into an error. If reading the body itself fails, the returned text
-/// preserves that failure so callers can include it in their error message.
-pub async fn http_error_body(response: reqwest::Response, context: &str) -> String {
-    match response.text().await {
-        Ok(body) => body,
-        Err(err) => format!("<failed to read {context} response body: {err}>"),
-    }
-}
-
-/// Shared HTTP client for all generic provider requests. Creating a `reqwest::Client` is expensive
-/// (~10ms due to TLS init, connection pool setup), so we reuse a single instance. Provider-specific
-/// transports may override the User-Agent on individual requests when they intentionally need to
-/// match an official client.
-pub fn shared_http_client() -> reqwest::Client {
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .user_agent(JCODE_USER_AGENT)
-                .connect_timeout(Duration::from_secs(15))
-                .tcp_keepalive(Some(Duration::from_secs(30)))
-                // Proactively detect half-dead pooled HTTP/2 connections before we
-                // reuse them. Without keepalive pings, a stale multiplexed connection
-                // (common behind NAT/VPN/proxy or flaky Wi-Fi) surfaces as
-                // "http2 error: stream error received: unspecific protocol error".
-                // Pinging while idle lets reqwest drop the connection instead.
-                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-                .http2_keep_alive_timeout(Duration::from_secs(15))
-                .http2_keep_alive_while_idle(true)
-                .pool_idle_timeout(Duration::from_secs(90))
-                .pool_max_idle_per_host(8)
-                .build()
-                .unwrap_or_else(|err| {
-                    eprintln!("jcode: failed to build shared provider HTTP client: {err}");
-                    match reqwest::Client::builder()
-                        .user_agent(JCODE_USER_AGENT)
-                        .build()
-                    {
-                        Ok(client) => client,
-                        Err(fallback_err) => {
-                            eprintln!(
-                                "jcode: failed to build fallback provider HTTP client: {fallback_err}"
-                            );
-                            reqwest::Client::new()
-                        }
-                    }
-                })
-        })
-        .clone()
-}
-
-/// Fresh HTTP client for transport-fault retries.
-///
-/// Retrying on the shared pooled client can reuse *other* idle connections
-/// established through the same broken network path (corrupting middlebox,
-/// flaky NAT/VPN) that produced a TLS fault like `BadRecordMac` - so the
-/// retry fails the same way. This client disables connection pooling, which
-/// guarantees the retry opens a brand-new TCP+TLS connection (the property
-/// that makes transport-fault retries actually succeed). Building a client
-/// costs ~10ms, which is fine on a retry path that already backs off >=1s.
-pub fn fresh_transport_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(JCODE_USER_AGENT)
-        .connect_timeout(Duration::from_secs(15))
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-        .http2_keep_alive_timeout(Duration::from_secs(15))
-        .http2_keep_alive_while_idle(true)
-        // No pooled reuse: every request gets a fresh connection.
-        .pool_max_idle_per_host(0)
-        .build()
-        .unwrap_or_else(|_| shared_http_client())
-}
+#[path = "lib_http_client.rs"]
+mod http_client;
+pub use http_client::fresh_transport_client;
+pub use http_client::http_error_body;
+pub use http_client::shared_http_client;
 
 #[derive(Debug, Clone)]
 pub struct NativeCompactionResult {
     pub summary_text: Option<String>,
     pub openai_encrypted_content: Option<String>,
+    /// Provider counters for this separately billed compaction request.
+    pub usage: Option<SimpleCompletionUsage>,
 }
 
 /// A single route to access a model: model + provider + API method
@@ -821,6 +1039,11 @@ impl RouteSelection {
         }
     }
 
+    /// Exact saved OAuth account encoded in the wire API method, if pinned.
+    pub fn account_label(&self) -> Option<&str> {
+        oauth_account_label(&self.api_method)
+    }
+
     /// The string model spec that applies this route selection, including any
     /// provider routing prefix/suffix (`openai-oauth:`, `claude-api:`,
     /// `openai/gpt-5@OpenAI`, `copilot:`, ...).
@@ -832,6 +1055,16 @@ impl RouteSelection {
     /// drift between provider implementations.
     pub fn routed_model_spec(&self) -> String {
         let model = self.model.trim();
+        if let Some(label) = self.account_label() {
+            let prefix = match self.runtime_key {
+                RuntimeKey::ClaudeOAuth => Some("claude-oauth"),
+                RuntimeKey::OpenAIOAuth => Some("openai-oauth"),
+                _ => None,
+            };
+            if let Some(prefix) = prefix {
+                return format!("{prefix}@{label}:{model}");
+            }
+        }
         match &self.runtime_key {
             RuntimeKey::JcodeSubscription => model.to_string(),
             RuntimeKey::ClaudeOAuth => format!("claude-oauth:{model}"),
@@ -914,6 +1147,19 @@ pub enum ModelRouteApiMethod {
     Other(String),
 }
 
+/// Account-qualified OAuth method, preserving the case-sensitive saved label.
+pub fn oauth_account_label(method: &str) -> Option<&str> {
+    let (base, label) = method.trim().split_once('@')?;
+    if !matches!(base, "claude-oauth" | "openai-oauth")
+        || label.is_empty()
+        || label.contains([':', '@'])
+        || label.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(label)
+}
+
 impl ModelRouteApiMethod {
     /// The route-vocabulary api_method for a canonical dual-auth route.
     pub fn from_auth_route(route: crate::auth_mode::AuthRoute) -> Self {
@@ -928,6 +1174,10 @@ impl ModelRouteApiMethod {
 
     pub fn parse(value: &str) -> Self {
         let trimmed = value.trim();
+        let trimmed = match (oauth_account_label(trimmed), trimmed.split_once('@')) {
+            (Some(_), Some((base, _))) => base,
+            _ => trimmed,
+        };
         let lower = trimmed.to_ascii_lowercase();
         // Dual-auth (Anthropic/OpenAI OAuth-vs-API) tokens share one canonical
         // alias table so the route vocabulary never drifts from the runtime/CLI
@@ -1126,12 +1376,14 @@ pub fn model_route_metadata_is_recommended(
         return false;
     }
     let api_method = ModelRouteApiMethod::parse(api_method);
+    // Recommendations track the curated quality-first defaults so the picker
+    // highlights the newest flagship automatically when the defaults move.
     match model {
-        "gpt-5.5" => {
+        DEFAULT_OPENAI_MODEL => {
             matches!(&api_method, ModelRouteApiMethod::OpenAIOAuth)
                 && model_route_provider_labels_match(provider, "openai")
         }
-        "claude-opus-4-8" => {
+        DEFAULT_CLAUDE_MODEL => {
             matches!(
                 &api_method,
                 ModelRouteApiMethod::ClaudeOAuth | ModelRouteApiMethod::AnthropicApiKey
@@ -1187,15 +1439,7 @@ impl ModelCatalogSnapshot {
     }
 
     pub fn from_provider(provider: &dyn Provider) -> Self {
-        // Note: on multi-providers both calls below build the same route
-        // catalog; MultiProvider memoizes it (short TTL) so this stays one
-        // build instead of two.
-        Self::new(
-            Some(provider.display_name()),
-            Some(provider.model()),
-            provider.available_models_display(),
-            provider.model_routes(),
-        )
+        provider.model_catalog_snapshot()
     }
 
     pub fn has_routes(&self) -> bool {
@@ -1377,375 +1621,12 @@ fn reference_request_cost_micros(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "saved_account_route_tests.rs"]
+mod saved_account_route_tests;
 
-    #[test]
-    fn metered_estimate_computes_reference_cost() {
-        let estimate = RouteCheapnessEstimate::metered(
-            RouteCostSource::Heuristic,
-            RouteCostConfidence::Low,
-            2_000_000,
-            8_000_000,
-            None,
-            None,
-        );
-        assert_eq!(estimate.estimated_reference_cost_micros, Some(90_000));
-    }
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
 
-    #[test]
-    fn shared_http_client_reuses_builder() {
-        let _a = shared_http_client();
-        let _b = shared_http_client();
-    }
-
-    #[test]
-    fn fresh_transport_client_builds_distinct_clients() {
-        // Each call must produce a brand-new client (new connection pool), not
-        // a cached one: the whole point is that a retry after a transport
-        // fault (e.g. TLS BadRecordMac) never reuses a possibly-poisoned
-        // pooled connection.
-        let _a = fresh_transport_client();
-        let _b = fresh_transport_client();
-    }
-
-    #[test]
-    fn canonical_user_agent_identifies_jcode() {
-        assert!(JCODE_USER_AGENT.starts_with("jcode/"));
-    }
-
-    #[test]
-    fn model_route_api_method_parser_keeps_profile_identity() {
-        assert_eq!(
-            ModelRouteApiMethod::parse("openai-compatible:cerebras"),
-            ModelRouteApiMethod::OpenAiCompatible {
-                profile_id: Some("cerebras".to_string())
-            }
-        );
-        assert!(
-            ModelRouteApiMethod::parse("openai-compatible:cerebras")
-                .matches_openai_compatible_profile("CEREBRAS")
-        );
-        assert_eq!(
-            ModelRouteApiMethod::parse("openai-api"),
-            ModelRouteApiMethod::OpenAIApiKey
-        );
-        assert_eq!(
-            ModelRouteApiMethod::parse("claude-api"),
-            ModelRouteApiMethod::AnthropicApiKey
-        );
-        assert_eq!(
-            ModelRouteApiMethod::parse("grok-build-acp"),
-            ModelRouteApiMethod::GrokBuild
-        );
-        assert_eq!(
-            ModelRouteApiMethod::parse("grok-build"),
-            ModelRouteApiMethod::GrokBuild
-        );
-    }
-
-    #[test]
-    fn model_route_provider_label_matching_uses_aliases_without_substring_false_positives() {
-        assert!(model_route_provider_labels_match("Anthropic", "Claude"));
-        assert!(model_route_provider_labels_match("auto", "OpenRouter"));
-        assert!(model_route_provider_labels_match(
-            "GitHub Copilot",
-            "Copilot"
-        ));
-        assert!(model_route_provider_labels_match("AWS Bedrock", "Bedrock"));
-        assert!(!model_route_provider_labels_match(
-            "OpenRouter/OpenAI",
-            "OpenAI"
-        ));
-        assert!(!model_route_provider_labels_match("OpenAI", "OpenRouter"));
-        assert!(!model_route_provider_labels_match("", ""));
-        assert!(!model_route_provider_labels_related("OpenAI", ""));
-    }
-
-    #[test]
-    fn model_route_provider_key_matching_prefers_explicit_route_key() {
-        assert!(model_route_provider_matches_key(
-            Some("cerebras"),
-            "Cerebras Cloud",
-            "CEREBRAS"
-        ));
-        assert!(model_route_provider_matches_key(
-            None,
-            "Anthropic",
-            "Claude"
-        ));
-        assert!(!model_route_provider_matches_key(
-            Some("cerebras"),
-            "Cerebras",
-            "groq"
-        ));
-    }
-
-    #[test]
-    fn model_route_provider_key_matching_folds_dual_auth_vocabularies() {
-        // `default_provider = "anthropic-api"` and a route keyed `claude-api`
-        // are two spellings of the same Anthropic API-key route, so they must
-        // match even though their raw forms normalize differently.
-        assert!(model_route_provider_matches_key(
-            Some("claude-api"),
-            "Anthropic",
-            "anthropic-api",
-        ));
-        assert!(model_route_provider_matches_key(
-            Some("anthropic-api-key"),
-            "Anthropic",
-            "claude-api",
-        ));
-        assert!(model_route_provider_matches_key(
-            Some("openai-api"),
-            "OpenAI",
-            "openai-api-key",
-        ));
-
-        // The fold must NOT collapse the OAuth-vs-API distinction: an API-key
-        // default must not light up the OAuth route (and vice versa).
-        assert!(!model_route_provider_matches_key(
-            Some("claude-oauth"),
-            "Anthropic",
-            "anthropic-api",
-        ));
-        assert!(!model_route_provider_matches_key(
-            Some("openai-oauth"),
-            "OpenAI",
-            "openai-api",
-        ));
-
-        // A bare provider default pins no credential, so it keeps the historical
-        // auth-method-agnostic behavior: it matches either dual-auth route via
-        // the label fallback (model identity still narrows the picker default).
-        assert!(model_route_provider_matches_key(
-            Some("claude-oauth"),
-            "Anthropic",
-            "claude",
-        ));
-        assert!(model_route_provider_matches_key(
-            Some("claude-api"),
-            "Anthropic",
-            "claude",
-        ));
-    }
-
-    #[test]
-    fn model_route_recommendation_policy_is_provider_aware() {
-        assert!(model_route_metadata_is_recommended(
-            "gpt-5.5",
-            "OpenAI",
-            "openai-oauth",
-            true
-        ));
-        assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5",
-            "OpenAI",
-            "openai-api-key",
-            true
-        ));
-        assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5", "Copilot", "copilot", true
-        ));
-        assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5",
-            "OpenAI",
-            "openai-oauth",
-            false
-        ));
-        assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
-            "Anthropic",
-            "claude-oauth",
-            true
-        ));
-        assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
-            "Anthropic",
-            "claude-api",
-            true
-        ));
-        assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
-            "Anthropic",
-            "claude-oauth",
-            true
-        ));
-        assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
-            "Anthropic",
-            "claude-api",
-            true
-        ));
-        assert!(!model_route_metadata_is_recommended(
-            "claude-opus-4-8",
-            "Anthropic",
-            "openrouter",
-            true
-        ));
-        assert!(!model_route_metadata_is_recommended(
-            "deepseek/deepseek-v4-pro",
-            "auto",
-            "openrouter",
-            true
-        ));
-    }
-
-    struct SnapshotTestProvider;
-
-    #[async_trait]
-    impl Provider for SnapshotTestProvider {
-        async fn complete(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolDefinition],
-            _system: &str,
-            _resume_session_id: Option<&str>,
-        ) -> Result<EventStream> {
-            unreachable!("snapshot test does not call complete")
-        }
-
-        fn name(&self) -> &str {
-            "snapshot-provider"
-        }
-
-        fn model(&self) -> String {
-            "snapshot-model".to_string()
-        }
-
-        fn available_models_display(&self) -> Vec<String> {
-            vec!["snapshot-model".to_string()]
-        }
-
-        fn model_routes(&self) -> Vec<ModelRoute> {
-            vec![ModelRoute {
-                model: "snapshot-model".to_string(),
-                provider: "Snapshot".to_string(),
-                api_method: "snapshot-api".to_string(),
-                available: true,
-                detail: "test route".to_string(),
-                usage: None,
-                cheapness: None,
-            }]
-        }
-
-        fn fork(&self) -> Arc<dyn Provider> {
-            Arc::new(SnapshotTestProvider)
-        }
-    }
-
-    #[test]
-    fn model_catalog_snapshot_materializes_provider_catalog_contract() {
-        let snapshot = ModelCatalogSnapshot::from_provider(&SnapshotTestProvider);
-
-        assert_eq!(snapshot.provider_name.as_deref(), Some("snapshot-provider"));
-        assert_eq!(snapshot.provider_model.as_deref(), Some("snapshot-model"));
-        assert_eq!(snapshot.available_models, ["snapshot-model"]);
-        assert!(snapshot.has_routes());
-        assert_eq!(snapshot.model_routes[0].api_method, "snapshot-api");
-    }
-
-    #[test]
-    fn runtime_key_distinguishes_openrouter_from_direct_compatible_profile() {
-        assert_eq!(
-            RuntimeKey::from_api_method(&ModelRouteApiMethod::parse("openrouter"), "auto"),
-            RuntimeKey::OpenRouter
-        );
-        assert_eq!(
-            RuntimeKey::from_api_method(
-                &ModelRouteApiMethod::parse("openai-compatible:nvidia-nim"),
-                "NVIDIA NIM",
-            ),
-            RuntimeKey::OpenAiCompatible {
-                profile_id: Some("nvidia-nim".to_string())
-            }
-        );
-    }
-
-    #[test]
-    fn route_selection_preserves_runtime_identity_from_model_route() {
-        let selection = RouteSelection::from_model_route(&ModelRoute {
-            model: "openrouter/owl-alpha".to_string(),
-            provider: "OpenRouter".to_string(),
-            api_method: "openrouter".to_string(),
-            available: true,
-            detail: "https://openrouter.ai/api/v1".to_string(),
-            usage: None,
-            cheapness: None,
-        });
-        assert_eq!(selection.model, "openrouter/owl-alpha");
-        assert_eq!(selection.runtime_key, RuntimeKey::OpenRouter);
-        assert_eq!(selection.api_method, "openrouter");
-
-        let selection = RouteSelection::from_model_route(&ModelRoute {
-            model: "nvidia/example".to_string(),
-            provider: "NVIDIA NIM".to_string(),
-            api_method: "openai-compatible:nvidia-nim".to_string(),
-            available: true,
-            detail: "https://integrate.api.nvidia.com/v1".to_string(),
-            usage: None,
-            cheapness: None,
-        });
-        assert_eq!(
-            selection.runtime_key,
-            RuntimeKey::OpenAiCompatible {
-                profile_id: Some("nvidia-nim".to_string())
-            }
-        );
-        assert_eq!(selection.provider_label, "NVIDIA NIM");
-    }
-
-    #[test]
-    fn grok_build_route_selection_is_a_first_class_runtime() {
-        let selection = RouteSelection::from_model_route(&ModelRoute {
-            model: "grok-4.6".to_string(),
-            provider: "Grok Build".to_string(),
-            api_method: "grok-build-acp".to_string(),
-            available: true,
-            detail: "Grok Build subscription via Jcode-managed ACP".to_string(),
-            cheapness: None,
-            usage: None,
-        });
-        assert_eq!(selection.runtime_key, RuntimeKey::GrokBuild);
-        assert_eq!(selection.runtime_key.stable_id(), "grok-build");
-        assert_eq!(selection.routed_model_spec(), "grok-build:grok-4.6");
-
-        let prefixed = RouteSelection::from_model_route(&ModelRoute {
-            model: "grok-build:grok-4.6".to_string(),
-            provider: "Grok Build".to_string(),
-            api_method: "grok-build-acp".to_string(),
-            available: true,
-            detail: String::new(),
-            cheapness: None,
-            usage: None,
-        });
-        assert_eq!(prefixed.routed_model_spec(), "grok-build:grok-4.6");
-    }
-
-    #[test]
-    fn runtime_key_other_is_internally_tagged_wire_safe() {
-        // Internally tagged newtype `Other(String)` cannot be serialized by
-        // serde. The struct variant is the wire form used by SetRoute.
-        let key = RuntimeKey::Other {
-            method: "custom-acp".to_string(),
-        };
-        let json = serde_json::to_value(&key).expect("Other must serialize");
-        assert_eq!(json["kind"], "other");
-        assert_eq!(json["method"], "custom-acp");
-        let decoded: RuntimeKey = serde_json::from_value(json).expect("Other must deserialize");
-        assert_eq!(
-            decoded,
-            RuntimeKey::Other {
-                method: "custom-acp".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn grok_build_runtime_key_is_internally_tagged_wire_safe() {
-        let json = serde_json::to_value(&RuntimeKey::GrokBuild).expect("GrokBuild must serialize");
-        assert_eq!(json, serde_json::json!({"kind": "grok-build"}));
-        let decoded: RuntimeKey = serde_json::from_value(json).expect("GrokBuild must deserialize");
-        assert_eq!(decoded, RuntimeKey::GrokBuild);
-    }
-}
+#[cfg(test)]
+mod catalog_snapshot_tests;

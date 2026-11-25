@@ -517,6 +517,24 @@ pub fn new_request_id() -> String {
     crate::id::new_id("req")
 }
 
+/// Read the recorded decision for a permission request, if any.
+///
+/// The permission surfaces (`jcode permissions`, the Telegram/email reply
+/// paths) all decide through [`record_permission_via_file`], which writes the
+/// decision into `history.json`. A gate that must apply a write only AFTER an
+/// approval needs to observe that decision, so this reads the same file the
+/// decision was written to.
+///
+/// Returns `None` when the request was never decided (still pending).
+pub fn permission_decision_via_file(request_id: &str) -> Result<Option<Decision>> {
+    let hp = history_path()?;
+    if !hp.exists() {
+        return Ok(None);
+    }
+    let history: Vec<Decision> = storage::read_json(&hp).unwrap_or_default();
+    Ok(history.into_iter().find(|d| d.request_id == request_id))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

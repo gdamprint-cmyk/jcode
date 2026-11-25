@@ -599,7 +599,7 @@ fn session_to_display_messages(session: &Session, max_messages: usize) -> Vec<Di
             continue;
         }
         match message.display_role {
-            Some(StoredDisplayRole::System) => {
+            Some(StoredDisplayRole::System | StoredDisplayRole::FileActivity) => {
                 out.push(DisplayMessage::system(text));
                 continue;
             }
@@ -649,7 +649,8 @@ fn stored_message_visible_text(message: &jcode::session::StoredMessage) -> Strin
             | ContentBlock::AnthropicThinking { .. }
             | ContentBlock::ReasoningTrace { .. }
             | ContentBlock::OpenAIReasoning { .. }
-            | ContentBlock::ToolReference { .. } => {}
+            | ContentBlock::ToolReference { .. }
+            | ContentBlock::ProviderNative { .. } => {}
         }
     }
     parts.join("\n\n")

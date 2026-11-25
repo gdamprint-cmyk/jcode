@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "dispatch_estimation_tests.rs"]
+mod estimation_tests;
+
 #[derive(Clone, Copy)]
 pub(super) enum CompletionMode<'a> {
     Unified {
@@ -33,12 +37,30 @@ impl MultiProvider {
         tools: &[ToolDefinition],
         mode: CompletionMode<'_>,
     ) -> (usize, usize) {
-        let mut chars = serde_json::to_string(messages)
-            .map(|value| value.len())
-            .unwrap_or(0)
-            + serde_json::to_string(tools)
-                .map(|value| value.len())
-                .unwrap_or(0);
+        // Count model context, not transport JSON. In particular, base64 images
+        // and opaque native compaction payloads are not tokenized as text.
+        let mut chars: usize = messages
+            .iter()
+            .map(jcode_compaction_core::message_char_count)
+            .sum();
+        let referenced_tools: std::collections::HashSet<&str> = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                crate::message::ContentBlock::ToolReference { tool_name, .. } => {
+                    Some(tool_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        // Native deferred catalogs travel over the wire but enter model context
+        // only when referenced. Non-native routes already strip deferred tools
+        // before dispatch, so do not charge their full unloaded catalogs here.
+        chars += tools
+            .iter()
+            .filter(|tool| !tool.defer_loading || referenced_tools.contains(tool.name.as_str()))
+            .map(ToolDefinition::prompt_chars)
+            .sum::<usize>();
         match mode {
             CompletionMode::Unified { system } => {
                 chars += system.len();
@@ -66,6 +88,7 @@ impl MultiProvider {
         match provider {
             ActiveProvider::Claude => {
                 if let Some(anthropic) = self.anthropic_provider() {
+                    self.bind_provider_session(anthropic.as_ref());
                     anthropic
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -77,6 +100,7 @@ impl MultiProvider {
             }
             ActiveProvider::OpenAI => {
                 if let Some(openai) = self.openai_provider() {
+                    self.bind_provider_session(openai.as_ref());
                     openai
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -93,6 +117,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(copilot) = copilot {
+                    self.bind_provider_session(copilot.as_ref());
                     copilot
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -105,6 +130,7 @@ impl MultiProvider {
             ActiveProvider::Antigravity => {
                 let antigravity = self.antigravity_provider();
                 if let Some(antigravity) = antigravity {
+                    self.bind_provider_session(antigravity.as_ref());
                     antigravity
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -121,6 +147,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(gemini) = gemini {
+                    self.bind_provider_session(gemini.as_ref());
                     gemini
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -137,6 +164,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(cursor) = cursor {
+                    self.bind_provider_session(cursor.as_ref());
                     cursor
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -148,6 +176,7 @@ impl MultiProvider {
             }
             ActiveProvider::Bedrock => {
                 if let Some(bedrock) = self.bedrock_provider() {
+                    self.bind_provider_session(bedrock.as_ref());
                     bedrock
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -160,6 +189,7 @@ impl MultiProvider {
             ActiveProvider::OpenRouter => {
                 let openrouter = self.active_openrouter_execution_provider();
                 if let Some(openrouter) = openrouter {
+                    self.bind_provider_session(openrouter.as_ref());
                     openrouter
                         .complete(messages, tools, system, resume_session_id)
                         .await
@@ -185,6 +215,7 @@ impl MultiProvider {
         match provider {
             ActiveProvider::Claude => {
                 if let Some(anthropic) = self.anthropic_provider() {
+                    self.bind_provider_session(anthropic.as_ref());
                     anthropic
                         .complete_split(
                             messages,
@@ -202,6 +233,7 @@ impl MultiProvider {
             }
             ActiveProvider::OpenAI => {
                 if let Some(openai) = self.openai_provider() {
+                    self.bind_provider_session(openai.as_ref());
                     openai
                         .complete_split(
                             messages,
@@ -224,6 +256,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(copilot) = copilot {
+                    self.bind_provider_session(copilot.as_ref());
                     copilot
                         .complete_split(
                             messages,
@@ -242,6 +275,7 @@ impl MultiProvider {
             ActiveProvider::Antigravity => {
                 let antigravity = self.antigravity_provider();
                 if let Some(antigravity) = antigravity {
+                    self.bind_provider_session(antigravity.as_ref());
                     antigravity
                         .complete_split(
                             messages,
@@ -264,6 +298,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(gemini) = gemini {
+                    self.bind_provider_session(gemini.as_ref());
                     gemini
                         .complete_split(
                             messages,
@@ -286,6 +321,7 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(cursor) = cursor {
+                    self.bind_provider_session(cursor.as_ref());
                     cursor
                         .complete_split(
                             messages,
@@ -303,6 +339,7 @@ impl MultiProvider {
             }
             ActiveProvider::Bedrock => {
                 if let Some(bedrock) = self.bedrock_provider() {
+                    self.bind_provider_session(bedrock.as_ref());
                     bedrock
                         .complete_split(
                             messages,
@@ -321,6 +358,7 @@ impl MultiProvider {
             ActiveProvider::OpenRouter => {
                 let openrouter = self.active_openrouter_execution_provider();
                 if let Some(openrouter) = openrouter {
+                    self.bind_provider_session(openrouter.as_ref());
                     openrouter
                         .complete_split(
                             messages,

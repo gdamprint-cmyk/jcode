@@ -13,7 +13,6 @@ use crate::memory_types::{
     StepStatus,
     ranking::{top_k_by_ord, top_k_by_score},
 };
-use crate::sidecar::Sidecar;
 use crate::storage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -45,12 +44,14 @@ pub use activity::{
 use cache::{cache_graph, cached_graph};
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
-    PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
-    clear_pending_memory, has_any_pending_memory, has_pending_memory, is_memory_injected,
-    is_memory_injected_any, mark_memories_injected, mark_memories_known, set_pending_memory,
+    PendingMemory, append_pending_memory_external, clear_all_injected_memories,
+    clear_all_pending_memory, clear_injected_memories, clear_pending_memory,
+    clear_pending_payload, has_any_pending_memory, has_pending_memory, is_memory_injected,
+    is_memory_injected_any, mark_memories_injected, mark_memories_known, note_tool_calls,
+    reset_tool_calls_since_refresh, set_pending_memory, set_pending_memory_external,
     set_pending_memory_for_project, set_pending_memory_with_ids,
     set_pending_memory_with_ids_and_display, sync_injected_memories, take_pending_memory,
-    take_pending_memory_for_project,
+    take_pending_memory_for_project, tool_calls_since_refresh,
 };
 #[cfg(test)]
 use pending::{backdate_injected_memory_for_test, insert_pending_memory_for_test};
@@ -116,14 +117,13 @@ struct LegacyNoteEntry {
 
 pub type MemoryEventSink = Arc<dyn Fn(crate::protocol::ServerEvent) + Send + Sync>;
 
-/// Optional text-generating extraction is independent of Jev recall.
-pub fn memory_sidecar_enabled() -> bool {
-    crate::config::config().agents.memory_sidecar_enabled
-}
-
-/// Availability of the optional extraction sidecar, never used to gate recall.
+/// Optional text-generating extraction is independent of recall.
+///
+/// MEASURED 2026-11-11: extraction is owned by Hindsight's retain pipeline (the
+/// bank configures `retain_mission`), so the local sidecar extraction path is
+/// gone. Recall is unaffected: it never depended on extraction.
 pub fn memory_llm_judge_available() -> bool {
-    memory_sidecar_enabled() && crate::sidecar::Sidecar::llm_backend_available()
+    false
 }
 
 /// Recall requires a Jev credential route. Subscription entitlement is checked
@@ -166,6 +166,18 @@ impl MemoryEntryEmbeddingExt for MemoryEntry {
             }
         }
     }
+}
+
+/// Per-project memory file for `project_dir`. Keyed by the absolute path, so a
+/// migrated session that keeps the same repo path keeps the same memories.
+pub fn project_memory_file(project_dir: &std::path::Path) -> Result<PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    project_dir.hash(&mut hasher);
+    let project_hash = format!("{:016x}", hasher.finish());
+    let memory_dir = storage::jcode_dir()?.join("memory").join("projects");
+    Ok(memory_dir.join(format!("{}.json", project_hash)))
 }
 
 #[derive(Debug, Clone)]
@@ -254,16 +266,7 @@ impl MemoryManager {
             None => return Ok(None),
         };
 
-        let project_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            project_dir.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
-
-        let memory_dir = storage::jcode_dir()?.join("memory").join("projects");
-        Ok(Some(memory_dir.join(format!("{}.json", project_hash))))
+        project_memory_file(&project_dir).map(Some)
     }
 
     fn legacy_notes_path(&self) -> Result<Option<PathBuf>> {
@@ -955,55 +958,39 @@ impl MemoryManager {
 
     // === Sidecar Integration ===
 
-    /// Extract memories from a session transcript using the Haiku sidecar
+    /// Extract memories from a session transcript using the Haiku sidecar.
+    ///
+    /// MEASURED 2026-11-11: this was the writer half of the removed Jev memory
+    /// backend. Hindsight now owns retention (the `hindsight_retain_turn.py`
+    /// hook posts turn digests, and the bank's own retain pipeline extracts
+    /// facts), so extracting a SECOND time into a local graph duplicated the
+    /// bank and produced the garbage facts the owner reported. The method is
+    /// kept as a no-op so callers compile; it never writes.
     pub async fn extract_from_transcript(
         &self,
-        transcript: &str,
-        session_id: &str,
+        _transcript: &str,
+        _session_id: &str,
     ) -> Result<Vec<String>> {
-        if !memory_llm_judge_available() {
-            crate::logging::info("Memory transcript extraction skipped: LLM judge unavailable");
-            return Ok(Vec::new());
-        }
-
-        let sidecar = Sidecar::new();
-        let extracted = sidecar.extract_memories(transcript).await?;
-
-        let mut ids = Vec::new();
-        for memory in extracted {
-            let category: MemoryCategory = memory.category.parse().unwrap_or(MemoryCategory::Fact);
-            let trust = match memory.trust.as_str() {
-                "high" => TrustLevel::High,
-                "medium" => TrustLevel::Medium,
-                _ => TrustLevel::Low,
-            };
-
-            let entry = MemoryEntry::new(category, memory.content)
-                .with_source(session_id)
-                .with_trust(trust);
-
-            // Store in project scope by default
-            let id = self.remember_project(entry)?;
-            ids.push(id);
-        }
-
-        Ok(ids)
+        crate::logging::info(
+            "Memory transcript extraction skipped: retention is Hindsight-owned",
+        );
+        Ok(Vec::new())
     }
 
-    /// Recall directly through Jev. The legacy `max_candidates` argument now
-    /// limits output, not the input pool: old memories must remain discoverable.
+    /// Recall through the local graph.
+    ///
+    /// MEASURED 2026-11-11: the remote Jev selection path was removed. The
+    /// local graph still serves explicit keyword lookup, so this is the
+    /// graph's own semantic scan rather than a remote decision.
     pub async fn get_relevant_for_context(
         &self,
         context: &str,
         max_candidates: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        Ok(
-            crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
-                .await?
-                .into_iter()
-                .map(|(entry, _)| entry)
-                .collect(),
-        )
+        Ok(self.search_scoped(context, MemoryScope::All)?
+            .into_iter()
+            .take(max_candidates)
+            .collect())
     }
 
     /// Local keyword lookup, available without a remote decision provider.
@@ -1089,7 +1076,10 @@ impl MemoryManager {
                     emit_memory_activity(event_tx.as_ref());
                 }
                 Ok(MemoryRelevanceResult { prompt: None, .. }) => {
-                    clear_pending_memory(&sid);
+                    // No selection this round: drop the queued payload but keep
+                    // the delivered set, so what the model already saw stays
+                    // known.
+                    clear_pending_payload(&sid);
                     set_state(MemoryState::Idle);
                     emit_memory_activity(event_tx.as_ref());
                 }
@@ -1108,101 +1098,26 @@ impl MemoryManager {
         });
     }
 
-    /// Jev-only automatic recall. Storage and per-session dedup remain local;
-    /// there is no embedding, conventional LLM, or unjudged fallback path.
+    /// Automatic recall is globally disabled. Explicit recall remains available.
     pub async fn get_relevant_parallel(
         &self,
         session_id: &str,
-        messages: &[crate::message::Message],
-        event_tx: Option<MemoryEventSink>,
+        _messages: &[crate::message::Message],
+        _event_tx: Option<MemoryEventSink>,
     ) -> Result<MemoryRelevanceResult> {
-        let query = format_focused_query_for_relevance(messages);
-        let query = crate::util::truncate_str(&query, crate::memory_jev::MAX_QUERY_BYTES);
-        if query.trim().is_empty() {
-            return Ok(MemoryRelevanceResult::default());
-        }
-        pipeline_start();
-        let entries = match crate::memory_jev::collect_scoped(self, MemoryScope::All) {
-            Ok(entries) => entries,
-            Err(error) => {
-                clear_pending_memory(session_id);
-                pipeline_update(|p| {
-                    p.search = StepStatus::Error;
-                    p.verify = StepStatus::Skipped;
-                    p.inject = StepStatus::Skipped;
-                });
-                set_state(MemoryState::Idle);
-                emit_memory_activity(event_tx.as_ref());
-                return Err(error);
-            }
-        };
-        let entries: Vec<_> = entries
-            .into_iter()
-            .filter(|entry| entry.active && !is_memory_injected(session_id, &entry.id))
-            .collect();
-        let entries = prefilter_for_jev(entries, query);
-        pipeline_update(|p| {
-            p.search = StepStatus::Done;
-            p.search_result = Some(StepResult {
-                summary: format!("{} local memories", entries.len()),
-                latency_ms: 0,
-            });
-            p.verify = StepStatus::Running;
-            p.maintain = StepStatus::Skipped;
-        });
-        set_state(MemoryState::SidecarChecking {
-            count: entries.len(),
-        });
-        emit_memory_activity(event_tx.as_ref());
-        let started = Instant::now();
-        let result = async {
-            if entries.is_empty() {
-                return Ok(Vec::new());
-            }
-            let client = crate::jev::JevClient::new()?;
-            crate::memory_jev::select(&client, query, entries, 5).await
-        }
-        .await;
-        let relevant: Vec<MemoryEntry> = match result {
-            Ok(results) => results.into_iter().map(|(entry, _)| entry).collect(),
-            Err(error) => {
-                clear_pending_memory(session_id);
-                pipeline_update(|p| {
-                    p.verify = StepStatus::Error;
-                    p.inject = StepStatus::Skipped;
-                });
-                set_state(MemoryState::Idle);
-                emit_memory_activity(event_tx.as_ref());
-                return Err(error);
-            }
-        };
-        let count = relevant.len();
-        pipeline_update(|p| {
-            p.verify = StepStatus::Done;
-            p.verify_result = Some(StepResult {
-                summary: format!("Jev: {count} relevant"),
-                latency_ms: started.elapsed().as_millis() as u64,
-            });
-            p.inject = if count == 0 {
-                StepStatus::Skipped
-            } else {
-                StepStatus::Pending
-            };
-        });
-        let prompt = format_relevant_prompt(&relevant, 5);
-        let display = format_relevant_display_prompt(&relevant, 5);
-        set_state(if count == 0 {
-            MemoryState::Idle
-        } else {
-            MemoryState::FoundRelevant { count }
-        });
-        emit_memory_activity(event_tx.as_ref());
-        Ok(MemoryRelevanceResult {
-            prompt,
-            display_prompt: display,
-            selected_entries: relevant,
-        })
+        // Automatic recall is disabled for everyone, including existing configs.
+        // Explicit memory-tool recall uses the local graph's semantic scan.
+        // Only the queued payload is dropped: the delivered set must survive,
+        // otherwise the same memories are delivered again on the next turn.
+        clear_pending_payload(session_id);
+        Ok(MemoryRelevanceResult::default())
     }
+
+    /// Retained Jev relevance pipeline for potential future opt-in recall.
+    ///
+    /// MEASURED 2026-11-11: removed with the Jev backend. Automatic recall is
+    /// owned by Hindsight (`memory_hindsight::recall` + the pending-memory
+    /// store), so a local-graph Jev pipeline had no consumer.
 
     /// Load the existing project graph without generating embeddings.
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
@@ -1534,97 +1449,16 @@ pub const EMBEDDING_MAX_HITS: usize = 10;
 /// Minimum per-retriever candidate pool size for hybrid fusion.
 const HYBRID_POOL_MIN: usize = 50;
 
-/// Most memories Jcode sends to Jev per automatic recall. Every 24 entries costs
-/// one Jev decision, so judging a whole store (thousands of memories) each turn
-/// exhausted the daily plan allowance within hours. Lexical relevance narrows
-/// the field first; Jev still judges every candidate that reaches the prompt.
+/// Maximum candidates the local graph considers for a hybrid recall.
+///
+/// MEASURED 2026-11-11: this bound existed for the removed Jev judge (72
+/// candidates = 3 decisions of 24). The local graph's own scan is cheap, so the
+/// constant is now only the prefilter cap.
 pub(crate) const MAX_JEV_RECALL_CANDIDATES: usize = 72;
 
-/// Keep the most lexically relevant memories for Jev judgement. Small stores
-/// pass through unchanged. Memories with no term overlap are dropped only when
-/// the store is larger than the candidate budget.
-fn prefilter_for_jev(entries: Vec<MemoryEntry>, query: &str) -> Vec<MemoryEntry> {
-    if entries.len() <= MAX_JEV_RECALL_CANDIDATES {
-        return entries;
-    }
-    let ranked = bm25_rank(&entries, query, MAX_JEV_RECALL_CANDIDATES);
-    let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
-    ranked
-        .into_iter()
-        .filter_map(|(idx, _)| entries[idx].take())
-        .collect()
-}
-
-/// Rank memories by BM25 over their normalized search text.
-///
-/// Returns `(entry_index, score)` pairs sorted by score desc, truncated to
-/// `limit`. Memories with zero query-term overlap are dropped.
-fn bm25_rank(entries: &[MemoryEntry], query_text: &str, limit: usize) -> Vec<(usize, f32)> {
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    let q_terms: Vec<String> = normalize_search_text(query_text)
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
-    if q_terms.is_empty() {
-        return Vec::new();
-    }
-    let q_set: std::collections::HashSet<&String> = q_terms.iter().collect();
-
-    // Tokenize each doc once; compute df and doc lengths.
-    let docs: Vec<Vec<String>> = entries
-        .iter()
-        .map(|e| {
-            e.searchable_text()
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .collect();
-
-    let n = docs.len().max(1) as f32;
-    let avgdl = docs.iter().map(|d| d.len()).sum::<usize>() as f32 / n;
-    let mut df: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-    for doc in &docs {
-        let unique: std::collections::HashSet<&str> = doc.iter().map(|s| s.as_str()).collect();
-        for t in unique {
-            *df.entry(t).or_insert(0.0) += 1.0;
-        }
-    }
-
-    let mut scored: Vec<(usize, f32)> = Vec::new();
-    for (idx, doc) in docs.iter().enumerate() {
-        if doc.is_empty() {
-            continue;
-        }
-        let dl = doc.len() as f32;
-        let mut tf: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-        for t in doc {
-            *tf.entry(t.as_str()).or_insert(0.0) += 1.0;
-        }
-        let mut score = 0.0f32;
-        for term in &q_set {
-            let Some(&f) = tf.get(term.as_str()) else {
-                continue;
-            };
-            let n_q = *df.get(term.as_str()).unwrap_or(&0.0);
-            if n_q == 0.0 {
-                continue;
-            }
-            let idf = (((n - n_q + 0.5) / (n_q + 0.5)) + 1.0).ln();
-            let denom = f + K1 * (1.0 - B + B * dl / avgdl);
-            score += idf * (f * (K1 + 1.0)) / denom;
-        }
-        if score > 0.0 {
-            scored.push((idx, score));
-        }
-    }
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(limit);
-    scored
-}
-
+#[path = "memory/ranking.rs"]
+mod ranking;
+use ranking::bm25_rank;
 impl Default for MemoryManager {
     fn default() -> Self {
         Self::new()

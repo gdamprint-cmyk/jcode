@@ -19,6 +19,20 @@ impl App {
         app.is_remote = false;
         app.is_replay = true;
         app.runtime_mode = AppRuntimeMode::Replay;
+        // The saved session supplies metadata only. Transcript state must enter
+        // exclusively through historical events, never through today's startup.
+        app.display_messages.clear();
+        app.session.messages.clear();
+        app.auto_poke_incomplete_todos = false;
+        app.auto_poke_default_on = false;
+        app.overnight_auto_poke = None;
+        app.queued_messages.clear();
+        app.queued_images.clear();
+        app.queued_commands.clear();
+        app.hidden_queued_system_messages.clear();
+        app.status_notice = None;
+        // Historical replay must never show today's on-disk todo state.
+        app.pinned_todos_payload = None;
         let model_name = app.session.model.clone().unwrap_or_default();
         let session_name = app.session.short_name.clone().unwrap_or_default();
 
@@ -206,6 +220,49 @@ impl App {
             .is_some_and(|mtime| mtime > startup_mtime)
     }
 
+    /// Event-driven hot reload for every client kind (local, attached, `--ssh`).
+    /// Triggered by `binary_watch` when a build is published. Waits for an idle
+    /// moment (no turn in flight, not mid-typing) and re-execs onto the newer
+    /// binary with input preserved. Deferred attempts re-arm and retry on tick.
+    pub(super) fn maybe_hot_reload_onto_new_binary(&mut self) -> bool {
+        super::binary_watch::ensure_started();
+        if !super::binary_watch::take_pending() {
+            return false;
+        }
+        if self.is_replay_runtime() || self.reload_requested.is_some() || self.should_quit {
+            return false;
+        }
+        const TYPING_QUIET: std::time::Duration = std::time::Duration::from_millis(1200);
+        let typing = self
+            .last_user_interaction
+            .is_some_and(|at| at.elapsed() < TYPING_QUIET);
+        if self.is_processing || typing {
+            super::binary_watch::rearm();
+            return false;
+        }
+        if !self.has_newer_binary() {
+            return false;
+        }
+        let session_id = if self.is_remote {
+            self.reload_handoff_session_id()
+        } else {
+            self.session.provider_session_id = self.provider_session_id.clone();
+            self.session
+                .set_status(crate::session::SessionStatus::Reloaded);
+            if let Err(error) = self.session.save() {
+                crate::logging::warn(&format!(
+                    "Failed to save session during TUI lifecycle: {error}"
+                ));
+            }
+            self.session.id.clone()
+        };
+        self.append_reload_message("Newer jcode build published; hot reloading client...");
+        self.save_input_for_reload(&session_id);
+        self.reload_requested = Some(session_id);
+        self.should_quit = true;
+        true
+    }
+
     /// After an in-process server reload (e.g. `self-dev build-reload`), the
     /// server PID is unchanged and connected clients never disconnect, so they
     /// keep running their old binary and client-side changes never take effect.
@@ -213,7 +270,7 @@ impl App {
     /// client is idle, re-exec onto the new binary so TUI-side changes apply too.
     /// Returns true when a client reload was requested.
     pub(super) fn maybe_self_reload_after_server_reload(&mut self) -> bool {
-        if !self.is_remote || crate::tui::is_ssh_remote() {
+        if !self.is_remote {
             return false;
         }
         let is_selfdev_session = self.remote_is_canary.unwrap_or(self.session.is_canary);
@@ -255,7 +312,10 @@ impl App {
             crate::logging::info(&format!("MCP: Found {} server(s) in config", server_count));
 
             let (successes, failures) = {
-                let manager = self.mcp_manager.write().await;
+                // `connect_all` uses the manager's internal locks. Keep only a
+                // read guard here so MCP management reads are not blocked by a
+                // slow initialize handshake.
+                let manager = self.mcp_manager.read().await;
                 let result = manager.connect_all().await.unwrap_or((0, Vec::new()));
                 // Cache server names with tool counts
                 let servers = manager.connected_servers().await;
@@ -336,29 +396,29 @@ impl App {
             self.session.provider_session_id = None;
             let mut restored_model = false;
             if let Some(model) = self.session.model.clone() {
-                let model_request =
-                    crate::provider::MultiProvider::model_switch_request_for_session_route(
-                        &model,
-                        self.session.provider_key.as_deref(),
-                        self.session.route_api_method.as_deref(),
-                    );
-                if let Err(e) = crate::provider::set_model_with_auth_refresh(
+                match crate::provider::restore_session_model(
                     self.provider.as_ref(),
-                    &model_request,
+                    &model,
+                    self.session.provider_key.as_deref(),
+                    self.session.route_api_method.as_deref(),
                 ) {
-                    self.push_display_message(DisplayMessage {
-                        role: "system".to_string(),
-                        content: format!(
-                            "⚠ Failed to restore model '{}' via '{}': {}",
-                            model, model_request, e
-                        ),
-                        tool_calls: vec![],
-                        duration_secs: None,
-                        title: None,
-                        tool_data: None,
-                    });
-                } else {
-                    restored_model = true;
+                    Err(e) => {
+                        self.push_display_message(DisplayMessage {
+                            role: "system".to_string(),
+                            content: format!("⚠ Failed to restore model '{}': {}", model, e),
+                            tool_calls: vec![],
+                            duration_secs: None,
+                            title: None,
+                            tool_data: None,
+                        });
+                    }
+                    Ok(restore) => {
+                        if let Some(healed) = restore.healed_route {
+                            self.session.provider_key = healed.provider_key;
+                            self.session.route_api_method = healed.route_api_method;
+                        }
+                        restored_model = true;
+                    }
                 }
             }
 
@@ -366,7 +426,7 @@ impl App {
             if restored_model || self.session.model.is_none() {
                 self.session.model = Some(active_model.clone());
             }
-            self.update_context_limit_for_model(&active_model);
+            self.update_context_limit_for_model(&active_model, None);
             // Mark session as active now that it's being used again
             self.session.mark_active();
             self.set_side_panel_snapshot(
@@ -574,19 +634,16 @@ pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
                     "off"
                 };
                 app.push_display_message(DisplayMessage::system(format!(
-                    "Onboarding simulator is {status}. Alt+5 resets and opens it; Cmd+5 toggles it; `/onboarding-sim on` / `off` also work. While active: Tab/→ next screen, Shift+Tab/← previous, h/l preview the highlight, Esc exits."
+                    "Onboarding rehearsal is {status}. Alt+5 starts it over; Cmd+5 toggles it; `/onboarding-sim on` / `off` also work. It runs the real first-run flow as if jcode were new on this machine. Esc skips onboarding, as it does for new users."
                 )));
             }
             "" | "on" => {
                 app.start_onboarding_simulator();
-                app.push_display_message(DisplayMessage::system(
-                    "Onboarding simulator started. Step screens with Tab/→, press Alt+5 to reset to the first screen, or Cmd+5 to toggle. On the import screen Up/Down move the checkbox cursor; h/l preview the highlight; Esc exits. Nothing real is logged in or imported.".to_string(),
-                ));
             }
             "off" => {
                 app.stop_onboarding_simulator();
                 app.push_display_message(DisplayMessage::system(
-                    "Onboarding simulator stopped.".to_string(),
+                    "Onboarding rehearsal stopped.".to_string(),
                 ));
             }
             _ => unreachable!("guarded by command matcher"),
@@ -642,10 +699,10 @@ pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
             app.cursor_pos = 0;
             app.clear_input_undo_history();
             app.follow_chat_bottom();
-            app.force_full_redraw = true;
+            app.request_full_repaint();
             app.set_status_notice("Onboarding preview: on");
         } else {
-            app.force_full_redraw = true;
+            app.request_full_repaint();
             app.set_status_notice("Onboarding preview: off");
         }
         return true;

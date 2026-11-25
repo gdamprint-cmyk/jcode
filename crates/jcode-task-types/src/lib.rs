@@ -106,6 +106,67 @@ pub struct GoalUpdate {
     pub summary: String,
 }
 
+/// The observable condition that makes a deferred goal worth reconsidering.
+///
+/// This is the plan's "reopen a good idea at the right time" primitive: an
+/// accepted goal that was deferred because a condition did not hold records
+/// WHAT would have to become true, and the goal is then reconsidered when a
+/// trusted source reports a change that bears on that condition.
+///
+/// The condition is deliberately a natural-language sentence plus the terms
+/// that identify it. It is not a machine-checkable predicate: deciding
+/// whether a reported change really satisfies it is a judgement, and the
+/// plan puts that judgement in `reflect`, which returns one of
+/// `wait` / `prepare` / `act_within_authority` / `ask_owner`.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("First complete feature to ship: reopen a good idea at the right time" -
+///   "Record the goal key, the budget constraint, the reason the old option
+///   failed and the evidence that would justify reconsideration"; and "Ask
+///   reflect to return one of `wait`, `prepare`, `act_within_authority` or
+///   `ask_owner`").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GoalReviewCondition {
+    /// The condition in the owner's words, e.g. "a free tier becomes usable".
+    #[serde(default)]
+    pub condition: String,
+    /// Why the goal was deferred: what the old option needed and failed.
+    #[serde(default)]
+    pub blocked_because: String,
+    /// The evidence that would justify reconsidering - what to look for.
+    #[serde(default)]
+    pub evidence_to_look_for: String,
+    /// Terms that identify the entity the condition is about. A reported
+    /// change is matched against these before anything is asked of the
+    /// owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_terms: Vec<String>,
+    /// Whether the owner authorized preparing an artifact once the condition
+    /// holds, or only wanted to be asked.
+    #[serde(default)]
+    pub preparation_authorized: bool,
+    /// When the condition was last assessed, and what the assessment was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assessed_at: Option<DateTime<Utc>>,
+    /// The last decision, so a repeated identical change is not re-proposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_decision: Option<String>,
+    /// The watermark of the evidence the last assessment saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evidence_at: Option<DateTime<Utc>>,
+}
+
+impl GoalReviewCondition {
+    /// Whether this condition carries enough to be worth acting on.
+    ///
+    /// A condition without a statement of what would change is not a
+    /// condition, and a goal with no watch terms cannot be matched against a
+    /// reported change without asking the owner first.
+    pub fn is_usable(&self) -> bool {
+        !self.condition.trim().is_empty() && !self.watch_terms.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Goal {
     pub id: String,
@@ -134,6 +195,15 @@ pub struct Goal {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub updates: Vec<GoalUpdate>,
+    /// The condition under which a deferred goal becomes worth reconsidering.
+    ///
+    /// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    ///   ("Use one accepted, deferred goal with a verifiable external
+    ///   condition ... Record the goal key, the budget constraint, the reason
+    ///   the old option failed and the evidence that would justify
+    ///   reconsideration").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_condition: Option<GoalReviewCondition>,
 }
 
 impl Goal {
@@ -156,6 +226,7 @@ impl Goal {
             created_at: now,
             updated_at: now,
             updates: Vec::new(),
+            review_condition: None,
         }
     }
 
@@ -429,6 +500,31 @@ semantic_state! {
     }
 }
 
+/// The todo is paused until the user completes an authentication the agent
+/// has no access to (a login, 2FA prompt, or credential). Not for approvals
+/// or decisions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoUserAuth {
+    #[serde(deserialize_with = "deserialize_nonempty_auth_reason")]
+    pub reason: String,
+}
+
+fn deserialize_nonempty_auth_reason<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "requires_user_auth reason must be nonempty",
+        ));
+    }
+    Ok(value)
+}
+
+/// `TodoItem::lane_owner` value that requests an auto-spawned swarm worker.
+pub const LANE_OWNER_WORKER: &str = "worker";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
@@ -438,8 +534,19 @@ pub struct TodoItem {
     /// Optional group label. Todos that share a group are displayed together
     /// under a single header. Use one group per coherent goal; when work is
     /// steered into a new area, start a new group instead of renaming.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Also accepted as `lane`: the lane this todo belongs to.
+    #[serde(default, alias = "lane", skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Explicit prerequisite todo IDs for this lane. `None` retains the default
+    /// phase barrier. All lane members carry the same nonempty list, referring
+    /// only to todos in earlier phases by first appearance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_after: Option<Vec<String>>,
+    /// Who runs this lane: [`LANE_OWNER_WORKER`] makes the swarm server spawn a
+    /// dedicated worker as soon as the lane is ready; anything else (default)
+    /// means this todo list's own agent runs it. Lane-wide, like `lane_after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_owner: Option<String>,
     /// Forward-looking evidence state that this todo can be completed
     /// correctly. Legacy sessions stored a 0-100 score; numbers map onto the
     /// closest state on load.
@@ -458,8 +565,89 @@ pub struct TodoItem {
     pub confidence_history: Vec<ConfidenceState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<String>,
+    /// Existing background task or durable swarm await IDs in this session.
+    /// Dependencies block only while pending, never after completion or timeout.
+    /// An empty array or null clears dependencies.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_waiting_on",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub waiting_on: Vec<String>,
+    /// Why this todo waits on `waiting_on`. The tool boundary presents the
+    /// pair as one `{ids, reason}` object. Meaningless without dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<String>,
+    /// Paused until the user authenticates. Items have no other block: legacy
+    /// `external_blocker` and `completely_blocked` fields are ignored on load,
+    /// so old sessions resume as ordinary actionable work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_user_auth: Option<TodoUserAuth>,
+    /// Worker session ID, or reserved `@self` for an explicit start by this
+    /// todo list's agent. Absence means ownership is unknown, not local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+    /// Optional execution stage. Stages run in order: stage 2 starts only
+    /// after every todo in stage 1 is done. Inside a stage, todos that share a
+    /// `group` form one lane that runs in list order, and different lanes run
+    /// in parallel. `None` means "sequential in list order". Deliberately a
+    /// plain number. Optional `lane_after` narrows the default phase barrier
+    /// to explicit earlier-phase prerequisites. Older sessions stored this as `wave`.
+    #[serde(
+        default,
+        alias = "wave",
+        alias = "phase",
+        deserialize_with = "deserialize_optional_stage",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stage: Option<u32>,
+    /// Optional longer brief: file paths, acceptance criteria, context. Never
+    /// drawn on the todo card (which shows only the short `content` title),
+    /// but appended to a swarm worker's assignment so short titles do not
+    /// starve workers of context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+fn deserialize_waiting_on<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Vec<String>>::deserialize(deserializer)? {
+        Some(dependencies) => Ok(dependencies),
+        // Null explicitly clears dependency references, just like an empty list.
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Accept `2`, `2.0`, `"2"`, `"stage 2"`, `""`, or `null` for a todo stage.
+/// Zero and unparseable values read as absent rather than failing the whole
+/// todo write, so a sloppy stage can never cost the model its plan.
+fn deserialize_optional_stage<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| parse_stage_value(&value)))
+}
+
+pub fn parse_stage_value(value: &serde_json::Value) -> Option<u32> {
+    let stage = match value {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f.round() as u64)),
+        serde_json::Value::String(s) => {
+            let digits: String = s
+                .trim()
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<u64>().ok()
+        }
+        _ => None,
+    }?;
+    u32::try_from(stage).ok().filter(|stage| *stage > 0)
 }
 
 /// Plan-level understanding of what the user actually wants, covering the
@@ -470,6 +658,10 @@ pub struct TodoItem {
 /// faithfully the plan and its feedback loops represent that.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoPlan {
+    /// Short session name (a few words) chosen by the agent. Used as the
+    /// session title in pickers ahead of lane names and generated titles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The user's underlying reason and desired outcome for this work, kept
     /// distinct from the agent's steps and validation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -499,6 +691,7 @@ pub struct TodoPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoPlanField {
+    Title,
     UserIntention,
     #[serde(alias = "alignment_score", alias = "user_intention_alignment")]
     UnderstandsUserIntent,
@@ -610,6 +803,11 @@ pub struct TodoGoal {
     /// research or open-ended goal is marked complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopping_evidence: Option<String>,
+    /// Why this goal is impossible to complete. The only way to stop
+    /// continuation for unfinished work that is neither waiting nor awaiting
+    /// user authorization. `None` means the goal is still being pursued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cannot_complete: Option<String>,
 }
 
 /// A goal field changed by a todo-tool update. This lets transcript renderers
@@ -628,6 +826,7 @@ pub enum TodoGoalField {
     Autonomy,
     IterationMaturity,
     StoppingEvidence,
+    CannotComplete,
 }
 
 /// Before/after state for one changed todo goal.
@@ -665,6 +864,63 @@ pub struct CatchupBrief {
 #[cfg(test)]
 mod semantic_state_tests {
     use super::*;
+
+    #[test]
+    fn todo_waiting_on_is_backward_compatible_and_nullable() {
+        let old =
+            serde_json::json!({"id":"a", "content":"A", "status":"pending", "priority":"high"});
+        let todo: TodoItem = serde_json::from_value(old.clone()).unwrap();
+        assert!(todo.waiting_on.is_empty());
+        assert!(
+            serde_json::to_value(&todo)
+                .unwrap()
+                .get("waiting_on")
+                .is_none()
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["task-a"]),
+        ] {
+            let mut payload = old.clone();
+            payload["waiting_on"] = value.clone();
+            let todo: TodoItem = serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                todo.waiting_on,
+                if value.is_null() {
+                    vec![]
+                } else {
+                    serde_json::from_value::<Vec<String>>(value).unwrap()
+                }
+            );
+        }
+        for invalid in [
+            serde_json::json!(42),
+            serde_json::json!([null]),
+            serde_json::json!({"task": "a"}),
+        ] {
+            let mut payload = old.clone();
+            payload["waiting_on"] = invalid;
+            assert!(serde_json::from_value::<TodoItem>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_item_blockers_are_ignored_on_load() {
+        let todo: TodoItem = serde_json::from_value(serde_json::json!({
+            "id": "a", "content": "A", "status": "pending", "priority": "high",
+            "external_blocker": {"reason": "old", "review_at": "2020-01-01T00:00:00Z"},
+            "completely_blocked": {"reason": "old"}
+        }))
+        .unwrap();
+        assert_eq!(todo.requires_user_auth, None);
+        let saved = serde_json::to_value(&todo).unwrap();
+        assert!(saved.get("external_blocker").is_none());
+        assert!(saved.get("completely_blocked").is_none());
+        assert!(
+            serde_json::from_value::<TodoUserAuth>(serde_json::json!({"reason": " "})).is_err()
+        );
+    }
 
     #[test]
     fn states_serialize_as_snake_case_strings() {

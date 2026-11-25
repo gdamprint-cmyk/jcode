@@ -1,5 +1,26 @@
 use super::*;
 
+fn assistant_output_tail_after(messages: &[StoredMessage], start_index: usize) -> Option<String> {
+    messages
+        .iter()
+        .skip(start_index)
+        .rev()
+        .filter(|message| message.role == Role::Assistant)
+        .find_map(|message| {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    // Never include tool activity, private reasoning, or results.
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            jcode_swarm_core::normalize_completion_report(Some(text))
+        })
+}
+
 impl Agent {
     /// Read-only source for splitting a new session before its first persistence.
     pub(crate) fn session_for_split(&self) -> &Session {
@@ -82,7 +103,8 @@ impl Agent {
                     | ContentBlock::ReasoningTrace { .. }
                     | ContentBlock::AnthropicThinking { .. }
                     | ContentBlock::OpenAIReasoning { .. }
-                    | ContentBlock::ToolReference { .. } => {}
+                    | ContentBlock::ToolReference { .. }
+                    | ContentBlock::ProviderNative { .. } => {}
                     ContentBlock::Image { .. } => {
                         transcript.push_str("[Image]\n");
                     }
@@ -143,6 +165,36 @@ impl Agent {
             })
     }
 
+    /// Tail of the latest non-empty assistant text response at or after `start_index`.
+    /// Earlier commentary, tool activity, reasoning, and results are excluded.
+    pub fn recent_assistant_output_tail_after(&self, start_index: usize) -> Option<String> {
+        assistant_output_tail_after(&self.session.messages, start_index)
+    }
+
+    /// The final visible assistant prose of this turn (its answer), used for
+    /// notification previews. Tool calls and reasoning are excluded.
+    pub fn final_assistant_text_after(&self, start_index: usize) -> Option<String> {
+        self.session
+            .messages
+            .iter()
+            .skip(start_index)
+            .rev()
+            .filter(|message| message.role == Role::Assistant)
+            .find_map(|message| {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.trim()),
+                        _ => None,
+                    })
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                (!text.is_empty()).then_some(text)
+            })
+    }
+
     pub fn last_upstream_provider(&self) -> Option<String> {
         self.last_upstream_provider
             .clone()
@@ -177,6 +229,14 @@ impl Agent {
     }
 
     pub(super) fn provider_key_for_new_session(&self) -> Option<String> {
+        if let Some(label) = self.provider.oauth_account_label() {
+            let method = if self.provider.name().eq_ignore_ascii_case("openai") {
+                "openai-oauth"
+            } else {
+                "claude-oauth"
+            };
+            return Some(format!("{method}@{label}"));
+        }
         if self
             .provider
             .explicit_provider_pin_for_current_model()
@@ -191,7 +251,70 @@ impl Agent {
             );
         }
 
+        // A direct OpenAI-compatible profile owns this session's provider
+        // identity, and only the runtime INSTANCE knows which profile serves
+        // the model. The process-global `JCODE_OPENROUTER_CACHE_NAMESPACE` is
+        // rewritten by every named-profile provider construction, so another
+        // session's model switch could otherwise stamp this session with a
+        // foreign profile (e.g. an ambient cycle on minimax persisting
+        // `provider_key=nous-free` because a swarm worker had just switched to
+        // the nous-free profile).
+        // reference: no prior art, searched this repo for an instance-scoped
+        // profile resolver (crates/jcode-base/src/provider/mod.rs
+        // openai_compatible_profile_owning_model) and the Rust trait-object
+        // dispatch guidance at https://siddharthqs.com/design-patterns-in-rust
+        // (dynamic dispatch through a trait object; avoid global mutable state).
+        let model = self.provider_model();
+        if let Some(profile_id) = self
+            .provider
+            .openai_compatible_profile_id_for_model(&model)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        {
+            return Some(profile_id);
+        }
+
         crate::session::derive_session_provider_key(self.provider.name())
+    }
+
+    /// Re-apply the persisted session model on resume (or attach). A stale
+    /// credential pin (the deployment's credential changed type since the
+    /// session was created) is recovered onto the usable credential and the
+    /// session's route metadata is rewritten to match, so swarm workers and
+    /// later resumes inherit the route this session actually runs on.
+    pub(crate) fn restore_session_model_from_session(&mut self) {
+        let Some(model) = self.session.model.clone() else {
+            self.session.model = Some(self.provider_model());
+            return;
+        };
+        match crate::provider::restore_session_model(
+            self.provider.as_ref(),
+            &model,
+            self.session.provider_key.as_deref(),
+            self.session.route_api_method.as_deref(),
+        ) {
+            Ok(restore) => {
+                if let Some(healed) = restore.healed_route {
+                    logging::warn(&format!(
+                        "Session {} route healed: '{}' -> '{}' (provider_key {:?} -> {:?})",
+                        self.session.id,
+                        healed.stale_request,
+                        restore.request,
+                        self.session.provider_key,
+                        healed.provider_key,
+                    ));
+                    self.session.provider_key = healed.provider_key;
+                    self.session.route_api_method = healed.route_api_method;
+                }
+                self.reconcile_explicit_provider_pin_route();
+            }
+            Err(e) => {
+                logging::error(&format!(
+                    "Failed to restore session model '{}': {}",
+                    model, e
+                ));
+            }
+        }
     }
 
     pub(super) fn reconcile_explicit_provider_pin_route(&mut self) {
@@ -209,5 +332,97 @@ impl Agent {
     /// Get the short/friendly name for this session (e.g., "fox")
     pub fn session_short_name(&self) -> Option<&str> {
         self.session.short_name.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod output_tail_tests {
+    use super::*;
+
+    fn message(role: &str, content: serde_json::Value) -> StoredMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "message", "role": role, "content": content,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn automatic_output_tail_excludes_tools_and_private_content() {
+        let messages = vec![
+            message(
+                "assistant",
+                serde_json::json!([{"type":"text", "text":"previous turn"}]),
+            ),
+            message(
+                "user",
+                serde_json::json!([{"type":"text", "text":"private user input"}]),
+            ),
+            message(
+                "assistant",
+                serde_json::json!([
+                    {"type":"reasoning", "text":"private reasoning must not leak"},
+                    {"type":"reasoning_trace", "text":"private trace must not leak"},
+                    {"type":"text", "text":"Implemented the parser fix."},
+                    {"type":"tool_result", "tool_use_id":"prior", "content":"private result must not leak"},
+                    {"type":"tool_use", "id":"test", "name":"bash", "input":{"intent":"Run parser tests"}}
+                ]),
+            ),
+            message(
+                "user",
+                serde_json::json!([{"type":"text", "text":"tool stdout must not leak"}]),
+            ),
+            message("assistant", serde_json::json!([])),
+        ];
+        assert_eq!(
+            assistant_output_tail_after(&messages, 1).as_deref(),
+            Some("Implemented the parser fix.")
+        );
+        assert_eq!(assistant_output_tail_after(&messages, messages.len()), None);
+        assert_eq!(assistant_output_tail_after(&messages, usize::MAX), None);
+    }
+
+    #[test]
+    fn automatic_output_tail_uses_only_latest_nonempty_assistant_response() {
+        let messages = vec![
+            message(
+                "assistant",
+                serde_json::json!([{"type":"text", "text":"first commentary"}]),
+            ),
+            message(
+                "assistant",
+                serde_json::json!([
+                    {"type":"text", "text":"final commentary"},
+                    {"type":"text", "text":"second paragraph"}
+                ]),
+            ),
+            message(
+                "assistant",
+                serde_json::json!([
+                    {"type":"text", "text":" \n\t"},
+                    {"type":"tool_use", "id":"test", "name":"bash", "input":{}}
+                ]),
+            ),
+        ];
+        assert_eq!(
+            assistant_output_tail_after(&messages, 0).as_deref(),
+            Some("final commentary\n\nsecond paragraph")
+        );
+        assert_eq!(assistant_output_tail_after(&messages, 2), None);
+    }
+
+    #[test]
+    fn automatic_output_tail_preserves_utf8_when_truncating_latest_response() {
+        let long = format!("{}\nLATEST RESULT", "界🦀".repeat(3000));
+        let messages = [message(
+            "assistant",
+            serde_json::json!([{"type":"text", "text":long}]),
+        )];
+        let tail = assistant_output_tail_after(&messages, 0).unwrap();
+        assert_eq!(
+            tail.chars().count(),
+            jcode_swarm_core::MAX_SWARM_COMPLETION_REPORT_CHARS
+        );
+        assert!(tail.starts_with("[Earlier response text truncated by jcode.]"));
+        assert!(tail.ends_with("LATEST RESULT"));
     }
 }

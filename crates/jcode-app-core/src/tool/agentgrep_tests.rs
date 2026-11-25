@@ -14,6 +14,21 @@ fn test_ctx(root: &Path) -> ToolContext {
     }
 }
 
+/// True when `haystack` contains `path` with either path separator. The
+/// renderer prints the platform-native separator (`src\app.rs` on Windows),
+/// so a literal "src/app.rs" only matches on Unix.
+fn contains_path(haystack: &str, path: &str) -> bool {
+    haystack.contains(path) || haystack.contains(&path.replace('/', "\\"))
+}
+
+/// The path the resolver produces for `rel` under `root`, rendered with the
+/// platform separator. Hard-coding "/tmp/root/src" only holds on Unix: on
+/// Windows `Path::join` renders "\", so the expected value has to be derived
+/// from the same join the code under test performs.
+fn expected_path(root: &Path, rel: &str) -> String {
+    root.join(rel).display().to_string()
+}
+
 fn test_exposure(message_index: usize, total_messages: usize) -> ExposureDescriptor {
     ExposureDescriptor {
         timestamp: Some(Utc::now()),
@@ -46,7 +61,7 @@ fn grep_input(query: &str, max_regions: Option<usize>) -> AgentGrepInput {
 
 #[tokio::test]
 async fn foreground_budget_returns_fast_search_result_directly() {
-    let handle = tokio::spawn(async { Ok(ToolOutput::new("fast result")) });
+    let handle = spawn_cancellable_search(|| Ok(ToolOutput::new("fast result")));
     let output = await_or_background_search(
         handle,
         std::time::Duration::from_secs(1),
@@ -80,6 +95,12 @@ async fn foreground_budget_promotes_slow_search_without_cancelling_it() {
     assert_eq!(metadata["timeout_promoted"], true);
     assert_eq!(metadata["foreground_timeout_ms"], 1);
     assert!(output.output.contains("continuing in background"));
+    assert!(
+        output
+            .output
+            .contains(crate::tool::BACKGROUND_WAIT_GUIDANCE)
+    );
+    assert!(!output.output.contains("Use `bg"));
 
     // The adopted handle must remain alive after the foreground call returns.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -88,6 +109,125 @@ async fn foreground_budget_promotes_slow_search_without_cancelling_it() {
         .await
         .expect("background manager should persist the eventual result");
     assert!(saved.contains("eventual search result"));
+}
+
+// Repeat real linked searches until the shared scope rejects work. Unlike a
+// token mock, this proves the dependency observes the worker's installed scope.
+fn repeating_search(
+    root: PathBuf,
+) -> (
+    tokio::task::JoinHandle<Result<ToolOutput>>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<String>,
+) {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+    let handle = spawn_cancellable_search(move || {
+        let mut started = Some(started_tx);
+        loop {
+            match execute_linked_agentgrep(&grep_input("needle", None), &test_ctx(&root), None) {
+                Ok(_) => {
+                    if let Some(tx) = started.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(error) => {
+                    let _ = stopped_tx.send(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+    });
+    (handle, started_rx, stopped_rx)
+}
+
+async fn assert_search_stopped(stopped: tokio::sync::oneshot::Receiver<String>) {
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+        .await
+        .expect("blocking linked search must terminate promptly")
+        .expect("blocking worker must report its cancellation");
+    assert!(error.contains("cancel"), "unexpected failure: {error}");
+}
+
+#[tokio::test]
+async fn search_cancellation_foreground_future_stops_linked_search() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("input.rs"), "fn needle() {}\n").unwrap();
+    let (handle, started, stopped) = repeating_search(root.path().to_path_buf());
+    let foreground = tokio::spawn(await_or_background_search(
+        handle,
+        std::time::Duration::from_secs(60),
+        "cancel foreground".into(),
+        "agentgrep-cancel-foreground".into(),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    foreground.abort();
+    let _ = foreground.await;
+    assert_search_stopped(stopped).await;
+}
+
+#[tokio::test]
+async fn search_cancellation_dropping_owner_stops_linked_search() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("input.rs"), "fn needle() {}\n").unwrap();
+    let (handle, started, stopped) = repeating_search(root.path().to_path_buf());
+    let owner = SearchTaskOwner(Some(handle));
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(owner);
+    assert_search_stopped(stopped).await;
+}
+
+#[tokio::test]
+async fn search_cancellation_promoted_search_lives_until_background_cancel() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("input.rs"), "fn needle() {}\n").unwrap();
+    let (handle, started, mut stopped) = repeating_search(root.path().to_path_buf());
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let output = await_or_background_search(
+        handle,
+        std::time::Duration::from_millis(1),
+        "promoted cancellation".into(),
+        "agentgrep-promoted-cancel".into(),
+    )
+    .await
+    .unwrap();
+    // Let the async owner and blocking worker run after handoff. An accidental
+    // abort during promotion must be observed before we request cancellation.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(matches!(
+        stopped.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let metadata = output.metadata.unwrap();
+    let task_id = metadata["task_id"].as_str().unwrap();
+    assert!(crate::background::global().cancel(task_id).await.unwrap());
+    assert_search_stopped(stopped).await;
+}
+
+#[tokio::test]
+async fn search_cancellation_background_reload_stops_linked_search() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("input.rs"), "fn needle() {}\n").unwrap();
+    let (handle, started, stopped) = repeating_search(root.path().to_path_buf());
+    tokio::time::timeout(std::time::Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let manager =
+        crate::background::BackgroundTaskManager::with_output_dir(output_dir.path().to_path_buf());
+    manager.adopt("agentgrep", "reload-search", handle).await;
+    assert_eq!(manager.abort_live_tasks_for_reload().await, 1);
+    assert_search_stopped(stopped).await;
 }
 
 #[test]
@@ -111,6 +251,7 @@ fn render_compacts_huge_grep_match_lines() {
         paths_only: false,
         hidden: false,
         no_ignore: false,
+        no_follow: false,
         path: None,
         glob: None,
     };
@@ -227,7 +368,10 @@ fn build_grep_args_includes_scope_flags() {
     assert!(args.paths_only);
     assert!(args.hidden);
     assert!(args.no_ignore);
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/src"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), "src").as_str())
+    );
     assert_eq!(args.glob.as_deref(), Some("src/**/*.rs"));
 }
 
@@ -256,7 +400,10 @@ fn build_grep_args_drops_match_all_glob() {
     let args = build_grep_args(&params, &ctx).unwrap();
     assert_eq!(args.query, "agentgrep");
     assert_eq!(args.file_type.as_deref(), Some("rs"));
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/."));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), ".").as_str())
+    );
     assert_eq!(args.glob, None);
 }
 
@@ -353,7 +500,10 @@ fn build_find_args_allows_glob_only_search() {
 
     let args = build_find_args(&params, &ctx).expect("glob-only find should be valid");
     assert!(args.query_parts.is_empty());
-    assert_eq!(args.path.as_deref(), Some("/tmp/root/."));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/tmp/root"), ".").as_str())
+    );
     assert_eq!(args.glob.as_deref(), Some("**/*release*"));
     assert_eq!(args.max_files, 25);
     assert!(args.paths_only);
@@ -425,7 +575,10 @@ fn build_smart_args_uses_terms() {
     assert!(args.debug_plan);
     assert!(args.debug_score);
     assert_eq!(args.file_type.as_deref(), Some("rs"));
-    assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/workspace"), "repo").as_str())
+    );
     assert_eq!(query.subject, "auth_status");
     assert_eq!(query.relation.as_str(), "rendered");
     assert_eq!(query.path_hint.as_deref(), Some("src/tui"));
@@ -573,7 +726,10 @@ fn build_outline_args_accepts_file_field() {
 
     let args = build_outline_args(&params, &ctx, None).unwrap();
     assert_eq!(args.file, "src/tool/agentgrep.rs");
-    assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
+    assert_eq!(
+        args.path.as_deref(),
+        Some(expected_path(Path::new("/workspace"), "repo").as_str())
+    );
 }
 
 #[test]
@@ -674,7 +830,7 @@ async fn execute_runs_linked_grep() {
         .await
         .expect("tool output");
     assert!(output.output.contains("query: auth_status"));
-    assert!(output.output.contains("src/app.rs"));
+    assert!(contains_path(&output.output, "src/app.rs"));
     assert!(output.output.contains("@ 1 pub fn auth_status() {}"));
 }
 

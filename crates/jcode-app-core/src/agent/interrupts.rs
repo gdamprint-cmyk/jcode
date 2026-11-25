@@ -9,10 +9,30 @@ use jcode_agent_runtime::{
 };
 use std::sync::Arc;
 
+fn frozen_snapshot_memory_profile(
+    locked_tools: Option<&[crate::message::ToolDefinition]>,
+    agents_md: Option<&String>,
+    skills: &[crate::prompt::SkillInfo],
+) -> serde_json::Value {
+    // Serialized schemas are an attribution proxy, not an allocation bound or
+    // capacity. The prompt strings report capacity without copying their text.
+    serde_json::json!({
+        "locked_tools_count": locked_tools.map_or(0, <[_]>::len),
+        "locked_tools_json_bytes": locked_tools
+            .map_or(0, |tools| crate::process_memory::estimate_json_bytes(&tools)),
+        "agents_md_snapshot_capacity_bytes": agents_md.map_or(0, String::capacity),
+        "prompt_skills_snapshot_count": skills.len(),
+        "prompt_skills_snapshot_capacity_bytes": skills.iter()
+            .map(|skill| skill.name.capacity().saturating_add(skill.description.capacity()))
+            .fold(0usize, usize::saturating_add),
+    })
+}
+
 fn soft_interrupt_session_display_role(source: SoftInterruptSource) -> Option<StoredDisplayRole> {
     match source {
         SoftInterruptSource::User => None,
         SoftInterruptSource::System => Some(StoredDisplayRole::System),
+        SoftInterruptSource::FileActivity => Some(StoredDisplayRole::FileActivity),
         SoftInterruptSource::BackgroundTask => Some(StoredDisplayRole::BackgroundTask),
     }
 }
@@ -22,6 +42,7 @@ fn soft_interrupt_protocol_display_role(source: SoftInterruptSource) -> Option<S
         SoftInterruptSource::User => None,
         SoftInterruptSource::System => Some("system".to_string()),
         SoftInterruptSource::BackgroundTask => Some("background_task".to_string()),
+        SoftInterruptSource::FileActivity => Some("file_activity".to_string()),
     }
 }
 
@@ -29,6 +50,9 @@ fn soft_interrupt_protocol_display_role(source: SoftInterruptSource) -> Option<S
 pub(super) struct InjectedSoftInterrupt {
     pub(super) content: String,
     pub(super) source: SoftInterruptSource,
+    /// Caller ids of the queued messages combined into this injection, in
+    /// queue order. Messages queued without an id contribute nothing.
+    pub(super) client_ids: Vec<String>,
 }
 
 pub(super) enum NoToolCallOutcome {
@@ -126,6 +150,19 @@ impl Agent {
         urgent: bool,
         source: SoftInterruptSource,
     ) {
+        self.queue_soft_interrupt_with_id(content, images, urgent, source, None);
+    }
+
+    /// Like [`queue_soft_interrupt`](Self::queue_soft_interrupt), with an
+    /// opaque caller id echoed back in `SoftInterruptInjected`.
+    pub fn queue_soft_interrupt_with_id(
+        &self,
+        content: String,
+        images: Vec<(String, String)>,
+        urgent: bool,
+        source: SoftInterruptSource,
+        client_id: Option<String>,
+    ) {
         let content_bytes = content.len();
         let content_chars = content.chars().count();
         let image_count = images.len();
@@ -136,6 +173,7 @@ impl Agent {
                 images,
                 urgent,
                 source,
+                client_id,
             });
             logging::info(&format!(
                 "AGENT_SOFT_INTERRUPT_QUEUE_PUSH session={} source={:?} urgent={} content_bytes={} content_chars={} image_count={} pending_before={} pending_after={}",
@@ -290,6 +328,11 @@ impl Agent {
                 "pending_alert_text_bytes": pending_alert_text_bytes,
             },
             "agent": {
+                "frozen_snapshots": frozen_snapshot_memory_profile(
+                    self.locked_tools.as_deref(),
+                    self.agents_md_snapshot.0.as_ref(),
+                    &self.prompt_skills_snapshot,
+                ),
                 "memory_enabled": self.memory_enabled,
                 "allowed_tools_count": self.allowed_tools.as_ref().map(|tools| tools.len()),
                 "disabled_tools_count": self.disabled_tools.len(),
@@ -328,6 +371,21 @@ impl Agent {
     /// Inject all pending soft interrupt messages into the conversation.
     /// Returns the combined message content and clears the queue.
     pub(super) fn inject_soft_interrupts(&mut self) -> Vec<InjectedSoftInterrupt> {
+        // A cancelled turn never makes another request. Injecting now would
+        // put the user's next prompt into history with no reply, and the
+        // client would treat it as delivered. Esc after typing a follow-up
+        // must stop this turn and run that prompt, so leave it queued: the
+        // client recovers it and sends it as the next turn.
+        if self.is_graceful_shutdown() {
+            if self.has_soft_interrupts() {
+                logging::info(&format!(
+                    "AGENT_SOFT_INTERRUPT_INJECT_SKIPPED_CANCELLED session={} pending_count={}",
+                    self.session_id(),
+                    self.soft_interrupt_count()
+                ));
+            }
+            return Vec::new();
+        }
         let messages: Vec<SoftInterruptMessage> = {
             let mut queue = match self.soft_interrupt_queue.lock() {
                 Ok(queue) => queue,
@@ -359,13 +417,16 @@ impl Agent {
         let mut current_source: Option<SoftInterruptSource> = None;
         let mut current_parts: Vec<String> = Vec::new();
         let mut current_images: Vec<(String, String)> = Vec::new();
+        let mut current_ids: Vec<String> = Vec::new();
 
         let flush_group = |agent: &mut Self,
                            injected: &mut Vec<InjectedSoftInterrupt>,
                            source: SoftInterruptSource,
                            parts: &mut Vec<String>,
-                           images: &mut Vec<(String, String)>| {
+                           images: &mut Vec<(String, String)>,
+                           ids: &mut Vec<String>| {
             if parts.is_empty() && images.is_empty() {
+                ids.clear();
                 return;
             }
             let content = parts.join("\n\n");
@@ -385,18 +446,25 @@ impl Agent {
                 blocks,
                 soft_interrupt_session_display_role(source),
             );
-            injected.push(InjectedSoftInterrupt { content, source });
+            injected.push(InjectedSoftInterrupt {
+                content,
+                source,
+                client_ids: std::mem::take(ids),
+            });
         };
 
         for message in messages {
+            // User follow-ups may share a model message. Notifications must
+            // retain their own delivery events and transcript entries.
             match current_source {
-                Some(source) if source != message.source => {
+                Some(source) if source != message.source || source != SoftInterruptSource::User => {
                     flush_group(
                         self,
                         &mut injected,
                         source,
                         &mut current_parts,
                         &mut current_images,
+                        &mut current_ids,
                     );
                     current_source = Some(message.source);
                 }
@@ -405,6 +473,7 @@ impl Agent {
             }
             current_parts.push(message.content);
             current_images.extend(message.images);
+            current_ids.extend(message.client_id);
         }
 
         if let Some(source) = current_source {
@@ -414,6 +483,7 @@ impl Agent {
                 source,
                 &mut current_parts,
                 &mut current_images,
+                &mut current_ids,
             );
         }
 
@@ -487,7 +557,68 @@ impl Agent {
                 display_role: soft_interrupt_protocol_display_role(interrupt.source),
                 point: point.to_string(),
                 tools_skipped: if idx == 0 { tools_skipped } else { None },
+                client_ids: interrupt.client_ids,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod frozen_snapshot_memory_tests {
+    use super::frozen_snapshot_memory_profile;
+
+    #[test]
+    fn frozen_snapshot_memory_counts_schema_json_without_disclosing_schema() {
+        let tools = [crate::message::ToolDefinition::new(
+            "private-tool",
+            "private-description",
+            serde_json::json!({"type": "object", "properties": {"private-key": {"type": "string"}}}),
+        )];
+        let profile = frozen_snapshot_memory_profile(Some(&tools), None, &[]);
+        assert_eq!(profile["locked_tools_count"], 1);
+        assert_eq!(
+            profile["locked_tools_json_bytes"],
+            serde_json::to_vec(&tools).unwrap().len()
+        );
+        assert!(!profile.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn frozen_snapshot_memory_empty_and_absent_values() {
+        let absent = frozen_snapshot_memory_profile(None, None, &[]);
+        assert_eq!(absent["locked_tools_count"], 0);
+        assert_eq!(absent["locked_tools_json_bytes"], 0);
+        assert_eq!(absent["agents_md_snapshot_capacity_bytes"], 0);
+        assert_eq!(absent["prompt_skills_snapshot_count"], 0);
+        assert_eq!(absent["prompt_skills_snapshot_capacity_bytes"], 0);
+        let empty = frozen_snapshot_memory_profile(Some(&[]), None, &[]);
+        assert_eq!(empty["locked_tools_json_bytes"], 2);
+    }
+
+    #[test]
+    fn frozen_snapshot_memory_counts_capacities_without_disclosing_content() {
+        let mut agents_md = String::with_capacity(512);
+        agents_md.push_str("private-project-instructions");
+        let mut name = String::with_capacity(128);
+        name.push_str("private-skill-name");
+        let mut description = String::with_capacity(256);
+        description.push_str("private-skill-description");
+        let expected_capacity = name.capacity() + description.capacity();
+        let skills = [crate::prompt::SkillInfo {
+            name,
+            description,
+            user_invoked_only: false,
+        }];
+        let profile = frozen_snapshot_memory_profile(None, Some(&agents_md), &skills);
+        assert_eq!(
+            profile["agents_md_snapshot_capacity_bytes"],
+            agents_md.capacity()
+        );
+        assert_eq!(
+            profile["prompt_skills_snapshot_capacity_bytes"],
+            expected_capacity
+        );
+        assert_eq!(profile["prompt_skills_snapshot_count"], 1);
+        assert!(!profile.to_string().contains("private-"));
     }
 }

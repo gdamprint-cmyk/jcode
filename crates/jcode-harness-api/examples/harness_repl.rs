@@ -12,11 +12,14 @@
 //! exercise the client against an in-process scripted server:
 //!   cargo run -p jcode-harness-api --example harness_repl -- --demo
 
+#[cfg(unix)]
 use jcode_harness_api::{
     API_VERSION_MAJOR, ApiEvent, ApiRequest, HarnessClient, ServerFrame, write_frame,
 };
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 
+#[cfg(unix)]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--demo") {
@@ -34,11 +37,18 @@ fn main() {
     run_session(HarnessClient::new(reader, stream), &message);
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("harness_repl requires a Unix socket; not supported on this platform");
+}
+
+#[cfg(unix)]
 fn default_socket_path() -> String {
     let home = std::env::var("HOME").expect("HOME not set");
     format!("{home}/.jcode/jcode-api.sock")
 }
 
+#[cfg(unix)]
 fn run_session<R: BufRead, W: Write>(mut client: HarnessClient<R, W>, message: &str) {
     let hello = client.hello("harness_repl/0.1").expect("handshake");
     print_event(&hello);
@@ -70,7 +80,7 @@ fn run_session<R: BufRead, W: Write>(mut client: HarnessClient<R, W>, message: &
     loop {
         let frame = client.recv().expect("recv");
         print_event(&frame);
-        if matches!(&frame.event, ApiEvent::TurnDone { session_id: s } if *s == session_id) {
+        if matches!(&frame.event, ApiEvent::TurnDone { session_id: s, .. } if *s == session_id) {
             break;
         }
         if matches!(frame.event, ApiEvent::Error { .. }) {
@@ -79,6 +89,7 @@ fn run_session<R: BufRead, W: Write>(mut client: HarnessClient<R, W>, message: &
     }
 }
 
+#[cfg(unix)]
 fn print_event(frame: &ServerFrame) {
     match &frame.event {
         ApiEvent::TextDelta { text, .. } => {
@@ -92,6 +103,7 @@ fn print_event(frame: &ServerFrame) {
 
 /// Scripted in-process server so the client flow can be exercised before the
 /// real server adapter exists.
+#[cfg(unix)]
 fn run_demo() {
     let (client_stream, server_stream) =
         std::os::unix::net::UnixStream::pair().expect("socketpair");
@@ -121,6 +133,7 @@ fn run_demo() {
                     ApiEvent::Attached {
                         session: jcode_harness_api::SessionInfo {
                             edit_stats: None,
+                            user_connected: false,
                             parent_session_id: None,
                             agent_label: None,
                             swarm_status: None,
@@ -148,6 +161,7 @@ fn run_demo() {
                     }
                     reply(&ServerFrame::event(ApiEvent::TurnDone {
                         session_id: "demo-1".into(),
+                        pending_soft_interrupts: None,
                     }));
                     return;
                 }

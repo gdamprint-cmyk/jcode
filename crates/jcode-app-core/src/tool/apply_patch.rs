@@ -2,6 +2,7 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::bus::{Bus, BusEvent, FileOp, FileTouch};
 use anyhow::Result;
 use async_trait::async_trait;
+use jcode_core::eol::{LineEnding, normalize_line_endings, resolve_line_ending};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
@@ -147,21 +148,26 @@ impl Tool for ApplyPatchTool {
                     }
                     let existed = resolved.exists();
                     let old = tokio::fs::read_to_string(&resolved).await.ok();
-                    tokio::fs::write(&resolved, contents).await?;
+                    let contents = normalize_line_endings(
+                        contents,
+                        resolve_line_ending(&resolved, old.as_deref()),
+                    );
+                    tokio::fs::write(&resolved, &contents).await?;
                     super::edit_stats::record(
                         &ctx,
                         old.as_deref().unwrap_or(""),
-                        contents,
+                        &contents,
                         existed && old.is_none(),
                     )
                     .await;
-                    let diff = generate_diff_summary("", contents);
+                    let diff = generate_diff_summary("", &contents);
                     publish_file_touch(
                         &ctx,
                         &resolved,
                         path,
                         "created",
                         &diff,
+                        super::edit_stats::line_delta(old.as_deref().unwrap_or(""), &contents),
                         params.intent.as_deref(),
                     );
                     touched_paths.push(path.clone());
@@ -199,6 +205,7 @@ impl Tool for ApplyPatchTool {
                             path,
                             "deleted",
                             &diff,
+                            super::edit_stats::line_delta(old_contents, ""),
                             params.intent.as_deref(),
                         );
                         touched_paths.push(path.clone());
@@ -220,6 +227,7 @@ impl Tool for ApplyPatchTool {
                     match apply_update_chunks(&resolved, chunks).await {
                         Ok((old_contents, new_contents)) => {
                             let diff = generate_diff_summary(&old_contents, &new_contents);
+                            let delta = super::edit_stats::line_delta(&old_contents, &new_contents);
                             if let Some(dest) = move_to {
                                 let dest_resolved = ctx.resolve_path(Path::new(dest));
                                 if let Some(parent) = dest_resolved.parent() {
@@ -227,7 +235,13 @@ impl Tool for ApplyPatchTool {
                                 }
                                 let dest_existed = dest_resolved.exists();
                                 let dest_old = tokio::fs::read_to_string(&dest_resolved).await.ok();
-                                tokio::fs::write(&dest_resolved, &new_contents).await?;
+                                // The destination keeps ITS OWN ending: a move must not
+                                // impose the source file's line endings on the target.
+                                let dest_contents = normalize_line_endings(
+                                    &new_contents,
+                                    resolve_line_ending(&dest_resolved, dest_old.as_deref()),
+                                );
+                                tokio::fs::write(&dest_resolved, &dest_contents).await?;
                                 if tokio::fs::remove_file(&resolved).await.is_ok() {
                                     super::edit_stats::record(
                                         &ctx,
@@ -260,6 +274,7 @@ impl Tool for ApplyPatchTool {
                                     path,
                                     "modified",
                                     &diff,
+                                    delta,
                                     params.intent.as_deref(),
                                 );
                                 publish_file_touch(
@@ -268,6 +283,7 @@ impl Tool for ApplyPatchTool {
                                     dest,
                                     "modified",
                                     &diff,
+                                    delta,
                                     params.intent.as_deref(),
                                 );
                                 touched_paths.push(path.clone());
@@ -303,6 +319,7 @@ impl Tool for ApplyPatchTool {
                                     path,
                                     "modified",
                                     &diff,
+                                    delta,
                                     params.intent.as_deref(),
                                 );
                                 touched_paths.push(path.clone());
@@ -411,6 +428,7 @@ fn publish_file_touch(
     display_path: &str,
     verb: &str,
     diff: &str,
+    (added, removed): (u64, u64),
     intent: Option<&str>,
 ) {
     let detail = build_file_touch_preview(diff);
@@ -424,6 +442,8 @@ fn publish_file_touch(
             .map(str::to_string),
         summary: Some(format!("{} via apply_patch", verb)),
         detail,
+        added,
+        removed,
     }));
     let _ = display_path;
 }
@@ -458,7 +478,12 @@ fn build_file_touch_preview(diff: &str) -> Option<String> {
 
 async fn apply_update_chunks(path: &Path, chunks: &[UpdateFileChunk]) -> Result<(String, String)> {
     let original_contents = tokio::fs::read_to_string(path).await?;
-    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
+    // The model emits LF while the file on disk may be CRLF. Work in one
+    // line-ending space so the chunk lines match, then write the file back in
+    // the ending it already had.
+    let ending = resolve_line_ending(path, Some(&original_contents));
+    let unified = normalize_line_endings(&original_contents, LineEnding::Lf);
+    let mut original_lines: Vec<String> = unified.split('\n').map(String::from).collect();
 
     if original_lines.last().is_some_and(String::is_empty) {
         original_lines.pop();
@@ -470,7 +495,8 @@ async fn apply_update_chunks(path: &Path, chunks: &[UpdateFileChunk]) -> Result<
     if !new_lines.last().is_some_and(String::is_empty) {
         new_lines.push(String::new());
     }
-    Ok((original_contents, new_lines.join("\n")))
+    let new_contents = normalize_line_endings(&new_lines.join("\n"), ending);
+    Ok((original_contents, new_contents))
 }
 
 /// Generate a compact diff with line numbers (max 30 lines).

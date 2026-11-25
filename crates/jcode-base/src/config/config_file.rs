@@ -1,8 +1,27 @@
 use super::*;
 use crate::storage::jcode_dir;
+use jcode_core::eol::{normalize_line_endings, resolve_line_ending};
 use std::path::PathBuf;
 
+type TrustedExternalAuthKey = (
+    Option<PathBuf>,
+    Option<std::time::SystemTime>,
+    Option<u64>,
+    Option<String>,
+);
+type TrustedExternalAuthLists = std::sync::Arc<(Vec<String>, Vec<String>)>;
+static TRUSTED_EXTERNAL_AUTH_MEMO: std::sync::Mutex<
+    Option<(TrustedExternalAuthKey, TrustedExternalAuthLists)>,
+> = std::sync::Mutex::new(None);
+
 impl Config {
+    /// Persist only the update preference, without baking in environment overrides.
+    pub fn set_update_channel(channel: UpdateChannel) -> anyhow::Result<()> {
+        let mut config = Self::load_for_update()?;
+        config.features.update_channel = channel;
+        config.save()
+    }
+
     /// Get the config file path
     pub fn path() -> Option<PathBuf> {
         jcode_dir().ok().map(|d| d.join("config.toml"))
@@ -76,6 +95,9 @@ impl Config {
         }
 
         let content = toml::to_string_pretty(self)?;
+        let existing = std::fs::read_to_string(&path).ok();
+        let content =
+            normalize_line_endings(&content, resolve_line_ending(&path, existing.as_deref()));
         std::fs::write(&path, content)?;
         Self::invalidate_cache();
         Ok(())
@@ -83,7 +105,30 @@ impl Config {
 
     /// Mark the process-cached config as stale and notify dependent caches.
     pub fn invalidate_cache() {
+        // Also drop the trust-list memo: its mtime key can miss two same-length
+        // saves inside one filesystem timestamp tick.
+        if let Ok(mut guard) = TRUSTED_EXTERNAL_AUTH_MEMO.lock() {
+            *guard = None;
+        }
         super::invalidate_config_cache();
+    }
+
+    /// Persist a worker-model default (`/agents global`). None clears it.
+    pub fn set_agent_model_default(target: &str, model: Option<&str>) -> anyhow::Result<()> {
+        let value = model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let mut cfg = Self::load_for_update()?;
+        match target {
+            "swarm" => cfg.agents.swarm_model = value,
+            "review" => cfg.autoreview.model = value,
+            "judge" => cfg.autojudge.model = value,
+            "memory" => cfg.agents.memory_model = value,
+            "ambient" => cfg.ambient.model = value,
+            other => anyhow::bail!("Unknown agent model target: {other}"),
+        }
+        cfg.save()
     }
 
     /// Persist the Anthropic cache duration for clients and the shared daemon.
@@ -118,6 +163,13 @@ impl Config {
             model.unwrap_or("(none)"),
             provider.unwrap_or("(auto)")
         ));
+        // The first auto-switch account is the default, so the order follows
+        // whichever path changed it. A failure here must not undo the save.
+        if let Some(route) = provider
+            && let Err(error) = crate::auth::account_pool::sync_order_with_default_route(route)
+        {
+            crate::logging::error(&format!("Could not sync account order: {error}"));
+        }
         Ok(())
     }
 
@@ -231,6 +283,18 @@ impl Config {
         crate::logging::info(&format!(
             "Saved display.show_agentgrep_output to config: {}",
             show
+        ));
+        Ok(())
+    }
+
+    /// Update the persisted LaTeX rendering mode.
+    pub fn set_latex_rendering(mode: LatexRenderingMode) -> anyhow::Result<()> {
+        let mut cfg = Self::load_for_update()?;
+        cfg.display.latex_rendering = mode;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.latex_rendering to config: {}",
+            mode.as_str()
         ));
         Ok(())
     }
@@ -449,6 +513,10 @@ impl Config {
         if content.ends_with('\n') {
             new_content.push('\n');
         }
+        // `lines()` dropped the original terminators, so re-apply the file's own
+        // ending instead of rewriting a CRLF config as LF.
+        let new_content =
+            normalize_line_endings(&new_content, resolve_line_ending(&path, Some(&content)));
         match std::fs::write(&path, new_content) {
             Ok(()) => {
                 Self::invalidate_cache();
@@ -534,6 +602,10 @@ impl Config {
         if content.ends_with('\n') {
             new_content.push('\n');
         }
+        // `lines()` dropped the original terminators, so re-apply the file's own
+        // ending instead of rewriting a CRLF config as LF.
+        let new_content =
+            normalize_line_endings(&new_content, resolve_line_ending(&path, Some(&content)));
         match std::fs::write(&path, new_content) {
             Ok(()) => {
                 Self::invalidate_cache();
@@ -578,9 +650,8 @@ impl Config {
             return false;
         }
 
-        let cfg = Self::load();
-        cfg.auth
-            .trusted_external_sources
+        Self::trusted_external_auth_lists()
+            .0
             .iter()
             .any(|value| value.trim().eq_ignore_ascii_case(&source_id))
     }
@@ -590,11 +661,45 @@ impl Config {
             return false;
         };
 
-        let cfg = Self::load();
-        cfg.auth
-            .trusted_external_source_paths
+        Self::trusted_external_auth_lists()
+            .1
             .iter()
             .any(|value| value.trim().eq_ignore_ascii_case(&entry))
+    }
+
+    /// Fresh `(trusted_external_sources, trusted_external_source_paths)`.
+    ///
+    /// Trust checks must observe a just-saved decision immediately, so they
+    /// cannot use the throttled [`config()`] snapshot. Re-parsing config.toml
+    /// on every call was the alternative, and a single auth probe makes a dozen
+    /// of these checks (~0.5ms of TOML parsing each, on the TUI's first frame).
+    /// Memoize the two lists keyed on everything that can change them: the
+    /// config path, the file's mtime and length, and the env override.
+    fn trusted_external_auth_lists() -> TrustedExternalAuthLists {
+        let path = Self::path();
+        let metadata = path.as_ref().and_then(|path| std::fs::metadata(path).ok());
+        let key: TrustedExternalAuthKey = (
+            path,
+            metadata.as_ref().and_then(|meta| meta.modified().ok()),
+            metadata.as_ref().map(std::fs::Metadata::len),
+            std::env::var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES").ok(),
+        );
+        if let Ok(guard) = TRUSTED_EXTERNAL_AUTH_MEMO.lock()
+            && let Some((cached_key, lists)) = guard.as_ref()
+            && *cached_key == key
+        {
+            return lists.clone();
+        }
+
+        let cfg = Self::load();
+        let lists = std::sync::Arc::new((
+            cfg.auth.trusted_external_sources,
+            cfg.auth.trusted_external_source_paths,
+        ));
+        if let Ok(mut guard) = TRUSTED_EXTERNAL_AUTH_MEMO.lock() {
+            *guard = Some((key, lists.clone()));
+        }
+        lists
     }
 
     /// Startup-sensitive variant that uses the process-cached config snapshot.
@@ -619,11 +724,11 @@ impl Config {
 
         // The global config snapshot can be initialized before an auth flow saves
         // a new path-bound trust decision, or before tests switch JCODE_HOME. Fall
-        // back to a fresh load on cache misses so fast auth probes remain correct
-        // without penalizing the common already-trusted path.
-        Self::load()
-            .auth
-            .trusted_external_source_paths
+        // back to a fresh read on cache misses so fast auth probes remain correct
+        // without penalizing the common already-trusted path. The memo re-stats
+        // config.toml, so it is as fresh as a full reload.
+        Self::trusted_external_auth_lists()
+            .1
             .iter()
             .any(|value| value.trim().eq_ignore_ascii_case(&entry))
     }
@@ -749,6 +854,31 @@ mod issue_1056_tests {
     }
 
     #[test]
+    fn update_channel_save_is_persistent_and_preserves_unrelated_preferences() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path());
+        let _channel = EnvGuard::set("JCODE_UPDATE_CHANNEL", "main");
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[features]\nmemory = false\n[display]\ncentered = true\n",
+        )
+        .unwrap();
+        Config::set_update_channel(super::UpdateChannel::Preview).unwrap();
+        let saved: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.features.update_channel, super::UpdateChannel::Preview);
+        assert!(!saved.features.memory);
+        assert!(saved.display.centered);
+        Config::set_update_channel(super::UpdateChannel::Stable).unwrap();
+        let saved: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.features.update_channel, super::UpdateChannel::Stable);
+        std::fs::write(&path, "[broken").unwrap();
+        assert!(Config::set_update_channel(super::UpdateChannel::Preview).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[broken");
+    }
+
+    #[test]
     fn effort_update_preserves_profile_with_capitalized_bearer_auth() {
         let _lock = crate::storage::lock_test_env();
         let home = tempfile::tempdir().unwrap();
@@ -802,5 +932,41 @@ reasoning_effort = "max"
 
         assert!(error.to_string().contains("Failed to parse config file"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn saving_a_crlf_config_keeps_its_crlf_ending() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path());
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[features]\r\nmemory = false\r\n[display]\r\ncentered = true\r\n",
+        )
+        .unwrap();
+
+        Config::set_update_channel(super::UpdateChannel::Preview).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.replace("\r\n", "").contains('\n'),
+            "saving a CRLF config must keep CRLF, got {saved:?}"
+        );
+        assert!(saved.contains("\r\n"));
+    }
+
+    #[test]
+    fn saving_an_lf_config_keeps_its_lf_ending() {
+        let _lock = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("JCODE_HOME", home.path());
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[features]\nmemory = false\n").unwrap();
+
+        Config::set_update_channel(super::UpdateChannel::Preview).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains('\r'), "saving an LF config must keep LF");
     }
 }

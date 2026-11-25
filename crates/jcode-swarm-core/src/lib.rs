@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub const MAX_SWARM_COMPLETION_REPORT_CHARS: usize = 4000;
-pub const SWARM_COMPLETION_REPORT_MARKER: &str = "SWARM COMPLETION REPORT REQUIRED";
+/// Approximate recent-output budget, using the shared four-bytes-per-token heuristic.
+pub const SWARM_OUTPUT_TAIL_TOKENS: usize = 1000;
 
-/// Message/report bodies longer than this require a sender-provided `tldr`
-/// so receiving UIs can render them collapsed to one line with an expand
-/// control instead of dumping the full body into the transcript.
+/// Message/report bodies longer than this get a derived preview when the sender
+/// omits `tldr`, so receiving UIs can still collapse them with an expand control.
 pub const SWARM_TLDR_REQUIRED_OVER_CHARS: usize = 240;
 
 /// Recommended upper bound for a sender-provided `tldr`, not a hard limit.
@@ -19,13 +19,13 @@ pub const MAX_SWARM_TLDR_CHARS: usize = 200;
 /// Validate a sender-provided `tldr` against the message body it summarizes.
 ///
 /// Returns the normalized (trimmed, whitespace-collapsed) tldr when present,
-/// `Ok(None)` when the body is short enough to not need one, and a
-/// human/model-actionable error when a long body is missing a tldr.
-/// Overlong summaries are preserved rather than rejecting the message.
+/// `Ok(None)` when the body is short enough to not need one, and a derived
+/// preview when a long body is missing a tldr. Missing or overlong summaries
+/// must never block delivery. The result signature is retained for compatibility.
 pub fn validate_swarm_tldr(
     tldr: Option<&str>,
     body: &str,
-    context: &str,
+    _context: &str,
 ) -> Result<Option<String>, String> {
     let normalized = tldr
         .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -37,12 +37,8 @@ pub fn validate_swarm_tldr(
 
     let body_chars = body.chars().count();
     if body_chars > SWARM_TLDR_REQUIRED_OVER_CHARS {
-        return Err(format!(
-            "'tldr' is required for {context} because the body is {body_chars} chars \
-             (over {SWARM_TLDR_REQUIRED_OVER_CHARS}). Add a one-line 'tldr' (under \
-             {MAX_SWARM_TLDR_CHARS} chars) summarizing it; recipients see the tldr \
-             collapsed with an expand control."
-        ));
+        let preview = truncate_detail(body, MAX_SWARM_TLDR_CHARS);
+        return Ok((!preview.is_empty()).then_some(preview));
     }
 
     Ok(None)
@@ -345,150 +341,47 @@ impl ChannelIndex {
     }
 }
 
-pub fn append_swarm_completion_report_instructions(message: &str) -> String {
-    if message.contains(SWARM_COMPLETION_REPORT_MARKER) {
-        return message.to_string();
+/// Keep the newest output, not the beginning, within an approximate token budget.
+/// Chunks are assistant-visible output in chronological order, excluding reasoning
+/// and tool results. UTF-8 boundaries are preserved even with a one-token budget.
+pub fn recent_output_tail<'a>(
+    chunks: impl DoubleEndedIterator<Item = &'a str>,
+    max_tokens: usize,
+) -> Option<String> {
+    let mut remaining = max_tokens.saturating_mul(4);
+    let mut parts = Vec::new();
+    for chunk in chunks
+        .rev()
+        .map(str::trim)
+        .filter(|chunk| !chunk.is_empty())
+    {
+        if remaining == 0 {
+            break;
+        }
+        if !parts.is_empty() {
+            if remaining <= 2 {
+                break;
+            }
+            remaining -= 2;
+        }
+        let mut start = chunk.len().saturating_sub(remaining);
+        while !chunk.is_char_boundary(start) {
+            start += 1;
+        }
+        let tail = &chunk[start..];
+        if tail.is_empty() {
+            break;
+        }
+        remaining = remaining.saturating_sub(tail.len());
+        parts.push(tail);
+        if start > 0 {
+            break;
+        }
     }
-
-    let mut out = message.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str("<system-reminder>\n");
-    out.push_str(SWARM_COMPLETION_REPORT_MARKER);
-    out.push_str(
-        "\nBefore finishing, call the swarm tool with action=\"report\" to submit your completion report. \
-Include a concise message, validation/tests performed, and blockers or follow-ups. \
-After the report tool succeeds, also write a brief final assistant response. \
-Do not finish with only tool output, a lifecycle status change, or no final response. \
-Do not send a separate DM for the final report unless you need interactive coordination before finishing.\n",
-    );
-    out.push_str("</system-reminder>");
-    out
-}
-
-/// Idempotency marker for [`append_deep_node_instructions`].
-pub const SWARM_DEEP_NODE_MARKER: &str = "DEEP TASK GRAPH NODE";
-
-/// Append the deep-mode execution contract to a task-graph node assignment.
-///
-/// Deep mode's comprehensiveness is structural: it only materializes when every
-/// worker knows it can decompose its node into parallel children and must close
-/// its node with a typed artifact. A freshly spawned worker has none of that
-/// context (the seeding session's `swarm-deep` directive is not inherited), so
-/// without this the budget goes unused: workers grind through nodes serially
-/// and auto-complete without artifacts, silently downgrading deep mode to
-/// light. This directive travels with the assignment itself, so it reaches
-/// every worker at any spawn depth. Idempotent via [`SWARM_DEEP_NODE_MARKER`].
-pub fn append_deep_node_instructions(message: &str, node_id: &str) -> String {
-    if message.contains(SWARM_DEEP_NODE_MARKER) {
-        return message.to_string();
-    }
-
-    let explicitly_non_expandable = message
-        .to_ascii_lowercase()
-        .contains("do not expand this node");
-
-    let mut out = message.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str("<system-reminder>\n");
-    out.push_str(SWARM_DEEP_NODE_MARKER);
-    if explicitly_non_expandable {
-        out.push_str(&format!(
-            "\nYou are executing node '{node_id}' of a deep task graph. The planner explicitly marked this node as bounded and non-expandable. Do NOT call expand_node, even if the node contains multiple concerns. Execute the assigned scope atomically, then call the swarm tool with action=\"complete_node\", node_id=\"{node_id}\", and a typed artifact containing findings, evidence (file:line refs), validation, open_questions, a REQUIRED confidence (low, medium, or high), and an honest what_i_did_not_check list. A turn that ends without complete_node gets re-queued and may fail.\n"
-        ));
-        out.push_str("</system-reminder>");
-        return out;
-    }
-    out.push_str(&format!(
-        "\nYou are executing node '{node_id}' of a deep task graph with a configurable parallel agent \
-budget (32 live workers by default, with a hard maximum of {MAX_SWARM_MEMBERS}; use available \
-parallelism deliberately, but do not spawn redundant agents). \
-Choose one of exactly two finishes for this node:\n\
-1. Decompose for parallelism: if this node contains more than one independently checkable \
-concern, do NOT work through it serially. Call the swarm tool with action=\"expand_node\", \
-node_id=\"{node_id}\", and MANY independent children (add depends_on edges only for real data \
-dependencies, so the ready set stays wide). Then finish your turn; the children fan out to \
-parallel agents and you will be re-woken to synthesize their results.\n\
-2. Execute atomically: do the work, then call the swarm tool with action=\"complete_node\", \
-node_id=\"{node_id}\", and a typed artifact: findings, evidence (file:line refs), validation, \
-open_questions, a REQUIRED confidence (low, medium, or high; report low honestly, it routes \
-follow-up work to shore up your scope instead of counting against you), and an honest \
-what_i_did_not_check (the critique gate turns those into new nodes, so listing them is how \
-coverage grows).\n\
-These are the ONLY two ways this node can close: a turn that ends without expand_node or \
-complete_node gets the node re-queued to a fresh agent, and a repeat fails it.\n"
-    ));
-    out.push_str("</system-reminder>");
-    out
-}
-
-/// Append the deep-mode gate contract to a critique/verify gate assignment.
-///
-/// Gates are the adversarial half of deep mode: they exist to spend budget on
-/// gaps. A gate that just rubber-stamps its parent wastes the swarm's capacity,
-/// so the directive names the two legal finishes (`inject_gap` with new nodes,
-/// or `complete_node` when genuinely clean) and reminds the gate to mine the
-/// children's `what_i_did_not_check` lists. `audited_ids` is the gate's audit
-/// scope: the server rejects a pass whose artifact does not account for each of
-/// these ids by name (enumerated accounting is what separates an audit from a
-/// rubber stamp), so the directive lists them up front. `low_confidence_siblings`
-/// are completed scope nodes whose artifacts self-reported low confidence: the
-/// strictest debts, named as priority probe targets. Shares the idempotency
-/// marker with [`append_deep_node_instructions`] since a single assignment gets
-/// exactly one deep directive.
-pub fn append_deep_gate_instructions(
-    message: &str,
-    gate_id: &str,
-    audited_ids: &[String],
-    low_confidence_siblings: &[String],
-) -> String {
-    if message.contains(SWARM_DEEP_NODE_MARKER) {
-        return message.to_string();
-    }
-
-    let mut out = message.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str("<system-reminder>\n");
-    out.push_str(SWARM_DEEP_NODE_MARKER);
-    out.push_str(&format!(
-        "\nYou are executing critique/verify gate '{gate_id}' of a deep task graph. Your job is \
-to find gaps, not to pass work through. Read every audited artifact, especially each \
-what_i_did_not_check list, and probe them. Finish in one of exactly two ways:\n\
-1. Gaps or failures found: call the swarm tool with action=\"inject_gap\", \
-gate_id=\"{gate_id}\", and one new node per gap (they run in parallel and you re-run \
-afterwards). The parent cannot close until they drain, so be thorough now. Injecting nodes \
-is SUCCESS for a gate, not failure: a growing graph is the system working.\n\
-2. Genuinely clean: call the swarm tool with action=\"complete_node\", node_id=\"{gate_id}\", \
-and an artifact whose findings account for EVERY node you audited BY ID with what you \
-checked and why no gaps remain. The server rejects a pass whose findings/open_questions \
-do not name each audited node id.\n"
-    ));
-    if !audited_ids.is_empty() {
-        out.push_str(&format!(
-            "AUDIT SCOPE: you are auditing node(s) [{}]. A passing artifact must address each \
-of these ids explicitly.\n",
-            audited_ids.join(", ")
-        ));
-    }
-    if !low_confidence_siblings.is_empty() {
-        out.push_str(&format!(
-            "PRIORITY: sibling node(s) [{}] completed with LOW confidence. The server will \
-REJECT your pass unless you either inject follow-up nodes that shore up that work, or name \
-each of those ids in your artifact findings with why the low confidence is acceptable. \
-Injecting follow-ups adds breadth but does not erase the record: when you re-run after they \
-drain, your passing artifact must STILL name each low-confidence id (e.g. 'X was shored up \
-by Y').\n",
-            low_confidence_siblings.join(", ")
-        ));
-    }
-    out.push_str("Do not pass the gate without doing one of these.\n");
-    out.push_str("</system-reminder>");
-    out
+    parts.reverse();
+    let output = parts.join("\n\n");
+    let output = output.trim();
+    (!output.is_empty()).then(|| output.to_string())
 }
 
 pub fn format_structured_completion_report(
@@ -525,11 +418,10 @@ pub fn normalize_completion_report(report: Option<String>) -> Option<String> {
         return Some(report);
     }
 
-    let suffix = "\n\n[Report truncated by jcode before delivery.]";
-    let keep_chars = MAX_SWARM_COMPLETION_REPORT_CHARS.saturating_sub(suffix.chars().count());
-    let mut truncated: String = report.chars().take(keep_chars).collect();
-    truncated.push_str(suffix);
-    Some(truncated)
+    let prefix = "[Earlier response text truncated by jcode.]\n\n";
+    let keep_chars = MAX_SWARM_COMPLETION_REPORT_CHARS.saturating_sub(prefix.chars().count());
+    let tail: String = report.chars().skip(char_count - keep_chars).collect();
+    Some(format!("{prefix}{tail}"))
 }
 
 fn completion_status_intro(name: &str, status: &str) -> String {
@@ -542,39 +434,36 @@ fn completion_status_intro(name: &str, status: &str) -> String {
     }
 }
 
-fn completion_followup(status: &str, has_report: bool) -> &'static str {
-    match (status, has_report) {
-        ("ready", true) => {
-            "Use assign_task to give them more work, stop to remove them, or summary/read_context for full context."
-        }
-        ("ready", false) => {
-            "Use summary/read_context to inspect results, assign_task for more work, or stop to remove them."
-        }
-        ("failed", true) => {
-            "Use summary/read_context for full context, retry with guidance, or stop to remove them."
-        }
-        ("failed", false) => {
-            "Use summary/read_context to inspect results, assign_task to retry with guidance, or stop to remove them."
-        }
-        ("stopped", _) => "Use summary/read_context to inspect results or stop to remove them.",
-        ("crashed", _) => {
-            "Any swarm task assignments they held are requeued automatically where possible. \
-             Check plan_status, and spawn a replacement or use retry/assign_task if work remains."
-        }
-        (_, true) => {
-            "Use assign_task to give them new work, stop to remove them, or summary/read_context for full context."
-        }
-        (_, false) => "Use assign_task to give them new work, or stop to remove them.",
-    }
+pub fn completion_notification_message(name: &str, status: &str, report: Option<&str>) -> String {
+    completion_notification_with_lane_plan(name, status, report, None)
 }
 
-pub fn completion_notification_message(name: &str, status: &str, report: Option<&str>) -> String {
+/// Completion handoff: authoritative lane progress first, final public response
+/// second. Runtime readiness does not imply that the lane's tasks are complete.
+pub fn completion_notification_with_lane_plan(
+    name: &str,
+    status: &str,
+    report: Option<&str>,
+    lane_plan: Option<&str>,
+) -> String {
     let intro = completion_status_intro(name, status);
-    let followup = completion_followup(status, report.is_some());
-    match report {
-        Some(report) => format!("{intro}\n\nReport:\n{report}\n\n{followup}"),
-        None => format!("{intro}\n\nNo final textual report was produced. {followup}"),
+    let plan = lane_plan.map(str::trim).filter(|plan| !plan.is_empty());
+    let response = normalize_completion_report(report.map(str::to_string));
+    let mut message = intro;
+    if let Some(plan) = plan {
+        message.push_str("\n\nLane plan:\n");
+        // The lane counts already convey completed work. Keep task names only
+        // when there is no result report, and always retain unfinished tasks.
+        let compact = plan
+            .lines()
+            .filter(|line| response.is_none() || !line.trim_start().starts_with("- [completed] "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        message.push_str(&compact);
     }
+    message.push_str("\n\nFinal response:\n");
+    message.push_str(response.as_deref().unwrap_or("No report captured."));
+    message
 }
 
 pub fn truncate_detail(text: &str, max_len: usize) -> String {
@@ -635,11 +524,41 @@ mod tests {
     }
 
     #[test]
-    fn validate_swarm_tldr_requires_tldr_for_long_body() {
-        let body = "x".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS + 1);
-        let err = validate_swarm_tldr(None, &body, "this DM").unwrap_err();
-        assert!(err.contains("'tldr' is required"), "{err}");
-        assert!(err.contains("this DM"), "{err}");
+    fn validate_swarm_tldr_derives_preview_for_long_body() {
+        for length in [241, 244, 4000] {
+            let body = "界".repeat(length);
+            for context in [
+                "this DM",
+                "this message",
+                "this broadcast",
+                "this channel message",
+                "this report",
+            ] {
+                let preview = validate_swarm_tldr(None, &body, context).unwrap().unwrap();
+                assert_eq!(
+                    preview,
+                    format!("{}...", "界".repeat(MAX_SWARM_TLDR_CHARS - 3))
+                );
+                assert_eq!(body.chars().count(), length);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_swarm_tldr_fallback_collapses_whitespace() {
+        let body = format!("  hello\n\tworld{}", " ".repeat(240));
+        assert_eq!(
+            validate_swarm_tldr(None, &body, "this DM"),
+            Ok(Some("hello world".into()))
+        );
+        assert_eq!(
+            validate_swarm_tldr(None, &" ".repeat(241), "this DM"),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_swarm_tldr(None, &"界".repeat(240), "this DM"),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -677,7 +596,10 @@ mod tests {
     #[test]
     fn validate_swarm_tldr_blank_tldr_counts_as_missing() {
         let body = "x".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS + 1);
-        assert!(validate_swarm_tldr(Some("   "), &body, "this DM").is_err());
+        assert_eq!(
+            validate_swarm_tldr(Some(" \n\t "), &body, "this DM"),
+            validate_swarm_tldr(None, &body, "this DM")
+        );
         assert_eq!(
             validate_swarm_tldr(Some("   "), "short", "this DM"),
             Ok(None)
@@ -695,82 +617,24 @@ mod tests {
     }
 
     #[test]
-    fn append_swarm_completion_report_instructions_is_idempotent() {
-        let prompt = "Do work";
-        let with_instructions = append_swarm_completion_report_instructions(prompt);
-        assert!(with_instructions.contains(SWARM_COMPLETION_REPORT_MARKER));
+    fn output_tail_keeps_newest_chunks_within_token_budget() {
         assert_eq!(
-            append_swarm_completion_report_instructions(&with_instructions),
-            with_instructions
+            recent_output_tail(["old", "new", "last"].into_iter(), 3),
+            Some("d\n\nnew\n\nlast".into())
         );
-    }
-
-    #[test]
-    fn deep_node_instructions_carry_expand_and_artifact_contract() {
-        let out = append_deep_node_instructions("Investigate the parser", "explore.parser");
-        assert!(out.starts_with("Investigate the parser"));
-        assert!(out.contains(SWARM_DEEP_NODE_MARKER));
-        // The two legal finishes must both name the node id explicitly.
-        assert!(out.contains("action=\"expand_node\", node_id=\"explore.parser\""));
-        assert!(out.contains("action=\"complete_node\", node_id=\"explore.parser\""));
-        // The budget is advertised so workers know fan-out is expected.
-        assert!(out.contains(&MAX_SWARM_MEMBERS.to_string()));
-        assert!(out.contains("what_i_did_not_check"));
-        // Idempotent: re-appending (even with a different id) is a no-op.
-        assert_eq!(append_deep_node_instructions(&out, "other"), out);
-    }
-
-    #[test]
-    fn deep_node_instructions_honor_explicit_non_expansion_marker() {
-        let out = append_deep_node_instructions(
-            "Audit the bounded surface. Do not expand this node.",
-            "audit.bounded",
-        );
-
-        assert!(out.contains("bounded and non-expandable"));
-        assert!(out.contains("Do NOT call expand_node"));
-        assert!(!out.contains("action=\"expand_node\""));
-        assert!(out.contains("action=\"complete_node\", node_id=\"audit.bounded\""));
-        assert!(out.contains("what_i_did_not_check"));
-    }
-
-    #[test]
-    fn deep_gate_instructions_carry_inject_gap_contract() {
-        let out = append_deep_gate_instructions("Critique the work", "root::gate", &[], &[]);
-        assert!(out.contains(SWARM_DEEP_NODE_MARKER));
-        assert!(out.contains("action=\"inject_gap\", gate_id=\"root::gate\""));
-        assert!(out.contains("action=\"complete_node\", node_id=\"root::gate\""));
-        assert!(out.contains("what_i_did_not_check"));
-        // No audit scope / low-confidence siblings: no callouts.
-        assert!(!out.contains("AUDIT SCOPE"));
-        assert!(!out.contains("PRIORITY"));
-        // Shares the marker with the node directive: one deep directive per assignment.
         assert_eq!(
-            append_deep_gate_instructions(&out, "root::gate", &[], &[]),
-            out
+            recent_output_tail(["prefix12345678"].into_iter(), 2),
+            Some("12345678".into())
         );
-        assert_eq!(append_deep_node_instructions(&out, "root::gate"), out);
-    }
-
-    #[test]
-    fn deep_gate_instructions_enumerate_audit_scope() {
-        let scope = vec!["root.a".to_string(), "root.b".to_string()];
-        let out = append_deep_gate_instructions("Critique the work", "root::gate", &scope, &[]);
-        assert!(out.contains("AUDIT SCOPE"));
-        assert!(out.contains("root.a, root.b"));
-        // The coverage contract is stated: each id must be addressed.
-        assert!(out.contains("address each"));
-    }
-
-    #[test]
-    fn deep_gate_instructions_name_low_confidence_probe_targets() {
-        let shaky = vec!["root.shaky".to_string(), "root.wobble".to_string()];
-        let out = append_deep_gate_instructions("Critique the work", "root::gate", &shaky, &shaky);
-        assert!(out.contains("PRIORITY"));
-        assert!(out.contains("root.shaky, root.wobble"));
-        assert!(out.contains("LOW confidence"));
-        // The enforcement is explained: pass is rejected unless addressed.
-        assert!(out.contains("REJECT"));
+        assert_eq!(recent_output_tail(["  ", ""].into_iter(), 100), None);
+        assert_eq!(recent_output_tail(["text"].into_iter(), 0), None);
+        for budget in 0..20 {
+            let tail = recent_output_tail(["世界🦊éfin"].into_iter(), budget);
+            if let Some(tail) = tail {
+                assert!(tail.len() <= budget * 4);
+                assert!("世界🦊éfin".ends_with(&tail));
+            }
+        }
     }
 
     #[test]
@@ -786,7 +650,61 @@ mod tests {
             normalized.chars().count(),
             MAX_SWARM_COMPLETION_REPORT_CHARS
         );
-        assert!(normalized.ends_with("[Report truncated by jcode before delivery.]"));
+        assert!(normalized.starts_with("[Earlier response text truncated by jcode.]"));
+        let long = format!(
+            "{}世界🦊 final result",
+            "x".repeat(MAX_SWARM_COMPLETION_REPORT_CHARS)
+        );
+        let normalized = normalize_completion_report(Some(long)).unwrap();
+        assert!(normalized.ends_with("世界🦊 final result"));
+        assert_eq!(
+            normalized.chars().count(),
+            MAX_SWARM_COMPLETION_REPORT_CHARS
+        );
+    }
+
+    #[test]
+    fn completion_handoff_puts_lane_state_before_final_response() {
+        let message = completion_notification_with_lane_plan(
+            "jaguar",
+            "ready",
+            Some("Implemented checks. Live acceptance unverified."),
+            Some(
+                "Phase 1 · security: 1/2 completed\n- [completed] Offline checks\n- [pending] Live acceptance",
+            ),
+        );
+        assert!(message.find("Lane plan:").unwrap() < message.find("Final response:").unwrap());
+        assert!(message.contains("[pending] Live acceptance"));
+        assert!(!message.contains("Recent output"));
+        assert!(!message.contains("Use assign_task"));
+        let empty = completion_notification_message("owl", "failed", None);
+        assert!(!empty.contains("Lane plan:"));
+        assert!(empty.contains("No report captured."));
+        assert!(!message.contains("[completed] Offline checks"));
+
+        let no_report = completion_notification_with_lane_plan(
+            "tulip",
+            "ready",
+            None,
+            Some(
+                "Phase 1 · controlled-compare: 1/1 completed\n- [completed] Implement sealed-image controlled comparison",
+            ),
+        );
+        assert!(no_report.contains("Implement sealed-image controlled comparison"));
+        assert!(no_report.contains("No report captured."));
+        assert!(!no_report.contains("No lane plan available."));
+        let redundant = completion_notification_with_lane_plan(
+            "tulip",
+            "ready",
+            Some("Implemented and tested."),
+            Some(
+                "Phase 1 · controlled-compare: 1/1 completed\n- [completed] Implement sealed-image controlled comparison",
+            ),
+        );
+        assert!(!redundant.contains("Implement sealed-image controlled comparison"));
+        assert!(redundant.contains("controlled-compare: 1/1 completed"));
+        assert!(redundant.contains("Implemented and tested."));
+        assert!(redundant.len() < no_report.len());
     }
 
     #[test]

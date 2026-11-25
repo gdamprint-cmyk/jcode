@@ -78,7 +78,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "wake": {
                 "type": "boolean",
-                "description": "Wake on completion."
+                "description": "Wake on completion. Defaults to true, so a finished background job resumes the session immediately."
             },
             "stall_wake_seconds": {
                 "type": "integer",

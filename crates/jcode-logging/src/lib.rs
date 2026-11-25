@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 static LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
-static TASK_LOG_CONTEXTS: OnceLock<Mutex<HashMap<String, LogContext>>> = OnceLock::new();
+static TASK_LOG_CONTEXTS: OnceLock<Mutex<HashMap<String, TaskLogContext>>> = OnceLock::new();
 static RATE_LIMITS: OnceLock<Mutex<HashMap<String, RateLimitState>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,19 +125,46 @@ fn with_task_context_mut(update: impl FnOnce(&mut LogContext)) -> bool {
 
     let store = TASK_LOG_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut contexts) = store.lock() {
-        let ctx = contexts.entry(task_id).or_default();
-        update(ctx);
+        if contexts.len() >= MAX_TASK_LOG_CONTEXTS && !contexts.contains_key(&task_id) {
+            evict_stale_task_contexts(&mut contexts);
+        }
+        let entry = contexts.entry(task_id).or_insert_with(|| TaskLogContext {
+            context: LogContext::default(),
+            last_used: Instant::now(),
+        });
+        entry.last_used = Instant::now();
+        update(&mut entry.context);
         true
     } else {
         false
     }
 }
 
+/// Per-task log contexts are keyed by tokio task id. Task ids are never
+/// reused and nothing observes task exit, so every finished turn task used to
+/// leave its context behind for the server's lifetime. Bound the map and drop
+/// the least recently used half when it fills.
+const MAX_TASK_LOG_CONTEXTS: usize = 1024;
+
+struct TaskLogContext {
+    context: LogContext,
+    last_used: Instant,
+}
+
+fn evict_stale_task_contexts(contexts: &mut HashMap<String, TaskLogContext>) {
+    let mut ages: Vec<Instant> = contexts.values().map(|entry| entry.last_used).collect();
+    ages.sort_unstable();
+    let cutoff = ages[ages.len() / 2];
+    contexts.retain(|_, entry| entry.last_used > cutoff);
+}
+
 fn task_context_snapshot() -> Option<LogContext> {
     let task_id = current_task_id()?;
     let store = TASK_LOG_CONTEXTS.get()?;
-    let contexts = store.lock().ok()?;
-    contexts.get(&task_id).cloned()
+    let mut contexts = store.lock().ok()?;
+    let entry = contexts.get_mut(&task_id)?;
+    entry.last_used = Instant::now();
+    Some(entry.context.clone())
 }
 
 /// Snapshot the current logging context for diagnostics that need stable,
@@ -177,9 +204,27 @@ fn context_prefix_for(ctx: &LogContext) -> String {
     }
 }
 
+// reference: Microsoft Learn Win32 WriteFile (GetLastError on failure) and CreateFileW
+// (reopen to obtain a fresh handle); ERROR_NOT_READY = 21 "The device is not ready"
+// (System Error Codes 0-499). A handle into a volume that stopped responding stays
+// failed until it is replaced, so the logger reopens instead of dropping lines.
+
 pub struct Logger {
+    /// Today's log file path, kept so a failed handle can be reopened. A file
+    /// handle into a volume that went away (USB disconnect, re-enumeration)
+    /// keeps failing until it is replaced, so the path is what lets us recover.
+    path: PathBuf,
     file: File,
 }
+
+/// How long to wait between reopen attempts after the log file write fails.
+/// The volume may be a USB disk that is spinning up or re-enumerating, so a
+/// short backoff is enough to recover without blocking the logging path for long.
+const LOG_REOPEN_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Upper bound on reopen attempts for one line. Keeps a dead volume from blocking
+/// the caller indefinitely.
+const LOG_REOPEN_ATTEMPTS: u32 = 5;
 
 fn log_dir() -> Option<PathBuf> {
     jcode_storage::logs_dir().ok()
@@ -200,17 +245,55 @@ impl Logger {
             .open(&path)
             .ok()?;
 
-        Some(Self { file })
+        Some(Self { path, file })
+    }
+
+    /// Replace the open handle after a write failed. `None` means the volume is
+    /// still unavailable and this line cannot be delivered.
+    fn reopen(&self) -> Option<File> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok()
     }
 
     fn write(&mut self, level: &str, message: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let ctx = context_prefix();
         let line = format!("[{}] [{}] {}{}\n", timestamp, level, ctx, message);
-        if let Err(err) = self.file.write_all(line.as_bytes()) {
-            eprintln!("jcode logger write failed: {err}");
+        let bytes = line.as_bytes();
+
+        match self.file.write_all(bytes) {
+            Ok(()) => {
+                self.flush();
+                return;
+            }
+            Err(err) => {
+                eprintln!("jcode logger write failed: {err}");
+            }
+        }
+
+        // The failed handle stays failed; reopen and retry the same line.
+        for attempt in 0..LOG_REOPEN_ATTEMPTS {
+            let Some(file) = self.reopen() else {
+                if attempt + 1 < LOG_REOPEN_ATTEMPTS {
+                    std::thread::sleep(LOG_REOPEN_BACKOFF);
+                }
+                continue;
+            };
+            self.file = file;
+            if let Err(err) = self.file.write_all(bytes) {
+                eprintln!("jcode logger reopen-write failed: {err}");
+                continue;
+            }
+            self.flush();
             return;
         }
+        eprintln!("jcode logger dropped line after {LOG_REOPEN_ATTEMPTS} reopen attempts");
+    }
+
+    fn flush(&mut self) {
         if let Err(err) = self.file.flush() {
             eprintln!("jcode logger flush failed: {err}");
         }
@@ -661,6 +744,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn evicting_task_contexts_keeps_most_recent_half() {
+        let base = Instant::now();
+        let mut contexts: HashMap<String, TaskLogContext> = (0..10)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    TaskLogContext {
+                        context: LogContext::default(),
+                        last_used: base + Duration::from_millis(i),
+                    },
+                )
+            })
+            .collect();
+        evict_stale_task_contexts(&mut contexts);
+        assert!(contexts.len() < 10 && !contexts.is_empty());
+        assert!(contexts.contains_key("9"));
+        assert!(!contexts.contains_key("0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_task_contexts_do_not_accumulate() {
+        for i in 0..(MAX_TASK_LOG_CONTEXTS * 3) {
+            tokio::spawn(async move { set_session(&format!("s{i}")) })
+                .await
+                .unwrap();
+        }
+        let len = TASK_LOG_CONTEXTS.get().unwrap().lock().unwrap().len();
+        assert!(len <= MAX_TASK_LOG_CONTEXTS, "{len}");
+    }
+
+    #[test]
     fn auth_log_redacts_secret_like_fields() {
         assert_eq!(redact_auth_field("api_key", "sk-secret"), "<redacted>");
         assert_eq!(
@@ -786,6 +900,51 @@ mod tests {
         assert!(old_memory.exists(), "memory-events jsonl must survive");
         assert!(old_other.exists(), "unrelated files must survive");
         assert!(subdir.is_dir(), "subdirectories must survive");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopen_replaces_a_dead_handle_and_writes_the_line() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-log-reopen-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp log dir");
+        let path = dir.join("jcode-2099-01-01.log");
+
+        // Build a Logger exactly as Logger::new does.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open log file");
+        let mut logger = Logger {
+            path: path.clone(),
+            file,
+        };
+        logger.write("INFO", "before");
+
+        // Simulate the volume fault: the cached handle is now unusable and every
+        // write on it fails, which is what ERROR_NOT_READY (21) looks like from
+        // the logger's point of view. Only a fresh open of the real path can
+        // deliver later lines.
+        let dead = File::open(&path).expect("open read-only handle as dead handle");
+        logger.file = dead; // read-only handle: writes fail
+        logger.write("WARN", "after-reopen");
+
+        let contents = fs::read_to_string(&path).expect("read log file");
+        assert!(contents.contains("before"), "first line must be present");
+        assert!(
+            contents.contains("after-reopen"),
+            "line after reopen must be written: {contents}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

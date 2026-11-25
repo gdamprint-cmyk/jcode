@@ -1,3 +1,9 @@
+#[path = "model_context_commands.rs"]
+mod model_commands;
+pub(super) use model_commands::*;
+#[path = "model_context_fallback_recovery.rs"]
+mod fallback_recovery;
+
 use super::*;
 
 /// Reroute target offered after a provider guardrail/refusal stop. Guardrail
@@ -6,24 +12,27 @@ use super::*;
 const GUARDRAIL_REROUTE_MODEL: &str = "claude-opus-4-8";
 
 impl App {
-    fn format_failover_count(value: usize) -> String {
-        match value {
-            0..=999 => value.to_string(),
-            1_000..=999_999 => format!("{:.1}k", value as f64 / 1_000.0),
-            _ => format!("{:.1}M", value as f64 / 1_000_000.0),
-        }
-    }
-
-    fn format_failover_input_summary(prompt: &crate::provider::ProviderFailoverPrompt) -> String {
-        format!(
-            "about {} input tokens (~{} chars)",
-            Self::format_failover_count(prompt.estimated_input_tokens),
-            Self::format_failover_count(prompt.estimated_input_chars),
-        )
-    }
-
-    fn failover_config_hint() -> &'static str {
-        "To turn this off, set [provider].cross_provider_failover = \"manual\" in ~/.jcode/config.toml or export JCODE_CROSS_PROVIDER_FAILOVER=manual."
+    /// Keep the actionable cause visible without dumping nested transport errors
+    /// or repeated request/configuration advice into the transcript.
+    pub(super) fn compact_provider_failure(reason: &str) -> String {
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        let compact = reason.find('{').and_then(|start| {
+            let mut values = serde_json::Deserializer::from_str(&reason[start..])
+                .into_iter::<serde_json::Value>();
+            let value = match values.next()? {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::logging::debug(&format!("Provider failure body is not JSON: {error}"));
+                    return None;
+                }
+            };
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(serde_json::Value::as_str)?;
+            Some(format!("{}{}", &reason[..start], message))
+        });
+        crate::util::truncate_str(compact.as_deref().unwrap_or(&reason), 240).to_string()
     }
 
     /// Shared post-switch bookkeeping for every local model/provider switch
@@ -38,21 +47,41 @@ impl App {
     /// explicit provider prefix like `openrouter:`); for provider-level
     /// switches without a model request, pass the active model name.
     pub(super) fn finalize_model_switch(&mut self, model_request: &str) -> String {
+        self.usage_reset.openai_quota_rejected = false;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.upstream_provider = None;
         self.status_detail = None;
         self.invalidate_model_picker_cache();
         let active_model = self.provider.model();
-        self.update_context_limit_for_model(&active_model);
+        self.update_context_limit_for_model(&active_model, None);
         self.session.provider_key =
             crate::provider::MultiProvider::session_provider_key_after_model_switch(
                 model_request,
                 self.provider.name(),
                 self.session.provider_key.as_deref(),
             );
+        if let Some(label) = self.provider.oauth_account_label() {
+            let method = if self.provider.name().eq_ignore_ascii_case("openai") {
+                "openai-oauth"
+            } else {
+                "claude-oauth"
+            };
+            self.session.route_api_method = Some(format!("{method}@{label}"));
+        } else if self
+            .session
+            .route_api_method
+            .as_deref()
+            .is_some_and(|method| jcode_provider_core::oauth_account_label(method).is_some())
+        {
+            self.session.route_api_method = None;
+        }
         self.session.model = Some(active_model.clone());
-        let _ = self.session.save();
+        if let Err(error) = self.session.save() {
+            self.push_display_message(DisplayMessage::error(format!(
+                "Model switched for this session, but the saved route could not be persisted: {error}"
+            )));
+        }
         active_model
     }
 
@@ -60,22 +89,381 @@ impl App {
         &mut self,
         prompt: &crate::provider::ProviderFailoverPrompt,
     ) -> anyhow::Result<String> {
-        self.provider
-            .switch_active_provider_to(&prompt.to_provider)?;
-        let active_model = self.provider.model();
-        Ok(self.finalize_model_switch(&active_model))
+        // Pool edits during the countdown apply to both ends. Derive the
+        // source from the live provider, never stale prompt/session metadata.
+        let provider = self.provider.name().to_ascii_lowercase();
+        let provider = match provider.as_str() {
+            "anthropic" | "claude" => "claude",
+            "openai" => "openai",
+            "copilot" | "gemini" | "cursor" | "antigravity" | "bedrock" | "openrouter" => {
+                provider.as_str()
+            }
+            _ => anyhow::bail!("Source identity is unknown. Use /model to switch manually."),
+        };
+        let credential = self.provider.active_resolved_credential();
+        let source_key = match (provider, credential) {
+            ("claude" | "openai", Some(jcode_provider_core::ResolvedCredential::Oauth)) => {
+                let label = self.provider.oauth_account_label().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Source account identity is unknown. Use /model to switch manually."
+                    )
+                })?;
+                let exists = if provider == "openai" {
+                    crate::auth::codex::list_accounts()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|account| account.label == label)
+                } else {
+                    crate::auth::claude::list_accounts()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|account| account.label == label)
+                };
+                anyhow::ensure!(
+                    exists,
+                    "Source account no longer exists. Use /model to switch manually."
+                );
+                crate::auth::account_pool::account_key(provider, Some(&label))
+            }
+            ("claude", Some(jcode_provider_core::ResolvedCredential::ApiKey)) => {
+                "anthropic-api".to_string()
+            }
+            ("openai", Some(jcode_provider_core::ResolvedCredential::ApiKey)) => {
+                "openai-api".to_string()
+            }
+            ("claude" | "openai", _) => {
+                anyhow::bail!("Source credential is unknown. Use /model to switch manually.")
+            }
+            _ => provider.to_string(),
+        };
+        let api_key = source_key.ends_with("-api")
+            || credential == Some(jcode_provider_core::ResolvedCredential::ApiKey)
+            || crate::provider_catalog::login_providers()
+                .iter()
+                .any(|login| {
+                    login.id == source_key
+                        && login.auth_kind == crate::provider_catalog::LoginProviderAuthKind::ApiKey
+                });
+        let pool = crate::auth::account_pool::AccountPool::load();
+        anyhow::ensure!(
+            !pool.excluded.contains(&source_key)
+                && pool.is_member(
+                    &source_key,
+                    crate::auth::account_pool::default_member(&source_key, api_key)
+                ),
+            "Source is no longer in the auto-switch pool. Use /model to switch manually."
+        );
+        let route = prompt.target_route.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No pool-approved target route was supplied. Use /model to switch manually."
+            )
+        })?;
+        anyhow::ensure!(
+            crate::provider::MultiProvider::is_failover_route_pool_approved(route),
+            "Target is no longer in the auto-switch pool. Use /model to switch manually."
+        );
+        self.provider.set_model(route)?;
+        Ok(self.finalize_model_switch(route))
+    }
+
+    /// Diagnostic metadata only. Never include prompts, reminders, credentials,
+    /// provider error bodies, or image bytes in recovery event fields.
+    pub(super) fn recovery_log_fields(&self, reason: &str) -> Vec<(&'static str, String)> {
+        let pending = self.rate_limit_pending_message.as_ref();
+        vec![
+            (
+                "auto_resume_enabled",
+                self.auto_poke_incomplete_todos.to_string(),
+            ),
+            (
+                "has_final_response",
+                self.streaming
+                    .response_output
+                    .has_final_response()
+                    .to_string(),
+            ),
+            (
+                "runtime_generation",
+                self.remote_turn_fence
+                    .diagnostic_identity()
+                    .map(|turn| turn.runtime_generation.clone())
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            (
+                "turn_id",
+                self.remote_turn_fence
+                    .diagnostic_identity()
+                    .map(|turn| turn.turn_id.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            (
+                "retry_delay_ms",
+                self.rate_limit_reset
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            ("reason", reason.to_string()),
+            (
+                "session_id",
+                self.remote_session_id
+                    .as_deref()
+                    .unwrap_or(&self.session.id)
+                    .to_string(),
+            ),
+            (
+                "request_id",
+                self.current_message_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            ("pending", pending.is_some().to_string()),
+            (
+                "attempt",
+                pending.map_or(0, |p| p.retry_attempts).to_string(),
+            ),
+            (
+                "auto_retry",
+                pending.is_some_and(|p| p.auto_retry).to_string(),
+            ),
+            (
+                "is_system",
+                pending.is_some_and(|p| p.is_system).to_string(),
+            ),
+            (
+                "image_count",
+                pending.map_or(0, |p| p.images.len()).to_string(),
+            ),
+            (
+                "draft_image_count",
+                self.pending_images
+                    .iter()
+                    .filter(|(_, data)| !data.is_empty())
+                    .count()
+                    .to_string(),
+            ),
+            ("has_draft", (!self.input.is_empty()).to_string()),
+            ("queued_count", self.queued_messages.len().to_string()),
+            (
+                "hidden_queue_count",
+                self.hidden_queued_system_messages.len().to_string(),
+            ),
+            ("processing", self.is_processing.to_string()),
+            (
+                "model_switch_pending",
+                self.remote_model_switch_in_flight.to_string(),
+            ),
+            ("retry_armed", self.rate_limit_reset.is_some().to_string()),
+        ]
+    }
+
+    pub(super) fn log_recovery_event(
+        &self,
+        level: crate::logging::LogLevel,
+        event: &str,
+        reason: &str,
+    ) {
+        crate::logging::event(level, event, self.recovery_log_fields(reason));
+    }
+
+    pub(super) fn restore_failover_payload(&mut self, payload: super::FallbackResendPayload) {
+        self.log_recovery_event(
+            crate::logging::LogLevel::Info,
+            "RECOVERY_DRAFT_RESTORE",
+            "held_payload",
+        );
+        let restored = payload.raw_input.unwrap_or(payload.content);
+        let image_indices: Vec<Option<usize>> = payload
+            .images
+            .into_iter()
+            .map(|image| {
+                if image.0.is_empty() || image.1.is_empty() {
+                    return None;
+                }
+                let index = self
+                    .pending_images
+                    .iter()
+                    .position(|existing| existing == &image)
+                    .unwrap_or_else(|| {
+                        self.pending_images.push(image);
+                        self.pending_images.len() - 1
+                    });
+                Some(index + 1)
+            })
+            .collect();
+        if self.input.is_empty() {
+            // The composer may already have attachment slots. Remap markers
+            // in the recovered prompt once, so swaps and collisions cannot
+            // associate its text with a different image.
+            static IMAGE_MARKER: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"\[image (\d+)\]"));
+            self.input = if let Ok(marker) = &*IMAGE_MARKER {
+                marker
+                    .replace_all(&restored, |captures: &regex::Captures<'_>| {
+                        captures[1]
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|number| number.checked_sub(1))
+                            .and_then(|index| image_indices.get(index).copied().flatten())
+                            .map(|index| format!("[image {index}]"))
+                            .unwrap_or_else(|| captures[0].to_string())
+                    })
+                    .into_owned()
+            } else {
+                restored.clone()
+            };
+            self.cursor_pos = self.input.len();
+        } else if !restored.is_empty() && self.input != restored {
+            // Do not turn a partially typed command or prompt into a different
+            // request. Keep the held request recoverable in the transcript.
+            self.push_display_message(DisplayMessage::system(format!(
+                "Failover request was not resent. Your draft text is preserved. Recover the previous request from here:\n\n{restored}"
+            )));
+        }
+        // Attachment synchronization intentionally drops payloads without a
+        // marker. Keep recovered images attached even for image-only prompts
+        // or when a newer draft was already present.
+        for index in image_indices.into_iter().flatten() {
+            let marker = format!("[image {index}]");
+            if !self.input.contains(&marker) {
+                if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
+                    self.input.push(' ');
+                }
+                self.input.push_str(&marker);
+                self.cursor_pos = self.input.len();
+            }
+        }
     }
 
     pub(super) fn cancel_pending_provider_failover(&mut self, notice: impl Into<String>) {
+        let notice = notice.into();
+        let staged = self.pending_automatic_failover_route.take().is_some();
+        let awaiting_ack = self.pending_automatic_failover_request_id.take().is_some();
+        self.pending_automatic_failover_started = None;
+        if staged || awaiting_ack {
+            self.remote_model_switch_in_flight = false;
+            if let Some(payload) = self.pending_fallback_resend.take() {
+                self.restore_failover_payload(payload);
+            }
+            self.set_status_notice(notice.clone());
+        }
         let Some(pending) = self.pending_provider_failover.take() else {
             return;
         };
+        if !self.is_remote {
+            self.pending_turn = false;
+        }
+        if let Some(payload) = pending.remote_resend {
+            self.restore_failover_payload(payload);
+        }
+        self.remove_failover_countdown_message(&pending.prompt.to_label);
         self.push_display_message(DisplayMessage::system(format!(
-            "⏸ Canceled provider auto-switch - kept {} active.\n\nYou can switch manually with /model, then resend. {}",
+            "Auto-switch canceled. Kept {} active. Use /model to switch manually.",
             pending.prompt.from_label,
-            Self::failover_config_hint(),
         )));
         self.set_status_notice(notice);
+    }
+
+    /// Key handling while an automatic account switch counts down. Returns
+    /// true when the key was fully consumed.
+    ///
+    /// Only Esc cancels. Typing the next prompt must not silently abort the
+    /// switch and leave the session on the exhausted account. Enter on a plain
+    /// prompt queues it to run after the switch and the held resend. Slash and
+    /// shell commands (for example a manual `/model`) cancel and run as usual.
+    pub(super) fn handle_key_during_provider_failover(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> bool {
+        use crossterm::event::KeyCode;
+        if self.pending_provider_failover.is_none() || self.is_processing {
+            return false;
+        }
+        match code {
+            KeyCode::Esc => {
+                self.cancel_pending_provider_failover("Provider auto-switch canceled");
+                true
+            }
+            KeyCode::Enter => {
+                let trimmed = self.input.trim();
+                if trimmed.is_empty() {
+                    return true;
+                }
+                if trimmed.starts_with('/')
+                    || trimmed.starts_with('!')
+                    || !self.pending_images.is_empty()
+                {
+                    self.cancel_pending_provider_failover("Provider auto-switch canceled");
+                    return false;
+                }
+                let prepared = super::input::take_prepared_input(self);
+                self.queued_messages.push(prepared.expanded);
+                let to_label = self
+                    .pending_provider_failover
+                    .as_ref()
+                    .map(|pending| pending.prompt.to_label.clone())
+                    .unwrap_or_default();
+                self.set_status_notice(format!("Queued. Sends after switching → {to_label}"));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn failover_countdown_message(to_label: &str) -> String {
+        format!("↪ Switching to {to_label} in 3s. Esc to cancel.")
+    }
+
+    fn failover_switching_message(to_label: &str) -> String {
+        format!("↪ Switching to {to_label} and retrying.")
+    }
+
+    /// The in-flight switch line is superseded by the confirmed
+    /// "Switched to model" notice, which names the model and account.
+    fn remove_failover_switching_message(&mut self) {
+        if let Some(idx) = self.display_messages.iter().rposition(|message| {
+            message.role == "system"
+                && message.content.starts_with("↪ Switching to ")
+                && message.content.ends_with(" and retrying.")
+        }) {
+            self.remove_display_message(idx);
+        }
+    }
+
+    /// The whole outcome of an automatic failover on one line. A spent
+    /// account's error says nothing the notice does not, so it is folded in
+    /// as the cause. Any other error stays visible above the notice.
+    pub(super) fn confirmed_failover_message(&mut self, model: &str, suffix: &str) -> String {
+        self.remove_failover_switching_message();
+        let usage_exhausted = self.display_messages.last().is_some_and(|message| {
+            message.role == "error"
+                && jcode_provider_core::is_definitive_usage_exhaustion(&message.content)
+        });
+        let cause = if usage_exhausted {
+            self.remove_display_message(self.display_messages.len() - 1);
+            "Usage limit reached. "
+        } else {
+            ""
+        };
+        format!("✓ {cause}Switched to model: {model}{suffix}. Retrying.")
+    }
+
+    /// The countdown line is only meaningful while the countdown runs. Once the
+    /// switch happens (or is canceled), drop it so the transcript keeps just the
+    /// outcome rather than how long we waited.
+    fn remove_failover_countdown_message(&mut self, to_label: &str) {
+        let countdown = Self::failover_countdown_message(to_label);
+        if let Some(idx) = self
+            .display_messages
+            .iter()
+            .rposition(|message| message.role == "system" && message.content == countdown)
+        {
+            self.remove_display_message(idx);
+        }
     }
 
     pub(super) fn maybe_progress_provider_failover_countdown(&mut self) -> bool {
@@ -85,9 +473,22 @@ impl App {
         if self.is_processing {
             return false;
         }
+        if crate::config::Config::load()
+            .provider
+            .cross_provider_failover
+            != crate::config::CrossProviderFailoverMode::Countdown
+        {
+            self.cancel_pending_provider_failover("Auto-switch disabled");
+            return true;
+        }
         let now = Instant::now();
         if now < pending.deadline {
-            let remaining = pending.deadline.saturating_duration_since(now).as_secs() + 1;
+            let remaining = pending
+                .deadline
+                .saturating_duration_since(now)
+                .as_secs()
+                .saturating_add(1)
+                .min(3);
             self.set_status_notice(format!(
                 "Provider auto-switch → {} in {}s (Esc to cancel)",
                 pending.prompt.to_label, remaining
@@ -96,16 +497,42 @@ impl App {
         }
 
         self.pending_provider_failover = None;
+        self.remove_failover_countdown_message(&pending.prompt.to_label);
+        if self.is_remote {
+            let selection = pending.prompt.target_route.as_deref().and_then(|target| {
+                self.fallback_candidate_routes()
+                    .iter()
+                    .filter(|route| route.available)
+                    .map(crate::provider::RouteSelection::from_model_route)
+                    .find(|selection| selection.routed_model_spec() == target)
+            });
+            let Some(selection) = selection else {
+                self.automatic_failover_stopped = true;
+                if let Some(payload) = pending.remote_resend {
+                    self.restore_failover_payload(payload);
+                }
+                self.push_display_message(DisplayMessage::error(
+                    "Auto-switch target is no longer available. Use /model to switch manually."
+                        .to_string(),
+                ));
+                return true;
+            };
+            self.pending_automatic_failover_route = Some(selection);
+            self.pending_fallback_resend = pending.remote_resend;
+            self.set_status_notice(format!(
+                "Switching → {} (will retry)",
+                pending.prompt.to_label
+            ));
+            return true;
+        }
         match self.apply_provider_switch_for_failover(&pending.prompt) {
             Ok(active_model) => {
-                self.push_display_message(DisplayMessage::system(format!(
-                    "⚡ Auto-switched provider after countdown: {} → {}.\n\nResending {} on model {}.\n\n{}",
-                    pending.prompt.from_label,
-                    pending.prompt.to_label,
-                    Self::format_failover_input_summary(&pending.prompt),
-                    active_model,
-                    Self::failover_config_hint(),
-                )));
+                let suffix = switched_model_account_suffix(
+                    self.provider.active_auth_method_label(),
+                    self.provider.active_oauth_account_email().as_deref(),
+                );
+                let message = self.confirmed_failover_message(&active_model, &suffix);
+                self.push_display_message(DisplayMessage::system(message));
                 self.set_status_notice(format!(
                     "Provider → {} (retrying)",
                     pending.prompt.to_label
@@ -114,6 +541,8 @@ impl App {
                 true
             }
             Err(error) => {
+                self.automatic_failover_stopped = true;
+                self.pending_turn = false;
                 self.push_display_message(DisplayMessage::error(format!(
                     "Failed to switch provider to {}: {}",
                     pending.prompt.to_label, error
@@ -125,57 +554,27 @@ impl App {
     }
 
     fn handle_provider_failover_prompt(&mut self, prompt: crate::provider::ProviderFailoverPrompt) {
-        let input_summary = Self::format_failover_input_summary(&prompt);
-        let manual_message = format!(
-            "⚠ {} became unavailable - jcode did not resend your prompt to {} automatically.\n\nReason: {}\n\nRetrying elsewhere would send {}.\n\nTo switch manually now, use /model and pick a model from {}, then resend. {}",
-            prompt.from_label,
-            prompt.to_label,
-            prompt.reason,
-            input_summary,
-            prompt.to_label,
-            Self::failover_config_hint(),
-        );
-
-        match crate::config::Config::load()
-            .provider
-            .cross_provider_failover
-        {
-            crate::config::CrossProviderFailoverMode::Manual if !self.is_remote => {
-                self.push_display_message(DisplayMessage::system(manual_message));
-                self.set_status_notice(format!(
-                    "{} unavailable; switch manually if desired",
-                    prompt.from_label
-                ));
-            }
-            crate::config::CrossProviderFailoverMode::Countdown if !self.is_remote => {
-                self.pending_provider_failover = Some(super::PendingProviderFailover {
-                    prompt: prompt.clone(),
-                    deadline: Instant::now() + Duration::from_secs(3),
-                });
-                self.push_display_message(DisplayMessage::system(format!(
-                    "⚠ {} became unavailable - jcode will switch to {} in 3 seconds unless you cancel.\n\nReason: {}\n\nRetrying would send {}. Press Esc to cancel.\n\n{}",
-                    prompt.from_label,
-                    prompt.to_label,
-                    prompt.reason,
-                    input_summary,
-                    Self::failover_config_hint(),
-                )));
-                self.set_status_notice(format!(
-                    "Provider auto-switch → {} in 3s (Esc to cancel)",
-                    prompt.to_label
-                ));
-            }
-            _ => {
-                self.push_display_message(DisplayMessage::system(format!(
-                    "{}\n\nAutomatic countdown switching is only available in local sessions right now.",
-                    manual_message,
-                )));
-                self.set_status_notice(format!(
-                    "{} unavailable; manual switch suggested",
-                    prompt.from_label
-                ));
-            }
-        }
+        // The provider already exhausted its usable accounts. Do not let todo
+        // pokes or held retries resend on the same unavailable route while a
+        // manual switch or configured countdown awaits a decision.
+        super::commands::disable_auto_poke(self);
+        self.overnight_auto_poke = None;
+        let remote_resend = if self.is_remote {
+            self.rate_limit_pending_message
+                .as_ref()
+                .map(|pending| super::FallbackResendPayload {
+                    retry_attempts: pending.retry_attempts,
+                    content: pending.content.clone(),
+                    images: pending.images.clone(),
+                    is_system: pending.is_system,
+                    auto_retry: pending.auto_retry,
+                    system_reminder: pending.system_reminder.clone(),
+                    raw_input: self.last_submitted_input.clone(),
+                })
+        } else {
+            None
+        };
+        self.handle_provider_failover_prompt_with_payload(prompt, remote_resend);
     }
 
     /// The model routes to consider when computing an error fallback, working in
@@ -208,15 +607,40 @@ impl App {
             self.provider.active_resolved_credential()
         };
         use jcode_provider_core::{ActiveProvider, ResolvedCredential};
+        let account_method = |base: &str| {
+            if !self.is_remote
+                && let Some(label) = self.provider.oauth_account_label()
+            {
+                return format!("{base}@{label}");
+            }
+            if let Some(method) = self.session.route_api_method.as_deref()
+                && method
+                    .split_once('@')
+                    .is_some_and(|(prefix, _)| prefix == base)
+                && jcode_provider_core::oauth_account_label(method).is_some()
+            {
+                return method.to_string();
+            }
+            let label = if self.is_remote {
+                None
+            } else if base == "claude-oauth" {
+                crate::auth::claude::active_account_label()
+            } else {
+                crate::auth::codex::active_account_label()
+            };
+            label
+                .map(|label| format!("{base}@{label}"))
+                .unwrap_or_else(|| base.to_string())
+        };
         match (provider, credential) {
             (Some(ActiveProvider::Claude), Some(ResolvedCredential::Oauth)) => {
-                Some("claude-oauth".to_string())
+                Some(account_method("claude-oauth"))
             }
             (Some(ActiveProvider::Claude), Some(ResolvedCredential::ApiKey)) => {
                 Some("claude-api".to_string())
             }
             (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::Oauth)) => {
-                Some("openai-oauth".to_string())
+                Some(account_method("openai-oauth"))
             }
             (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::ApiKey)) => {
                 Some("openai-api".to_string())
@@ -255,9 +679,10 @@ impl App {
     /// one exists, arm an interactive offer the user can accept with a keypress to
     /// switch and resend. Returns true when an offer was armed.
     ///
-    /// This is the manual counterpart to automatic cross-provider failover: it can
-    /// switch *auth methods on the same provider* (e.g. from a broken API key to a
-    /// working OAuth login), which the automatic path never does.
+    /// Retryable failures first consider automatic pool-approved account routes
+    /// when countdown mode is enabled. If no eligible automatic route exists,
+    /// preserve an unrestricted manual offer, including another auth method on
+    /// the same provider.
     ///
     /// Works in both local and remote sessions. Remote offers capture the failed
     /// turn's payload (from the pending retry slot) so accepting the offer can
@@ -270,6 +695,7 @@ impl App {
             self.rate_limit_pending_message
                 .as_ref()
                 .map(|pending| super::FallbackResendPayload {
+                    retry_attempts: pending.retry_attempts,
                     content: pending.content.clone(),
                     images: pending.images.clone(),
                     is_system: pending.is_system,
@@ -283,69 +709,28 @@ impl App {
         self.offer_fallback_after_error_with_payload(error, remote_resend)
     }
 
-    /// [`Self::offer_fallback_after_error`] with an explicitly captured resend
-    /// payload, for callers whose error-cleanup already cleared the pending
-    /// retry slot before the offer could be armed.
-    pub(super) fn offer_fallback_after_error_with_payload(
-        &mut self,
-        error: &str,
-        remote_resend: Option<super::FallbackResendPayload>,
-    ) -> bool {
-        // Never compete with the automatic countdown switcher.
-        if self.pending_provider_failover.is_some() {
-            return false;
+    /// The pool identity is independent of model availability. A failed source
+    /// may be cooling down, but its explicit membership still governs consent.
+    fn fallback_pool_identity(api_method: &str) -> Option<(String, bool)> {
+        if let Some((method, label)) = api_method.split_once('@') {
+            let provider = match method {
+                "claude-oauth" => "claude",
+                "openai-oauth" => "openai",
+                _ => return None,
+            };
+            return Some((
+                crate::auth::account_pool::account_key(provider, Some(label)),
+                false,
+            ));
         }
-        let routes = self.fallback_candidate_routes();
-        if routes.is_empty() {
-            return false;
+        match api_method {
+            "claude-oauth" | "openai-oauth" | "" => None,
+            "claude-api" | "anthropic-api" | "anthropic-api-key" => {
+                Some(("anthropic-api".into(), true))
+            }
+            "openai-api" | "openai-api-key" => Some(("openai-api".into(), true)),
+            other => Some((other.into(), true)),
         }
-        let current_model = self.current_model_for_fallback();
-        let current_provider = self.current_provider_label_for_fallback();
-        let current_api_method = self.current_route_api_method().unwrap_or_default();
-
-        // A credential failure (expired OAuth session, failed token refresh,
-        // broken API key) breaks every route behind that credential, so widen
-        // the exclusion set: offering a sibling model on the same broken
-        // credential would fail identically.
-        let options = crate::provider::FallbackPickOptions {
-            credential_failure: crate::provider::error_looks_like_credential_failure(error),
-        };
-        let Some(index) = crate::provider::pick_next_fallback_route_with_options(
-            &routes,
-            &current_model,
-            &current_provider,
-            &current_api_method,
-            options,
-        ) else {
-            return false;
-        };
-        let route = routes[index].clone();
-        let target_label = Self::describe_route(&route);
-        let from_method = crate::provider::ModelRouteApiMethod::parse(&current_api_method);
-        let from_label = if current_api_method.is_empty() {
-            current_provider.clone()
-        } else {
-            format!("{} via {}", current_provider, from_method.display_label())
-        };
-
-        let remote_resend = if self.is_remote { remote_resend } else { None };
-
-        // The raw error was already shown by the caller just above this offer,
-        // so only name the failed route here instead of echoing the error text
-        // a second time.
-        let key_label = crate::tui::keybind::fallback_switch_key_label();
-        self.push_display_message(DisplayMessage::system(format!(
-            "↪ {} failed. Fallback available: press {} to switch to {} and resend.",
-            from_label, key_label, target_label,
-        )));
-        self.set_status_notice(format!("Press {} to switch to {}", key_label, route.model));
-        self.pending_fallback_offer = Some(super::PendingFallbackOffer {
-            selection: crate::provider::RouteSelection::from_model_route(&route),
-            target_label,
-            from_label,
-            remote_resend,
-        });
-        true
     }
 
     pub(super) fn clear_pending_fallback_offer(&mut self) {
@@ -412,6 +797,7 @@ impl App {
             self.rate_limit_pending_message
                 .as_ref()
                 .map(|pending| super::FallbackResendPayload {
+                    retry_attempts: pending.retry_attempts,
                     content: pending.content.clone(),
                     images: pending.images.clone(),
                     is_system: pending.is_system,
@@ -468,12 +854,14 @@ impl App {
         if self.is_remote {
             self.upstream_provider = None;
             self.status_detail = None;
-            // Track the method we are switching to so subsequent fallback picks
-            // know the active credential path (remote sessions have no other
-            // client-side route bookkeeping).
-            self.session.route_api_method = Some(offer.selection.api_method.clone());
+            // Route metadata changes only after the server confirms the
+            // selection. A rejected switch must leave the active route intact.
             self.pending_route_selection = Some(offer.selection);
-            self.pending_fallback_resend = offer.remote_resend;
+            self.pending_fallback_resend = offer.remote_resend.map(|mut payload| {
+                // An explicit user action starts a fresh retry budget.
+                payload.retry_attempts = 0;
+                payload
+            });
             self.push_display_message(DisplayMessage::system(format!(
                 "↪ Switching to {} and resending (was {}).",
                 offer.target_label, offer.from_label,
@@ -491,7 +879,7 @@ impl App {
                 self.status_detail = None;
                 self.invalidate_model_picker_cache();
                 let active_model = self.provider.model();
-                self.update_context_limit_for_model(&active_model);
+                self.update_context_limit_for_model(&active_model, None);
                 self.session.provider_key =
                     crate::provider::MultiProvider::session_provider_key_after_model_switch(
                         &spec,
@@ -500,7 +888,11 @@ impl App {
                     );
                 self.session.model = Some(active_model.clone());
                 self.session.route_api_method = Some(offer.selection.api_method.clone());
-                let _ = self.session.save();
+                if let Err(error) = self.session.save() {
+                    self.push_display_message(DisplayMessage::error(format!(
+                "Model switched for this session, but the saved route could not be persisted: {error}"
+            )));
+                }
                 self.push_display_message(DisplayMessage::system(format!(
                     "↪ Switched to {} and resending (was {}).",
                     offer.target_label, offer.from_label,
@@ -510,6 +902,7 @@ impl App {
                 true
             }
             Err(error) => {
+                self.pending_turn = false;
                 self.push_display_message(DisplayMessage::error(format!(
                     "Failed to switch to {}: {}",
                     offer.target_label, error
@@ -544,11 +937,10 @@ impl App {
         match self.provider.set_model(&next_model) {
             Ok(()) => {
                 self.finalize_model_switch(&next_model);
-                let auth_suffix = self
-                    .provider
-                    .active_auth_method_label()
-                    .map(|method| format!(" (via {})", method))
-                    .unwrap_or_default();
+                let auth_suffix = switched_model_account_suffix(
+                    self.provider.active_auth_method_label(),
+                    self.provider.active_oauth_account_email().as_deref(),
+                );
                 self.push_display_message(DisplayMessage::system(format!(
                     "✓ Switched to model: {}{}",
                     next_model, auth_suffix
@@ -569,10 +961,9 @@ impl App {
         // Remote/self-dev sessions infer the level list from provider+model (the
         // same source the model picker uses), since `self.provider` is a local
         // stand-in. Local sessions read the real provider. This keeps the cycle
-        // and the picker consistent (both expose swarm / swarm-deep).
+        // and the picker consistent (both expose swarm).
         let efforts = if self.is_remote {
-            let (provider_name, provider_model) = self.remote_effort_identity();
-            inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref())
+            self.remote_reasoning_effort_ladder()
         } else {
             self.provider.available_efforts()
         };
@@ -627,15 +1018,80 @@ impl App {
         }
     }
 
-    pub(super) fn update_context_limit_for_model(&mut self, model: &str) {
-        let limit = if self.is_remote {
-            crate::provider::context_limit_for_model_with_provider(
-                model,
-                self.remote_provider_name.as_deref(),
-            )
-            .unwrap_or(self.provider.context_window())
-        } else {
-            self.provider.context_window()
+    /// Step the speed tier (Standard -> Fast -> Ultrafast) for a local session.
+    pub(super) fn cycle_speed_tier(&mut self, direction: i8) {
+        let provider_name = self.provider.name().to_string();
+        let model = self.provider.model();
+        let available = self.provider.available_service_tiers();
+        let ladder = jcode_provider_core::service_tier::speed_tier_ladder_with_capabilities(
+            Some(&provider_name),
+            Some(&model),
+            Some(&available),
+        );
+        let current = self.provider.service_tier();
+        let Some((index, next, at_end)) = jcode_provider_core::service_tier::step_speed_tier(
+            &ladder,
+            current.as_deref(),
+            direction,
+        ) else {
+            self.set_status_notice("Speed tiers not available for this model");
+            return;
+        };
+        if at_end {
+            self.set_status_notice(speed_tier_notice(
+                next,
+                index,
+                ladder.len(),
+                Some(direction),
+            ));
+            return;
+        }
+        match self.provider.set_service_tier(next) {
+            Ok(()) => {
+                let applied = self.provider.service_tier();
+                let applied =
+                    jcode_provider_core::service_tier::canonical_speed_tier(applied.as_deref());
+                let index = ladder.iter().position(|t| *t == applied).unwrap_or(index);
+                let mut notice = speed_tier_notice(applied, index, ladder.len(), None);
+                if self.is_processing {
+                    notice.push_str(" (next request)");
+                }
+                self.set_status_notice(notice);
+            }
+            Err(e) => self.set_status_notice(format!("Speed switch failed: {}", e)),
+        }
+    }
+
+    pub(super) fn update_context_limit_for_model(
+        &mut self,
+        model: &str,
+        server_context_window: Option<u64>,
+    ) {
+        // Prefer the window the server resolved. A remote client's own provider is
+        // an inert placeholder with no model catalog, and the static resolver has
+        // no entry for a model it does not recognise, so both answer the generic
+        // default. Measured: `stealth/space-bunny-alpha@Stealth` has a catalog
+        // entry with context_length 1000000, and the panel showed 200000 because
+        // the number never crossed the wire.
+        let limit = match server_context_window {
+            Some(window) => window as usize,
+            None if self.is_remote => {
+                // The static catalog resolves the models it knows, so keep using
+                // it. What must not happen is the final fallback: for a model
+                // chosen server-side it is not in the catalog, and the client's
+                // own provider is an inert placeholder whose context_window()
+                // is the generic 200_000 default. Substituting that over a value
+                // the server already reported correctly is how a 1M route went
+                // back to displaying 200000. The server is the source of truth
+                // for an unknown model, so leave the last reported value alone
+                // instead of overwriting it with the default.
+                crate::provider::context_limit_for_model_with_provider(
+                    model,
+                    self.remote_provider_name.as_deref(),
+                )
+                .unwrap_or(self.context_limit as usize)
+            }
+            None => self.provider.context_window(),
         };
         self.context_limit = limit as u64;
         self.context_warning_shown = false;
@@ -647,6 +1103,22 @@ impl App {
                 manager.set_budget(limit);
             };
         }
+    }
+
+    /// Assign the panel's context window and keep the compaction budget in step
+    /// with it.
+    ///
+    /// Assigning `context_limit` directly updates the panel but skips the
+    /// budget sync, so the two can disagree: a correct panel with a stale
+    /// compaction trigger that fires about five times too early on a 1M route.
+    /// Every direct assignment should come through here.
+    pub(super) fn set_context_limit_and_sync_budget(&mut self, limit: usize) {
+        self.context_limit = limit as u64;
+        self.context_warning_shown = false;
+        let compaction = self.registry.compaction();
+        if let Ok(mut manager) = compaction.try_write() {
+            manager.set_budget(limit);
+        };
     }
 
     pub(super) fn effective_context_tokens_from_usage(
@@ -755,6 +1227,35 @@ impl App {
         };
     }
 
+    /// Recover the complete user payload before a terminal retry path clears it.
+    /// Restoring only `last_submitted_input` loses consumed image attachments.
+    pub(super) fn restore_terminal_remote_retry_input(&mut self) {
+        self.log_recovery_event(
+            crate::logging::LogLevel::Warn,
+            "RECOVERY_RETRY_RESTORE",
+            "terminal_retry_stop",
+        );
+        if let Some(pending) = self
+            .rate_limit_pending_message
+            .take_if(|pending| !pending.is_system)
+        {
+            let raw_input = self.last_submitted_input.take();
+            self.restore_failover_payload(super::FallbackResendPayload {
+                content: pending.content,
+                images: pending.images,
+                is_system: pending.is_system,
+                system_reminder: pending.system_reminder,
+                auto_retry: pending.auto_retry,
+                retry_attempts: pending.retry_attempts,
+                raw_input,
+            });
+            self.reset_tab_completion();
+            self.sync_model_picker_preview_from_input();
+        } else {
+            self.restore_failed_input_to_box();
+        }
+    }
+
     /// Put the prompt that started the failed turn back into the input box so the
     /// user does not lose what they typed when a turn errors out (for example a
     /// "token refresh needed" / auth error). Only restores when the input box is
@@ -781,13 +1282,15 @@ impl App {
         let error = error.into();
         self.refresh_openai_usage_after_quota_error(&error);
         self.last_stream_error = Some(error.clone());
-        self.restore_failed_input_to_box();
 
         if let Some(prompt) = crate::provider::parse_failover_prompt_message(&error) {
             self.handle_provider_failover_prompt(prompt);
+            self.restore_failed_input_to_box();
             return;
         }
+        self.restore_failed_input_to_box();
 
+        let visible_error = Self::compact_provider_failure(&error);
         if is_request_payload_too_large_error(&error) {
             // 413 is a request body-size rejection driven by inline images.
             // Strip oversized images now so a manual resubmit (or auto-poke
@@ -796,19 +1299,50 @@ impl App {
                 .session
                 .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
             if stripped > 0 {
-                self.messages.clear();
-                self.reseed_compaction_from_provider_messages();
+                self.refresh_provider_messages_from_session();
                 self.push_display_message(DisplayMessage::error(format!(
                     "Error: {} Dropped {} oversized image(s); you can retry.",
-                    error, stripped
+                    visible_error, stripped
+                )));
+            } else if self.session.strip_all_images() > 0 {
+                // The 413 came from the whole body, so an image can be far under
+                // the per-image byte budget and still be the payload that pushes
+                // the request over the gateway ceiling. `strip_oversized_images`
+                // only drops images above `PAYLOAD_IMAGE_CHAR_BUDGET` and returns
+                // 0 here, which used to strand the session on `/fix`. Dropping
+                // every inline image is the same deterministic move the
+                // image-rejection recovery already makes (#1712): the request
+                // shrinks, the turn can proceed, and the context survives as
+                // text notes. No message is removed and nothing is persisted
+                // until the next save, so the user can still re-open the images.
+                crate::logging::warn(
+                    "Request-too-large recovery: no image exceeded the per-image budget; dropped every inline image so the whole body fits",
+                );
+                self.refresh_provider_messages_from_session();
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {} Dropped all inline images so the request fits; you can retry.",
+                    visible_error
                 )));
             } else {
+                // No inline image left to drop: the body is text (or already
+                // stripped), so this is an ordinary size-overflow recovery, not
+                // a dead end. Reuse the context-limit path, which hard-compacts
+                // and then truncates large tool results; only if that also fails
+                // is the turn genuinely stuck and auto-poke gets disarmed.
+                let recovery = self.auto_recover_context_limit();
+                let recovered = recovery.is_some();
+                let hint = match recovery {
+                    Some(msg) => format!(" {}", msg),
+                    None => " Request body was too large and auto-recovery could not shrink it. Run /fix to try manual recovery.".to_string(),
+                };
                 self.push_display_message(DisplayMessage::error(format!(
-                    "Error: {} Request body was too large but no inline images could be dropped. Run /fix to try manual recovery.",
-                    error
+                    "Error: {}{}",
+                    visible_error, hint
                 )));
-                super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
-                self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+                if !recovered {
+                    super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
+                    self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+                }
             }
             return;
         }
@@ -820,7 +1354,10 @@ impl App {
                 Some(msg) => format!(" {}", msg),
                 None => " Context limit exceeded but auto-recovery failed. Run /fix to try manual recovery.".to_string(),
             };
-            self.push_display_message(DisplayMessage::error(format!("Error: {}{}", error, hint)));
+            self.push_display_message(DisplayMessage::error(format!(
+                "Error: {}{}",
+                visible_error, hint
+            )));
             if should_stop_auto_poke {
                 super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
                 self.stop_overnight_auto_poke_for_non_retryable_error(&error);
@@ -831,12 +1368,17 @@ impl App {
             // offer is informational; auto-poke still stops so an unattended loop
             // does not silently keep retrying a path that needs a human decision.
             let offered = self.offer_fallback_after_error(&error);
-            if offered {
-                self.push_display_message(DisplayMessage::error(format!("Error: {}", error)));
+            if offered && self.pending_provider_failover.is_some() {
+                // The countdown notice already includes the compact cause.
+            } else if offered {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {}",
+                    visible_error
+                )));
             } else {
                 self.push_display_message(DisplayMessage::error(format!(
                     "Error: {} Run /fix to attempt recovery.",
-                    error
+                    visible_error
                 )));
             }
             super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
@@ -993,133 +1535,12 @@ impl App {
         }
     }
 
-    /// Attempt automatic compaction and retry when context limit is exceeded.
-    /// Returns true if the retry succeeded.
-    pub(super) async fn try_auto_compact_and_retry(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        event_stream: &mut EventStream,
-    ) -> bool {
-        if self.is_remote || !self.provider.supports_compaction() {
-            return false;
-        }
-
-        self.push_display_message(DisplayMessage::system(
-            "⚠️ Context limit exceeded - auto-compacting and retrying...".to_string(),
-        ));
-
-        // Force the compaction manager to think we're at the limit
-        let compaction = self.registry.compaction();
-        let compact_started = match compaction.try_write() {
-            Ok(mut manager) => {
-                let mut provider_messages = self.materialized_provider_messages();
-                manager.update_observed_input_tokens(self.context_limit);
-                let usage = manager.context_usage_with(&provider_messages);
-                if usage > 1.5 {
-                    let recovery = manager.recover_within_budget(&mut provider_messages);
-                    if recovery.did_anything() {
-                        self.messages = provider_messages;
-                        self.sync_session_compaction_state_from_manager(&manager);
-                        drop(manager);
-                        self.reset_state_for_compaction_retry();
-
-                        self.push_display_message(DisplayMessage::system(format!(
-                            "{} Retrying...",
-                            recovery.summary_line(usage)
-                        )));
-                        return self.run_compaction_retry_turn(terminal, event_stream).await;
-                    }
-                    false
-                } else {
-                    match manager.force_compact_with(&provider_messages, self.provider.clone()) {
-                        Ok(()) => true,
-                        Err(_) => match manager.hard_compact_with(&provider_messages) {
-                            Ok(_) => {
-                                self.sync_session_compaction_state_from_manager(&manager);
-                                drop(manager);
-                                self.reset_state_for_compaction_retry();
-
-                                self.push_display_message(DisplayMessage::system(
-                                    "✓ Context compacted (emergency). Retrying...".to_string(),
-                                ));
-                                return self
-                                    .run_compaction_retry_turn(terminal, event_stream)
-                                    .await;
-                            }
-                            Err(_) => false,
-                        },
-                    }
-                }
-            }
-            Err(_) => false,
-        };
-
-        if !compact_started {
-            return false;
-        }
-
-        // Wait for compaction to finish (up to 60s), reacting to Bus event
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        self.status = ProcessingStatus::RunningTool("compacting context...".to_string());
-        let mut bus_rx = Bus::global().subscribe();
-
-        loop {
-            if std::time::Instant::now() >= deadline {
-                self.push_display_message(DisplayMessage::error(
-                    "Auto-compaction timed out.".to_string(),
-                ));
-                return false;
-            }
-
-            // Redraw UI while we wait
-            let _ = terminal.draw(|frame| crate::tui::ui::draw(frame, self));
-
-            let compaction = self.registry.compaction();
-            let done = if let Ok(mut manager) = compaction.try_write() {
-                let provider_messages = self.materialized_provider_messages();
-                if let Some(event) = manager.poll_compaction_event_with(&provider_messages) {
-                    self.sync_session_compaction_state_from_manager(&manager);
-                    self.handle_compaction_event(event);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if done {
-                break;
-            }
-
-            // Wait for Bus notification or timeout (instead of sleep-polling)
-            let timeout = tokio::time::sleep(Duration::from_secs(1));
-            tokio::select! {
-                _ = bus_rx.recv() => {}
-                _ = timeout => {}
-            }
-        }
-
-        self.push_display_message(DisplayMessage::system(
-            "✓ Context compacted. Retrying...".to_string(),
-        ));
-
-        self.reset_state_for_compaction_retry();
-
-        // Retry the turn
-        self.run_compaction_retry_turn(terminal, event_stream).await
-    }
-
     pub(super) fn handle_usage_report(&mut self, results: Vec<crate::usage::ProviderUsage>) {
         self.usage_report_refreshing = false;
         self.clear_usage_transient_ui();
-        self.upsert_usage_display_card(Self::format_usage_display_card(
-            &results,
-            false,
-            results.len(),
-            results.len(),
-            false,
-        ));
+        let shown = self.filter_usage_reports(&results);
+        let cards = self.usage_cards(&shown, false, results.len(), results.len(), false);
+        self.replace_usage_cards(cards);
         if results.is_empty() {
             self.set_status_notice("Usage → no connected providers");
         } else {
@@ -1133,13 +1554,15 @@ impl App {
     ) {
         self.usage_report_refreshing = !progress.done;
         self.clear_usage_transient_ui();
-        self.upsert_usage_display_card(Self::format_usage_display_card(
-            &progress.results,
+        let shown = self.filter_usage_reports(&progress.results);
+        let cards = self.usage_cards(
+            &shown,
             !progress.done,
             progress.completed,
             progress.total,
             progress.from_cache,
-        ));
+        );
+        self.replace_usage_cards(cards);
 
         if progress.done {
             if progress.results.is_empty() {
@@ -1162,13 +1585,11 @@ impl App {
 
     pub(super) fn push_usage_loading_card(&mut self) {
         self.clear_usage_transient_ui();
-        self.push_display_message(DisplayMessage::usage(Self::format_usage_display_card(
-            &[],
-            true,
-            0,
-            0,
-            false,
-        )));
+        for (title, content) in self.usage_cards(&[], true, 0, 0, false) {
+            let mut message = DisplayMessage::usage(content);
+            message.title = Some(title);
+            self.push_display_message(message);
+        }
     }
 
     fn clear_usage_transient_ui(&mut self) {
@@ -1184,119 +1605,211 @@ impl App {
         }
     }
 
-    fn upsert_usage_display_card(&mut self, content: String) {
-        let existing = self.display_messages.iter().rposition(|message| {
-            message.role == "usage" && message.title.as_deref() == Some("Usage")
+    /// Replace the most recent run of consecutive usage cards in place, so a
+    /// refresh updates its own cards instead of stacking duplicates.
+    fn replace_usage_cards(&mut self, cards: Vec<(String, String)>) {
+        // Other cards share the "usage" role (e.g. `/cache` stats), so match
+        // report cards by title or by the provider-card row protocol.
+        let is_report = |message: &DisplayMessage| {
+            message.role == "usage"
+                && (message.content.starts_with('*')
+                    || message
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title == "Usage" || title.starts_with("Usage · ")))
+        };
+        let Some(end) = self.display_messages.iter().rposition(is_report) else {
+            for (title, content) in cards {
+                let mut message = DisplayMessage::usage(content);
+                message.title = Some(title);
+                self.push_display_message(message);
+            }
+            return;
+        };
+        let start = self.display_messages[..end]
+            .iter()
+            .rposition(|message| !is_report(message))
+            .map_or(0, |idx| idx + 1);
+        let unchanged = end + 1 - start == cards.len()
+            && self.display_messages[start..=end].iter().zip(&cards).all(
+                |(message, (title, content))| {
+                    message.title.as_deref() == Some(title.as_str()) && &message.content == content
+                },
+            );
+        if unchanged {
+            return;
+        }
+        let replacement = cards.into_iter().map(|(title, content)| {
+            let mut message = DisplayMessage::usage(content);
+            message.title = Some(title);
+            message
         });
-        if let Some(idx) = existing {
-            self.replace_display_message_title_and_content(idx, Some("Usage".to_string()), content);
-        } else {
-            self.push_display_message(DisplayMessage::usage(content));
+        self.display_messages.splice(start..=end, replacement);
+        self.bump_display_messages_version();
+    }
+
+    fn usage_status_title(&self) -> String {
+        match &self.usage_provider_filter {
+            Some(filter) => format!("Usage · {filter}"),
+            None => "Usage".to_string(),
         }
     }
 
-    fn format_usage_display_card(
+    fn filter_usage_reports(
+        &self,
         reports: &[crate::usage::ProviderUsage],
+    ) -> Vec<crate::usage::ProviderUsage> {
+        reports
+            .iter()
+            .filter(|report| {
+                self.usage_provider_filter
+                    .as_deref()
+                    .is_none_or(|filter| usage_provider_matches(&report.provider_name, filter))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// One card per provider, plus a status card while refreshing or when
+    /// nothing matches. Returns `(title, content)` pairs.
+    fn usage_cards(
+        &self,
+        shown: &[crate::usage::ProviderUsage],
         refreshing: bool,
         completed: usize,
         total: usize,
         from_cache: bool,
-    ) -> String {
-        let mut lines = Vec::new();
-
+    ) -> Vec<(String, String)> {
+        let title = self.usage_status_title();
+        let mut cards = Vec::new();
         if refreshing {
-            if total > 0 {
-                lines.push(format!(
-                    "# Refreshing usage ({}/{})",
-                    completed.min(total),
-                    total
-                ));
-            } else if from_cache {
-                lines.push("# Showing cached usage while refreshing".to_string());
+            let status = if total > 0 {
+                format!("refreshing {}/{}", completed.min(total), total)
             } else {
-                lines.push("# Refreshing usage".to_string());
-            }
-            lines.push("Checking connected provider limits...".to_string());
-            if !reports.is_empty() {
-                lines.push(String::new());
-            }
-        } else if reports.is_empty() {
-            lines.push("# No connected providers".to_string());
-            lines.push(
-                "Use `/login claude` or `/login openai`, then run `/usage` again.".to_string(),
-            );
+                "refreshing".to_string()
+            };
+            let note = if from_cache {
+                "Showing cached usage while live limits load…"
+            } else {
+                "Checking connected provider limits…"
+            };
+            cards.push((title, format!("*busy\t{status}\n- {note}")));
+        } else if shown.is_empty() {
+            let content = match &self.usage_provider_filter {
+                Some(filter) => format!(
+                    "*none\tno match\n- No connected provider matches \"{filter}\".\n- Run `/usage` to see every connected provider."
+                ),
+                None => "*none\tnot connected\n- No providers are connected yet.\n- Run `/login claude` or `/login openai`, then `/usage` again.".to_string(),
+            };
+            return vec![(title, content)];
+        }
+        cards.extend(shown.iter().map(|provider| {
+            (
+                provider.provider_name.clone(),
+                Self::format_usage_provider_card(provider),
+            )
+        }));
+        cards
+    }
+
+    /// Card body for one provider, in the row protocol that
+    /// `ui_messages::usage::ProviderCard` renders: a `*level\tstatus` header
+    /// (`*%\tpeak` for utilization), `= label\tpct\treset` gauges,
+    /// `: key\tvalue` details (`+` highlights the value), `! alert`, `- note`,
+    /// and blank spacer rows.
+    fn format_usage_provider_card(provider: &crate::usage::ProviderUsage) -> String {
+        let one_line = |text: &str| text.replace(['\t', '\n'], " ");
+        let mut lines = vec![Self::format_usage_provider_summary(provider)];
+
+        if let Some(error) = &provider.error {
+            lines.push(format!("! {}", one_line(error)));
             return lines.join("\n");
-        } else {
-            lines.push(format!("# Usage updated · {} source(s)", reports.len()));
-            lines.push(String::new());
+        }
+        if provider.hard_limit_reached {
+            lines.push("! Hard limit reached".to_string());
         }
 
-        for (idx, provider) in reports.iter().enumerate() {
-            if idx > 0 {
+        for limit in &provider.limits {
+            let reset = limit
+                .resets_at
+                .as_deref()
+                .map(crate::usage::format_reset_time)
+                .unwrap_or_default();
+            lines.push(format!(
+                "= {}\t{:.0}%\t{}",
+                one_line(&limit.name),
+                limit.usage_percent.clamp(0.0, 100.0),
+                reset
+            ));
+        }
+
+        let mut details = Vec::new();
+        if let Some(credits) = &provider.openai_reset_credits {
+            let marker = if credits.available_count > 0 {
+                '+'
+            } else {
+                ':'
+            };
+            details.push(format!(
+                "{marker} Banked resets\t{} available",
+                credits.available_count
+            ));
+        }
+        if let Some(offer) = &provider.anthropic_limit_reset {
+            let next = offer
+                .next_available_at
+                .as_deref()
+                .filter(|_| !offer.available)
+                .map(crate::usage::format_reset_time)
+                .map(|time| format!(" · next in {}", time))
+                .unwrap_or_default();
+            let marker = if offer.available { '+' } else { ':' };
+            details.push(format!(
+                "{marker} Session resets\t{} available{}",
+                u64::from(offer.available),
+                next
+            ));
+        }
+        for (key, value) in &provider.extra_info {
+            let mut key = one_line(key);
+            if let Some(first) = key.get(..1) {
+                key = first.to_uppercase() + &key[1..];
+            }
+            details.push(format!(": {}\t{}", key, one_line(value)));
+        }
+        if !details.is_empty() {
+            if !provider.limits.is_empty() {
                 lines.push(String::new());
             }
-            lines.push(Self::format_usage_provider_summary(provider));
-
-            if let Some(error) = &provider.error {
-                lines.push(format!("  error: {}", error));
-                continue;
-            }
-
-            if provider.hard_limit_reached {
-                lines.push("  hard limit reached".to_string());
-            }
-
-            if provider.limits.is_empty() && provider.extra_info.is_empty() {
-                lines.push("  no usage data available".to_string());
-                continue;
-            }
-
-            for limit in &provider.limits {
-                let reset = limit
-                    .resets_at
-                    .as_deref()
-                    .map(crate::usage::format_reset_time)
-                    .map(|value| format!(" · resets in {}", value))
-                    .unwrap_or_default();
-                lines.push(format!(
-                    "  {}: {}{}",
-                    limit.name,
-                    crate::usage::format_usage_bar(limit.usage_percent, 14),
-                    reset
-                ));
-            }
-
-            for (key, value) in &provider.extra_info {
-                lines.push(format!("  {}: {}", key, value));
-            }
+            lines.extend(details);
         }
-
+        if lines.len() == 1 {
+            lines.push("- No usage data reported for this account.".to_string());
+        }
         lines.join("\n")
     }
 
     fn format_usage_provider_summary(provider: &crate::usage::ProviderUsage) -> String {
         if provider.error.is_some() {
-            return format!("! {} - error", provider.provider_name);
+            return "*crit\terror".to_string();
         }
         if provider.hard_limit_reached {
-            return format!("! {} - hard limit", provider.provider_name);
+            return "*crit\thard limit".to_string();
         }
-
-        let max_percent = provider
+        if let Some(peak) = provider
             .limits
             .iter()
             .map(|limit| limit.usage_percent)
-            .fold(0.0_f32, f32::max);
-        if max_percent >= 90.0 {
-            format!("! {} - {:.0}% used", provider.provider_name, max_percent)
-        } else if max_percent >= 70.0 {
-            format!("~ {} - {:.0}% used", provider.provider_name, max_percent)
-        } else if provider.limits.is_empty() && provider.extra_info.is_empty() {
-            format!("{} - no data", provider.provider_name)
-        } else if max_percent > 0.0 {
-            format!("+ {} - {:.0}% used", provider.provider_name, max_percent)
+            .reduce(f32::max)
+        {
+            format!("*%\t{:.0}", peak.clamp(0.0, 100.0))
+        } else if provider.extra_info.is_empty()
+            && provider.openai_reset_credits.is_none()
+            && provider.anthropic_limit_reset.is_none()
+        {
+            "*none\tno data".to_string()
         } else {
-            format!("+ {} - available", provider.provider_name)
+            "*ok\tconnected".to_string()
         }
     }
 
@@ -1415,369 +1928,6 @@ impl App {
     }
 }
 
-pub(super) fn handle_model_command(app: &mut App, trimmed: &str) -> bool {
-    if is_refresh_model_list_command(trimmed) {
-        let session_id = app
-            .active_client_session_id()
-            .unwrap_or(app.session.id.as_str())
-            .to_string();
-        crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
-            crate::bus::UiActivity::catalog(
-                Some(session_id.clone()),
-                crate::message::format_model_refresh_progress_markdown(
-                    "Starting provider model catalog refresh",
-                    Some(5),
-                ),
-                Some("Refreshing model list..."),
-            ),
-        ));
-        app.set_status_notice("Refreshing model list...");
-        let provider = app.provider.clone();
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let result =
-                    refresh_model_catalog_with_progress(provider, session_id.clone()).await;
-                crate::bus::Bus::global().publish(crate::bus::BusEvent::ModelRefreshCompleted(
-                    crate::bus::ModelRefreshCompleted { session_id, result },
-                ));
-            });
-        } else {
-            std::thread::spawn(move || {
-                let result = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(refresh_model_catalog_with_progress(
-                        provider,
-                        session_id.clone(),
-                    )),
-                    Err(error) => Err(error.to_string()),
-                };
-                crate::bus::Bus::global().publish(crate::bus::BusEvent::ModelRefreshCompleted(
-                    crate::bus::ModelRefreshCompleted { session_id, result },
-                ));
-            });
-        }
-        return true;
-    }
-
-    if trimmed == "/model" || trimmed == "/models" {
-        app.record_keybinding_slow(crate::tui::app::shortcut_hints::LearnableAction::ModelSwitch);
-        app.open_model_picker();
-        return true;
-    }
-
-    if let Some(model_name) = trimmed.strip_prefix("/model ") {
-        app.record_keybinding_slow(crate::tui::app::shortcut_hints::LearnableAction::ModelSwitch);
-        let model_name = model_name.trim();
-        match app.provider.set_model(model_name) {
-            Ok(()) => {
-                let active_model = app.finalize_model_switch(model_name);
-                let auth_suffix = app
-                    .provider
-                    .active_auth_method_label()
-                    .map(|method| format!(" (via {})", method))
-                    .unwrap_or_default();
-                app.push_display_message(DisplayMessage {
-                    role: "system".to_string(),
-                    content: format!("✓ Switched to model: {}{}", active_model, auth_suffix),
-                    tool_calls: vec![],
-                    duration_secs: None,
-                    title: None,
-                    tool_data: None,
-                });
-                app.set_status_notice(format!("Model → {}", model_name));
-            }
-            Err(e) => {
-                app.push_display_message(DisplayMessage::error(model_switch_failure_message(
-                    &e.to_string(),
-                    app.is_remote,
-                )));
-                app.set_status_notice("Model switch failed");
-            }
-        }
-        return true;
-    }
-
-    if trimmed == "/effort" {
-        app.record_keybinding_slow(crate::tui::app::shortcut_hints::LearnableAction::EffortCycle);
-        let current = app.provider.reasoning_effort();
-        let efforts = app.provider.available_efforts();
-        if efforts.is_empty() {
-            app.push_display_message(DisplayMessage::system(
-                "Reasoning effort not available for this provider.".to_string(),
-            ));
-        } else {
-            let current_label = current
-                .as_deref()
-                .map(effort_display_label)
-                .unwrap_or("default");
-            let list: Vec<String> = efforts
-                .iter()
-                .map(|e| {
-                    if Some(e.to_string()) == current {
-                        format!("{} <- current", effort_display_label(e))
-                    } else {
-                        effort_display_label(e).to_string()
-                    }
-                })
-                .collect();
-            app.push_display_message(DisplayMessage::system(format!(
-                "Effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
-                current_label,
-                list.join(" · "),
-                crate::tui::keybind::effort_switch_keys_label()
-            )));
-        }
-        return true;
-    }
-
-    if let Some(level) = trimmed.strip_prefix("/effort ") {
-        app.record_keybinding_slow(crate::tui::app::shortcut_hints::LearnableAction::EffortCycle);
-        let level = level.trim();
-        match app.provider.set_reasoning_effort(level) {
-            Ok(()) => {
-                let new_effort = app.provider.reasoning_effort();
-                let label = new_effort
-                    .as_deref()
-                    .map(effort_display_label)
-                    .unwrap_or("default");
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Reasoning effort → {}",
-                    label
-                )));
-                let efforts = app.provider.available_efforts();
-                let idx = new_effort
-                    .as_ref()
-                    .and_then(|e| efforts.iter().position(|x| *x == e.as_str()))
-                    .unwrap_or(0);
-                let bar = effort_bar(idx, efforts.len());
-                app.set_status_notice(format!("Effort: {} {}", label, bar));
-            }
-            Err(e) => {
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Failed to set effort: {}",
-                    e
-                )));
-            }
-        }
-        return true;
-    }
-
-    if matches!(trimmed, "/fast default" | "/fast default status") {
-        let default_tier = crate::config::Config::load().provider.openai_service_tier;
-        let default_enabled = default_tier.as_deref() == Some("priority");
-        let default_label = default_tier
-            .as_deref()
-            .map(service_tier_display_label)
-            .unwrap_or("Standard");
-        app.push_display_message(DisplayMessage::system(fast_mode_default_message(
-            default_enabled,
-            default_label,
-        )));
-        return true;
-    }
-
-    if let Some(mode) = trimmed.strip_prefix("/fast default ") {
-        let mode = mode.trim().to_ascii_lowercase();
-        match mode.as_str() {
-            "on" => super::auth::save_openai_fast_setting_local(app, true),
-            "off" => super::auth::save_openai_fast_setting_local(app, false),
-            "status" => {
-                let default_tier = crate::config::Config::load().provider.openai_service_tier;
-                let default_enabled = default_tier.as_deref() == Some("priority");
-                let default_label = default_tier
-                    .as_deref()
-                    .map(service_tier_display_label)
-                    .unwrap_or("Standard");
-                app.push_display_message(DisplayMessage::system(fast_mode_default_message(
-                    default_enabled,
-                    default_label,
-                )));
-            }
-            _ => {
-                app.push_display_message(DisplayMessage::error(
-                    "Usage: /fast default [on|off|status]".to_string(),
-                ));
-            }
-        }
-        return true;
-    }
-
-    if matches!(trimmed, "/fast" | "/fast status") {
-        let current = app.provider.service_tier();
-        let status = if current.as_deref() == Some("priority") {
-            "on"
-        } else {
-            "off"
-        };
-        let current_label = current
-            .as_deref()
-            .map(service_tier_display_label)
-            .unwrap_or("Standard");
-        let default_tier = crate::config::Config::load().provider.openai_service_tier;
-        let default_enabled = default_tier.as_deref() == Some("priority");
-        let default_label = default_tier
-            .as_deref()
-            .map(service_tier_display_label)
-            .unwrap_or("Standard");
-        app.push_display_message(DisplayMessage::system(fast_mode_overview_message(
-            status == "on",
-            current_label,
-            default_enabled,
-            default_label,
-        )));
-        return true;
-    }
-
-    if let Some(mode) = trimmed.strip_prefix("/fast ") {
-        let mode = mode.trim().to_ascii_lowercase();
-        let target = match mode.as_str() {
-            "on" => "priority",
-            "off" => "off",
-            "status" => {
-                let current = app.provider.service_tier();
-                let enabled = current.as_deref() == Some("priority");
-                let current_label = current
-                    .as_deref()
-                    .map(service_tier_display_label)
-                    .unwrap_or("Standard");
-                let default_tier = crate::config::Config::load().provider.openai_service_tier;
-                let default_enabled = default_tier.as_deref() == Some("priority");
-                let default_label = default_tier
-                    .as_deref()
-                    .map(service_tier_display_label)
-                    .unwrap_or("Standard");
-                app.push_display_message(DisplayMessage::system(fast_mode_overview_message(
-                    enabled,
-                    current_label,
-                    default_enabled,
-                    default_label,
-                )));
-                return true;
-            }
-            _ => {
-                app.push_display_message(DisplayMessage::error(
-                    "Usage: /fast [on|off|status|default ...]".to_string(),
-                ));
-                return true;
-            }
-        };
-
-        match app.provider.set_service_tier(target) {
-            Ok(()) => {
-                let current = app.provider.service_tier();
-                let enabled = current.as_deref() == Some("priority");
-                let label = current
-                    .as_deref()
-                    .map(service_tier_display_label)
-                    .unwrap_or("Standard");
-                let applies_next_request = app.is_processing;
-                app.push_display_message(DisplayMessage::system(fast_mode_success_message(
-                    enabled,
-                    label,
-                    applies_next_request,
-                )));
-                app.set_status_notice(fast_mode_status_notice(enabled, applies_next_request));
-            }
-            Err(e) => {
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Failed to set fast mode: {}",
-                    e
-                )));
-            }
-        }
-        return true;
-    }
-
-    if trimmed == "/transport" {
-        let current = app.provider.transport();
-        let transports = app.provider.available_transports();
-        if transports.is_empty() {
-            app.push_display_message(DisplayMessage::system(
-                "Transport switching is not available for this provider.".to_string(),
-            ));
-        } else {
-            let current_label = current.as_deref().unwrap_or("unknown");
-            let list: Vec<String> = transports
-                .iter()
-                .map(|t| {
-                    if Some(*t) == current.as_deref() {
-                        format!("{} <- current", t)
-                    } else {
-                        t.to_string()
-                    }
-                })
-                .collect();
-            app.push_display_message(DisplayMessage::system(format!(
-                "Transport: {}\nAvailable: {}\nUse /transport <mode> to change.",
-                current_label,
-                list.join(" · ")
-            )));
-        }
-        return true;
-    }
-
-    if let Some(mode) = trimmed.strip_prefix("/transport ") {
-        let mode = mode.trim();
-        match app.provider.set_transport(mode) {
-            Ok(()) => {
-                let new_transport = app.provider.transport().unwrap_or_else(|| mode.to_string());
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Transport → {}",
-                    new_transport
-                )));
-                app.set_status_notice(format!("Transport → {}", new_transport));
-            }
-            Err(e) => {
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Failed to set transport: {}",
-                    e
-                )));
-            }
-        }
-        return true;
-    }
-
-    false
-}
-
-async fn refresh_model_catalog_with_progress(
-    provider: std::sync::Arc<dyn crate::provider::Provider>,
-    session_id: String,
-) -> Result<crate::provider::ModelCatalogRefreshSummary, String> {
-    let started = std::time::Instant::now();
-    let refresh = provider.refresh_model_catalog();
-    tokio::pin!(refresh);
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            result = &mut refresh => {
-                return result.map_err(|error| error.to_string());
-            }
-            _ = heartbeat.tick() => {
-                let elapsed_secs = started.elapsed().as_secs();
-                if elapsed_secs > 0 {
-                    let percent = (10 + elapsed_secs.saturating_mul(5)).min(95) as u8;
-                    crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
-                        crate::bus::UiActivity::catalog(
-                            Some(session_id.clone()),
-                            crate::message::format_model_refresh_progress_markdown(
-                                &format!("Waiting on provider APIs ({elapsed_secs}s elapsed)"),
-                                Some(percent),
-                            ),
-                            Some("Refreshing model list..."),
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-}
-
 impl App {
     pub(super) fn handle_model_refresh_completed(
         &mut self,
@@ -1821,126 +1971,30 @@ impl App {
     }
 }
 
-pub(super) fn is_refresh_model_list_command(trimmed: &str) -> bool {
-    trimmed == "/refresh-model-list"
-}
+#[path = "model_context_messages.rs"]
+mod messages;
+pub(super) use messages::*;
 
-pub(super) fn format_model_refresh_summary(
-    summary: &crate::provider::ModelCatalogRefreshSummary,
-) -> String {
-    let mut message = format!(
-        "Model List Refresh Complete\n\nModels: {} → {}  (+{} / -{})\nRoutes: {} → {}  (+{} / -{} / ~{})",
-        summary.model_count_before,
-        summary.model_count_after,
-        summary.models_added,
-        summary.models_removed,
-        summary.route_count_before,
-        summary.route_count_after,
-        summary.routes_added,
-        summary.routes_removed,
-        summary.routes_changed,
-    );
-    append_model_name_diff(&mut message, summary);
-    message
-}
-
-pub(super) fn append_model_name_diff(
-    message: &mut String,
-    summary: &crate::provider::ModelCatalogRefreshSummary,
-) {
-    if !summary.models_added_names.is_empty() {
-        message.push_str("\nAdded models: ");
-        message.push_str(&format_model_name_list(&summary.models_added_names, 12));
-    }
-    if !summary.models_removed_names.is_empty() {
-        message.push_str("\nRemoved models: ");
-        message.push_str(&format_model_name_list(&summary.models_removed_names, 12));
-    }
-}
-
-pub(super) fn format_model_name_list(models: &[String], limit: usize) -> String {
-    let shown = models
-        .iter()
-        .take(limit)
-        .map(|model| model.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    if models.len() > limit {
-        format!("{} … and {} more", shown, models.len() - limit)
-    } else {
-        shown
-    }
-}
-
-pub(super) fn no_models_available_message(is_remote: bool) -> String {
-    let mut lines = vec![
-        "No models are available right now.".to_string(),
-        String::new(),
-        "Next steps:".to_string(),
-        "  - Run /login to connect or refresh a provider".to_string(),
-        "  - Run /account to inspect or switch credentials".to_string(),
-        "  - If you just logged in, wait a moment and try /model again".to_string(),
-    ];
-
-    if is_remote {
-        lines.push(
-            "  - If this is a remote session, reconnect if the server model list looks stale"
-                .to_string(),
-        );
-    }
-
-    lines.join("\n")
-}
-
-pub(super) fn model_switch_failure_message(error: &str, is_remote: bool) -> String {
-    let mut lines = vec![
-        format!("Failed to switch model: {}", error),
-        String::new(),
-        "Next steps:".to_string(),
-        "  - Use /model to choose another available route".to_string(),
-        "  - Run /login to add or refresh credentials".to_string(),
-        "  - Run /account to inspect or switch accounts".to_string(),
-    ];
-
-    if is_remote {
-        lines.push(
-            "  - If this is a remote session and the list looks stale, reconnect and try again"
-                .to_string(),
-        );
-    }
-
-    lines.join("\n")
-}
-
-pub(super) fn unavailable_model_route_message(
-    model: &str,
-    provider: &str,
-    detail: &str,
-    is_remote: bool,
-) -> String {
-    let reason = if detail.trim().is_empty() {
-        "This route is not currently available.".to_string()
-    } else {
-        format!("This route is not currently available: {}", detail.trim())
+/// Match `/usage <provider>` queries against report names such as
+/// "Anthropic (Claude)" or "OpenAI (ChatGPT)", accepting common aliases.
+pub(super) fn usage_provider_matches(provider_name: &str, query: &str) -> bool {
+    let normalize = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
     };
-
-    let mut lines = vec![
-        format!("Cannot use {} via {} right now.", model, provider),
-        String::new(),
-        reason,
-        String::new(),
-        "Next steps:".to_string(),
-        "  - Pick another available row in /model".to_string(),
-        "  - Run /login to add or refresh credentials".to_string(),
-        "  - Run /account to inspect or switch accounts".to_string(),
-    ];
-
-    if is_remote {
-        lines.push(
-            "  - If this is a remote session, wait a moment or reconnect if the catalog looks stale"
-                .to_string(),
-        );
+    let name = normalize(provider_name);
+    let query = normalize(query);
+    if query.is_empty() {
+        return true;
     }
-
-    lines.join("\n")
+    let alias = match query.as_str() {
+        "claude" | "anthropic" => "anthropic",
+        "openai" | "chatgpt" | "codex" | "gpt" => "openai",
+        "gemini" | "google" => "gemini",
+        "copilot" | "github" => "copilot",
+        _ => query.as_str(),
+    };
+    name.contains(&query) || name.contains(alias)
 }

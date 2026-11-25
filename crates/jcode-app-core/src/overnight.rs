@@ -1041,6 +1041,11 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let existing = std::fs::read_to_string(path).ok();
+    let content = jcode_core::eol::normalize_line_endings(
+        content,
+        jcode_core::eol::resolve_line_ending(path, existing.as_deref()),
+    );
     std::fs::write(path, content)?;
     Ok(())
 }
@@ -1048,6 +1053,33 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_text_file_keeps_a_crlf_report_crlf() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("review.html");
+        std::fs::write(&path, "<html>\r\n</html>\r\n").expect("seed crlf report");
+
+        write_text_file(&path, "<html>\nbody\n</html>\n").expect("write report");
+
+        let written = std::fs::read_to_string(&path).expect("read report");
+        assert!(
+            !written.replace("\r\n", "").contains('\n'),
+            "a CRLF report must stay CRLF, got {written:?}"
+        );
+        assert!(written.contains("body"));
+    }
+
+    #[test]
+    fn write_text_file_writes_a_new_report_with_lf() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("review.html");
+
+        write_text_file(&path, "<html>\nbody\n</html>\n").expect("write report");
+
+        let written = std::fs::read_to_string(&path).expect("read report");
+        assert!(!written.contains('\r'), "a new report must use LF");
+    }
 
     fn test_manifest(root: &Path, run_id: &str) -> OvernightManifest {
         let run_dir = root.join("run");

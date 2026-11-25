@@ -1,3 +1,9 @@
+// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+//   ("Use one accepted, deferred goal with a verifiable external condition.
+//   ... Record the goal key, the budget constraint, the reason the old option
+//   failed and the evidence that would justify reconsideration."; and "Ask
+//   reflect to return one of `wait`, `prepare`, `act_within_authority` or
+//   `ask_owner`").
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::{Tool, ToolContext, ToolOutput};
@@ -81,6 +87,60 @@ struct GoalInput {
     checkpoint_summary: Option<String>,
     #[serde(default)]
     display: Option<String>,
+    /// The condition under which a deferred goal becomes worth reconsidering.
+    ///
+    /// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+    ///   ("Record the goal key, the budget constraint, the reason the old
+    ///   option failed and the evidence that would justify reconsideration").
+    #[serde(default)]
+    review_condition: Option<GoalReviewConditionInput>,
+}
+
+/// The condition that makes a deferred goal worth reconsidering.
+///
+/// reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+///   ("A sentence such as 'remind me if a free option becomes usable' gives
+///   Jcode an observable condition.").
+#[derive(Debug, Clone, Deserialize)]
+struct GoalReviewConditionInput {
+    /// The condition in the owner's words.
+    #[serde(default)]
+    condition: Option<String>,
+    /// Why the goal was deferred: what the old option needed and failed.
+    #[serde(default)]
+    blocked_because: Option<String>,
+    /// The evidence that would justify reconsidering.
+    #[serde(default)]
+    evidence_to_look_for: Option<String>,
+    /// Terms that identify the entity the condition is about.
+    #[serde(default)]
+    watch_terms: Option<Vec<String>>,
+    /// Whether preparation was authorized in advance.
+    #[serde(default)]
+    preparation_authorized: Option<bool>,
+}
+
+impl GoalReviewConditionInput {
+    fn into_condition(self) -> crate::goal::GoalReviewCondition {
+        crate::goal::GoalReviewCondition {
+            condition: self.condition.unwrap_or_default().trim().to_string(),
+            blocked_because: self.blocked_because.unwrap_or_default().trim().to_string(),
+            evidence_to_look_for: self
+                .evidence_to_look_for
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            watch_terms: self
+                .watch_terms
+                .unwrap_or_default()
+                .into_iter()
+                .map(|term| term.trim().to_ascii_lowercase())
+                .filter(|term| !term.is_empty())
+                .collect(),
+            preparation_authorized: self.preparation_authorized.unwrap_or(false),
+            ..Default::default()
+        }
+    }
 }
 
 fn goal_step_schema() -> Value {
@@ -121,7 +181,7 @@ impl Tool for InitiativeTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "show", "resume", "update", "checkpoint", "focus"],
+                    "enum": ["create", "list", "show", "resume", "update", "checkpoint", "focus", "review"],
                     "description": "Action."
                 },
                 "id": {"type": "string"},
@@ -136,7 +196,18 @@ impl Tool for InitiativeTool {
                 "blockers": {"type": "array", "items": {"type": "string"}},
                 "current_milestone_id": {"type": "string"},
                 "progress_percent": {"type": "integer"},
-                "checkpoint_summary": {"type": "string"}
+                "checkpoint_summary": {"type": "string"},
+                "review_condition": {
+                    "type": "object",
+                    "description": "The condition under which a deferred goal becomes worth reconsidering.",
+                    "properties": {
+                        "condition": {"type": "string", "description": "What would have to become true."},
+                        "blocked_because": {"type": "string", "description": "Why the goal was deferred."},
+                        "evidence_to_look_for": {"type": "string", "description": "What evidence would justify reconsidering."},
+                        "watch_terms": {"type": "array", "items": {"type": "string"}, "description": "Terms identifying the entity the condition is about."},
+                        "preparation_authorized": {"type": "boolean", "description": "Whether preparation may proceed once the condition holds."}
+                    }
+                }
             }
         })
     }
@@ -191,6 +262,10 @@ impl Tool for InitiativeTool {
                         blockers: params.blockers.unwrap_or_default(),
                         current_milestone_id: params.current_milestone_id.clone(),
                         progress_percent: params.progress_percent,
+                        review_condition: params
+                            .review_condition
+                            .clone()
+                            .map(|condition| condition.into_condition()),
                     },
                     working_dir,
                 )?;
@@ -311,6 +386,10 @@ impl Tool for InitiativeTool {
                         } else {
                             None
                         },
+                        review_condition: params
+                            .review_condition
+                            .clone()
+                            .map(|condition| Some(condition.into_condition())),
                         checkpoint_summary: if params.action == "checkpoint" {
                             params
                                 .checkpoint_summary
@@ -347,6 +426,69 @@ impl Tool for InitiativeTool {
                         .with_title(goal.title.clone())
                         .with_metadata(serde_json::to_value(&goal)?),
                 )
+            }
+            "review" => {
+                // The plan's "reopen a good idea" action: assess a deferred
+                // goal against a reported change and report what should
+                // happen. The decision comes from `reflect`; this action
+                // never acts on it.
+                //
+                // reference: C:/Users/WorkShop1/Documents/Codex/2026-11-08/new-chat/outputs/jcode-hindsight-implementation.md
+                //   ("Ask reflect to return one of `wait`, `prepare`,
+                //   `act_within_authority` or `ask_owner` with `goal_id`,
+                //   `evidence_ids`, `counterevidence_ids`,
+                //   `unverified_conditions` and `why_now`.").
+                let change = params
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("description is required for review: the reported change")
+                    })?;
+
+                let goals = crate::goal::list_relevant_goals(working_dir)?;
+                let candidates = crate::goal_review::candidates_for_change(&goals, change);
+                if candidates.is_empty() {
+                    return Ok(ToolOutput::new(
+                        "No deferred goal carries a review condition that this change bears on.",
+                    )
+                    .with_title("nothing to reopen"));
+                }
+
+                let config = crate::memory_hindsight::recall_configured()?;
+                let mut outcomes = Vec::new();
+                for candidate in &candidates {
+                    let outcome = crate::goal_review::assess_candidate(&config, candidate, change)?;
+                    outcomes.push(outcome);
+                }
+
+                let mut output = String::new();
+                let mut notify = false;
+                for outcome in &outcomes {
+                    let decision = outcome
+                        .assessment
+                        .decision
+                        .map(|decision| decision.as_str().to_string())
+                        .unwrap_or_else(|| "inconclusive".to_string());
+                    output.push_str(&format!(
+                        "- `{}` -> {}\n",
+                        outcome.candidate.goal_id, decision
+                    ));
+                    if let Some(why_now) = outcome.assessment.why_now.as_deref() {
+                        output.push_str(&format!("  why now: {why_now}\n"));
+                    }
+                    if outcome.worth_notifying {
+                        notify = true;
+                    }
+                }
+                if !notify {
+                    output.push_str("\nNothing here needs the owner's attention right now.");
+                }
+                Ok(ToolOutput::new(output).with_title(format!(
+                    "{} goal(s) assessed",
+                    outcomes.len()
+                )))
             }
             other => anyhow::bail!("unknown goal action: {}", other),
         }

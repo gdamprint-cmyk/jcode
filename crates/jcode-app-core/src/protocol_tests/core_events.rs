@@ -17,6 +17,7 @@ fn test_request_roundtrip() -> Result<()> {
 fn test_compacted_history_request_roundtrip() -> Result<()> {
     let req = Request::GetCompactedHistory {
         id: 7,
+        recent_history: false,
         visible_messages: 64,
     };
     let json = serde_json::to_string(&req)?;
@@ -215,6 +216,7 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         provider_model: Some("gpt-5.4".to_string()),
         available_models: vec!["gpt-5.4".to_string()],
         available_model_routes: Vec::new(),
+        available_service_tiers: None,
         mcp_servers: Vec::new(),
         skills: Vec::new(),
         total_tokens: Some((123, 45)),
@@ -240,6 +242,8 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         status_detail: None,
         upstream_provider: None,
         resolved_credential: None,
+        provider_oauth_email: None,
+        provider_oauth_account_label: None,
         reasoning_effort: None,
         service_tier: None,
         subagent_model: None,
