@@ -41,6 +41,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -381,6 +382,15 @@ _TRUNCATION_MARKER_B64 = "[... truncated by entire-agent-jcode ...]"
 # its image codecs cover only Claude Code, Codex and Pi
 # (cmd/entire/cli/transcript/imageextract/imageextract.go:106-110).
 _ASSET_PLACEHOLDER_PREFIX = "entire-asset:assets/"
+# The placeholder's NAME grammar, taken from upstream rather than inferred from a
+# delimiter: upstream matches `entire-asset:assets/(img-[0-9a-f]+\.[a-z0-9]+)`.
+# Scanning for the first `"` instead let an adjacent or nested prefix (any text
+# that merely quotes the placeholder format) truncate a name and strand the rest.
+# reference: entireio/cli cmd/entire/cli/transcript/imageextract/imageextract.go
+#   placeholderRe, read 2026-11-24; re.sub with a bytes pattern is documented at
+#   docs.python.org/3/library/re.html (read 2026-11-24).
+_PLACEHOLDER_RE_REINJECT = re.compile(
+    re.escape(_ASSET_PLACEHOLDER_PREFIX.encode("ascii")) + rb"(img-[0-9a-f]+\.[a-z0-9]+)")
 # The placeholder must stay low-entropy: upstream's redaction pass flags any
 # [A-Za-z0-9+_=-]{10,} run whose Shannon entropy is >= 4.5 bits/char. A hex run
 # has at most 4 bits/char (16 symbols), so the id run stays well under it.
@@ -449,12 +459,57 @@ def _assets_dir(session_id: str) -> Path:
     Inside the agent session directory, next to the ETF sidecar: the CLI's
     session-store containment check requires the session reference to resolve
     inside that directory.
+
+    MEASURED 2026-11-24 by an independent review lane (~/.jcode/scratch/r6e/
+    review.md, finding E6): concatenating the id unnormalized let `..\escape`
+    and an absolute path (`C:\Windows\Temp\evil`) resolve OUTSIDE the store,
+    defeating exactly the containment this docstring claims. The id now has to be
+    a single path component that resolves back inside the assets root; otherwise
+    the write is refused at the caller (a hostile id cannot escape the store).
+    reference: entireio/cli validation.ValidateSessionID - upstream rejects a
+    malformed session id at the write boundary rather than normalizing it,
+    cmd/entire/cli/checkpoint/persistent.go writeSession, read 2026-11-24.
     """
-    return _sessions_dir() / _SIDECAR_DIR / _ASSETS_DIR_NAME / session_id
+    root = _sessions_dir() / _SIDECAR_DIR / _ASSETS_DIR_NAME
+    candidate = root / session_id
+    resolved_root = root.resolve()
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate.absolute()
+    # ONE path component: no separator, no traversal, no drive/absolute form.
+    # A separator is not merely an escape - `a/b` and `.\b` resolve INSIDE the
+    # store while aliasing a DIFFERENT session's directory
+    # (MEASURED 2026-11-24, ~/.jcode/scratch/r6e/review.md E6: `.\session_C`
+    # and `session_C` share one manifest). One component cannot do either.
+    if (resolved != resolved_root and resolved_root not in resolved.parents) \
+            or Path(session_id).name != session_id:
+        raise ValueError(
+            f"session id {session_id!r} is not one path component inside the "
+            f"asset store ({resolved})")
+    return candidate
 
 
 def _asset_manifest_path(session_id: str) -> Path:
     return _assets_dir(session_id) / _ASSET_MANIFEST_NAME
+
+
+def _referenced_names(path: Path) -> set[str]:
+    """The asset names a manifest vouches for; empty when it cannot be read.
+
+    A corrupt, unreadable or directory-shaped manifest vouches for NOTHING,
+    which is the point: a caller replacing it must not leave blobs behind on
+    the strength of a reference nobody can resolve.
+    """
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - unreadable is "vouches for nothing"
+        return set()
+    items = previous.get("assets") if isinstance(previous, dict) else None
+    if not isinstance(items, list):
+        return set()
+    return {item["name"] for item in items
+            if isinstance(item, dict) and item.get("name")}
 
 
 def _externalize_image(session_id: str, media_type: str, encoded: str) -> tuple[str, dict] | None:
@@ -507,14 +562,42 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
     if not entries:
         return
     path = _asset_manifest_path(session_id)
+    # The set of names the manifest that is about to be REPLACED can vouch for,
+    # captured before the write. A failed write must leave the store exactly as
+    # reachable as it was: a blob no surviving manifest lists is unreachable,
+    # because `_reinject_assets` reads only the placeholder and the blob (it never
+    # opens the manifest - measured 2026-11-24), so an unlisted blob is dead weight.
+    reachable_before = _referenced_names(path)
     merged: dict[str, dict] = {}
     rebuilt_from_disk = False
     try:
         if path.exists():
             previous = json.loads(path.read_text(encoding="utf-8"))
-            for item in previous.get("assets") or []:
+            items = previous.get("assets") if isinstance(previous, dict) else None
+            # Rebuild from disk unless the manifest parsed into the shape this
+            # writer produces. A JSON-parseable but wrong shape - a bare list,
+            # `{"assets": "..."}`, `{"assets": ["a.png"]}`, `{"assets": null}` -
+            # raises nothing, so an except-only trigger left merged={} and silently
+            # discarded references to blobs still on disk: the same leak class D3
+            # removed, reachable through a manifest that PARSES.
+            # MEASURED 2026-11-24 (scratch/r6e/d3_isolate.py R1): each of those shapes
+            # gave `before=1 after=1 disk=2 lost=1 orphans=['img-...png']`.
+            # reference: entireio/cli cmd/entire/cli/checkpoint/persistent.go
+            # (readSummaryFromBlob failing is treated as no summary and rebuilt,
+            # never as an empty one), read 2026-11-24.
+            if not isinstance(items, list):
+                raise ValueError("manifest assets is not a list")
+            for item in items:
+                # A bare string is an asset NAME, and this writer's own store can
+                # hold one: dropping it would discard a reference to a blob that
+                # IS on disk (the leak class D3 removed).
+                # MEASURED 2026-11-24 (scratch/r6e/d3_isolate.py R1,
+                # `assets-is-list-of-strings`): `after=1 disk=2 lost=1
+                # orphans=['img-...png']`.
                 if isinstance(item, dict) and item.get("name"):
                     merged[item["name"]] = item
+                elif isinstance(item, str) and item:
+                    merged.setdefault(item, {"name": item})
     except Exception:  # noqa: BLE001 - a corrupt manifest is rebuilt, not fatal
         # MEASURED 2026-11-24 by an independent review lane
         # (~/.jcode/scratch/r6b/review.md, finding D3): the bare `except` set
@@ -535,12 +618,37 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
                 f"[entire-agent-jcode] rebuild asset manifest from disk: {exc}\n")
             blobs = []
         for blob in blobs:
-            if blob.is_file():
+            # The manifest lives IN this directory, so an unfiltered glob lists
+            # itself as an image asset. That entry then survives every later
+            # conversion (the merge preserves entries by name) and
+            # `_reinject_assets` would inject the manifest's own bytes as base64
+            # if a transcript ever carried its placeholder.
+            # MEASURED 2026-11-24 (scratch/r6e/manifest_self_listing2.py H1/H2):
+            # `entries_after ['img-...92d.png', 'manifest.json']`,
+            # `BOGUS_ENTRY_PERSISTS True`, reinjection `out 793 bytes`.
+            # reference: entireio/cli imageextract.go placeholderRe
+            # (`img-[0-9a-f]+\.[a-z0-9]+`) - upstream's asset name grammar
+            # excludes a manifest filename by construction, read 2026-11-24.
+            if blob.is_file() and blob.name != _ASSET_MANIFEST_NAME:
                 merged.setdefault(blob.name, {"name": blob.name})
     for entry in entries:
         name = entry.get("name")
         if name:
             merged[name] = entry
+    # E3 (MEASURED 2026-11-24, ~/.jcode/scratch/r6e/review.md): a parsed entry was
+    # kept unconditionally, so a manifest could keep naming a blob that is gone -
+    # `still_lists_missing_blob ['img-...png'] blob_exists False`. The acceptance
+    # test asserts `referenced <= on_disk` ("no reference is missing its blob"),
+    # but only on the happy re-conversion path; neither a deleted blob nor a pass
+    # with no new assets repaired it. Enforce the same invariant here: an entry
+    # whose blob is absent is a reference nobody can resolve.
+    directory = _assets_dir(session_id)
+    dangling = [name for name in merged if not (directory / name).is_file()]
+    for name in dangling:
+        del merged[name]
+        sys.stderr.write(
+            f"[entire-agent-jcode] asset {name} has no blob; "
+            f"dropped from the manifest\n")
     manifest = {"version": 1, "assets": list(merged.values())}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -556,18 +664,40 @@ def _write_asset_manifest(session_id: str, entries: list[dict]) -> None:
         # blobs here; if removal fails, name them on stderr so the leak is
         # visible rather than silent.
         directory = _assets_dir(session_id)
-        for entry in entries:
-            name = entry.get("name")
-            if not name:
+        # Remove every blob the surviving manifest will NOT list.
+        #
+        # D2 (MEASURED 2026-11-24 by an independent review lane,
+        # ~/.jcode/scratch/r6b/review.md): on this path the blobs of THIS call
+        # were already written and unreferenced, so they had to go.
+        #
+        # E5 (MEASURED 2026-11-24, ~/.jcode/scratch/r6e/review.md, persistent
+        # failure): when the write fails REPEATEDLY (the manifest path is a
+        # directory, disk full, permissions), cleaning only this call's names left
+        # earlier blobs with no manifest anywhere and no repair path - every later
+        # conversion re-fails identically (`blobs on disk: 3`, manifest path a
+        # directory). Keep a blob ONLY if the manifest being replaced still vouched
+        # for it; otherwise it is unreachable and must not accumulate.
+        referenced = set(merged) | {e.get("name") for e in entries}
+        referenced.discard(None)
+        keep = referenced & reachable_before
+        try:
+            candidates = sorted(directory.glob("*")) if directory.is_dir() else []
+        except OSError as list_exc:
+            sys.stderr.write(
+                f"[entire-agent-jcode] list asset dir after failed manifest "
+                f"write: {list_exc}\n")
+            candidates = []
+        for blob in candidates:
+            if not blob.is_file() or blob.name == _ASSET_MANIFEST_NAME:
+                continue
+            if blob.name in keep:
                 continue
             try:
-                blob = directory / name
-                if blob.is_file():
-                    blob.unlink()
+                blob.unlink()
             except OSError as rm_exc:
                 sys.stderr.write(
-                    f"[entire-agent-jcode] asset {name} is UNREFERENCED after a "
-                    f"failed manifest write: {rm_exc}\n")
+                    f"[entire-agent-jcode] asset {blob.name} is UNREFERENCED "
+                    f"after a failed manifest write: {rm_exc}\n")
 
 
 def _reinject_assets(session_id: str, transcript: bytes) -> bytes:
@@ -590,37 +720,30 @@ def _reinject_assets(session_id: str, transcript: bytes) -> bytes:
     re.sub with a function repl is documented as being called "for every
     non-overlapping occurrence" (reference: docs.python.org/3/library/re.html,
     read 2026-11-24). A hand-written while/break loop is what produced the bug.
+
+    MEASURED 2026-11-24 by an independent review lane (~/.jcode/scratch/r6e/review.md,
+    finding E4): the name ended at the first `"`, so an adjacent/nested prefix made
+    the scan see two placeholders and resolve neither (`restored False ph_left 2`).
+    The name is now delimited by upstream's own asset-name grammar rather than by
+    a quote: reference: entireio/cli cmd/entire/cli/transcript/imageextract/
+    imageextract.go placeholderRe `img-[0-9a-f]+\.[a-z0-9]+`, read 2026-11-24.
+    A text that merely quotes the placeholder format therefore cannot smuggle in
+    bytes outside that grammar, and a name can never run past its real end.
     """
-    prefix = _ASSET_PLACEHOLDER_PREFIX.encode("ascii")
-    if prefix not in transcript:
-        return transcript
     directory = _assets_dir(session_id)
-    out = []
-    cursor = 0
-    while True:
-        start = transcript.find(prefix, cursor)
-        if start == -1:
-            out.append(transcript[cursor:])
-            break
-        end = transcript.find(b'"', start)
-        if end == -1:
-            # An unterminated placeholder is not ours to guess at; leave the
-            # remainder verbatim rather than dropping bytes.
-            out.append(transcript[cursor:])
-            break
-        name = transcript[start + len(prefix):end].decode("utf-8", "replace")
+
+    def repl(match: re.Match) -> bytes:
+        raw_name = match.group(1)
+        name = raw_name.decode("ascii")
         try:
             raw = (directory / name).read_bytes()
         except OSError:
-            # Leave THIS placeholder, advance past it, keep scanning. One
-            # missing blob must not strand every later image (see docstring).
-            out.append(transcript[cursor:end])
-            cursor = end
-            continue
-        out.append(transcript[cursor:start])
-        out.append(base64.b64encode(raw))
-        cursor = end
-    return b"".join(out)
+            # Leave THIS placeholder verbatim; the scan continues with the next
+            # match. One missing blob must not strand every later image.
+            return match.group(0)
+        return base64.b64encode(raw)
+
+    return _PLACEHOLDER_RE_REINJECT.sub(repl, transcript)
 
 
 def _truncate_bytes(text: str, limit: int) -> str:
